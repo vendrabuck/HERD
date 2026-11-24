@@ -689,6 +689,56 @@ async def test_callback_repeat_success_is_noop(internal_client):
     assert len(res.device_ids) == 2
 
 
+async def test_callback_success_with_repeated_device_ids_attaches_each_once(internal_client):
+    """RES-DYN-7 (issue #1533): a success callback whose device_ids repeat a new id
+    and repeat the already-booked DEVICE_A answers 200 applied, lands ACTIVE, and
+    attaches each id once: the stored set, the reservation.created payload, and
+    the fork's member list each hold DEVICE_A and the two new ids exactly once. A
+    second PENDING_PROVISION reservation keeps its status and its device set."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+    other_device = str(uuid.uuid4())
+    bystander = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION,
+        device_ids=[other_device],
+        dynamic_template_ids=[TEMPLATE_ID],
+    )
+    inst_1 = str(uuid.uuid4())
+    inst_2 = str(uuid.uuid4())
+    reported = [inst_1, inst_1, DEVICE_A, inst_2, inst_1, DEVICE_A, inst_2]
+    fork_mock = AsyncMock()
+    with patch(
+        "app.services.reservation_service._create_reservation_fork_best_effort",
+        new=fork_mock,
+    ):
+        resp = await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": True, "device_ids": reported, "error": None},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"reservation_id": str(rid), "status": "ACTIVE", "applied": True}
+
+    expected = sorted([DEVICE_A, inst_1, inst_2])
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert sorted(str(d) for d in res.device_ids) == expected
+
+    created = await _outbox_rows("herd.reservations.created")
+    assert len(created) == 1
+    assert created[0].payload["reservation_id"] == str(rid)
+    assert sorted(created[0].payload["device_ids"]) == expected
+
+    fork_mock.assert_awaited_once()
+    assert fork_mock.await_args.args[0] == rid
+    assert sorted(str(d) for d in fork_mock.await_args.kwargs["member_device_ids"]) == expected
+
+    other = await _get_reservation(bystander)
+    assert other.status == ReservationStatus.PENDING_PROVISION
+    assert [str(d) for d in other.device_ids] == [other_device]
+
+
 # --- Provision-result callback: failure ---------------------------------------
 
 

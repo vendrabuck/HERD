@@ -142,7 +142,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   already booked), moves to `ACTIVE` with `reservation.created` in that transaction, then
   creates the fork best-effort. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`)
 - **RES-DYN-8.** A failed callback moves to `FAILED` with `reservation.failed` and the
   purpose marker in that transaction, then releases exclusive devices (holder-aware) and
   archives the fork. \
@@ -703,12 +703,12 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   refuses an invisible device as not found (400). The calendar, which returns rows,
   fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
   (`l3=0`). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`)
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`, `test_patch_topology_membership_break_is_400_with_the_structured_body`)
 - **RES-PATCH-9.** An added exclusive device must not conflict over
   `[max(now, start), end)`, checked by the same refusal create uses, with create's
   wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
@@ -843,7 +843,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_returns_cross_user_reservations`, `test_calendar_boundary_exclusion`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_returns_cross_user_reservations`, `test_calendar_boundary_exclusion`, `test_calendar_visibility_is_the_callers_and_judged_per_row`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_returns_exactly_the_rows_overlapping_the_half_open_window`)
 - **RES-CAL-2.** A window wider than `CALENDAR_MAX_SPAN_DAYS` (default 366) is 422; 0
   disables the cap. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
@@ -857,7 +857,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   calendar page shows a could-not-load state on the refusal, not the empty-range
   message. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids_strict`); `frontend/src/pages/ReservationCalendarPage.tsx` (`ReservationCalendarPage`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`, `test_calendar_visibility_is_the_callers_and_judged_per_row`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`, `test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_visible`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
 
 **Out of scope.** Utilization reports (`GET /reports/utilization` and its CSV) live in
 this service but belong to `operations-and-observability.md`.
@@ -891,7 +891,7 @@ routes in section 5; background work `purpose_classify_loop` every
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,
   including terminal; anyone else gets 403 (not 404). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
-  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_by_admin`, `test_patch_purpose_category_allowed_on_completed_reservation`, `test_patch_purpose_category_by_third_user_is_403`)
+  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_by_admin`, `test_patch_purpose_category_allowed_on_completed_reservation`, `test_patch_purpose_category_by_third_user_is_403`, `test_patch_purpose_category_writes_only_the_named_row`, `test_patch_purpose_category_by_a_third_user_is_403_and_writes_nothing`)
 - **RES-PURPOSE-3.** A null category clears the category, its setter, and its time
   together. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
