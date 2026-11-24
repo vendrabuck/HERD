@@ -22,8 +22,19 @@ from app.models.reservation import (
     ReservationStatus,
     TopologyType,
 )
+from app.services.purpose_service import classify_purpose_one
 from app.tasks.expiration import _run_purpose_classify_reconcile
 from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from tests._purpose_classify_answers import (
+    ANSWER_IDS,
+    ANSWERS,
+    OUTCOME_WORDS,
+    SUGGESTION_BODY,
+    Answer,
+    ProbeUnexpectedError,
+    deliver,
+)
 
 # The structured 403 detail the orchestrator's flag refusal carries (issue
 # #706), matching services/ai-orchestrator/app/routes/purpose_classification.py's
@@ -77,19 +88,30 @@ async def _insert(
     purpose_classify_attempts: int = 0,
     purpose_suggestion: dict | None = None,
     dynamic: bool = False,
+    topology_id: uuid.UUID | None = None,
+    user_id: uuid.UUID = USER_ID,
+    device_ids: list[str] | None = None,
+    purpose: str = "a support case replication run",
+    status: ReservationStatus = ReservationStatus.COMPLETED,
+    purpose_category: str | None = None,
+    start_time: datetime = NOW - timedelta(hours=3),
+    end_time: datetime = NOW - timedelta(hours=1),
 ) -> uuid.UUID:
     res = Reservation(
-        user_id=USER_ID,
+        user_id=user_id,
         owner_name="owner",
-        device_ids=[str(uuid.uuid4())],
+        device_ids=device_ids if device_ids is not None else [str(uuid.uuid4())],
+        topology_id=topology_id,
         topology_type=TopologyType.PHYSICAL,
-        purpose="a support case replication run",
-        start_time=NOW - timedelta(hours=3),
-        end_time=NOW - timedelta(hours=1),
-        status=ReservationStatus.COMPLETED,
+        purpose=purpose,
+        start_time=start_time,
+        end_time=end_time,
+        status=status,
+        purpose_category=purpose_category,
         purpose_classify_requested_at=purpose_classify_requested_at,
         purpose_classify_attempts=purpose_classify_attempts,
         purpose_suggestion=purpose_suggestion,
+        purpose_suggested_at=NOW - timedelta(days=1) if purpose_suggestion else None,
     )
     if dynamic:
         res.dynamic_requests = [ReservationDynamicRequest(template_id=uuid.uuid4())]
@@ -103,6 +125,44 @@ async def _insert(
 async def _get(rid: uuid.UUID) -> Reservation:
     async with TestSessionLocal() as db:
         return await db.get(Reservation, rid)
+
+
+async def _snapshot(rid: uuid.UUID) -> dict:
+    """Every mapped column of the row, read on a fresh session."""
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        return {a.key: getattr(res, a.key) for a in Reservation.__mapper__.column_attrs}
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """SQLite hands a timezone-aware column back naive (in UTC); compare that way."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _assert_answer_applied(
+    answer: Answer, before: dict, after: dict, started: datetime, finished: datetime
+) -> None:
+    """The row after one classification is the row before, with exactly the columns
+    the answer's rule writes changed: one more attempt (RES-PURPOSE-7), or the body
+    verbatim as the suggestion with its time (RES-PURPOSE-8), or nothing at all
+    (RES-PURPOSE-6). `updated_at` is left out only when something was written, since
+    the column's onupdate moves it then."""
+    expected = dict(before)
+    after = dict(after)
+    if answer.counts_attempt:
+        expected["purpose_classify_attempts"] = before["purpose_classify_attempts"] + 1
+    if answer.stores is not None:
+        expected["purpose_suggestion"] = answer.stores
+        suggested_at = after["purpose_suggested_at"]
+        assert suggested_at is not None
+        assert _naive_utc(started) <= _naive_utc(suggested_at) <= _naive_utc(finished)
+        expected["purpose_suggested_at"] = suggested_at
+    if answer.counts_attempt or answer.stores is not None:
+        expected.pop("updated_at")
+        after.pop("updated_at")
+    assert after == expected
 
 
 @pytest.mark.asyncio
@@ -328,15 +388,27 @@ async def test_reconcile_timeout_head_of_line_row_stops_blocking_after_cap():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_transport_error_never_raises_and_is_transient():
-    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+async def test_reconcile_transport_error_ends_tick_without_bump():
+    """A connection error is transient (RES-PURPOSE-6): the single-row classifier
+    returns "transient" without raising, and the sweep makes one call, ends the tick
+    there, and counts no attempt on either of the two eligible rows."""
+    rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    before = {rid: await _snapshot(rid) for rid in (rid_first, rid_second)}
     call = AsyncMock(side_effect=httpx.ConnectError("down"))
     with patch("app.services.purpose_service.call_service", call):
-        # Must not raise.
         await _run_purpose_classify_reconcile()
-    res = await _get(rid)
-    assert res.purpose_suggestion is None
-    assert res.purpose_classify_attempts == 0
+    call.assert_awaited_once()
+    assert call.await_args.kwargs["json_body"]["reservation_id"] == str(rid_first)
+    for rid in (rid_first, rid_second):
+        assert await _snapshot(rid) == before[rid]
+
+    call = AsyncMock(side_effect=httpx.ConnectError("down"))
+    with patch("app.services.purpose_service.call_service", call):
+        assert await classify_purpose_one(rid_second) == "transient"
+    call.assert_awaited_once()
+    for rid in (rid_first, rid_second):
+        assert await _snapshot(rid) == before[rid]
 
 
 @pytest.mark.asyncio
@@ -413,3 +485,244 @@ async def test_reconcile_oldest_requested_first():
     with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
         await _run_purpose_classify_reconcile()
     assert seen_order == [older, newer]
+
+
+# --- Issue #1525: row scope, payload, and the outcome of every answer -------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ineligible", ["suggested", "at_attempt_cap", "not_requested"])
+async def test_reconcile_batch_is_filled_only_by_eligible_rows(monkeypatch, ineligible):
+    """RES-PURPOSE-5: a tick takes only stamped rows with no suggestion and fewer than
+    the maximum attempts. Two rows that fail one of those three conditions, and only
+    that one, sort ahead of the one eligible row (an older stamp, or no stamp, which
+    SQLite sorts first), and the batch has two slots: the tick still makes exactly one
+    call, for the eligible row, and leaves both other rows as they were."""
+    monkeypatch.setattr(settings, "purpose_classify_batch_size", 2)
+    ineligible_kwargs = {
+        "suggested": {"purpose_suggestion": {"top_category": "training"}},
+        "at_attempt_cap": {"purpose_classify_attempts": settings.purpose_classify_max_attempts},
+        "not_requested": {"purpose_classify_requested_at": None},
+    }[ineligible]
+    others = []
+    for minutes in (30, 20):
+        kwargs = {"purpose_classify_requested_at": NOW - timedelta(minutes=minutes)}
+        kwargs.update(ineligible_kwargs)
+        others.append(await _insert(**kwargs))
+    eligible = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=1))
+    before = {rid: await _snapshot(rid) for rid in others}
+
+    sent: list[str] = []
+
+    async def _fake_call(*args, **kwargs):
+        sent.append(kwargs["json_body"]["reservation_id"])
+        return _suggestion_response("qa_regression")
+
+    with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
+        await _run_purpose_classify_reconcile()
+
+    assert sent == [str(eligible)]
+    assert (await _get(eligible)).purpose_suggestion["top_category"] == "qa_regression"
+    for rid in others:
+        assert await _snapshot(rid) == before[rid]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sends_each_rows_own_payload():
+    """RES-PURPOSE-8's request: each row's call carries exactly the keys of the
+    orchestrator's `InternalClassifyRequest`, with that row's own values. A row with a
+    topology sends its id as a string; a row without one sends null, not "None"."""
+    topology_id = uuid.uuid4()
+    other_user = uuid.uuid4()
+    with_topology_devices = [str(uuid.uuid4()), str(uuid.uuid4())]
+    without_topology_devices = [str(uuid.uuid4())]
+    with_topology = await _insert(
+        purpose_classify_requested_at=NOW - timedelta(minutes=10),
+        topology_id=topology_id,
+        device_ids=with_topology_devices,
+        purpose="topology run",
+        status=ReservationStatus.CANCELLED,
+        start_time=NOW - timedelta(hours=5),
+        end_time=NOW - timedelta(hours=4),
+    )
+    without_topology = await _insert(
+        purpose_classify_requested_at=NOW - timedelta(minutes=5),
+        user_id=other_user,
+        device_ids=without_topology_devices,
+        purpose="bare devices",
+        status=ReservationStatus.FAILED,
+        dynamic=True,
+        start_time=NOW - timedelta(hours=3),
+        end_time=NOW - timedelta(hours=2),
+    )
+    template_id = (await _get(without_topology)).dynamic_requests[0].template_id
+
+    sent: dict[str, dict] = {}
+
+    async def _fake_call(*args, **kwargs):
+        sent[kwargs["json_body"]["reservation_id"]] = kwargs["json_body"]
+        return _suggestion_response()
+
+    with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
+        await _run_purpose_classify_reconcile()
+
+    assert set(sent) == {str(with_topology), str(without_topology)}
+    expected = {
+        str(with_topology): {
+            "reservation_id": str(with_topology),
+            "categories": list(settings.purpose_categories),
+            "purpose": "topology run",
+            "user_id": str(USER_ID),
+            "device_ids": with_topology_devices,
+            "topology_id": str(topology_id),
+            "dynamic_requests": None,
+            "status": "CANCELLED",
+        },
+        str(without_topology): {
+            "reservation_id": str(without_topology),
+            "categories": list(settings.purpose_categories),
+            "purpose": "bare devices",
+            "user_id": str(other_user),
+            "device_ids": without_topology_devices,
+            "topology_id": None,
+            "dynamic_requests": [{"template_id": str(template_id), "count": 1}],
+            "status": "FAILED",
+        },
+    }
+    windows = {
+        str(with_topology): (NOW - timedelta(hours=5), NOW - timedelta(hours=4)),
+        str(without_topology): (NOW - timedelta(hours=3), NOW - timedelta(hours=2)),
+    }
+    for rid, body in sent.items():
+        body = dict(body)
+        start, end = body.pop("start_time"), body.pop("end_time")
+        # The model keeps a device set, not its order (Reservation.device_ids).
+        devices = body.pop("device_ids")
+        assert sorted(devices) == sorted(expected[rid].pop("device_ids"))
+        assert len(devices) == len(set(devices))
+        assert body == expected[rid]
+        assert _naive_utc(datetime.fromisoformat(start)) == _naive_utc(windows[rid][0])
+        assert _naive_utc(datetime.fromisoformat(end)) == _naive_utc(windows[rid][1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ANSWERS, ids=ANSWER_IDS)
+async def test_classify_one_maps_each_answer_to_its_outcome(answer):
+    """RES-PURPOSE-6, RES-PURPOSE-7, RES-PURPOSE-8: for every answer class in
+    `tests/_purpose_classify_answers.py`, the single-row classifier returns the
+    rule's outcome word without raising, makes one call for the named row, and writes
+    exactly what the rule says on that row: the body as the suggestion with a time
+    taken during the call, or one more attempt, or nothing (`updated_at` may move only
+    when something is written). A second eligible row, with an older stamp, keeps
+    every mapped column. The named row starts with a category of its own, which a
+    stored suggestion must not change."""
+    bystander = await _insert(
+        purpose_classify_requested_at=NOW - timedelta(minutes=30), user_id=uuid.uuid4()
+    )
+    rid = await _insert(
+        purpose_classify_requested_at=NOW - timedelta(minutes=5),
+        purpose_classify_attempts=1,
+        purpose_category="training",
+    )
+    before, bystander_before = await _snapshot(rid), await _snapshot(bystander)
+    call = AsyncMock(side_effect=lambda *a, **k: deliver(answer))
+
+    started = datetime.now(timezone.utc)
+    with patch("app.services.purpose_service.call_service", call):
+        outcome = await classify_purpose_one(rid)
+    finished = datetime.now(timezone.utc)
+
+    assert outcome == answer.outcome
+    call.assert_awaited_once()
+    assert call.await_args.kwargs["json_body"]["reservation_id"] == str(rid)
+    _assert_answer_applied(answer, before, await _snapshot(rid), started, finished)
+    assert await _snapshot(bystander) == bystander_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ANSWERS, ids=ANSWER_IDS)
+async def test_reconcile_ends_or_continues_the_tick_by_answer(answer):
+    """RES-PURPOSE-6 and RES-PURPOSE-7 at the sweep: two eligible rows, the older one
+    answered with the case's answer and the newer one with a suggestion. An answer
+    that ends the tick leaves one call made and both rows as they were; any other
+    answer is applied to the older row only, and the newer row is classified in the
+    same tick."""
+    first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
+    second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    first_before, second_before = await _snapshot(first), await _snapshot(second)
+
+    sent: list[str] = []
+
+    async def _fake_call(*args, **kwargs):
+        rid = kwargs["json_body"]["reservation_id"]
+        sent.append(rid)
+        if rid == str(first):
+            return deliver(answer)
+        return httpx.Response(200, json=SUGGESTION_BODY)
+
+    started = datetime.now(timezone.utc)
+    with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
+        await _run_purpose_classify_reconcile()
+    finished = datetime.now(timezone.utc)
+
+    if answer.ends_tick:
+        assert sent == [str(first)]
+        assert await _snapshot(first) == first_before
+        assert await _snapshot(second) == second_before
+        return
+    assert sent == [str(first), str(second)]
+    _assert_answer_applied(answer, first_before, await _snapshot(first), started, finished)
+    stored = next(a for a in ANSWERS if a.stores is not None)
+    _assert_answer_applied(stored, second_before, await _snapshot(second), started, finished)
+
+
+@pytest.mark.asyncio
+async def test_classify_one_never_raises_on_an_unexpected_exception():
+    """The classifier never raises (section 7's dependency table): an exception from
+    the call that is not an httpx error at all (call_service raises RuntimeError for a
+    missing token) still comes back as an outcome word, and neither the named row nor
+    a second eligible row gets a suggestion."""
+    bystander = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=30))
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    bystander_before = await _snapshot(bystander)
+    call = AsyncMock(side_effect=ProbeUnexpectedError("probe"))
+    with patch("app.services.purpose_service.call_service", call):
+        outcome = await classify_purpose_one(rid)
+    assert outcome in OUTCOME_WORDS
+    call.assert_awaited_once()
+    assert (await _get(rid)).purpose_suggestion is None
+    assert await _snapshot(bystander) == bystander_before
+
+
+@pytest.mark.asyncio
+async def test_classify_one_leaves_an_already_suggested_row_alone():
+    """A row that already holds a suggestion when the classifier reads it (one that
+    landed after the sweep's SELECT) is "ok" with no call: the stored suggestion and
+    its time stay as they were, and so does every other column of it and of a second,
+    eligible row."""
+    bystander = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=30))
+    rid = await _insert(
+        purpose_classify_requested_at=NOW - timedelta(minutes=5),
+        purpose_suggestion={"top_category": "training"},
+    )
+    before, bystander_before = await _snapshot(rid), await _snapshot(bystander)
+    assert before["purpose_suggested_at"] is not None
+    call = AsyncMock(return_value=_suggestion_response("qa_regression"))
+    with patch("app.services.purpose_service.call_service", call):
+        assert await classify_purpose_one(rid) == "ok"
+    call.assert_not_awaited()
+    assert await _snapshot(rid) == before
+    assert await _snapshot(bystander) == bystander_before
+
+
+@pytest.mark.asyncio
+async def test_classify_one_on_an_unknown_id_is_ok_without_a_call():
+    """A row deleted after the sweep's SELECT is "ok" with no call and no raise, and
+    an eligible row that is present is left as it was."""
+    bystander = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=30))
+    bystander_before = await _snapshot(bystander)
+    call = AsyncMock(return_value=_suggestion_response())
+    with patch("app.services.purpose_service.call_service", call):
+        assert await classify_purpose_one(uuid.uuid4()) == "ok"
+    call.assert_not_awaited()
+    assert await _snapshot(bystander) == bystander_before
