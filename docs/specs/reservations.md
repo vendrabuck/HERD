@@ -1055,13 +1055,16 @@ reconcile on the expiration loop.
   that holds nothing actionable (anything but a non-empty list: JSON `null`, an empty
   list, a corrupt non-list value, as a process on the previous code could still write) to
   SQL NULL in the same tick, in any status, without iterating it, so a corrupt value
-  never stops the rows after it; the heal reads the marker again under the row lock and
-  leaves it if a concurrent write made it a non-empty list. A non-list value is logged at
+  never stops the rows after it; the heal reads the marker again under the row lock,
+  which it holds until its UPDATE commits (so a concurrent write waits for the heal and
+  is never nulled by it), and leaves the marker if a concurrent write made it a
+  non-empty list. The heal's write also moves `updated_at` (the model's `onupdate`), as
+  the ORM clear always has. A non-list value is logged at
   ERROR by type name only. So the reconciler never keeps a row with nothing pending in
   its batch for more than one tick, and a backlog of emptied rows cannot keep a new
   marker out of it. \
   Enforced in: `services/reservations/app/models/reservation.py` (`Reservation`); `services/reservations/app/services/reservation_service.py` (`_clear_pending_fork_prune`, `_prune_marker_actionable`, `_heal_non_actionable_prune_marker`); `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`); `services/reservations/migrations/versions/0018_pending_fork_prune_sql_null.py` (`upgrade`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
   absence is 503. \

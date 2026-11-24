@@ -16,6 +16,9 @@ three; this suite proves them on the real column type:
   - the heal stores SQL NULL for a JSON "null" (which loads as None, so an attribute
     assignment of None would write nothing) and for a corrupt non-list value, and
     leaves a real list alone;
+  - the heal holds the row lock from its re-read to its UPDATE, so a second
+    connection's write of a real list in that window waits for the heal's commit
+    (here it is refused by its lock_timeout) instead of being nulled;
   - migration 0018's upgrade, schema-qualified as the stack runs it, turns JSON "null"
     and an empty list (whatever their spacing) into SQL NULL without converting any
     row to jsonb, leaves every other row byte for byte (`["\\u0000"]`, which a
@@ -27,21 +30,29 @@ Env contract identical to test_reservation_status_cas_live_pg.py:
                             server into a hard failure instead of the normal skip.
 
 Gate-ledger scoping (issue #819). The gate runs this suite against its ALREADY-USED
-database while its reservations service's sweeper runs. Every test works inside ONE
-transaction on one connection, at REPEATABLE READ, and rolls it back: its own rows
-(a random user_id) are never committed, so the live sweeper never sees them and nothing
-needs deleting, and the production clear's and heal's own sessions join that
-transaction through savepoints. Inside the transaction (a fixed snapshot) every
-foreign row's marker is compared exactly before and after: the ORM and heal tests must
-leave all of them as they were, and the migration test must change exactly the foreign
-rows holding an empty form (to SQL NULL; a database built by this code holds none, a
-database written before it may). The migration's UPDATE holds row locks on those rows
-until the rollback, a few milliseconds. After the rollback the committed markers of the
-foreign rows that existed before the test are compared with a snapshot taken then, by
-`tests/_prune_marker_snapshot.py`'s `foreign_marker_violations`: a row that was SQL
-NULL must still be; a row holding any other non-list or empty value must be unchanged
-or SQL NULL (the running sweeper's heal); a row holding a list may change (the running
-sweeper may prune it); rows created or deleted meanwhile are ignored.
+database while its reservations service's sweeper runs. Every test but the lock test
+works inside ONE transaction on one connection, at REPEATABLE READ, and rolls it back:
+its own rows (a random user_id) are never committed, so the live sweeper never sees
+them and nothing needs deleting, and the production clear's and heal's own sessions
+join that transaction through savepoints. The lock test
+(`test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`) needs a heal that
+commits and a writer on a second connection, so it commits ONE row of its own (a
+COMPLETED reservation under a random id and user_id holding JSON "null"), writes no
+other row, and deletes its row in a `finally`; the live sweeper may heal that row
+first, which the test is built to tolerate (its docstring says how), and the heal
+holds that row's lock for about one second. Inside each rolled-back transaction (a
+fixed snapshot) every foreign row's marker is compared exactly before and after: the
+ORM test and the other heal test must leave all of them as they were, and the
+migration test must change exactly the foreign rows holding an empty form (to SQL
+NULL; a database built by this code holds none, a database written before it may).
+The migration's UPDATE holds row locks on those rows until the rollback, a few
+milliseconds. After every test (the rollback, or the lock test's delete) the
+committed markers of the foreign rows that existed before the test are compared with
+a snapshot taken then, by `tests/_prune_marker_snapshot.py`'s
+`foreign_marker_violations`: a row that was SQL NULL must still be; a row holding any
+other non-list or empty value must be unchanged or SQL NULL (the running sweeper's
+heal); a row holding a list may change (the running sweeper may prune it); rows
+created or deleted meanwhile are ignored.
 
 The engine pins search_path to the reservations schema: the models are mapped
 schema-less by the SQLite-oriented conftest.
@@ -53,6 +64,7 @@ import asyncio
 import importlib.util
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -64,9 +76,11 @@ from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.services.reservation_service import (
     _clear_pending_fork_prune,
     _heal_non_actionable_prune_marker,
+    _prune_marker_actionable,
 )
 from app.tasks.expiration import _pending_prune_stmt
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from tests._prune_marker_snapshot import SQL_NULL, foreign_marker_violations
@@ -304,6 +318,144 @@ async def test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_po
         finally:
             await trans.rollback()
 
+    async with pg_engine.connect() as conn:
+        assert await _markers(conn, user_id, own=True) == {}
+    await _assert_committed_foreign_as_expected(pg_engine, user_id, committed_before)
+
+
+# SQLSTATE lock_not_available: what a statement gets when lock_timeout expires.
+_LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _sqlstate(exc: DBAPIError) -> str | None:
+    orig = exc.orig
+    return getattr(orig, "sqlstate", None) or getattr(orig.__cause__, "sqlstate", None)
+
+
+async def _write_while_the_heal_holds_the_row(rid: uuid.UUID, marker: str) -> dict:
+    """The concurrent writer: on its own engine (it runs on another thread's event
+    loop), read the row's committed marker, then try to store a real list on it with
+    a lock_timeout of one second. Returns what it saw and how the write ended."""
+    engine = _make_engine()
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SET lock_timeout = '1s'"))
+            # A plain SELECT takes no row lock, so it never waits on the heal's.
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT pending_fork_prune_device_ids IS NULL AS is_null,"
+                        " pending_fork_prune_device_ids::text AS raw"
+                        " FROM reservations WHERE id = :id"
+                    ),
+                    {"id": rid},
+                )
+            ).one()
+            await conn.commit()
+            seen = SQL_NULL if row.is_null else row.raw
+            try:
+                await conn.execute(
+                    text(
+                        "UPDATE reservations SET pending_fork_prune_device_ids ="
+                        " CAST(:m AS json) WHERE id = :id"
+                    ),
+                    {"m": marker, "id": rid},
+                )
+                await conn.commit()
+            except DBAPIError as exc:
+                await conn.rollback()
+                return {"seen": seen, "write": _sqlstate(exc) or repr(exc.orig)}
+            return {"seen": seen, "write": "committed"}
+    finally:
+        await engine.dispose()
+
+
+async def test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update(pg_engine):
+    """A real list written between the heal's re-read and its UPDATE must not be
+    nulled. The heal re-reads the marker `FOR UPDATE`, so a concurrent writer cannot
+    commit in that window: it waits for the heal's commit. Without the lock the
+    writer commits a real list and the heal's `IS NOT NULL` UPDATE (READ COMMITTED
+    re-checks the new row version) stores SQL NULL over it, which is issue #462 again.
+    `test_pending_fork_prune.py`'s
+    `test_a_real_marker_written_between_the_select_and_the_heal_survives` commits its
+    write before the heal starts, so the re-read alone passes it; this test needs a
+    real second connection.
+
+    Isolation. Unlike the rest of this suite, the heal must commit and the writer
+    must run on its own connection, so the test COMMITS one row of its own: a
+    COMPLETED reservation under a random id and user_id holding JSON "null", seeded
+    with raw SQL, deleted in a `finally`. It touches no other row, and the committed
+    foreign markers are compared after it exactly as in the other tests.
+
+    Ordering, without sleeps. `_prune_marker_actionable` runs exactly once in the heal,
+    after the `FOR UPDATE` re-read and before the UPDATE; the patched one runs the
+    writer there, on a second engine on another thread's event loop (the heal's own
+    loop is blocked meanwhile, so its transaction cannot commit and the lock is
+    certainly held while the writer waits). The writer's `lock_timeout` of one second
+    bounds that wait; it never orders anything.
+
+    Beside the gate's running sweeper. That sweeper heals a JSON "null" in any status,
+    so it may store SQL NULL on this row before this heal reads it. The lock does not
+    depend on the value: `FOR UPDATE` locks the row whether its marker is JSON "null"
+    or SQL NULL, the predicate is called either way, and the writer is refused either
+    way; so the lock assertion holds in both cases and the mutant fails in both (its
+    writer commits, and the heal's UPDATE then matches the real list). The writer
+    records the committed marker the heal locked, and the heal must return True
+    exactly when that was JSON "null". COMPLETED keeps every other sweep step off the
+    row (the reminder, expiry, and fork backstop select ACTIVE rows; the fork archive
+    only acts on ids cabling reports; nothing requests a purpose classification).
+    """
+    user_id = uuid.uuid4()
+    committed_before = await _committed_foreign(pg_engine, user_id)
+    real = f'["{uuid.uuid4()}"]'
+    async with pg_engine.connect() as conn:
+        rid = await _insert_raw(conn, user_id, "null", status="COMPLETED")
+        await conn.commit()
+
+    outcome: dict = {}
+
+    def _actionable_then_concurrent_write(marker: object) -> bool:
+        actionable = _prune_marker_actionable(marker)
+        if not outcome:
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    outcome.update(
+                        pool.submit(
+                            asyncio.run, _write_while_the_heal_holds_the_row(rid, real)
+                        ).result()
+                    )
+            except BaseException as exc:  # surfaced by the assertions below
+                outcome["error"] = repr(exc)
+        return actionable
+
+    try:
+        with (
+            patch(
+                "app.services.reservation_service.AsyncSessionLocal",
+                new=async_sessionmaker(pg_engine, expire_on_commit=False),
+            ),
+            patch(
+                "app.services.reservation_service._prune_marker_actionable",
+                new=_actionable_then_concurrent_write,
+            ),
+        ):
+            healed = await _heal_non_actionable_prune_marker(rid)
+        async with pg_engine.connect() as conn:
+            after = (await _markers(conn, user_id, own=True))[rid]
+    finally:
+        async with pg_engine.connect() as conn:
+            await conn.execute(text("DELETE FROM reservations WHERE id = :id"), {"id": rid})
+            await conn.commit()
+
+    assert "error" not in outcome, outcome
+    assert outcome["write"] == _LOCK_NOT_AVAILABLE, (
+        f"the concurrent write was not refused while the heal held the row: it ended "
+        f"{outcome['write']!r}, and after the heal the marker is {after!r} (a real "
+        f"list, {real}, was written between the heal's re-read and its UPDATE)"
+    )
+    assert outcome["seen"] in ("null", SQL_NULL)
+    assert healed is (outcome["seen"] == "null")
+    assert after == SQL_NULL
     async with pg_engine.connect() as conn:
         assert await _markers(conn, user_id, own=True) == {}
     await _assert_committed_foreign_as_expected(pg_engine, user_id, committed_before)

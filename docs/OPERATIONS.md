@@ -137,8 +137,10 @@ service onto the new code before the migration or right after it: a process stil
 running the previous code writes the JSON `null` form again on its next clear (the
 dev reloader does not fire on a git-driven file swap, so `docker compose restart
 reservations`). From this version the expiration sweep also repairs such a marker,
-and any corrupt one, to SQL NULL on its next tick, so a row written that way leaves
-the sweep's batch of 20 after one tick rather than occupying it forever.
+and any corrupt one, to SQL NULL: the reconciler repairs up to 20 such markers per
+tick, oldest first, so a backlog of n drains in ceil(n/20) ticks instead of occupying
+the batch forever (more ticks if older real markers whose prune keeps failing hold
+some of the 20 places).
 
 `make migrate-cabling` (part of a plain `make migrate`) includes a one-time data
 scrub (revision 0013, hardening): every stored canvas across `topologies`,
