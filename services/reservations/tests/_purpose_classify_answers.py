@@ -1,7 +1,16 @@
-"""Every class of orchestrator answer the purpose classifier must map, and what it
-maps to (issue #1525; RES-PURPOSE-6, RES-PURPOSE-7, RES-PURPOSE-8, RES-PURPOSE-13).
+"""Orchestrator answers the purpose classifier must map, one or more per answer class,
+and the outcome each maps to (issue #1525; RES-PURPOSE-6, RES-PURPOSE-7, RES-PURPOSE-8,
+RES-PURPOSE-13).
 
-The expected values come from the rule text in `docs/specs/reservations.md`, not from
+Covered: a 200 whose body is a JSON object (a suggestion); a 200 whose body does not
+parse as JSON; a 403 with the disabled marker, and 403s without it; a 404; 429, 502,
+503, and 504; every other `http.HTTPStatus` member; a timeout; a transport error other
+than a timeout.
+Left out: a 200 whose body parses as JSON but is not an object (a list, a string, a
+number, `null`): the product mishandles that class (issue #1543, an open defect), so
+this table does not pin it.
+
+Most expected values come from the rule text in `docs/specs/reservations.md`, not from
 `app/services/purpose_service.py`:
 
 - RES-PURPOSE-6: a feature-off answer (403 with the disabled marker, or 404), a
@@ -13,17 +22,23 @@ The expected values come from the rule text in `docs/specs/reservations.md`, not
 - RES-PURPOSE-13: Classify now answers 200 with the outcome word for every outcome
   except feature-off.
 
+Three entries are decided by the code, not by a rule, since RES-PURPOSE-6 does not say
+where the marker sits in a 403 body or which strings count as the marker:
+`403-legacy-marker` (the legacy plain-string detail reads as the marker, as the
+classifier's docstring and `test_reconcile_403_legacy_string_detail_is_still_feature_off`
+state), `403-marker-under-another-key` (the marker read only under `detail`), and
+`403-json-list` (a body that is not an object has no marker).
+
 The outcome words are the six `classify_purpose_one`'s docstring names: `ok`,
 `feature_off`, `forbidden`, `timeout`, `transient`, `failed`.
 
 Enumerated from the library rather than listed by hand, so a member added later is
 covered without an edit here: every `http.HTTPStatus` member the rules do not name is
 "any other non-200" (each sent with a well-formed suggestion body, so a status read as
-a success would store it); every subclass of `httpx.TimeoutException` that httpx
-defines is a timeout; every other subclass of `httpx.TransportError` that httpx
-defines, plus `ProbeTransportError`, is a transport error other than a timeout.
-The legacy plain-string 403 detail is read as the disabled marker, as the classifier's
-docstring and `test_reconcile_403_legacy_string_detail_is_still_feature_off` state.
+a success would store it); every subclass of `httpx.TimeoutException` defined in the
+`httpx` package is a timeout; every other subclass of `httpx.TransportError` defined
+in the `httpx` package, plus `ProbeTransportError`, is a transport error other than a
+timeout.
 
 Kept out of the test files so the single-row tests, the sweep tests, and the
 Classify now tests run over the same table.
@@ -87,16 +102,20 @@ def _subclasses(root: type) -> list[type]:
     return out
 
 
+def _defined_in_httpx(cls: type) -> bool:
+    """True for a class of the `httpx` package itself, not of a package whose name
+    merely starts with it (such as `httpx2`)."""
+    return cls.__module__ == "httpx" or cls.__module__.startswith("httpx.")
+
+
 def _timeout_classes() -> list[type]:
-    return [c for c in _subclasses(httpx.TimeoutException) if c.__module__.startswith("httpx")]
+    return [c for c in _subclasses(httpx.TimeoutException) if _defined_in_httpx(c)]
 
 
 def _non_timeout_transport_classes() -> list[type]:
     timeouts = set(_subclasses(httpx.TimeoutException))
     named = [
-        c
-        for c in _subclasses(httpx.TransportError)
-        if c not in timeouts and c.__module__.startswith("httpx")
+        c for c in _subclasses(httpx.TransportError) if c not in timeouts and _defined_in_httpx(c)
     ]
     return [*named, ProbeTransportError]
 

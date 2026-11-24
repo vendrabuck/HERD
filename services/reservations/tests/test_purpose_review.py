@@ -4,7 +4,9 @@ backfill (issue #646 phase 2, ADR 0013 point 10).
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from app.config import settings
 from app.database import get_db
@@ -35,10 +37,13 @@ def _client_as(sub: str, role: str = "user") -> AsyncClient:
 
 
 def _suggestion(top_category: str = "qa_regression") -> dict:
+    # The first distribution entry is deliberately NOT top_category (issue #1525), so a
+    # read of the distribution in place of `top_category` (RES-PURPOSE-10) shows.
+    first = "other" if top_category != "other" else "training"
     return {
         "distribution": [
+            {"category": first, "probability": 0.3},
             {"category": top_category, "probability": 0.7},
-            {"category": "other", "probability": 0.3},
         ],
         "top_category": top_category,
         "pass": "end",
@@ -573,3 +578,41 @@ async def test_review_list_is_newest_suggestion_first_then_by_id():
         assert page.json()["total"] == 5
         paged += [i["reservation_id"] for i in page.json()["items"]]
     assert paged == expected
+
+
+# Every purpose review route (RES-PURPOSE-14), as a literal list: the purpose review rows
+# of the section 5 route table. A route added later is not picked up here on its own.
+_PURPOSE_REVIEW_ROUTES = [
+    ("GET", "/admin/purpose-review"),
+    ("POST", "/admin/purpose-review/{rid}/accept"),
+    ("POST", "/admin/purpose-review/{rid}/dismiss"),
+    ("POST", "/admin/purpose-review/{rid}/classify"),
+    ("POST", "/admin/purpose/backfill"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "path"), _PURPOSE_REVIEW_ROUTES)
+async def test_every_purpose_review_route_refuses_a_non_admin(method, path):
+    """RES-PURPOSE-14: a signed-in user without the admin role gets 403 `Admin or
+    superadmin role required` from every purpose review route, no orchestrator call is
+    made, and no mapped column of either seeded row changes (one of them is a terminal
+    row backfill would stamp). The named row is stamped and carries a suggestion, and
+    every request carries a valid accept body, so without the role check no route
+    answers 403: list, accept, dismiss, and backfill answer 200 and classify answers
+    409 `already_suggested`."""
+    rid = await _insert_reservation(
+        purpose_suggestion=_suggestion("qa_regression"),
+        purpose_classify_requested_at=NOW - timedelta(minutes=5),
+    )
+    unstamped = await _insert_reservation(status=ReservationStatus.COMPLETED)
+    before = {r: await _snapshot(r) for r in (rid, unstamped)}
+    call = AsyncMock(return_value=httpx.Response(500))
+    with patch("app.services.purpose_service.call_service", call):
+        async with _client_as(OTHER_ID, role="user") as ac:
+            resp = await ac.request(method, path.format(rid=rid), json={"purpose_category": None})
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": "Admin or superadmin role required"}
+    call.assert_not_awaited()
+    for r in (rid, unstamped):
+        assert await _snapshot(r) == before[r]

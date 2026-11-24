@@ -1731,7 +1731,7 @@ named in each rule.
   Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`names the templates per type on the mixed-types 422 (#1038)`); `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for the unconnectable 422 and a plain string`, `renders the message then one line per type`)
 
 **Out of scope.** The Purpose Review page and the Classify now button are reservations
-callers (`reservations.md`, RES-PURPOSE-9 to RES-PURPOSE-14).
+callers (`reservations.md`, RES-PURPOSE-9 to RES-PURPOSE-15).
 
 ### 8.13 AI generation evaluation harness
 

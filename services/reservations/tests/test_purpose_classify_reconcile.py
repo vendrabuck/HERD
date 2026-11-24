@@ -7,6 +7,7 @@ trigger; call_service is patched at its new home,
 app.services.purpose_service, not app.tasks.expiration).
 """
 
+import inspect
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,8 @@ from app.models.reservation import (
 )
 from app.services.purpose_service import classify_purpose_one
 from app.tasks.expiration import _run_purpose_classify_reconcile
+from herd_common.internal_client import InternalTokenAuth
+from herd_common.internal_client import call_service as real_call_service
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests._purpose_classify_answers import (
@@ -528,10 +531,19 @@ async def test_reconcile_batch_is_filled_only_by_eligible_rows(monkeypatch, inel
 
 
 @pytest.mark.asyncio
-async def test_reconcile_sends_each_rows_own_payload():
-    """RES-PURPOSE-8's request: each row's call carries exactly the keys of the
-    orchestrator's `InternalClassifyRequest`, with that row's own values. A row with a
-    topology sends its id as a string; a row without one sends null, not "None"."""
+async def test_reconcile_sends_each_rows_own_payload(monkeypatch):
+    """Each row's call is the request section 10's dependency table names, `POST
+    /internal/classify-purpose` to ai-orchestrator with the internal token and
+    `PURPOSE_CLASSIFY_TIMEOUT_SECONDS`, and its body carries exactly the keys of the
+    orchestrator's `InternalClassifyRequest` with that row's own values. No rule states
+    the body, so the body is pinned as built. A row with a topology sends its id as a
+    string; a row without one sends null, not "None". The call is compared by
+    `call_service`'s own signature, so passing an argument by name instead of by
+    position still passes. The three settings are set to probe values, so a constant
+    or another setting in their place shows."""
+    monkeypatch.setattr(settings, "ai_orchestrator_service_url", "http://orchestrator.probe:1")
+    monkeypatch.setattr(settings, "internal_api_token", "probe-token-1525")
+    monkeypatch.setattr(settings, "purpose_classify_timeout_seconds", 17.5)
     topology_id = uuid.uuid4()
     other_user = uuid.uuid4()
     with_topology_devices = [str(uuid.uuid4()), str(uuid.uuid4())]
@@ -559,14 +571,30 @@ async def test_reconcile_sends_each_rows_own_payload():
 
     sent: dict[str, dict] = {}
 
+    calls: list[dict] = []
+
     async def _fake_call(*args, **kwargs):
-        sent[kwargs["json_body"]["reservation_id"]] = kwargs["json_body"]
+        bound = inspect.signature(real_call_service).bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        body = arguments.pop("json_body")
+        calls.append(arguments)
+        sent[body["reservation_id"]] = body
         return _suggestion_response()
 
     with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
         await _run_purpose_classify_reconcile()
 
     assert set(sent) == {str(with_topology), str(without_topology)}
+    expected_call = {
+        "base_url": "http://orchestrator.probe:1",
+        "method": "POST",
+        "path": "/internal/classify-purpose",
+        "params": None,
+        "timeout": 17.5,
+        "auth": InternalTokenAuth(token="probe-token-1525"),
+    }
+    assert calls == [expected_call, expected_call]
     expected = {
         str(with_topology): {
             "reservation_id": str(with_topology),
@@ -678,7 +706,7 @@ async def test_reconcile_ends_or_continues_the_tick_by_answer(answer):
 
 @pytest.mark.asyncio
 async def test_classify_one_never_raises_on_an_unexpected_exception():
-    """The classifier never raises (section 7's dependency table): an exception from
+    """The classifier never raises (section 10's dependency table): an exception from
     the call that is not an httpx error at all (call_service raises RuntimeError for a
     missing token) still comes back as an outcome word, and neither the named row nor
     a second eligible row gets a suggestion."""
