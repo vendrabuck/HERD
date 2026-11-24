@@ -2152,7 +2152,7 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
-| 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, a validation list | a bad report window or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
+| 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, `<start or end> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, a validation list | a bad report window, a bound with no UTC equivalent, or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
 | 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices | OPS-REPORT-8, OPS-REPORT-9 |
 | 503 | `Inventory service is unreachable` | the fleet CSV when inventory cannot answer | OPS-REPORT-14 |
 
