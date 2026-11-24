@@ -14,9 +14,12 @@ from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
+from app.schemas.reservation import PurposeReviewAcceptBody
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
+from tests._route_table import path_segments, routes_where
 
 OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
@@ -580,25 +583,116 @@ async def test_review_list_is_newest_suggestion_first_then_by_id():
     assert paged == expected
 
 
-# Every purpose review route (RES-PURPOSE-14), as a literal list: the purpose review rows
-# of the section 5 route table. A route added later is not picked up here on its own.
-_PURPOSE_REVIEW_ROUTES = [
-    ("GET", "/admin/purpose-review"),
-    ("POST", "/admin/purpose-review/{rid}/accept"),
-    ("POST", "/admin/purpose-review/{rid}/dismiss"),
-    ("POST", "/admin/purpose-review/{rid}/classify"),
-    ("POST", "/admin/purpose/backfill"),
-]
+# Every purpose review route (RES-PURPOSE-14), read from the app (tests/_route_table.py):
+# every route whose FIRST path segment is exactly `admin` and whose SECOND segment is
+# exactly `purpose-review` or `purpose`, for each method it declares except HEAD and
+# OPTIONS, so a route added to the family is tested without editing this test. A
+# `reservation_id` path parameter gets the seeded row's id and an optional query
+# parameter is left out; any other path parameter, a required query parameter, or a
+# body model not in PURPOSE_REVIEW_BODIES fails the test with a message naming what to
+# add. (tests/_route_table.py's request builder is not used: it wants every query
+# parameter to be a required UUID, and the list route's are optional.)
+#
+# Limits: a purpose review route of any other shape (`/purpose-review`,
+# `/admin/purposes`, `/admin/x/purpose-review`) is not read, however it is guarded; a
+# mounted sub-application is not read (iter_route_contexts does not descend into a
+# Mount); HEAD and OPTIONS are not requested. The probe test below shows each selection
+# limit on a small app.
+PURPOSE_REVIEW_BODIES = {PurposeReviewAcceptBody: {"purpose_category": None}}
+_FAMILY_SECOND_SEGMENTS = {"purpose-review", "purpose"}
+
+
+def _is_purpose_review_path(path: str) -> bool:
+    segments = path_segments(path)
+    return len(segments) >= 2 and segments[0] == "admin" and segments[1] in _FAMILY_SECOND_SEGMENTS
+
+
+def _purpose_review_routes(routes=None):
+    return routes_where(_is_purpose_review_path, routes)
+
+
+def _request_for(route, reservation_id: uuid.UUID) -> dict:
+    where = "_request_for in services/reservations/tests/test_purpose_review.py"
+    for param in route.dependant.path_params:
+        assert param.alias == "reservation_id", (
+            f"{route.path}: path parameter {param.alias!r}; give it a value in {where}"
+        )
+    for param in route.dependant.query_params:
+        assert not param.field_info.is_required(), (
+            f"{route.path}: required query parameter {param.alias!r}; supply it in {where}"
+        )
+    request: dict = {"url": route.path.replace("{reservation_id}", str(reservation_id))}
+    for body in route.dependant.body_params:
+        model = body.field_info.annotation
+        assert model in PURPOSE_REVIEW_BODIES, (
+            f"{route.path}: add a minimal valid {model.__name__} body to PURPOSE_REVIEW_BODIES"
+        )
+        request["json"] = PURPOSE_REVIEW_BODIES[model]
+    return request
+
+
+def test_the_purpose_review_selection_on_a_small_app():
+    """The selection rule and its limits in the comment above, on a small app."""
+    probe = FastAPI()
+
+    @probe.api_route("/admin/purpose-review", methods=["GET", "HEAD", "OPTIONS"])
+    async def listing():
+        return {}
+
+    @probe.post("/admin/purpose/backfill")
+    async def backfill():
+        return {}
+
+    @probe.get("/purpose-review")
+    async def no_admin_segment():
+        return {}
+
+    @probe.get("/admin/purposes")
+    async def other_second_segment():
+        return {}
+
+    @probe.get("/admin/x/purpose-review")
+    async def nested():
+        return {}
+
+    sub = FastAPI()
+
+    @sub.get("/x")
+    async def mounted():
+        return {}
+
+    probe.mount("/admin/purpose-review/sub", sub)
+    assert [(m, r.path) for m, r in _purpose_review_routes(probe.routes)] == [
+        ("GET", "/admin/purpose-review"),
+        ("POST", "/admin/purpose/backfill"),
+    ]
+
+
+def test_the_app_has_the_five_purpose_review_routes():
+    """The read finds at least the five routes section 5 lists, so the parametrized
+    test below cannot run over an empty or partial table unnoticed."""
+    found = {(m, r.path) for m, r in _purpose_review_routes()}
+    assert found >= {
+        ("GET", "/admin/purpose-review"),
+        ("POST", "/admin/purpose-review/{reservation_id}/accept"),
+        ("POST", "/admin/purpose-review/{reservation_id}/dismiss"),
+        ("POST", "/admin/purpose-review/{reservation_id}/classify"),
+        ("POST", "/admin/purpose/backfill"),
+    }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("method", "path"), _PURPOSE_REVIEW_ROUTES)
-async def test_every_purpose_review_route_refuses_a_non_admin(method, path):
+@pytest.mark.parametrize(
+    ("method", "route"),
+    _purpose_review_routes(),
+    ids=[f"{m} {r.path}" for m, r in _purpose_review_routes()],
+)
+async def test_every_purpose_review_route_refuses_a_non_admin(method, route):
     """RES-PURPOSE-14: a signed-in user without the admin role gets 403 `Admin or
     superadmin role required` from every purpose review route, no orchestrator call is
     made, and no mapped column of either seeded row changes (one of them is a terminal
     row backfill would stamp). The named row is stamped and carries a suggestion, and
-    every request carries a valid accept body, so without the role check no route
+    accept gets a valid body, so without the role check none of today's five routes
     answers 403: list, accept, dismiss, and backfill answer 200 and classify answers
     409 `already_suggested`."""
     rid = await _insert_reservation(
@@ -607,10 +701,11 @@ async def test_every_purpose_review_route_refuses_a_non_admin(method, path):
     )
     unstamped = await _insert_reservation(status=ReservationStatus.COMPLETED)
     before = {r: await _snapshot(r) for r in (rid, unstamped)}
+    request = _request_for(route, rid)
     call = AsyncMock(return_value=httpx.Response(500))
     with patch("app.services.purpose_service.call_service", call):
         async with _client_as(OTHER_ID, role="user") as ac:
-            resp = await ac.request(method, path.format(rid=rid), json={"purpose_category": None})
+            resp = await ac.request(method, **request)
     assert resp.status_code == 403, resp.text
     assert resp.json() == {"detail": "Admin or superadmin role required"}
     call.assert_not_awaited()
