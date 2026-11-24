@@ -1481,12 +1481,12 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 - **OPS-REPORT-2.** A reservation counts for the hours it overlaps the window, clipped to
   the window; one with no overlap is skipped. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`, `test_a_row_with_no_overlap_is_skipped`)
 - **OPS-REPORT-3.** Without `status`, the user, device, topology type, day, group, and
   purpose sections count only `COMPLETED` reservations and the fleet section counts
   `ACTIVE` and `COMPLETED`; a given `status` list applies to every section. \
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `FLEET_DEFAULT_STATUS_FILTER`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_counts_active_but_legacy_default_does_not`, `test_explicit_filter_applies_to_fleet_too`, `test_report_route_fleet_defaults_count_active`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_filters_status`)
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`, `FLEET_DEFAULT_STATUS_FILTER`) \
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_counts_active_but_legacy_default_does_not`, `test_explicit_filter_applies_to_fleet_too`, `test_report_route_fleet_defaults_count_active`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_filters_status`); `services/reservations/tests/test_utilization_report_routes.py` (`test_each_section_counts_the_rule_s_statuses_on_both_routes`)
 - **OPS-REPORT-4.** The day section splits each reservation's hours at UTC midnight,
   labels each slice with its UTC date, and counts a reservation once per day it touches.
   `start` and `end` may carry any UTC offset, and a value without one is UTC (never the
@@ -1517,23 +1517,23 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   as reserved, and a suggestion-only reservation adds transit hours but no transit
   purpose rows. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`, `_fetch_transit_devices`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`)
 - **OPS-REPORT-8.** Transit devices are read from cabling in chunks of 500 reservations;
   a transport error or non-200 from any chunk fails the report closed with 503
   `{"error": "transit_gear_unavailable"}`, and `include_transit=false` makes no cabling
   call. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`_fetch_transit_devices`, `_TRANSIT_BATCH_CHUNK_SIZE`, `TransitGearUnavailable`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
 - **OPS-REPORT-9.** The routes map that failure to 503 `{"error":
   "transit_gear_unavailable"}`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: none
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
 - **OPS-REPORT-10.** The fleet section lists every device inventory returns (paged by 500,
   with the caller's token, stopping at 100,000), each with its hours over the whole
   window as `utilization_pct`, unclamped; devices with no hours are the idle count, and a
   deleted device stays only in the device section. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fetch_fleet_devices_paginates_past_500`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_stops_at_100_000_devices`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with
   `fleet` null. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`) \
@@ -2353,4 +2353,3 @@ None at present.
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.
-- OPS-REPORT-9: the routes' mapping of a transit failure to 503.
