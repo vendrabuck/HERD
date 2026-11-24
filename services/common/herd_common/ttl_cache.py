@@ -9,11 +9,10 @@ it are handed the same outcome instead of each running their own fetch.
 
 The fetch runs as its own task rather than inside the caller that started it,
 for two reasons. One caller going away must not cancel everyone else's answer:
-awaiting a bare future propagates the caller's cancellation into it, so a
-waiter that timed out would cancel the fetch for all of them; every caller
-awaits the task through `asyncio.shield`. And fetches for different keys run
-concurrently instead of one at a time per cache, which is safe because the
-keys are independent upstream lookups.
+awaiting the task directly would propagate the caller's cancellation into it,
+so every caller awaits the task through `asyncio.shield`. And fetches for
+different keys run concurrently instead of one at a time per cache, which is
+safe because the keys are independent upstream lookups.
 
 Two shapes, matching the two things being extracted:
 
@@ -98,9 +97,9 @@ class Uncached(Generic[V]):
 def _discard(task: "asyncio.Task") -> None:
     """Read a finished task's exception so asyncio does not log it as unretrieved.
 
-    A fetch that raises while no caller is waiting would otherwise surface as
-    "Future exception was never retrieved". A cancelled task has no exception to
-    read, and reading one would raise CancelledError here.
+    A fetch that raises while no caller is waiting would otherwise be logged by
+    asyncio as an unretrieved task/future exception. A cancelled task has no
+    exception to read, and reading one would raise CancelledError here.
     """
     if not task.cancelled():
         task.exception()
@@ -110,8 +109,8 @@ class TTLCache(Generic[K, V]):
     """Per-key async TTL cache that shares an in-flight fetch between callers.
 
     The fetch itself runs as its own task, which is what lets one caller go
-    away without taking everyone's answer with it: awaiting a bare future
-    propagates the caller's cancellation into that future. `shield` keeps a
+    away without taking everyone's answer with it: awaiting the task directly
+    would propagate the caller's cancellation into it. `shield` keeps a
     cancelled caller from touching the task, and the task clears its own slot,
     so no caller can join a fetch that has already finished.
 

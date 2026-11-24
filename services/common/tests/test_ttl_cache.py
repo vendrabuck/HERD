@@ -540,11 +540,16 @@ async def test_an_exception_in_the_fetch_reaches_every_waiter_and_none_hangs():
     """The failure is shared as an exception too, and nobody is left waiting."""
     started = asyncio.Event()
     release = asyncio.Event()
+    calls = {"n": 0}
 
     async def fetch(key: str):
-        started.set()
-        await release.wait()
-        raise RuntimeError("upstream is down")
+        calls["n"] += 1
+        n = calls["n"]
+        if n == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream is down")
+        return f"answer-{n}"
 
     cache: TTLCache[str, str] = TTLCache(fetch=fetch, ttl_seconds=60)
     callers = [asyncio.create_task(cache.get("k")) for _ in range(3)]
@@ -554,6 +559,10 @@ async def test_an_exception_in_the_fetch_reaches_every_waiter_and_none_hangs():
 
     results = await asyncio.gather(*callers, return_exceptions=True)
     assert all(isinstance(r, RuntimeError) for r in results)
+    assert calls["n"] == 1
+    # A failed shared fetch is not cached: the next caller makes one new attempt.
+    assert await cache.get("k") == "answer-2"
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -611,11 +620,16 @@ async def test_an_exception_in_the_singleton_fetch_reaches_every_waiter():
     """The singleton shares a raising fetch instead of hanging its callers."""
     started = asyncio.Event()
     release = asyncio.Event()
+    calls = {"n": 0}
 
     async def fetch():
-        started.set()
-        await release.wait()
-        raise RuntimeError("upstream is down")
+        calls["n"] += 1
+        n = calls["n"]
+        if n == 1:
+            started.set()
+            await release.wait()
+            raise RuntimeError("upstream is down")
+        return [f"answer-{n}"]
 
     cache: SingletonTTLCache[list[str]] = SingletonTTLCache(fetch=fetch, ttl_seconds=60)
     callers = [asyncio.create_task(cache.get()) for _ in range(3)]
@@ -625,6 +639,9 @@ async def test_an_exception_in_the_singleton_fetch_reaches_every_waiter():
 
     results = await asyncio.gather(*callers, return_exceptions=True)
     assert all(isinstance(r, RuntimeError) for r in results)
+    assert calls["n"] == 1
+    assert await cache.get() == ["answer-2"]
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio

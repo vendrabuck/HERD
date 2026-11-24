@@ -750,7 +750,7 @@ everyone with a live reservation on it is told.
 - **INTEG-HEALTH-8.** The admin list is cached for the TTL, and concurrent misses share
   one in-flight fetch, that fetch's failure included: the callers already queued get the
   answer the first one paid for, so an outage costs one upstream attempt rather than one
-  per waiter. A fetch that raises hands its exception to every waiter rather than hanging
+  per waiter. A fetch that raises hands its exception to every waiter and each waiter receives the same exception
   any of them. The fetch runs as its own task and every caller awaits it shielded, so a
   caller being cancelled gets `CancelledError` without cancelling the fetch or the other
   waiters. Nothing is stored for a failure, so a caller arriving after it asks again
