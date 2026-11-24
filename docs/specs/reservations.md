@@ -264,7 +264,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 | POST | `/{id}/fork/versions/{vid}/restore` | owner, or any admin; ACTIVE only | 200 | RES-FORK-4, RES-FORK-6, RES-FORK-9, RES-FORK-10 |
 | GET | `/{id}/wiring-status` | owner, or any admin | 200 | RES-FORK-4, RES-FORK-18 |
 | POST | `/{id}/wiring/retry` | owner, or any admin; not `PENDING` or `PENDING_PROVISION` | 200 | RES-FORK-4, RES-FORK-18 |
-| GET | `/admin/purpose-review` | admin | 200 | RES-PURPOSE-9, RES-PURPOSE-14 |
+| GET | `/admin/purpose-review` | admin | 200 | RES-PURPOSE-9, RES-PURPOSE-14, RES-PURPOSE-15 |
 | POST | `/admin/purpose-review/{id}/accept` | admin | 200 | RES-PURPOSE-10, RES-PURPOSE-14 |
 | POST | `/admin/purpose-review/{id}/dismiss` | admin | 200 | RES-PURPOSE-11, RES-PURPOSE-14 |
 | POST | `/admin/purpose-review/{id}/classify` | admin | 200 | RES-PURPOSE-13, RES-PURPOSE-14 |
@@ -887,7 +887,7 @@ routes in section 5; background work `purpose_classify_loop` every
   holding a lone surrogate is now refused before the route runs, with the shared 422,
   one `string_unicode` item at `["body"]` (OPS-VALID-6), and nothing is written. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`); `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
-  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
+  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_list_a_category_must_be_in_is_the_one_the_string_gives`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,
   including terminal; anyone else gets 403 (not 404). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
@@ -908,20 +908,20 @@ routes in section 5; background work `purpose_classify_loop` every
   rows with no suggestion and fewer than `PURPOSE_CLASSIFY_MAX_ATTEMPTS` attempts,
   oldest stamp first. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_purpose_classify_reconcile`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`, `test_reconcile_batch_is_filled_only_by_eligible_rows`)
 - **RES-PURPOSE-6.** A feature-off answer (403 with the disabled marker, or 404), a
   transient answer (429, 502, 503, 504, or a transport error other than a timeout), or
   a 403 without the marker ends the tick and counts no attempt. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`, `test_reconcile_transport_error_ends_tick_without_bump`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
 - **RES-PURPOSE-7.** A timeout, any other non-200, or an unparseable body counts one
   attempt on that row and the tick continues. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_bump_purpose_classify_attempts`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
 - **RES-PURPOSE-8.** A 200 stores the orchestrator's body verbatim as the suggestion; it
-  never writes `purpose_category`. \
+  never writes `purpose_category`. Known gap, see #1543. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`, `test_classify_one_maps_each_answer_to_its_outcome`)
 - **RES-PURPOSE-9.** The review list holds rows with an undismissed suggestion whose
   category is unset or differs from the suggestion's `top_category`. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
@@ -930,11 +930,11 @@ routes in section 5; background work `purpose_classify_loop` every
   with a value, that value (validated as RES-PURPOSE-1); the accepting admin becomes the
   setter. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`accept_purpose_suggestion`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`, `test_accept_unknown_category_value_is_422`, `test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`, `test_accept_unknown_category_value_is_422`, `test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing`, `test_accept_changes_only_the_named_row`, `test_accept_and_dismiss_read_the_named_rows_suggestion`)
 - **RES-PURPOSE-11.** Dismiss sets only `purpose_suggestion_dismissed_at` and keeps the
   suggestion. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`dismiss_purpose_suggestion`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_dismiss_sets_dismissed_at_and_keeps_suggestion`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_dismiss_sets_dismissed_at_and_keeps_suggestion`, `test_dismiss_changes_only_the_named_row`, `test_accept_and_dismiss_read_the_named_rows_suggestion`)
 - **RES-PURPOSE-12.** Backfill stamps every terminal row with no stamp and no
   suggestion, and resets the attempt count of every capped row with no suggestion; it
   returns the sum. \
@@ -942,12 +942,17 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_backfill_marks_terminal_rows_without_suggestion`, `test_backfill_resets_capped_rows_without_suggestion`, `test_backfill_counts_newly_marked_and_reset_rows_together`)
 - **RES-PURPOSE-13.** Classify now runs the same single-row classifier immediately,
   ignores the attempt cap, and answers 200 with the outcome word for every outcome except
-  feature-off. \
+  feature-off. Known gap, see #1543. \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`, `test_trigger_answers_the_outcome_word_for_every_answer`)
 - **RES-PURPOSE-14.** Every purpose review route is admin-only. \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`require_admin`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`, `test_every_purpose_review_route_refuses_a_non_admin`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
+- **RES-PURPOSE-15.** The review list is ordered by `purpose_suggested_at`, newest first,
+  then by reservation id. The id is unique, so the order is total, and paging through a
+  queue that does not change in between neither repeats nor skips a row. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_newest_suggestion_first_then_by_id`)
 
 **Out of scope.** The classifier, its prompt, and its feature gate are
 ai-orchestrator's (`ai-features.md`, [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md)).
@@ -1364,7 +1369,13 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-None at present.
+- #1543 (RES-PURPOSE-8, RES-PURPOSE-13): a classify answer of 200 whose JSON body is
+  not an object is taken as the suggestion. A list, a string, or a number is stored
+  verbatim, and every route that then reads the row answers 500: Classify now, the
+  review list, accept, dismiss (after its write commits), and the owner's `GET /{id}`.
+  A JSON `null` stores nothing, counts no attempt, and is sent again on every sweep
+  tick with no cap. A real orchestrator cannot answer such a body; it takes a
+  deployment fault at the orchestrator's address.
 
 ### Limits by decision
 
