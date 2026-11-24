@@ -1142,7 +1142,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (seventeen today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (nineteen today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1201,6 +1201,15 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # federated_identities row unchanged, and deletes all of them in a finally; it
 # holds a federated_identities table lock that blocks writes (never reads), or
 # one of its own account rows FOR UPDATE, for well under a second per race.
+# The reservations suite added for issue #1522 (the pending fork-prune marker's
+# SQL NULL, the reconciler's heal, and migration 0018's rewrite) needs the
+# migrated reservations schema. Three of its tests commit nothing: each inserts
+# its rows, runs the production clear, the heal, or the migration's upgrade
+# inside one REPEATABLE READ transaction, and rolls it back; the upgrade
+# row-locks any foreign row holding an empty marker until then. The heal's
+# row-lock test commits one reservation of its own under a random id, holds its
+# row lock for about one second, writes no other row, and deletes it in a
+# finally.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1245,6 +1254,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_reservation_list_filters_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_sweep_claim_cancel_race_live_pg.py -v) && \
+	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_pending_fork_prune_live_pg.py -v) && \
 	(cd services/inventory && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_config_apply_races_live_pg.py -v)
 
