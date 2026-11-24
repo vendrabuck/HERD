@@ -1156,3 +1156,79 @@ async def test_a_non_utf8_import_file_is_422_naming_the_encoding(admin_client, f
         "detail": "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
     }
     assert await _count_versions() == before
+
+
+@pytest.mark.asyncio
+async def test_a_topology_upload_over_the_bound_is_a_413(admin_client, monkeypatch):
+    """Issue #1417: `await file.read()` held the whole upload in memory before
+    it was parsed, on the event loop every topology read depends on."""
+    from unittest.mock import patch
+
+    from app.routes import bulk as bulk_router
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", 16)
+    body = json.dumps([{"name": "topology-one"}]).encode()
+    assert len(body) > 16
+
+    with patch("app.routes.bulk.import_topologies", side_effect=AssertionError("parsed")) as parse:
+        resp = await admin_client.post(
+            "/topologies/import",
+            params={"format": "json"},
+            files={"file": ("big.json", io.BytesIO(body), "application/json")},
+        )
+
+    assert resp.status_code == 413
+    assert resp.json()["detail"] == [
+        {
+            "type": "body_too_large",
+            "loc": ["body"],
+            "msg": "Request body is larger than 16 bytes",
+        }
+    ]
+    parse.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_bound_is_exact_one_byte_over_is_refused(admin_client, monkeypatch):
+    """The cap is a byte count: at it is accepted, one byte over is refused.
+
+    Mutation-checked: changing `len(raw) > limit` to `>=` makes this fail, and
+    inventory already had the same test.
+    """
+    from app.routes import bulk as bulk_router
+
+    body = b'[{"name": "topology-one"}]'
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(body))
+    at_bound = await admin_client.post(
+        "/topologies/import",
+        params={"format": "json"},
+        files={"file": ("at.json", io.BytesIO(body), "application/json")},
+    )
+    assert at_bound.status_code == 200, at_bound.text
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(body) - 1)
+    over = await admin_client.post(
+        "/topologies/import",
+        params={"format": "json"},
+        files={"file": ("over.json", io.BytesIO(body), "application/json")},
+    )
+    assert over.status_code == 413
+    assert over.json()["detail"][0]["msg"] == (f"Request body is larger than {len(body) - 1} bytes")
+
+
+@pytest.mark.asyncio
+async def test_the_read_asks_for_exactly_one_byte_past_the_bound(monkeypatch):
+    """Mutation-checked: `file.read()` with the length check kept fails this."""
+    from app.routes import bulk as bulk_router
+
+    asked: list[int] = []
+
+    class _File:
+        async def read(self, size: int = -1) -> bytes:
+            asked.append(size)
+            return b""
+
+    await bulk_router._read_capped(_File(), 4096)
+
+    assert asked == [4097]

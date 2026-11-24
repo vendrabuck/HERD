@@ -96,9 +96,9 @@ async def test_without_credentials_the_limit_answers_before_authentication():
 # -- The upload routes take their own limit ------------------------------------------------
 #
 # The default plus the file bound each route already enforces: DRIVER_MAX_SIZE_BYTES for
-# a driver package, and the import file bound `IMPORT_UPLOAD_BYTES` for a bulk import
-# (whose own read is still unbounded, issue #1417). Both are read at each request, so
-# they are shrunk here to keep the bodies small.
+# a driver package, and the import file bound `IMPORT_UPLOAD_BYTES` for a bulk import,
+# which #1417 caps before parsing. Both are read at each request, so they are shrunk
+# here to keep the bodies small.
 
 _UPLOAD_BYTES = 2000
 _UPLOAD_ROUTES = {

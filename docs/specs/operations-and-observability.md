@@ -1997,8 +1997,8 @@ fixed set (OPS-VALID-7).
   | Route | Service | Extra bytes | Limit with the defaults |
   |---|---|---|---|
   | `POST /drivers`, `PUT /drivers/{driver_id}/file` | inventory | `DRIVER_MAX_SIZE_BYTES` (10485760) | 10747904 |
-  | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`: the routes read the whole upload with no bound of their own (issue #1417, open), so this is the only bound on an import file | 10747904 |
-  | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`, for the same reason | 10747904 |
+  | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`; `_read_capped` applies the same number to the file itself (INV-BULK-23) | 10747904 |
+  | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`; `_read_capped` applies the same number to the file itself (TOPO-BULK-20) | 10747904 |
   | `POST /generate` | ai-orchestrator | `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES` (5 times 5242880), the aggregate `_read_uploads` enforces | 26476544 |
   | `POST /internal/validate-package` | execution | the base64 length of `VALIDATE_PACKAGE_MAX_BYTES` (13981016 for 10485760), the JSON `package_b64` the validator decodes | 14243160 |
   | `PUT /topologies/{topology_id}`, `POST /templates`, `PUT /templates/{template_id}` | cabling | `LARGE_JSON_BODY_BYTES`: a canvas. In the shape the topology editor's Save sends (UUID node and edge ids, the seven persisted device keys plus `label` and `topologyType`, React Flow's `measured`, `selected`, and `dragging`, and each link's port ids, port names, `portsCabled`, `pathValid`, and `pathHopCount`) a device node is about 520 bytes and a link about 460: 1,000 devices and 4,000 links are 2361613 bytes, a 250-device reservation's canvas with 1,000 links is 590443, already over the default, and this limit holds 1,887 devices with four links each (1,776 within the 4 MiB allowance alone) | 4456448 |
@@ -2340,9 +2340,10 @@ None at present.
   form) can still be refused by the service it is forwarded to, which answers 413 and
   the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
   that growth. Recorded in issue #1466.
-- The bulk import routes of inventory and cabling read the whole upload with no bound
-  of their own, so the body limit's 10 MiB import file bound is their only one
-  (OPS-VALID-10). Recorded in issue #1417.
+- A bulk import file of up to 10 MiB is still decoded and parsed on the event loop,
+  the loop every reservation and topology read depends on; `_read_capped` bounds what
+  is copied out of the spool, not that parse (INV-BULK-23, TOPO-BULK-20). Step 2 of
+  issue #1417, moving the parse off the event loop, is not done.
 
 ### Rules with no test
 
