@@ -54,6 +54,46 @@ async def test_utilization_report_reflects_reservation(admin_client, fresh_devic
         await admin_client.delete(f"/reservations/{reservation['id']}")
 
 
+async def test_utilization_report_by_day_sums_to_total_with_an_offset_start(
+    admin_client, fresh_device
+):
+    """Issue #1523, OPS-REPORT-4: a start whose local date is not its UTC date.
+
+    The window starts after the reservation does, so the reservation is clipped to
+    the window's start, the bound the day split used to read local date fields from.
+    Other tests' ACTIVE rows may share the window; the invariant holds for all of them.
+    """
+    reservation = await _create_short_reservation(admin_client, fresh_device["id"])
+    try:
+        now = datetime.now(timezone.utc)
+        start_utc = now + timedelta(minutes=10)
+        end_utc = now + timedelta(hours=2)
+        # -12:00 puts the local date on the day before while the UTC hour is under 12,
+        # +14:00 on the day after from 10:00 UTC on; both are real zones.
+        offset = timedelta(hours=-12) if start_utc.hour < 12 else timedelta(hours=14)
+        start = start_utc.astimezone(timezone(offset))
+        assert start.date() != start_utc.date()
+        resp = await admin_client.get(
+            "/reservations/reports/utilization",
+            params={"start": start.isoformat(), "end": end_utc.isoformat(), "status": "ACTIVE"},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        echoed = datetime.fromisoformat(data["window_start"].replace("Z", "+00:00"))
+        assert echoed == start_utc
+        assert echoed.utcoffset() == timedelta(0)
+        assert data["total_hours"] > 0
+        utc_days = {start_utc.date().isoformat(), end_utc.date().isoformat()}
+        assert {b["day"] for b in data["by_day"]} <= utc_days
+        assert all(b["hours"] > 0 for b in data["by_day"])
+        # Each bucket and the total are rounded to four places on their own.
+        assert sum(b["hours"] for b in data["by_day"]) == pytest.approx(
+            data["total_hours"], abs=1e-4 * (len(data["by_day"]) + 1)
+        )
+    finally:
+        await admin_client.delete(f"/reservations/{reservation['id']}")
+
+
 async def test_utilization_report_non_admin_forbidden(user_client):
     now = datetime.now(timezone.utc)
     resp = await user_client.get(

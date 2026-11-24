@@ -91,13 +91,20 @@ ReservationSortDir = Literal["asc", "desc"]
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
-    """Normalize a timezone-aware filter bound to UTC (issue #959).
+    """Normalize a list filter bound or a report bound to UTC (issues #959, #1523).
 
     Postgres compares timestamptz by instant, but SQLite compares the stored text, so
     an offset like +05:00 must be converted before it reaches the query for both
-    dialects to agree.
+    dialects to agree. The report routes read UTC dates off their bounds (the day
+    section, the CSV file name), so they convert too. A naive value is taken as UTC,
+    never as the host's local zone (which is what astimezone would assume); only the
+    report routes admit one, the list filters are AwareDatetime.
     """
-    return value.astimezone(timezone.utc) if value is not None else None
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
@@ -323,6 +330,10 @@ async def get_utilization_report(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
+    # Issue #1523: every later read of the bounds (the day split, the run-count
+    # query) sees UTC, whatever offset the caller sent.
+    start = _as_utc(start)
+    end = _as_utc(end)
     status_filter = status if status else [ReservationStatus.COMPLETED]
     # The fleet section defaults to ACTIVE+COMPLETED so a reservation running
     # right now counts toward utilization; an explicit ?status= applies to
@@ -365,6 +376,10 @@ async def get_utilization_report_csv(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
+    # Issue #1523: the file name below is dated with the bounds' UTC dates, the
+    # same calendar the day section uses.
+    start = _as_utc(start)
+    end = _as_utc(end)
     status_filter = status if status else [ReservationStatus.COMPLETED]
     fleet_devices = None
     fleet_filter = None

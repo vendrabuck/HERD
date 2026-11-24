@@ -1483,10 +1483,15 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   `ACTIVE` and `COMPLETED`; a given `status` list applies to every section. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `FLEET_DEFAULT_STATUS_FILTER`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_counts_active_but_legacy_default_does_not`, `test_explicit_filter_applies_to_fleet_too`, `test_report_route_fleet_defaults_count_active`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_filters_status`)
-- **OPS-REPORT-4.** The day section splits each reservation's hours at UTC midnight and
-  counts a reservation once per day it touches. \
-  Enforced in: `services/reservations/app/services/reporting_service.py` (`_split_hours_per_day`) \
-  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`)
+- **OPS-REPORT-4.** The day section splits each reservation's hours at UTC midnight,
+  labels each slice with its UTC date, and counts a reservation once per day it touches.
+  `start` and `end` may carry any UTC offset, and a value without one is UTC (never the
+  host's zone): both routes convert the bounds to UTC before anything reads them, and
+  the split converts on its own, so its slices are positive, contiguous, and sum to the
+  overlap, the day hours sum to `total_hours`, and the report echoes the window in UTC
+  (issue #1523). \
+  Enforced in: `services/reservations/app/services/reporting_service.py` (`_split_hours_per_day`, `_as_utc`, `build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
+  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`); `services/reservations/tests/test_report_utc_days.py` (`test_split_hours_negative_offset_start_late_in_local_day`, `test_split_hours_positive_offset_labels_the_utc_dates`, `test_split_hours_mixed_offsets_crossing_several_utc_midnights`, `test_split_hours_start_exactly_at_utc_midnight_in_an_offset`, `test_split_hours_naive_start_with_an_offset_end`, `test_split_hours_property_any_offsets_any_window`, `test_build_report_by_day_sums_to_total_for_any_offset_window`, `test_build_report_takes_a_naive_and_an_offset_bound_and_echoes_utc`, `test_report_route_by_day_is_split_at_utc_midnight_for_any_offset`, `test_report_route_hands_utc_bounds_downstream`, `test_report_routes_take_a_naive_bound_as_utc_not_the_host_zone`); `tests/integration/test_reporting.py` (`test_utilization_report_by_day_sums_to_total_with_an_offset_start`)
 - **OPS-REPORT-5.** The group section rolls each user's hours into every group the user
   belongs to (a user in two groups counts in both) and a user in none into `Ungrouped`;
   when auth cannot answer, every user is `Ungrouped` and the report still answers 200. \
@@ -1533,9 +1538,10 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_fetch_execution_run_count_returns_total`, `test_fetch_execution_run_count_swallows_http_errors`, `test_fetch_execution_run_count_returns_none_on_non_200`)
 - **OPS-REPORT-13.** The CSV route serves one `section` (`user`, `device`, `fleet`,
   `purpose`, `user_purpose`, `device_purpose`, `purpose_suggested`; anything else is
-  422) as `text/csv` with a dated attachment name; hours have four decimals. \
+  422) as `text/csv` with an attachment name dated with the UTC dates of `start` and
+  `end`; hours have four decimals. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`); `services/reservations/app/services/reporting_service.py` (`report_to_csv`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `services/reservations/tests/test_report_utc_days.py` (`test_csv_route_reproduction_matches_json_and_names_utc_dates`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
 - **OPS-REPORT-14.** The `fleet` CSV is 503 `Inventory service is unreachable` when
   inventory cannot answer; the other sections make no inventory call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`) \
