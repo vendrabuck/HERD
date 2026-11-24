@@ -205,7 +205,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   `reservation_cancel_cas_exhausted` and stages nothing. A row that went terminal
   meanwhile is a clean no-op. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward`, `test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing`, `test_cancel_loses_to_a_concurrent_completion_is_a_noop`)
+  Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward`, `test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing`, `test_cancel_loses_to_any_terminal_winner_is_a_noop`, `test_cancel_loses_to_a_non_terminal_winner_retries_and_cancels`)
 - **RES-CANCEL-5.** A winning cancel stages `reservation.cancelled` whose `user_id` is
   the owner (also on an admin cancel), stamps the purpose marker, then releases devices
   only if it left `PENDING_PROVISION` or `ACTIVE`, then requests a fork archive (a
