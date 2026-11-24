@@ -792,9 +792,12 @@ section 5).
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_purpose_category_value_and_none`, `test_purpose_category_unknown_is_422_with_pinned_message`)
 - **RES-LIST-8.** Time bounds must carry a timezone; `*_after` is inclusive and
-  `*_before` exclusive, compared by instant. \
+  `*_before` exclusive, compared by instant. A bound whose instant has no UTC
+  equivalent (an offset near year 1 or year 9999) is 422 `<parameter> must fall between
+  0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
+  500 (issue #1523). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`) \
-  Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`)
+  Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`, `test_window_bound_with_no_utc_equivalent_is_422`, `test_window_bound_at_the_edge_of_the_utc_range_is_accepted`)
 - **RES-LIST-9.** `total` is the filtered total. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_total_is_filtered_total_across_pages_and_sort`)

@@ -263,6 +263,36 @@ async def test_window_bad_or_naive_timestamp_is_422(make_client, param, bad):
     assert resp.json()["detail"][0]["loc"] == ["query", param]
 
 
+@pytest.mark.parametrize("param", ["starts_after", "starts_before", "ends_after", "ends_before"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "0001-01-01T00:00:00+05:00",  # before year 1 in UTC
+        "0001-01-01T00:59:59.999999+01:00",  # one microsecond before it
+        "9999-12-31T23:00:00-05:00",  # after year 9999 in UTC
+        "9999-12-31T19:00:00-05:00",  # exactly 10000-01-01T00:00Z
+    ],
+)
+async def test_window_bound_with_no_utc_equivalent_is_422(make_client, param, bad):
+    """A bound whose UTC instant is outside datetime's range was an OverflowError (500)."""
+    async with make_client(A_USER) as c:
+        resp = await c.get("/", params={param: bad})
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": f"{param} must fall between 0001-01-01T00:00:00Z and "
+        "9999-12-31T23:59:59.999999Z once converted to UTC"
+    }
+
+
+@pytest.mark.parametrize("param", ["starts_after", "starts_before", "ends_after", "ends_before"])
+@pytest.mark.parametrize("edge", ["0001-01-01T01:00:00+01:00", "9999-12-31T18:59:59.999999-05:00"])
+async def test_window_bound_at_the_edge_of_the_utc_range_is_accepted(make_client, param, edge):
+    """The first and the last representable UTC instants, written in an offset."""
+    async with make_client(A_USER) as c:
+        resp = await c.get("/", params={param: edge})
+    assert resp.status_code == 200, resp.text
+
+
 async def test_period_views_partition_the_rows(make_client):
     """The frontend's upcoming, current, and past views, computed at one instant,
     are disjoint and together cover every row."""
