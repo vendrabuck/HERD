@@ -193,7 +193,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   status), after the commit and before the tick's claimed rows activate; a device
   another live row holds is skipped. A later claim re-flips the devices. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `release_devices_not_held_by_others`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`, `test_restart_backstop_judges_each_row_by_its_own_dynamic_requests`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`, `test_restart_backstop_judges_each_row_by_its_own_dynamic_requests`, `test_restart_backstop_leaves_a_dynamic_row_that_appears_after_the_dynamic_select`)
 - **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
@@ -643,7 +643,7 @@ pending-prune reconcile.
   A failure in one step is logged at ERROR and does not stop the loop or skip any
   other step. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`expiration_loop`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_awaits_exactly_the_four_named_steps`, `test_expiration_loop_runs_every_step_and_a_failing_step_skips_none`)
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_awaits_exactly_the_four_named_steps_and_the_sleep`, `test_expiration_loop_runs_every_step_and_a_failing_step_skips_none`)
 - **RES-SWEEP-11.** Purpose classification runs on its own task and interval, never
   inside the expiration loop. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/reservations/app/tasks/expiration.py` (`purpose_classify_loop`) \
@@ -1050,8 +1050,9 @@ reconcile on the expiration loop.
 - **RES-FORK-17.** Each tick retries up to 20 reservations with a pending prune marker,
   oldest `updated_at` first, one attempt each; a marker on a non-ACTIVE reservation is
   cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20).
-  On an `ACTIVE` row, marker entries that are not UUIDs are cleared in the same tick
-  without a prune, and the row's valid entries are retried as usual (RES-FORK-16). \
+  On an `ACTIVE` row, marker entries that do not parse as a UUID are cleared in the
+  same tick without a prune, and the row's other entries are retried as usual
+  (RES-FORK-16). \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`)
 - **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,

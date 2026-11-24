@@ -7,6 +7,10 @@ advisory-lock Postgres branch, the update-reservation extend/add/remove device
 paths, the cancel/release exclusive-device selection, the expiration_loop
 exception handling, and a few small schema/reporting validators. All external
 HTTP is mocked; NATS publishing is stubbed; no real DB or network is used.
+
+It also holds a guard on expiration_loop's source (RES-SWEEP-10, issue #1531): the
+calls each tick awaits must be exactly the four steps and the sleep. What that scan
+reads and its Limits are in the docstring of `_per_tick_awaits`.
 """
 
 import ast
@@ -1097,39 +1101,257 @@ class _StopLoop(Exception):
     pass
 
 
-# RES-SWEEP-10 (issue #1531): every tick runs every step, and a step that raises
-# skips none of the others. The step list is the loop's own source: the test below
-# reads every bare-name call the while body awaits, so a fifth step added to the loop
-# fails it until the step and its error line are added here, and the parametrized
-# test then runs it, alone and with every other step raising.
+# RES-SWEEP-10 (issue #1531): every tick runs every step, each once, and a step that
+# raises skips none of the others. RES-SWEEP-10 states no order between the steps, so
+# neither test below compares order: both compare multisets (each name, how many
+# times). Two tests hold it:
+#
+# - a guard on the loop's source (`_per_tick_awaits`, its Limits in its docstring):
+#   the awaited calls in the while body must be exactly the four steps plus
+#   asyncio.sleep, so a fifth awaited call of any spelling it reads fails until it is
+#   added to `_LOOP_AWAITS` and, if it is a step, to `_LOOP_STEPS`;
+# - a runtime test over `_LOOP_STEPS`: one tick with no step, each step, and every step
+#   raising, each step run exactly once.
+#
+# A behavior-preserving refactor of the loop (a `for` loop over a table of steps, the
+# steps gathered, a helper per step) fails the guard on purpose: update `_LOOP_AWAITS`
+# to the new spelling and make the runtime test patch whatever the loop now calls.
 _LOOP_STEPS = {
     "_run_expiration_cycle": "Expiration cycle failed",
     "_run_reminder_cycle": "Expiry reminder cycle failed",
     "_run_fork_archive_reconcile": "Fork archive reconcile cycle failed",
     "_run_pending_prune_reconcile": "Pending fork-prune reconcile cycle failed",
 }
+_LOOP_AWAITS = [*_LOOP_STEPS, "asyncio.sleep"]
+
+_NEW_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
 
-def _steps_awaited_in_the_loop_body() -> list[str]:
-    """Every awaited call of a bare name inside expiration_loop's while body, in
-    source order. asyncio.sleep is an attribute call, so it is not a step."""
+def _dotted(node: ast.AST) -> str:
+    """A key for an expression, built from the AST (never `ast.unparse`): a name, an
+    attribute chain `a.b.c`, a call as its callee plus `()`, else `<NodeType>`."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_dotted(node.value)}.{node.attr}"
+    if isinstance(node, ast.Call):
+        return f"{_dotted(node.func)}()"
+    return f"<{type(node).__name__}>"
+
+
+def _awaits_in(node: ast.AST) -> list[str]:
+    keys: list[str] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _NEW_SCOPES):
+            continue
+        if isinstance(child, ast.Await):
+            value = child.value
+            if isinstance(value, ast.Call):
+                keys.append(_dotted(value.func))
+            else:
+                keys.append(f"<awaited non-call {_dotted(value)}>")
+        keys.extend(_awaits_in(child))
+    return keys
+
+
+def _per_tick_awaits(source: str) -> list[str]:
+    """Every `await` inside the one top-level `while` loop of the async function in
+    `source`, keyed by what it awaits: a call by its callee's dotted name
+    (`_run_reminder_cycle`, `asyncio.sleep`, `asyncio.gather`, `mod._run_x`), anything
+    else as `<awaited non-call ...>`. Awaits in the loop's condition, its body at any
+    depth (inside `try`, `if`, `with`, nested loops, comprehensions, another await's
+    arguments), and its `else` are counted.
+
+    The function's body must hold exactly one top-level `while` statement; zero or two
+    fail with a message naming the count.
+
+    Limits (each one is a fixture case in `_SCAN_LIMITS` below, which proves the scan
+    really is blind to it):
+    - a call that is not awaited (a coroutine created and dropped, or work started
+      with `asyncio.create_task` and never awaited) is not seen;
+    - an await outside the `while` (before the loop, so it runs once) is not seen;
+    - an await inside a nested `def`, `async def`, or class in the loop body is not
+      seen, whether or not it runs; the call of a nested helper, if awaited, is;
+    - a step passed un-awaited to an awaited wrapper (`asyncio.gather`,
+      `asyncio.wait_for`, any awaited call) is seen only as the wrapper, so a step
+      moved into the argument list of another awaited step passes;
+    - names are keyed as written, not resolved: a different function bound to a step's
+      name (an import alias, a rebinding outside the loop) passes;
+    - reachability and error handling are not judged: an awaited step under `if False:`
+      or outside any `try` is counted the same (the runtime test judges handling).
+    """
+    (function,) = ast.parse(textwrap.dedent(source)).body
+    loops = [stmt for stmt in function.body if isinstance(stmt, ast.While)]
+    assert len(loops) == 1, (
+        f"{function.name} must hold exactly one top-level while loop, found {len(loops)}"
+    )
+    return _awaits_in(loops[0])
+
+
+def _expiration_loop_source() -> str:
     from app.tasks import expiration
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(expiration.expiration_loop)))
-    (loop,) = [node for node in ast.walk(tree) if isinstance(node, ast.While)]
-    awaited = [
-        node.value
-        for node in ast.walk(loop)
-        if isinstance(node, ast.Await)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-    ]
-    awaited.sort(key=lambda call: (call.lineno, call.col_offset))
-    return [call.func.id for call in awaited]
+    return inspect.getsource(expiration.expiration_loop)
 
 
-def test_expiration_loop_awaits_exactly_the_four_named_steps():
-    assert _steps_awaited_in_the_loop_body() == list(_LOOP_STEPS)
+def test_expiration_loop_awaits_exactly_the_four_named_steps_and_the_sleep():
+    assert sorted(_per_tick_awaits(_expiration_loop_source())) == sorted(_LOOP_AWAITS)
+
+
+# Fixture sources for the guard. `_SCAN_BASE` has the loop's shape; each case is an
+# (old, new) edit of it with the keys the scan must then return.
+_SCAN_BASE = textwrap.dedent(
+    """\
+    async def expiration_loop(interval_seconds=60):
+        while True:
+            try:
+                await _run_expiration_cycle()
+            except Exception:
+                pass
+            try:
+                await _run_reminder_cycle()
+            except Exception:
+                pass
+            try:
+                await _run_fork_archive_reconcile()
+            except Exception:
+                pass
+            try:
+                await _run_pending_prune_reconcile()
+            except Exception:
+                pass
+            await asyncio.sleep(interval_seconds)
+    """
+)
+_SLEEP = "        await asyncio.sleep(interval_seconds)\n"
+_REMINDER = "            await _run_reminder_cycle()\n"
+
+
+def _before_sleep(line: str) -> tuple[str, str]:
+    return _SLEEP, f"        {line}\n{_SLEEP}"
+
+
+def _with(*added: str, without: str | None = None) -> list[str]:
+    keys = [*_LOOP_AWAITS, *added]
+    if without is not None:
+        keys.remove(without)
+    return keys
+
+
+# Spellings the scan sees: each changes the keys, so the guard fails.
+_SCAN_SEES = {
+    "fifth_step_bare_name": (_before_sleep("await _run_new_step()"), _with("_run_new_step")),
+    "fifth_step_to_thread": (
+        _before_sleep("await asyncio.to_thread(int)"),
+        _with("asyncio.to_thread"),
+    ),
+    "fifth_step_module_attribute": (
+        _before_sleep("await expiration._run_reminder_cycle()"),
+        _with("expiration._run_reminder_cycle"),
+    ),
+    "step_gathered": (
+        (_REMINDER, "            await asyncio.gather(_run_reminder_cycle())\n"),
+        _with("asyncio.gather", without="_run_reminder_cycle"),
+    ),
+    "step_awaited_twice": (
+        _before_sleep("await _run_reminder_cycle()"),
+        _with("_run_reminder_cycle"),
+    ),
+    "step_removed": ((_REMINDER, "            pass\n"), _with(without="_run_reminder_cycle")),
+    "step_through_a_nested_helper": (
+        (_REMINDER, "            await helper()\n"),
+        _with("helper", without="_run_reminder_cycle"),
+    ),
+    "sleep_renamed_import": (
+        (_SLEEP, "        await sleep(interval_seconds)\n"),
+        _with("sleep", without="asyncio.sleep"),
+    ),
+    "sleep_removed": ((_SLEEP, ""), _with(without="asyncio.sleep")),
+    "awaited_non_call": (_before_sleep("await pending"), _with("<awaited non-call pending>")),
+    "await_in_a_nested_while": (
+        _before_sleep("while False:\n            await _run_new_step()"),
+        _with("_run_new_step"),
+    ),
+    "await_in_a_comprehension": (
+        _before_sleep("[await _run_new_step() for _ in ()]"),
+        _with("_run_new_step"),
+    ),
+    "steps_from_a_table": (
+        (
+            _REMINDER,
+            "            for run in (_run_reminder_cycle,):\n                await run()\n",
+        ),
+        _with("run", without="_run_reminder_cycle"),
+    ),
+}
+
+# Changes the scan is blind to (its Limits): the keys stay those of `_SCAN_BASE`.
+_SCAN_LIMITS = {
+    "call_not_awaited": _before_sleep("_run_new_step()"),
+    "create_task_not_awaited": _before_sleep("asyncio.create_task(_run_new_step())"),
+    "await_before_the_loop": (
+        "    while True:\n",
+        "    await _run_new_step()\n    while True:\n",
+    ),
+    "await_in_a_nested_def": _before_sleep("async def later():\n            await _run_new_step()"),
+    "step_inside_an_awaited_wrapper": (
+        _REMINDER,
+        "            await _run_reminder_cycle(_run_new_step())\n",
+    ),
+    "name_rebound_outside_the_loop": (
+        "    while True:\n",
+        "    _run_reminder_cycle = _run_new_step\n    while True:\n",
+    ),
+    "step_unreachable": (_REMINDER, "            if False:\n" + "    " + _REMINDER),
+    "step_outside_any_try": (
+        "        try:\n            await _run_pending_prune_reconcile()\n"
+        "        except Exception:\n            pass\n",
+        "        await _run_pending_prune_reconcile()\n",
+    ),
+}
+
+
+def _edited(old: str, new: str) -> str:
+    assert _SCAN_BASE.count(old) == 1, old
+    return _SCAN_BASE.replace(old, new)
+
+
+def test_the_step_scan_base_fixture_reads_as_the_loop_does():
+    assert sorted(_per_tick_awaits(_SCAN_BASE)) == sorted(_LOOP_AWAITS)
+
+
+@pytest.mark.parametrize("case", sorted(_SCAN_SEES))
+def test_the_step_scan_sees_each_listed_spelling(case):
+    (old, new), keys = _SCAN_SEES[case]
+    found = sorted(_per_tick_awaits(_edited(old, new)))
+    assert found == sorted(keys)
+    assert found != sorted(_LOOP_AWAITS)
+
+
+@pytest.mark.parametrize("case", sorted(_SCAN_LIMITS))
+def test_the_step_scan_is_blind_to_each_listed_limit(case):
+    old, new = _SCAN_LIMITS[case]
+    assert sorted(_per_tick_awaits(_edited(old, new))) == sorted(_LOOP_AWAITS)
+
+
+_NO_LOOP = "async def expiration_loop(interval_seconds=60):\n    pass\n"
+_TWO_LOOPS = _SCAN_BASE + _SCAN_BASE.split("\n", 1)[1]
+
+
+@pytest.mark.parametrize(("source", "count"), [(_NO_LOOP, 0), (_TWO_LOOPS, 2)])
+def test_the_step_scan_refuses_a_function_without_exactly_one_top_level_loop(source, count):
+    with pytest.raises(AssertionError, match=f"exactly one top-level while loop, found {count}"):
+        _per_tick_awaits(source)
+
+
+class _StepFailed(Exception):
+    """Raised by a fake step; private, so narrowing a step's handler to any other
+    exception type lets it escape the loop and fails the test."""
+
+
+class _StepRanTwice(BaseException):
+    """Raised by a fake step called a second time. Not an Exception, so the loop's
+    handlers do not catch it: a loop that lost its sleep fails at once, not by hanging."""
 
 
 _FAILING_SETS = {
@@ -1140,21 +1362,28 @@ _FAILING_SETS = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("case", list(_FAILING_SETS))
 async def test_expiration_loop_runs_every_step_and_a_failing_step_skips_none(case, caplog):
-    """One tick awaits each step exactly once whichever steps raise, logs one error
-    line per raising step carrying that step's exception, and reaches the sleep. The
-    otherwise-infinite loop ends because the patched sleep raises; no real clock."""
+    """One tick awaits each step exactly once (in any order; RES-SWEEP-10 states none)
+    whichever steps raise, logs one error line per raising step carrying the exact
+    exception that step raised, and reaches the sleep. The otherwise-infinite loop
+    ends because the patched sleep raises; no real clock. A step called a second time
+    raises `_StepRanTwice`, so a loop without its sleep fails at once; the timeout
+    marker is the backstop for any other hang."""
     from app.tasks import expiration
 
     failing = _FAILING_SETS[case]
+    raised = {name: _StepFailed(name) for name in failing}
     ran: list[str] = []
 
     def step(name):
         async def run():
+            if name in ran:
+                raise _StepRanTwice(name)
             ran.append(name)
-            if name in failing:
-                raise RuntimeError(name)
+            if name in raised:
+                raise raised[name]
 
         return run
 
@@ -1167,17 +1396,23 @@ async def test_expiration_loop_runs_every_step_and_a_failing_step_skips_none(cas
         with pytest.raises(_StopLoop):
             await expiration.expiration_loop(interval_seconds=7)
 
-    assert ran == list(_LOOP_STEPS)
+    assert sorted(ran) == sorted(_LOOP_STEPS)
     sleep.assert_awaited_once_with(7)
-    errors = [
-        (r.getMessage(), str(r.exc_info[1]))
-        for r in caplog.records
-        if r.name == "app.tasks.expiration" and r.levelname == "ERROR"
-    ]
-    assert errors == [(_LOOP_STEPS[name], name) for name in _LOOP_STEPS if name in failing]
+    errors = sorted(
+        (
+            (r.getMessage(), r.exc_info[1])
+            for r in caplog.records
+            if r.name == "app.tasks.expiration" and r.levelname == "ERROR"
+        ),
+        key=lambda error: error[0],
+    )
+    assert errors == sorted(
+        ((_LOOP_STEPS[name], raised[name]) for name in failing), key=lambda error: error[0]
+    )
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
 async def test_expiration_loop_no_longer_drives_purpose_classify_reconcile():
     """Issue #702: the purpose-classify reconciler moved to its own task
     (purpose_classify_loop); expiration_loop must never call it, even though
