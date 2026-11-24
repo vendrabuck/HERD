@@ -201,7 +201,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_failed_is_terminal_no_release_no_event`); `services/reservations/tests/test_reservations.py` (`test_cancel_already_cancelled`)
 - **RES-CANCEL-4.** Cancel compare-and-swaps from the exact status it read; when the row
-  moved, it re-reads and retries, at most three times, then logs
+  moved, it re-reads and tries again, three attempts in all, then logs
   `reservation_cancel_cas_exhausted` and stages nothing. A row that went terminal
   meanwhile is a clean no-op. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
