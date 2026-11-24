@@ -1182,7 +1182,7 @@ user in the flow. The routes, callers, and answers are in section 7.
 
 - **RES-INTERNAL-1.** A wrong internal token answers 403; a missing header answers 422. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`internal_token_matches`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_bad_token_rejected`, `test_internal_status_missing_token_rejected`, `test_internal_active_bad_token_rejected`, `test_active_users_requires_valid_internal_token`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_every_internal_route_answers_422_without_the_token_header`, `test_every_internal_route_answers_403_to_a_wrong_token`, `test_internal_status_bad_token_rejected`, `test_internal_status_missing_token_rejected`, `test_internal_active_bad_token_rejected`, `test_internal_active_missing_token_rejected`, `test_active_users_requires_valid_internal_token`, `test_internal_by_topology_bad_token_rejected`, `test_internal_by_device_bad_token_rejected`); `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_refuses_a_wrong_internal_token`); `services/reservations/tests/test_dynamic_requests.py` (`test_callback_wrong_token_403_wording`, `test_callback_missing_token_rejected`)
 - **RES-INTERNAL-2.** `is_active` is true only when the status is `ACTIVE` and now is
   within `[start_time, end_time]`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
@@ -1190,16 +1190,16 @@ user in the flow. The routes, callers, and answers are in section 7.
 - **RES-INTERNAL-3.** `owns_active` is true only when the user owns an `ACTIVE`
   reservation that contains the device and whose window contains now. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`owns_active_reservation_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_owner_with_device_returns_true`, `test_internal_active_non_owner_returns_false`, `test_internal_active_outside_window_returns_false`, `test_internal_active_cancelled_returns_false`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_owner_with_device_returns_true`, `test_internal_active_non_owner_returns_false`, `test_internal_active_outside_window_returns_false`, `test_internal_active_cancelled_returns_false`, `test_internal_active_answers_only_from_the_users_reservation_holding_the_device`, `test_internal_active_is_true_only_for_an_active_reservation`, `test_internal_active_is_true_only_while_the_window_contains_now`)
 - **RES-INTERNAL-4.** `active-users` lists, once each, the owners of `ACTIVE`
   reservations containing the device whose window contains now. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_active_reservation_users_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_active_users_dedupes_same_user_multiple_reservations`, `test_active_users_filters_by_time_window`, `test_active_users_filters_by_status`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_active_users_dedupes_same_user_multiple_reservations`, `test_active_users_filters_by_time_window`, `test_active_users_filters_by_status`, `test_active_users_lists_only_the_owner_of_the_reservation_holding_the_device`, `test_active_users_lists_only_owners_of_active_reservations`, `test_active_users_lists_only_owners_whose_window_contains_now`)
 - **RES-INTERNAL-5.** `by-topology` and `by-device` return every reservation that
   references the topology or contains the device, in every status and for every owner,
   without pagination. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_reservations_for_topology`, `list_reservations_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`, `test_internal_by_device_returns_only_the_reservation_holding_the_device`)
 - **RES-INTERNAL-6.** The literal `active`, `active-users`, `held-devices`,
   `by-topology`, and `by-device` segments are never parsed as a reservation id. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
@@ -1219,7 +1219,7 @@ user in the flow. The routes, callers, and answers are in section 7.
   user's `PENDING_PROVISION` and `ACTIVE` reservations (the statuses that hold devices),
   and nothing of a `PENDING` or terminal row or of another user's (issue #1030). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_devices_held_by_user`) \
-  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_lists_only_the_users_live_reservations`, `test_held_devices_for_a_user_with_nothing_live_is_empty`, `test_held_devices_refuses_a_wrong_internal_token`)
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_lists_only_the_users_live_reservations`, `test_held_devices_lists_a_row_by_its_own_status_alone`, `test_held_devices_for_a_user_with_nothing_live_is_empty`, `test_held_devices_refuses_a_wrong_internal_token`)
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
 
