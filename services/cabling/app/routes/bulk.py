@@ -24,9 +24,9 @@ POST /topologies/{id}/validate does.
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, Header, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from herd_common.validation_errors import extends_body_limit
+from herd_common.validation_errors import body_too_large_error, extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,11 +43,36 @@ from app.services.bulk_service import (
 
 router = APIRouter(prefix="/topologies", tags=["topology-bulk"])
 
-# The import file bound for the request body limit (issue #1466). The import route
-# reads the whole upload with no bound of its own (as inventory's do, issue #1417),
-# so this is the only bound on the file: a body may hold it plus
-# MAX_REQUEST_BODY_BYTES.
+# The import file bound, and the extra the route declares for the request body
+# limit (issue #1466). It caps the file itself: `_read_capped` reads one byte
+# past it and refuses the rest, so unlike the envelope this cap does not grow
+# when an operator raises MAX_REQUEST_BODY_BYTES.
 IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes:
+    """Read one upload, up to ``limit``, and refuse a longer one (issue #1417).
+
+    A single ``file.read(limit + 1)``, then a length check: reading one byte past
+    the bound is what makes the refusal exact at the byte. The route's
+    ``extends_body_limit`` bound is on the request body, the whole multipart
+    envelope, so a file may be that size plus the form overhead; this is the
+    per-file bound, and it does not grow when an operator raises
+    ``MAX_REQUEST_BODY_BYTES``. The 413 is the one the body-limit middleware
+    builds.
+
+    Starlette has already received the upload and spooled it to a temporary file
+    by the time a route reads it, so this bounds what is copied out of the spool
+    into memory and not the upload itself. A file up to 10 MiB is still decoded
+    and parsed on the event loop; step 2 of #1417 is not done here.
+    """
+    raw = await file.read(limit + 1)
+    if len(raw) > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=[body_too_large_error(limit)],
+        )
+    return raw
 
 
 @router.get("/export")
@@ -109,7 +134,7 @@ async def import_topologies_endpoint(
     never trigger the visibility lookup. An unanswerable visibility lookup
     fails CLOSED with a 503; nothing is written for that request.
     """
-    raw = await file.read()
+    raw = await _read_capped(file, IMPORT_UPLOAD_BYTES)
     actor_id = uuid.UUID(payload["sub"])
     actor_name = payload.get("username", "")
     actor_role = payload.get("role", "user")
