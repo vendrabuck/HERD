@@ -194,6 +194,73 @@ async def test_build_report_clips_hours_to_window(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_offset", "end_offset"),
+    [
+        (timedelta(hours=-3), timedelta(0)),
+        (timedelta(hours=24), timedelta(hours=27)),
+        (timedelta(hours=5), timedelta(hours=5)),
+        (timedelta(days=-30), timedelta(days=-29)),
+        (timedelta(days=30), timedelta(days=31)),
+    ],
+    ids=[
+        "ends-at-window-start",
+        "starts-at-window-end",
+        "zero-length-inside",
+        "far-before",
+        "far-after",
+    ],
+)
+async def test_a_row_with_no_overlap_is_skipped(db_session, start_offset, end_offset):
+    """OPS-REPORT-2: "one with no overlap is skipped". Beside one counted row, a row
+    that overlaps the 24-hour window for no time at all (far before or after it,
+    touching either bound, or of zero length inside it) shows in none of the totals or
+    the user, device, topology type, day, and purpose sections. The two rows have
+    different users and devices."""
+    window_start = NOW - timedelta(days=1)
+    window_end = NOW
+    counted_device = uuid.uuid4()
+    skipped_device = uuid.uuid4()
+    db_session.add(
+        _res(
+            USER_A,
+            "alice",
+            [str(counted_device)],
+            window_start + timedelta(hours=1),
+            window_start + timedelta(hours=3),
+        )
+    )
+    db_session.add(
+        _res(
+            USER_B,
+            "bob",
+            [str(skipped_device)],
+            window_start + start_offset,
+            window_start + end_offset,
+        )
+    )
+    await db_session.commit()
+
+    report = await build_utilization_report(
+        db_session, window_start, window_end, [ReservationStatus.COMPLETED]
+    )
+
+    assert report.total_reservations == 1
+    assert report.total_hours == pytest.approx(2.0)
+    assert [(b.user_id, b.hours, b.reservation_count) for b in report.by_user] == [(USER_A, 2.0, 1)]
+    assert [(b.device_id, b.hours) for b in report.by_device] == [(counted_device, 2.0)]
+    assert [(b.topology_type, b.reservation_count) for b in report.by_topology_type] == [
+        (TopologyType.PHYSICAL, 1)
+    ]
+    assert [(b.day, b.hours) for b in report.by_day] == [
+        ((window_start + timedelta(hours=1)).date().isoformat(), 2.0)
+    ]
+    assert [(b.purpose_category, b.reservations) for b in report.by_purpose] == [
+        ("unclassified", 1)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_malformed_device_id_rejected_at_write_time(db_session):
     """A malformed device id can no longer corrupt reporting: the typed
     reservation_devices join table rejects it when the reservation is built,
