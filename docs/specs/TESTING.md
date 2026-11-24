@@ -211,6 +211,16 @@ The losing FAILED-to-ACTIVE CAS writer in all three wiring ledgers read `reusabl
 - `services/execution/tests/_wiring_due_cases.py` holds the parity cases for the retry tick's due selects once, shared by `test_wiring_due.py` (SQLite) and the pg-live suite; a new prefix or a new skip rule must keep select and drive rule equal on both.
 - `services/execution/tests/test_route_service.py` pins the RouteAssignment partial-unique index and `record_route_active` redelivery idempotency directly against the model.
 
+### Seed a row that must not match (the 2026-11-24 mutation run)
+
+A mutation run applied 2,935 one-line defects to the reservations service. Most of the surviving defects that mattered had one cause: the test seeded exactly one row, user, device, or reservation, so a query that had lost its filter still gave the right answer (issues #1525, #1529, #1532, #1533).
+
+- A test of anything that selects, filters, authorizes, or writes by an id, an owner, a device, a status, or a time window seeds at least two rows: one that must match and one that must NOT (a second reservation on another device, a second user's row, a row outside the window, a row in another status). It asserts on both: the matching row gives the expected result, and the other row is absent from the result or unchanged in the database.
+- The non-matching row differs from the matching one in the ONE field the filter reads and is otherwise valid, so it would be returned or written if the filter were dropped.
+- A negative test (a 404, an empty list, a false answer) seeds the thing asked about under a DIFFERENT owner or key, never nothing at all: a lookup for a device that no reservation holds answers false with or without the membership check.
+- A fixture that hardwires one user and one device hides the whole class; give it parameters before writing the test.
+- The proof is a mutation: with the filter clause removed from the query, the test fails.
+
 ## NOS lab tiers
 
 - NOS lab CI tiers (issue #785): `make nos-test-dialect` runs the four dialect suites (`NOS_DIALECT_TESTS`, one driver against one lab node, no stack; boots the lab if it is not up and tears down only what it started) and is run on every PR by ci.yml's advisory `nos-dialect` job; `make nos-test-feature` runs the two via-stack suites (`NOS_FEATURE_TESTS`; needs a running stack, attaches the lab, `seed-nos`, always detaches; honors `COMPOSE_PROJECT_NAME`) and runs in nightly after the seeded e2e pass and before the load test as project `herd`. `tests/unit/test_nos_lab_ci_wiring.py` fails if a new `tests/nos_lab/` file is in neither list. `make everything` runs `nos-test-dialect` as its own phase after the live-LDAP phase, while `master` still runs neither target, and `nos-test-feature` stays nightly-only.
