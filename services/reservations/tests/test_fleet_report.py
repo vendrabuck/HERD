@@ -396,7 +396,10 @@ async def test_fetch_fleet_devices_lists_every_device_inventory_returns(held, to
     and an inventory whose `total` is larger than what it holds, absent, not an int,
     or null: there a short page is the only sign the list is done. A fetch that stopped
     early lists too few devices; one that never stopped reaches the 100,000 stop and
-    returns no list, or, with that stop broken too, raises _RunawayPaging."""
+    returns no list, or, with that stop broken too, raises _RunawayPaging. Each request
+    is also checked for a 10 second timeout and for no `X-Internal-Token` header; those
+    two are pinned as built (the spec's upstream table lists the timeout), and no
+    OPS-REPORT rule states them."""
     devices = [_inventory_device(uuid.uuid4(), f"dev-{i:04d}") for i in range(held)]
     with respx.mock(assert_all_called=False) as router:
         requests = _fake_inventory(router, devices, total)
@@ -411,7 +414,9 @@ async def test_fetch_fleet_devices_lists_every_device_inventory_returns(held, to
 async def test_fetch_fleet_devices_stops_at_100_000_devices():
     """OPS-REPORT-10's "stopping at 100,000": an inventory that answers a full page to
     every request and never reports a total gets exactly 200 requests, the last at
-    skip 99,500. What the fetch then returns is in no rule and is not asserted."""
+    skip 99,500. What the fetch then returns is in no rule and is not asserted. Each
+    request is checked as in the test above, its 10 second timeout and the absence of
+    `X-Internal-Token` pinned as built, with no OPS-REPORT rule stating them."""
     page = [_inventory_device(uuid.uuid4(), f"dev-{i:03d}") for i in range(500)]
     with respx.mock(assert_all_called=False) as router:
         requests: list[httpx.Request] = []

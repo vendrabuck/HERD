@@ -445,8 +445,11 @@ async def test_transit_devices_of_every_chunk_are_merged(db_session, cabling):
     """OPS-REPORT-7 and OPS-REPORT-8 over two chunks (500 and 1), parsed from the
     real response bodies: one row of each chunk has a fork with its own transit
     switch, and both switches are counted. The two requests carry, between them,
-    exactly the 501 counted rows' ids, 500 then 1, and each is a POST to the batch
-    path with the internal token, no `Authorization` header, and a 10 second timeout."""
+    exactly the 501 counted rows' ids, one request 500 and the other 1 (their order is
+    not pinned), and each is a POST to the batch
+    path with the internal token, no `Authorization` header, and a 10 second timeout.
+    The timeout is pinned as built: the spec's upstream table lists it, but no
+    OPS-REPORT rule states it."""
     rows = await _seed_chunks(db_session, 501)
     reserved = {str(r.id): str(r.device_ids[0]) for r in rows}
     switch_one, switch_two = uuid.uuid4(), uuid.uuid4()
@@ -472,7 +475,7 @@ async def test_transit_devices_of_every_chunk_are_merged(db_session, cabling):
     assert transit == {switch_one: (1, 1.0), switch_two: (1, 1.0)}
     requests = [call.request for call in batch.calls]
     sent_ids = [json.loads(r.content)["reservation_ids"] for r in requests]
-    assert [len(ids) for ids in sent_ids] == [500, 1]
+    assert sorted(len(ids) for ids in sent_ids) == [1, 500]
     assert sorted(sent_ids[0] + sent_ids[1]) == sorted(str(r.id) for r in rows)
     for sent in requests:
         assert (sent.method, str(sent.url)) == ("POST", BATCH_URL)
@@ -497,22 +500,25 @@ TRANSIT_FAILURES = [
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failing_chunk", [0, 1], ids=["first-chunk", "second-chunk"])
+@pytest.mark.parametrize("failing_size", [500, 1], ids=["the-500-chunk", "the-1-chunk"])
 @pytest.mark.parametrize("failure", TRANSIT_FAILURES)
 async def test_a_failure_from_any_chunk_raises_transit_gear_unavailable(
-    db_session, cabling, failure, failing_chunk
+    db_session, cabling, failure, failing_size
 ):
     """OPS-REPORT-8: "a transport error or non-200 from any chunk fails the report
-    closed". The other chunk answers 200, and the failing one answers each failure
-    class through the real transport, so the helper's own handling of an httpx error
-    runs."""
+    closed". The 501 counted rows make a chunk of 500 and a chunk of 1, told apart by
+    their size, not by the order they arrive in. The other chunk answers 200, and the
+    failing one answers each failure class through the real transport, so the helper's
+    own handling of an httpx error runs. Pinned: the failing chunk is asked and the
+    report raises TransitGearUnavailable. Not pinned: the order of the requests, and
+    whether the other chunk is asked at all once one has failed."""
     await _seed_chunks(db_session, 501)
-    calls = 0
+    asked: list[int] = []
 
     def _answer(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        index, calls = calls, calls + 1
-        if index != failing_chunk:
+        size = len(json.loads(request.content)["reservation_ids"])
+        asked.append(size)
+        if size != failing_size:
             return httpx.Response(200, json={"devices": {}})
         if isinstance(failure, Exception):
             raise failure
@@ -524,4 +530,4 @@ async def test_a_failure_from_any_chunk_raises_transit_gear_unavailable(
             await build_utilization_report(
                 db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
             )
-    assert calls == failing_chunk + 1
+    assert failing_size in asked

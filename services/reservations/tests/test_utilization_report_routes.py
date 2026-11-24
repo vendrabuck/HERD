@@ -333,7 +333,8 @@ async def test_transit_devices_come_from_one_internal_cabling_call_for_the_count
     ACTIVE row is loaded, for the fleet section, so its id is one a lookup over every
     loaded row would send.) The one request is a POST to cabling's batch path with the
     internal token, without the caller's bearer, with a 10 second timeout, and with
-    the counted rows' ids as its body.
+    the counted rows' ids as its body. The timeout is pinned as built: the spec's
+    upstream table lists it, but no OPS-REPORT rule states it.
     """
     reserved_a, reserved_b, reserved_c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     shared_switch, own_switch = uuid.uuid4(), uuid.uuid4()
@@ -407,6 +408,69 @@ async def test_transit_devices_come_from_one_internal_cabling_call_for_the_count
     assert sorted(body["reservation_ids"]) == sorted(
         [str(first.id), str(second.id), str(no_fork.id)]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ROUTES)
+async def test_valid_fork_devices_count_around_entries_that_are_not_uuids(
+    network, make_client, real_transit_lookup, route
+):
+    """OPS-REPORT-7: the device sections count every device on a counted row's fork
+    wiring that it did not reserve, so a malformed entry in cabling's answer must not
+    cost the valid ones around it. In the answer, in this order: the first row's list
+    has a string that is not a UUID before, between, and after its two switches; a key
+    that is not a UUID lists a switch of its own; the second row, after that key,
+    lists its reserved device and a switch; the third row's list is null. Each counted
+    row has its own hours. Expected: the first row's two switches with its hours, the
+    second row's switch with its hours, the third row's reserved device alone, and
+    nothing from the key that names no reservation.
+
+    Only string values are sent. A wrongly typed value (a number or a boolean as a
+    device id, a number as the list, `devices` as a list, a list as the body) is not
+    tried: no rule says what it becomes.
+    """
+    reserved_a, reserved_b, reserved_c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    switch_a1, switch_a2, switch_b, orphan_switch = (uuid.uuid4() for _ in range(4))
+    first = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[reserved_a], hours=3, owner_name="ann"
+    )
+    second = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[reserved_b], hours=5, owner_name="bo"
+    )
+    third = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[reserved_c], hours=7, owner_name="cy"
+    )
+    network.post(CABLING_BATCH_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "devices": {
+                    str(first.id): [
+                        "not-a-uuid",
+                        str(switch_a1),
+                        "",
+                        str(switch_a2),
+                        "also-not-a-uuid",
+                    ],
+                    "not-a-reservation-id": [str(orphan_switch)],
+                    str(second.id): [str(reserved_b), str(switch_b)],
+                    str(third.id): None,
+                }
+            },
+        )
+    )
+
+    async with make_client(ADMIN) as client:
+        rows = await _device_rows(client, route)
+
+    assert rows == {
+        str(reserved_a): (3.0, 1, 0, 0.0),
+        str(reserved_b): (5.0, 1, 0, 0.0),
+        str(reserved_c): (7.0, 1, 0, 0.0),
+        str(switch_a1): (3.0, 1, 1, 3.0),
+        str(switch_a2): (3.0, 1, 1, 3.0),
+        str(switch_b): (5.0, 1, 1, 5.0),
+    }
 
 
 # Every answer class OPS-REPORT-8 names as a failure: a transport error, and a non-200
