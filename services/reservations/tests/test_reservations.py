@@ -4383,20 +4383,33 @@ async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field
         assert after.end_time == before.end_time
 
 
+# The visibility lookup's answer for a PATCH asking for [DEVICE_A, DEVICE_B] on a row
+# that already holds DEVICE_A.
+_PATCH_VISIBLE_SETS = {
+    "both_visible": {DEVICE_A, DEVICE_B},
+    "added_device_invisible": {DEVICE_A},
+    "held_device_invisible": {DEVICE_B},
+    "nothing_visible": set(),
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
 @pytest.mark.parametrize("role", _ROLES)
-@pytest.mark.parametrize("b_visible", [False, True], ids=["b_invisible", "b_visible"])
-async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(b_visible, role, status):
-    """RES-PATCH-7: a non-admin's new device_ids must all be visible to them. The
-    owner's row holds DEVICE_A and the PATCH asks for DEVICE_A plus DEVICE_B.
+@pytest.mark.parametrize("visible_case", sorted(_PATCH_VISIBLE_SETS))
+async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(visible_case, role, status):
+    """RES-PATCH-7: a non-admin's new device_ids must ALL be visible to them. The
+    owner's row holds DEVICE_A and the PATCH asks for DEVICE_A plus DEVICE_B, so
+    the new device_ids are both devices, the one already held included.
 
-    A non-admin is checked once, for their own user id with their own token, and
-    gets the 403 with the pinned wording (and an unchanged device set) when
-    DEVICE_B is not visible, or 200 when it is. An admin or superadmin is never
-    checked and gets 200 either way."""
+    A non-admin is checked once, for their own user id with their own token. They
+    get 200 only when both devices are visible; when the added DEVICE_B is not
+    visible, when the already-held DEVICE_A is not visible, or when the lookup
+    answers that nothing is visible, they get the 403 with the pinned wording, the
+    device fetch is never awaited, and the stored device set is unchanged. An
+    admin or superadmin is never checked and gets 200 in every case."""
     rid = await _insert_editable_row(status, [DEVICE_A])
-    visible = {DEVICE_A, DEVICE_B} if b_visible else {DEVICE_A}
+    visible = _PATCH_VISIBLE_SETS[visible_case]
     visible_mock, fetch, validate, statuses = _patch_mocks(visible=visible)
     try:
         async with _client_as(CALLER_ID, role) as ac:
@@ -4410,7 +4423,7 @@ async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(b_visible, ro
         lookup.assert_not_awaited()
     else:
         lookup.assert_awaited_once_with(uuid.UUID(CALLER_ID), CALLER_TOKEN)
-    if role not in _ADMIN_ROLES and not b_visible:
+    if role not in _ADMIN_ROLES and visible_case != "both_visible":
         assert resp.status_code == 403
         assert resp.json() == {"detail": "You do not have access to one or more requested devices"}
         fetch_mock.assert_not_awaited()
@@ -4423,11 +4436,13 @@ async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(b_visible, ro
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
 async def test_patch_topology_membership_break_is_400_with_the_structured_body(status):
-    """RES-PATCH-8 and the error table: when cabling's membership check refuses a
-    device-set change on a topology-backed row, PATCH answers 400 with
+    """RES-PATCH-8 and the error table: when the membership check refuses a
+    device-set change on a topology-backed row (`_validate_topology_connectivity`
+    raising `TopologyDeviceNotMember`), PATCH answers 400 with
     `{"error": "topology_device_not_member", "device_ids": [...]}` naming the
-    devices cabling named, after one validation call with the routing pass
-    skipped; the stored device set is unchanged and no device status is written."""
+    devices the membership check named, after one validation call with the
+    routing pass skipped; the stored device set is unchanged and no device status
+    is written."""
     topo_id = str(uuid.uuid4())
     foreign = [str(uuid.uuid4()), str(uuid.uuid4())]
     rid = await _insert_editable_row(status, [DEVICE_A], topology_id=topo_id)

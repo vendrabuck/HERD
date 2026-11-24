@@ -419,10 +419,10 @@ async def test_calendar_returns_exactly_the_rows_overlapping_the_half_open_windo
     end_time > range_start, whatever its status or owner. A row ending exactly at
     range_start and one starting exactly at range_end are outside; rows one
     microsecond inside either bound, straddling either bound, inside, and
-    containing the window are in. The rows are inserted latest start first, every
-    status appears among the overlapping rows, two users own them, and the answer
-    is compared as an exact list in start_time order, with no status filter and
-    with a filter naming every status."""
+    containing the window are in. Every status appears among the overlapping rows
+    and two users own them. The answer is compared as a multiset of ids, with no
+    status filter and with a filter naming every status; RES-CAL-1 states no
+    order, so `test_calendar_orders_by_start_time_under_every_filter` owns it."""
     statuses = list(ReservationStatus)
     ids = {}
     status_of = {}
@@ -443,11 +443,11 @@ async def test_calendar_returns_exactly_the_rows_overlapping_the_half_open_windo
         assert {status_of[label] for label in expected_labels} == set(ReservationStatus)
 
         unfiltered = await list_calendar_reservations(db, _WIN_START, _WIN_END)
-        assert [r.id for r in unfiltered] == expected
+        assert sorted(r.id for r in unfiltered) == sorted(expected)
         every_status = await list_calendar_reservations(
             db, _WIN_START, _WIN_END, status_filter=list(ReservationStatus)
         )
-        assert [r.id for r in every_status] == expected
+        assert sorted(r.id for r in every_status) == sorted(expected)
 
 
 @pytest.mark.asyncio
@@ -455,9 +455,11 @@ async def test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_vis
     """RES-CAL-3 at the query: with DEVICE_A and DEVICE_B visible, a row is kept
     only when every one of its own devices is in the visible set. A row whose
     several devices include exactly one invisible device is dropped, and a row on
-    the invisible DEVICE_C alone is dropped without hiding any other row. A row
-    with no devices is kept (no device of it is invisible). An all-visible row
-    outside the window stays out."""
+    the invisible DEVICE_C alone is dropped without hiding any other row. An
+    all-visible row outside the window stays out. The answer is compared as a
+    multiset of ids; the order test owns the order. A reservation with no devices
+    is left out of this test on purpose: no decision covers whether a non-admin
+    sees one."""
     visible = {str(DEVICE_A), str(DEVICE_B)}
     start = _WIN_START + timedelta(hours=1)
     async with TestSessionLocal() as db:
@@ -469,7 +471,6 @@ async def test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_vis
             ("invisible_c_only", [DEVICE_C], False),
             ("b_only", [DEVICE_B], True),
             ("a_and_invisible_c", [DEVICE_A, DEVICE_C], False),
-            ("no_devices", [], True),
         ]
         ids = {}
         for offset, (label, devices, _) in reversed(list(enumerate(rows))):
@@ -491,19 +492,24 @@ async def test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_vis
         result = await list_calendar_reservations(
             db, _WIN_START, _WIN_END, visible_device_ids=visible
         )
-        assert [r.id for r in result] == [ids[label] for label, _, keep in rows if keep]
+        assert sorted(r.id for r in result) == sorted(ids[label] for label, _, keep in rows if keep)
         assert outside not in {r.id for r in result}
-        # The seven rows above are in the window: without the visibility filter all come back.
+        # The six rows above are in the window: without the visibility filter all come back.
         unfiltered = await list_calendar_reservations(db, _WIN_START, _WIN_END)
-        assert [r.id for r in unfiltered] == [ids[label] for label, _, _ in rows]
+        assert sorted(r.id for r in unfiltered) == sorted(ids[label] for label, _, _ in rows)
 
 
 @pytest.mark.asyncio
 async def test_calendar_orders_by_start_time_under_every_filter():
     """The calendar comes back in ascending start_time under each filter shape (no
     filter, a status filter, a device filter, a visibility filter, and all three
-    together). Rows are inserted latest start first, so an unordered SELECT that
-    returns insertion order comes back reversed."""
+    together). No rule states this order, so the test is cited under none.
+
+    Rows are inserted latest start first. On SQLite, with the ORDER BY dropped,
+    only the status-filter shape and the all-three shape come back out of
+    start_time order; the other three plans happen to return start_time order
+    anyway, so they do not discriminate there. Postgres plan order is not
+    exercised."""
     statuses = [
         ReservationStatus.PENDING,
         ReservationStatus.ACTIVE,
