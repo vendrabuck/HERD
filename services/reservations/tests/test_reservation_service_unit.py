@@ -364,6 +364,194 @@ async def test_calendar_visibility_subset_and_empty_set():
         assert await list_calendar_reservations(db, *window, visible_device_ids=set()) == []
 
 
+# --- list_calendar_reservations: the half-open window, visibility, order (issue #1533) ---
+
+# A fixed UTC window, far from "now", so nothing here depends on the clock.
+_WIN_START = datetime(2031, 3, 10, 12, 0, tzinfo=timezone.utc)
+_WIN_END = _WIN_START + timedelta(hours=10)
+_US = timedelta(microseconds=1)
+_OTHER_USER = uuid.uuid4()
+DEVICE_C = uuid.uuid4()
+
+
+async def _insert_window_row(db, start, end, *, status, user_id=USER_ID, device_ids=None):
+    res = Reservation(
+        user_id=user_id,
+        device_ids=[str(d) for d in (device_ids if device_ids is not None else [DEVICE_A])],
+        topology_type=TopologyType.PHYSICAL,
+        purpose="window",
+        start_time=start,
+        end_time=end,
+        status=status,
+    )
+    db.add(res)
+    await db.commit()
+    await db.refresh(res)
+    return res.id
+
+
+# (label, start, end, overlaps [_WIN_START, _WIN_END)). Every start differs, so the
+# expected order is total.
+_WINDOW_CASES = [
+    ("contains_the_window", _WIN_START - timedelta(hours=5), _WIN_END + timedelta(hours=5), True),
+    ("ends_one_us_after_range_start", _WIN_START - timedelta(hours=3), _WIN_START + _US, True),
+    (
+        "straddles_range_start",
+        _WIN_START - timedelta(hours=1),
+        _WIN_START + timedelta(hours=1),
+        True,
+    ),
+    ("starts_at_range_start", _WIN_START, _WIN_START + timedelta(hours=2), True),
+    ("inside", _WIN_START + timedelta(hours=3), _WIN_START + timedelta(hours=4), True),
+    ("ends_at_range_end", _WIN_START + timedelta(hours=7), _WIN_END, True),
+    ("straddles_range_end", _WIN_END - timedelta(hours=1), _WIN_END + timedelta(hours=1), True),
+    ("starts_one_us_before_range_end", _WIN_END - _US, _WIN_END + timedelta(hours=2), True),
+    ("ends_at_range_start", _WIN_START - timedelta(hours=2), _WIN_START, False),
+    ("starts_at_range_end", _WIN_END, _WIN_END + timedelta(hours=2), False),
+    ("entirely_before", _WIN_START - timedelta(hours=8), _WIN_START - timedelta(hours=6), False),
+    ("entirely_after", _WIN_END + timedelta(hours=3), _WIN_END + timedelta(hours=4), False),
+]
+
+
+@pytest.mark.asyncio
+async def test_calendar_returns_exactly_the_rows_overlapping_the_half_open_window():
+    """RES-CAL-1: a row is returned exactly when start_time < range_end and
+    end_time > range_start, whatever its status or owner. A row ending exactly at
+    range_start and one starting exactly at range_end are outside; rows one
+    microsecond inside either bound, straddling either bound, inside, and
+    containing the window are in. The rows are inserted latest start first, every
+    status appears among the overlapping rows, two users own them, and the answer
+    is compared as an exact list in start_time order, with no status filter and
+    with a filter naming every status."""
+    statuses = list(ReservationStatus)
+    ids = {}
+    status_of = {}
+    async with TestSessionLocal() as db:
+        ordered = sorted(_WINDOW_CASES, key=lambda case: case[1], reverse=True)
+        for i, (label, start, end, _) in enumerate(ordered):
+            status_of[label] = statuses[i % len(statuses)]
+            ids[label] = await _insert_window_row(
+                db,
+                start,
+                end,
+                status=status_of[label],
+                user_id=USER_ID if i % 2 else _OTHER_USER,
+            )
+        expected_labels = [label for label, _, _, overlaps in _WINDOW_CASES if overlaps]
+        expected = [ids[label] for label in expected_labels]
+        # Every status is held by at least one row that must come back.
+        assert {status_of[label] for label in expected_labels} == set(ReservationStatus)
+
+        unfiltered = await list_calendar_reservations(db, _WIN_START, _WIN_END)
+        assert [r.id for r in unfiltered] == expected
+        every_status = await list_calendar_reservations(
+            db, _WIN_START, _WIN_END, status_filter=list(ReservationStatus)
+        )
+        assert [r.id for r in every_status] == expected
+
+
+@pytest.mark.asyncio
+async def test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_visible():
+    """RES-CAL-3 at the query: with DEVICE_A and DEVICE_B visible, a row is kept
+    only when every one of its own devices is in the visible set. A row whose
+    several devices include exactly one invisible device is dropped, and a row on
+    the invisible DEVICE_C alone is dropped without hiding any other row. A row
+    with no devices is kept (no device of it is invisible). An all-visible row
+    outside the window stays out."""
+    visible = {str(DEVICE_A), str(DEVICE_B)}
+    start = _WIN_START + timedelta(hours=1)
+    async with TestSessionLocal() as db:
+        # Inserted latest start first; each row starts one hour after the previous.
+        rows = [
+            ("a_and_b", [DEVICE_A, DEVICE_B], True),
+            ("a_b_and_invisible_c", [DEVICE_A, DEVICE_B, DEVICE_C], False),
+            ("a_only", [DEVICE_A], True),
+            ("invisible_c_only", [DEVICE_C], False),
+            ("b_only", [DEVICE_B], True),
+            ("a_and_invisible_c", [DEVICE_A, DEVICE_C], False),
+            ("no_devices", [], True),
+        ]
+        ids = {}
+        for offset, (label, devices, _) in reversed(list(enumerate(rows))):
+            ids[label] = await _insert_window_row(
+                db,
+                start + timedelta(hours=offset),
+                start + timedelta(hours=offset, minutes=30),
+                status=ReservationStatus.ACTIVE,
+                device_ids=devices,
+            )
+        outside = await _insert_window_row(
+            db,
+            _WIN_END,
+            _WIN_END + timedelta(hours=1),
+            status=ReservationStatus.ACTIVE,
+            device_ids=[DEVICE_A],
+        )
+
+        result = await list_calendar_reservations(
+            db, _WIN_START, _WIN_END, visible_device_ids=visible
+        )
+        assert [r.id for r in result] == [ids[label] for label, _, keep in rows if keep]
+        assert outside not in {r.id for r in result}
+        # The seven rows above are in the window: without the visibility filter all come back.
+        unfiltered = await list_calendar_reservations(db, _WIN_START, _WIN_END)
+        assert [r.id for r in unfiltered] == [ids[label] for label, _, _ in rows]
+
+
+@pytest.mark.asyncio
+async def test_calendar_orders_by_start_time_under_every_filter():
+    """The calendar comes back in ascending start_time under each filter shape (no
+    filter, a status filter, a device filter, a visibility filter, and all three
+    together). Rows are inserted latest start first, so an unordered SELECT that
+    returns insertion order comes back reversed."""
+    statuses = [
+        ReservationStatus.PENDING,
+        ReservationStatus.ACTIVE,
+        ReservationStatus.COMPLETED,
+        ReservationStatus.ACTIVE,
+        ReservationStatus.PENDING,
+        ReservationStatus.CANCELLED,
+    ]
+    devices = [[DEVICE_A], [DEVICE_A, DEVICE_B], [DEVICE_B], [DEVICE_A], [DEVICE_C], [DEVICE_A]]
+    async with TestSessionLocal() as db:
+        by_start = []
+        for i in reversed(range(len(statuses))):
+            rid = await _insert_window_row(
+                db,
+                _WIN_START + timedelta(hours=i),
+                _WIN_START + timedelta(hours=i, minutes=45),
+                status=statuses[i],
+                device_ids=devices[i],
+            )
+            by_start.insert(0, (rid, statuses[i], devices[i]))
+
+        def expect(keep):
+            return [rid for rid, st, devs in by_start if keep(st, devs)]
+
+        live = [ReservationStatus.ACTIVE, ReservationStatus.PENDING]
+        visible = {str(DEVICE_A), str(DEVICE_B)}
+        cases = [
+            ({}, lambda st, devs: True),
+            ({"status_filter": live}, lambda st, devs: st in live),
+            ({"device_id": DEVICE_A}, lambda st, devs: DEVICE_A in devs),
+            (
+                {"visible_device_ids": visible},
+                lambda st, devs: {str(d) for d in devs} <= visible,
+            ),
+            (
+                {"status_filter": live, "device_id": DEVICE_A, "visible_device_ids": visible},
+                lambda st, devs: (
+                    st in live and DEVICE_A in devs and {str(d) for d in devs} <= visible
+                ),
+            ),
+        ]
+        for kwargs, keep in cases:
+            result = await list_calendar_reservations(db, _WIN_START, _WIN_END, **kwargs)
+            expected = expect(keep)
+            assert len(expected) >= 2, kwargs
+            assert [r.id for r in result] == expected, kwargs
+
+
 # --- outbox enqueue (issue #21) ---
 
 
