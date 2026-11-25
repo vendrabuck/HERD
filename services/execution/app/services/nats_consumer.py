@@ -3431,6 +3431,7 @@ async def _apply_l2_memberships(
         JOIN_LOST_ALLOCATION_RELEASED,
         is_membership_active,
         membership_needs_remove,
+        membership_owes_undo,
         record_l2_failed,
     )
 
@@ -3441,6 +3442,29 @@ async def _apply_l2_memberships(
         return retry_ids.get((str(switch_id), port))
 
     touched_allocations: set[uuid.UUID] = {uuid.UUID(str(r["vlan_assignment_id"])) for r in removes}
+
+    # Issue #1413: a port whose row still owes the removal of a lost join's add from a
+    # released number gets no add, no define, and no build write here: its row cannot
+    # move to a new allocation until that removal succeeds (the release-direction retry
+    # drives it, and the build retry then re-allocates the row).
+    if adds:
+        async with get_db_session() as db:
+            owed = [
+                a
+                for a in adds
+                if await membership_owes_undo(
+                    db, res_uuid, uuid.UUID(str(a["switch_device_id"])), a["port"]
+                )
+            ]
+        if owed:
+            logger.info(
+                "Deferring %d L2 join(s) of reservation %s: each row still owes the "
+                "removal of a lost join's add",
+                len(owed),
+                reservation_id,
+                extra={"action": "l2_join_deferred_for_owed_undo"},
+            )
+            adds = [a for a in adds if a not in owed]
 
     define_ids = {uuid.UUID(str(a["vlan_assignment_id"])) for a in adds}
     define_ids.update(uuid.UUID(str(v)) for v in (define_allocation_ids or ()) if v is not None)
@@ -3681,6 +3705,92 @@ async def _apply_l2_memberships(
     await _release_orphaned_allocations(touched_allocations, get_db_session, ctx)
 
 
+async def _undo_lost_join(
+    db,
+    driver_path: str,
+    context: dict,
+    password_keys: set,
+    switch_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    res_uuid: uuid.UUID,
+    port: str,
+    vlan_id: int,
+) -> bool:
+    """Remove the port of a join that lost to the release of its allocation from the
+    number its add_to_vlan used (issue #1413); True when the port is known not to be left
+    in that number by this join.
+
+    Runs in the caller's logged-in switch session, after the join's session was rolled
+    back, so no row lock is held across the driver call. Superseded first: when an
+    ACTIVE membership on this (switch, port), of any reservation, sits on an ACTIVE
+    allocation holding the same number (l2_membership_service.port_holds_number_live),
+    the port belongs in that number, no driver call is made, and the answer is True.
+    Otherwise one remove_from_vlan is driven, with its own execution run, result-gated
+    like every other call (Decision 3); the answer is whether it succeeded. A failure is
+    logged with the action `l2_join_undo_failed` and no driver text; the caller records
+    the removal as owed.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.execution_service import (
+        create_execution_run,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l2_membership_service import port_holds_number_live
+
+    if await port_holds_number_live(db, switch_uuid, port, vlan_id):
+        logger.info(
+            "Not undoing the lost join of reservation %s on switch %s port %s: a live "
+            "membership holds VLAN %d on that port",
+            res_uuid,
+            switch_uuid,
+            port,
+            vlan_id,
+            extra={"action": "l2_join_undo_superseded"},
+        )
+        return True
+    action = "remove_from_vlan"
+    method_kwargs = {"port": port, "vlan_id": vlan_id}
+    run = await create_execution_run(
+        db,
+        switch_uuid,
+        driver_id,
+        driver_sha256,
+        action,
+        WIRING_SYSTEM_USER,
+        redact_context_for_logging(context, password_keys),
+        res_uuid,
+        port,
+        method_kwargs=method_kwargs,
+    )
+    started = datetime.now(timezone.utc)
+    ok, _attempts, err, result = await _run_driver_with_retry(
+        driver_path, action, context, password_keys, method_kwargs=method_kwargs
+    )
+    await update_execution_run(
+        db,
+        run,
+        "SUCCESS" if ok else "FAILED",
+        output=json.dumps(result["output"], default=str) if ok and result else None,
+        error=None if ok else err,
+        started_at=started,
+        completed_at=datetime.now(timezone.utc),
+    )
+    if not ok:
+        logger.error(
+            "Undo of the lost join of reservation %s on switch %s port %s failed; the "
+            "removal from VLAN %d is owed and stays tracked on the row",
+            res_uuid,
+            switch_uuid,
+            port,
+            vlan_id,
+            extra={"action": "l2_join_undo_failed", "reservation_id": str(res_uuid)},
+        )
+    return ok
+
+
 async def _apply_one_vlan_action(
     db,
     action: str,
@@ -3713,7 +3823,13 @@ async def _apply_one_vlan_action(
     row the other retry channel already holds returns without an execution_run, a
     driver call, or a ledger write, and so does a row that no longer intends this
     action's direction (issue #1496). Taken here rather than at selection because a
-    selected batch is driven sequentially behind a per-switch login.
+    selected batch is driven sequentially behind a per-switch login. An add's claim is
+    sized for one more driver action (issue #1413).
+
+    Issue #1413: an add whose join lost to the release of its allocation is undone in
+    this same session by _undo_lost_join (record_l2_membership_active then records the
+    outcome), and a successful remove of a row that owed such an undo turns it back
+    into a pending join (settle_undone_join) instead of releasing it.
     """
     from datetime import datetime, timezone
 
@@ -3726,13 +3842,19 @@ async def _apply_one_vlan_action(
         record_l2_failed,
         record_l2_membership_active,
         release_l2_membership,
+        settle_undone_join,
     )
+    from app.services.wiring_claim import ROW_DRIVER_ACTIONS, claim_budget
 
     # The direction this call drives (issue #1496): the claim requires the row to
     # intend it, and a failure write records it (WIRE-LEDGER-5).
     intended = "ACTIVE" if action == "add_to_vlan" else "RELEASED"
+    # Issue #1413: an add may be followed by one more driver action on the same row, the
+    # undo of a join that lost to the release of its allocation, so its claim is sized
+    # for that action too.
+    budget = claim_budget(ROW_DRIVER_ACTIONS + 1) if action == "add_to_vlan" else None
     if claims is not None and not await claims.claim(
-        db, L2PortAssignment, retry_row_id, intended=intended
+        db, L2PortAssignment, retry_row_id, intended=intended, budget=budget
     ):
         return
 
@@ -3768,6 +3890,21 @@ async def _apply_one_vlan_action(
             completed_at=datetime.now(timezone.utc),
         )
         if action == "add_to_vlan":
+
+            async def _undo() -> bool:
+                return await _undo_lost_join(
+                    db,
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    port,
+                    vlan_id,
+                )
+
             await record_l2_membership_active(
                 db,
                 res_uuid,
@@ -3776,8 +3913,11 @@ async def _apply_one_vlan_action(
                 port,
                 row_id=retry_row_id,
                 claims=claims,
+                undo_lost_join=_undo,
             )
-        else:
+        elif not await settle_undone_join(db, res_uuid, switch_uuid, port):
+            # Issue #1413: a row that owed a lost join's undo becomes a pending join
+            # again (settle_undone_join); every other removal is released as before.
             await release_l2_membership(db, res_uuid, switch_uuid, port)
     else:
         await update_execution_run(
@@ -5335,6 +5475,7 @@ async def _teardown_from_ledgers(
         park_stale_l1_build,
     )
     from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
         TEARDOWN_PENDING_VLAN_REMOVAL,
         active_memberships_for_reservation,
         failed_memberships_for_reservation,
@@ -5415,14 +5556,20 @@ async def _teardown_from_ledgers(
     # delete-failure is log-and-continue with accepted bounded lingering).
     async with get_db_session() as db:
         l2_rows = await active_memberships_for_reservation(db, res_str)
-        l2_failed = [
+        all_failed = await failed_memberships_for_reservation(db, res_str)
+        l2_failed = [row for row in all_failed if row.intended == "ACTIVE"]
+        # Issue #1413: a row that owes the removal of a lost join's add is removed here
+        # too, from the released number it names (the frozen reservation's success then
+        # releases it, settle_undone_join refusing a frozen row).
+        l2_owed = [
             row
-            for row in await failed_memberships_for_reservation(db, res_str)
-            if row.intended == "ACTIVE"
+            for row in all_failed
+            if row.intended == "RELEASED" and row.last_error == JOIN_UNDO_PENDING_REMOVAL
         ]
-    if l2_rows or l2_failed:
+    if l2_rows or l2_failed or l2_owed:
         _nil = uuid.UUID(int=0)
         remove_alloc_ids = {row.vlan_assignment_id for row in l2_rows}
+        remove_alloc_ids.update(row.vlan_assignment_id for row in l2_owed)
         remove_alloc_ids.update(
             row.vlan_assignment_id
             for row in l2_failed
@@ -5436,7 +5583,7 @@ async def _teardown_from_ledgers(
                 "vlan_assignment_id": row.vlan_assignment_id,
                 "vlan_id": vlan_by_alloc.get(row.vlan_assignment_id, 0),
             }
-            for row in l2_rows
+            for row in [*l2_rows, *l2_owed]
         ]
         # Issue #1501, the L1 park above for L2, in the reconcile's stale-settlement
         # form (WIRE-STALE-2): a FAILED intended-ACTIVE membership with a resolvable

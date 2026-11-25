@@ -1521,6 +1521,10 @@ async def test_joins_of_a_switch_whose_define_lost_are_parked_not_driven():
 
     adds_driven = [(c[1], c[2]) for c in calls if c[0] == "add_to_vlan"]
     assert adds_driven == [(SW_L2, "0/0/1")]
+    # Issue #1413: the add driven on the already-defined switch is undone in the pass.
+    assert [(c[0], c[1], c[2], c[3]) for c in calls if c[0] == "remove_from_vlan"] == [
+        ("remove_from_vlan", SW_L2, "0/0/1", 100)
+    ]
     rows = {(str(r.switch_device_id), r.port): r for r in await _membership_rows()}
     assert set(rows) == {(SW_L2, "0/0/1"), (SW_MID, "0/0/1")}
     for row in rows.values():

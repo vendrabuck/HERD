@@ -19,6 +19,9 @@ the release winner re-read the row was never undefined. Now:
     allocation keep both switches; the release winner's trim removes only what it
     deleted from the list as it stands;
   - two joins of one allocation hold their share locks at once;
+  - a retry's join that loses after its add_to_vlan landed, with its undo failing, keeps
+    a row naming that number until a later retry removes the port from it; the row then
+    becomes a pending join, and the next retry re-allocates and adds on the new number;
   - a failed join on an allocation the retry reads as released is re-resolved before
     its add_to_vlan, which names the fresh allocation's number.
 
@@ -253,6 +256,8 @@ class _Harness:
         self.blocked = threading.Event()
         self.unblock = threading.Event()
         self.block_returned = False
+        # Driver actions that answer a failure (every attempt) while listed here.
+        self.fail: set[str] = set()
         self._fabrics: dict[str, uuid.UUID] = defaultdict(uuid.uuid4)
         for sid in self.switches:
             self._fabrics[sid] = self.fabric
@@ -266,6 +271,8 @@ class _Harness:
             self.blocked.set()
             self.unblock.wait(COORDINATION_TIMEOUT)
             self.block_returned = True
+        if action in self.fail:
+            return {"success": False, "output": None, "error": "boom", "duration_ms": 1}
         return SUCCESS_RESULT
 
     async def _fetch_device(self, device_id, client=None):
@@ -1011,4 +1018,130 @@ async def test_the_retry_of_a_failed_join_on_a_released_allocation_drives_a_fres
         assert [o["outcome"] for o in outcomes] == ["reconnected"]
         await _assert_invariants(session_factory, h, before)
     finally:
+        await _cleanup(session_factory, h)
+
+
+async def _own_row(session_factory, row_id):
+    async with session_factory() as s:
+        return await s.get(L2PortAssignment, row_id)
+
+
+async def _assert_number_tracked(session_factory, h: _Harness, allocation_id):
+    """Some own row that is not RELEASED names the released allocation, so its number
+    stays tracked, and no own ACTIVE membership sits on an allocation not ACTIVE."""
+    rows = await _own_memberships(session_factory, h)
+    assert any(r.vlan_assignment_id == allocation_id and r.status != "RELEASED" for r in rows)
+    allocations = await _own_allocations(session_factory, h)
+    for r in rows:
+        if r.status == "ACTIVE":
+            assert allocations[r.vlan_assignment_id].status == "ACTIVE"
+
+
+async def test_a_lost_retry_join_owes_its_removal_until_it_succeeds_then_re_allocates(
+    session_factory, pg_engine, tagged, pending
+):
+    """End to end on a real race: the release holds its guarded UPDATE uncommitted while
+    a retry pass's join waits on the row lock, so the join loses after its add_to_vlan
+    landed on the number N. Its undo fails: the row owes the removal and keeps naming N.
+    The next retry removes the port from N and turns the row into a pending join, still
+    on N; the one after re-allocates and adds on the fresh number. At every step a row
+    names N until the removal succeeded, and no ACTIVE membership sits on an allocation
+    that is not ACTIVE."""
+    from app.services.l2_membership_service import (
+        JOIN_LOST_ALLOCATION_RELEASED,
+        JOIN_UNDO_PENDING_REMOVAL,
+    )
+    from app.services.vlan_service import _derive_vlan_id
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    preferred = _derive_vlan_id(str(h.reservation))
+    vlan_id = next(n for n in await _free_vlan_numbers(session_factory, 2) if n != preferred)
+    wires = [
+        {
+            "device_a_id": h.dut,
+            "port_a": "eth0",
+            "device_b_id": switch,
+            "port_b": "0/0/1",
+            "layer": "L1",
+            "physical_connection_id": None,
+            "edge_key": None,
+        }
+    ]
+
+    async def _retry(get_db):
+        async with session_factory() as s:
+            rows = [await s.get(L2PortAssignment, rid)]
+        return await _reattempt_l2_rows(rows, get_db)
+
+    try:
+        alloc = await _seed(session_factory, h, vlan_id, scope=[switch], defined=[switch])
+        rid = await _seed_failed_join(session_factory, h, alloc, "0/0/1", "boom")
+        before = await _foreign_snapshot(session_factory, h)
+        gate = pending.gate()
+        release_engine, _ = tagged("release")
+        retry_engine, retry_app = tagged("retry")
+        outcomes: list[bool] = []
+        with h.patches(wires=wires):
+            # Pass 1: the join loses to a held release, and its undo fails.
+            h.fail = {"remove_from_vlan"}
+            release = pending.task(
+                _releaser("no_removal", _gated_maker(release_engine, gate), alloc, outcomes)
+            )
+            await asyncio.wait_for(gate.inside.wait(), COORDINATION_TIMEOUT)
+            retry = pending.task(
+                _retry(_session_ctx(async_sessionmaker(retry_engine, expire_on_commit=False)))
+            )
+            waited = await _seen_waiting(pg_engine, retry_app, retry)
+            release_was_holding = not gate.returned
+            gate.proceed.set()
+            await asyncio.wait_for(asyncio.gather(release, retry), COORDINATION_TIMEOUT)
+            assert release_was_holding and waited and outcomes == [True]
+            assert h.of("add_to_vlan") == [(switch, vlan_id)]
+            assert set(h.of("remove_from_vlan")) == {(switch, vlan_id)}
+            row = await _own_row(session_factory, rid)
+            assert (row.status, row.intended, row.last_error, row.vlan_assignment_id) == (
+                "FAILED",
+                "RELEASED",
+                JOIN_UNDO_PENDING_REMOVAL,
+                alloc,
+            )
+            await _assert_number_tracked(session_factory, h, alloc)
+
+            # Pass 2: the removal succeeds; the row is a pending join, still on N.
+            h.fail = set()
+            h.calls.clear()
+            await _retry(_session_ctx(session_factory))
+            assert h.of("remove_from_vlan") == [(switch, vlan_id)]
+            assert h.of("add_to_vlan") == []
+            row = await _own_row(session_factory, rid)
+            assert (row.status, row.intended, row.last_error, row.vlan_assignment_id) == (
+                "FAILED",
+                "ACTIVE",
+                JOIN_LOST_ALLOCATION_RELEASED,
+                alloc,
+            )
+            # Hide the row from the gate stack's own tick again (the pending join was
+            # written with attempts 0); the pass below loads it by id.
+            async with session_factory() as s:
+                await s.execute(
+                    update(L2PortAssignment)
+                    .where(L2PortAssignment.id == rid)
+                    .values(attempts=HIDDEN_ATTEMPTS)
+                )
+                await s.commit()
+
+            # Pass 3: re-allocated, then added on the fresh number.
+            h.calls.clear()
+            await _retry(_session_ctx(session_factory))
+            allocations = await _own_allocations(session_factory, h)
+            (fresh,) = [a for a in allocations.values() if a.status == "ACTIVE"]
+            assert fresh.vlan_id != vlan_id
+            assert h.of("add_to_vlan") == [(switch, fresh.vlan_id)]
+            row = await _own_row(session_factory, rid)
+            assert (row.status, row.vlan_assignment_id) == ("ACTIVE", fresh.id)
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await pending.settle()
         await _cleanup(session_factory, h)
