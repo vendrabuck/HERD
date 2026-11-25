@@ -1539,11 +1539,13 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   deleted device stays only in the device section. The fleet section lists its devices
   by `utilization_pct` (rounded to two decimals), highest first, then by `name` in code
   point order; devices equal in both keep inventory's order. The device fetch stops after
-  a page shorter than 500, or, when inventory's `total` is an integer, after the page
-  that brings the devices held to at least `total`; so a fleet whose size is an exact
-  multiple of 500, reported in `total`, takes no extra request. The fetch asks for at
-  most 200 pages (100,000 devices); when the 200th page is full and does not reach an
-  integer `total`, the fleet is null as if inventory could not answer. \
+  a page shorter than 500, or, when inventory's `total` is a JSON integer (a number
+  written without a fraction or exponent; a boolean reads as 1 or 0), after the page
+  that brings the devices held to at least `total`; any other `total` is ignored. So a
+  fleet whose size is an exact multiple of 500, reported in `total`, takes no extra
+  request. The fetch asks for at most 200 pages (100,000 devices); when the 200th page is
+  full and does not reach a JSON integer `total`, the fleet is null as if inventory
+  could not answer. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fleet_devices_are_listed_busiest_first_then_by_name`, `test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total`, `test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total`, `test_fetch_fleet_devices_stops_at_100_000_devices`, `test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total`, `test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with

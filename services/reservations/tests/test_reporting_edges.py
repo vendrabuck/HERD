@@ -343,6 +343,13 @@ async def test_the_report_query_loads_only_rows_that_overlap_the_window(db_sessi
             [],
             {ReservationStatus.PENDING, ReservationStatus.CANCELLED},
         ),
+        (
+            [ReservationStatus.CANCELLED],
+            [ReservationStatus.ACTIVE],
+            [],
+            {ReservationStatus.ACTIVE, ReservationStatus.CANCELLED},
+        ),
+        ([ReservationStatus.COMPLETED], [], [], set(ReservationStatus)),
         (None, None, None, set(ReservationStatus)),
     ],
     ids=[
@@ -350,6 +357,8 @@ async def test_the_report_query_loads_only_rows_that_overlap_the_window(db_sessi
         "no-fleet-section",
         "fleet-section-adds-its-statuses",
         "fleet-section-takes-the-same-statuses",
+        "user-section-status-outside-the-fleet-list",
+        "fleet-section-counts-every-status",
         "every-status-counted",
     ],
 )
@@ -358,9 +367,11 @@ async def test_the_report_query_loads_only_the_statuses_a_section_counts(
 ):
     """OPS-REPORT-2: the report query loads only reservations in a status the user,
     device, or fleet section counts. One row per status lies inside the window. With no
-    inventory list there is no fleet section, so a fleet status list adds nothing; with
-    one (empty here), the fleet section counts its own statuses, or the user section's
-    when it is given none; with no status list every status is counted and loaded."""
+    inventory list there is no fleet section, so a fleet status list adds nothing. With
+    one (empty here) the query loads the statuses of both sections, also when neither
+    list contains the other: the fleet section counts its own list, the user section's
+    when its list is left out (None), and every status when its list is empty. With no
+    user status list every status is counted and loaded."""
     window_start = NOW - timedelta(days=1)
     for status in ReservationStatus:
         db_session.add(

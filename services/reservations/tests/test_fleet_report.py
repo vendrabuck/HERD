@@ -275,25 +275,30 @@ def test_build_fleet_section_skips_device_with_unusable_id():
 def test_fleet_devices_are_listed_busiest_first_then_by_name():
     """OPS-REPORT-10's order: `utilization_pct` highest first, then `name` in code point
     order. Inventory lists the idle device first, then the less busy one, then the
-    three equally busy ones in the reverse of their expected order. `B` comes before
-    `a` by code point, though not in a case-blind order."""
-    idle, mid, zz, lower_a, upper_b = (uuid.uuid4() for _ in range(5))
+    five equally busy ones in the reverse of their expected order. `B` comes before
+    `a` by code point, though not in a case-blind order, and `d10` comes before `d9`,
+    though not in a length-first or a natural (digits as numbers) order."""
+    idle, mid, zz, lower_a, upper_b, d9, d10 = (uuid.uuid4() for _ in range(7))
     section = _build_fleet_section(
         [
             _inventory_device(idle, "idle"),
             _inventory_device(mid, "mid"),
             _inventory_device(zz, "zz"),
+            _inventory_device(d9, "d9"),
+            _inventory_device(d10, "d10"),
             _inventory_device(lower_a, "a"),
             _inventory_device(upper_b, "B"),
         ],
-        {zz: 6.0, lower_a: 6.0, upper_b: 6.0, mid: 3.0},
-        {zz: 1, lower_a: 2, upper_b: 1, mid: 1},
+        {zz: 6.0, lower_a: 6.0, upper_b: 6.0, d9: 6.0, d10: 6.0, mid: 3.0},
+        {zz: 1, lower_a: 2, upper_b: 1, d9: 1, d10: 1, mid: 1},
         WINDOW_START,
         WINDOW_END,
     )
     assert [(d.name, d.utilization_pct) for d in section.devices] == [
         ("B", 25.0),
         ("a", 25.0),
+        ("d10", 25.0),
+        ("d9", 25.0),
         ("zz", 25.0),
         ("mid", 12.5),
         ("idle", 0.0),
@@ -301,30 +306,36 @@ def test_fleet_devices_are_listed_busiest_first_then_by_name():
 
 
 def test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie():
-    """OPS-REPORT-10's order compares `utilization_pct` rounded to two decimals: `bb`
-    is busier than `ba` before rounding (50.0004 percent against 50) and both report
-    50.0, so `bb` follows `ba` by name although inventory lists it first. Two idle
-    devices both named `twin` are equal in both keys and keep inventory's order, which
-    is the reverse of their id order."""
-    ba, bb = uuid.uuid4(), uuid.uuid4()
-    twins = sorted((uuid.uuid4(), uuid.uuid4()), key=str, reverse=True)
+    """OPS-REPORT-10's order compares `utilization_pct` rounded to two decimals. Over
+    the 24 hour window `ba` is 50 percent, `bb` 50.0042 before rounding, and `bc`
+    50.01: rounded to two decimals `bc` (50.01) comes first and `bb` (50.0) follows `ba`
+    by name, while rounding to one decimal would put all three at 50.0 (`ba`, `bb`,
+    `bc`), and to three or more, or not at all, would put `bb` before `ba`. Three idle
+    devices all named `twin` are equal in both keys and keep inventory's order, which
+    is neither their ascending nor their descending id order."""
+    ba, bb, bc = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    twins = sorted((uuid.uuid4() for _ in range(3)), key=str)
     section = _build_fleet_section(
         [
-            _inventory_device(twins[0], "twin"),
-            _inventory_device(bb, "bb"),
             _inventory_device(twins[1], "twin"),
+            _inventory_device(bb, "bb"),
+            _inventory_device(twins[0], "twin"),
             _inventory_device(ba, "ba"),
+            _inventory_device(twins[2], "twin"),
+            _inventory_device(bc, "bc"),
         ],
-        {ba: 12.0, bb: 12.0001},
-        {ba: 1, bb: 1},
+        {ba: 12.0, bb: 12.001, bc: 12.0024},
+        {ba: 1, bb: 1, bc: 1},
         WINDOW_START,
         WINDOW_END,
     )
     assert [(d.device_id, d.name, d.utilization_pct) for d in section.devices] == [
+        (bc, "bc", 50.01),
         (ba, "ba", 50.0),
         (bb, "bb", 50.0),
-        (twins[0], "twin", 0.0),
         (twins[1], "twin", 0.0),
+        (twins[0], "twin", 0.0),
+        (twins[2], "twin", 0.0),
     ]
 
 
@@ -488,17 +499,34 @@ async def test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_i
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("total", "pages", "listed"),
-    [(300, 1, 500), (500, 1, 500), (501, 2, 1000), ("500", 3, 1000)],
-    ids=["total-below-the-first-page", "total-at-the-first-page", "total-one-past", "string"],
+    [
+        (300, 1, 500),
+        (500, 1, 500),
+        (501, 2, 1000),
+        (True, 1, 500),
+        (False, 1, 500),
+        ("500", 3, 1000),
+        (500.0, 3, 1000),
+    ],
+    ids=[
+        "total-below-the-first-page",
+        "total-at-the-first-page",
+        "total-one-past",
+        "boolean-true",
+        "boolean-false",
+        "string",
+        "with-a-fraction",
+    ],
 )
 async def test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total(
     total, pages, listed
 ):
-    """OPS-REPORT-10: with an integer `total`, the fetch stops after the page that
+    """OPS-REPORT-10: with a JSON integer `total`, the fetch stops after the page that
     brings the devices held to at least `total`, even when inventory holds more (1,000
     here) and the page is full; the devices past that page are not asked for. A
-    `total` that is a string is not an integer, so only the short (empty) third page
-    ends the fetch."""
+    boolean reads as 1 or 0, so it stops the fetch after the first page. A `total` that
+    is a string, or a number written with a fraction (`500.0`), is ignored, so only the
+    short (empty) third page ends the fetch."""
     devices = [_inventory_device(uuid.uuid4(), f"dev-{i:04d}") for i in range(1000)]
     with respx.mock(assert_all_called=False) as router:
         requests = _fake_inventory(router, devices, total)
@@ -556,7 +584,7 @@ async def test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_int
 ):
     """OPS-REPORT-10's cap: inventory answers 199 full pages, then a 200th of
     `last_page_size` devices, with the given `total` (left out when "absent"). When the
-    200th page is full and does not reach an integer `total` the fetch returns None,
+    200th page is full and does not reach a JSON integer `total` the fetch returns None,
     the value it returns when inventory cannot answer; when the 200th page is short, or
     reaches `total`, it returns every device. Either way it makes exactly 200 requests
     (a 201st raises _RunawayPaging)."""
@@ -813,12 +841,19 @@ async def test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_invento
     """OPS-REPORT-10's cap through both routes, with respx as inventory: every request
     gets a full page and no `total`. After 200 requests the JSON report answers 200
     with `fleet` null (OPS-REPORT-11) and the fleet CSV answers 503 `Inventory service
-    is unreachable` (OPS-REPORT-14), as when inventory cannot answer."""
+    is unreachable` (OPS-REPORT-14), as when inventory cannot answer. A request past
+    the 200th raises _RunawayPaging, so a fetch with no stop fails fast."""
     page = [_inventory_device(uuid.uuid4(), f"dev-{i:03d}") for i in range(500)]
     with respx.mock(assert_all_called=False) as router:
-        inventory = router.get(url__startswith=INVENTORY_DEVICES_URL).mock(
-            side_effect=lambda request: httpx.Response(200, json={"items": page})
-        )
+        requests: list[httpx.Request] = []
+
+        def _full_page(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) > MAX_PAGES:
+                raise _RunawayPaging(f"request {len(requests)} for the fleet")
+            return httpx.Response(200, json={"items": page})
+
+        inventory = router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=_full_page)
         router.get(url__startswith=f"{settings.execution_service_url}/runs").mock(
             return_value=httpx.Response(200, json={"total": 0})
         )
