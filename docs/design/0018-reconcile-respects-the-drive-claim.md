@@ -15,6 +15,48 @@ this defect have been built and reverted, and two revisions of this record were 
 unsound in review, so each trace says which kind it is, and the first section says
 plainly what stopping early costs.
 
+## What has shipped since this record was written
+
+The Context, the traces, and the line citations below read main at `821eed1c`, the
+commit this record names, and the items in this list have merged since; where the body
+and this list disagree, this list and the specifications are current. Each item was
+checked against the merged code or the specification on main, not against this record.
+
+- PR #1500 (issue #1496) shipped phase 1: a retry claim now also requires the row's
+  `intended` to equal the direction its call site drives (WIRE-CLAIM-1,
+  `direction_admits`). This closes R1, so "R1, reproduced" in "What the code shows that
+  the issue does not" describes main before this change, and the phase 1 row of
+  "Smallest safe first step" is done.
+- PR #1500 also admits a release claim on a frozen reservation whatever the row's
+  `intended`, and never admits a build there; the phase 1 wording in "Spec rule edits
+  for the implementing pull requests" omits that exception.
+- PR #1515 (issue #1498) moved the schema extraction off the event loop
+  (`load_driver` awaits it through `asyncio.to_thread`) and put a total deadline on the
+  driver download (`DRIVER_DOWNLOAD_DEADLINE_SECONDS`, 120 seconds). These are two of
+  the bounds in phase 2 part (b), in D2, and in item 9 of "What the code shows that
+  the issue does not". The rest of phase 2 part (b) was not rechecked.
+- PR #1514 (issue #1493) set the per-switch route limit this record called proposed:
+  `herd_common.l3_route_limit.MAX_ROUTES_PER_SWITCH` is 1,000. The 25 hour figure in
+  D13 is therefore computed against a limit that exists, not a proposed one.
+- PR #1516 (part of issue #1501) made the terminal teardown park each FAILED
+  intended-`ACTIVE` L1 and L2 build, as it already parked L3 pins, and remove it with
+  the ACTIVE rows (WIRE-TEARDOWN-2 and WIRE-TEARDOWN-6). The Teardown row of "What the
+  reconcile does to a FAILED row today" lists L3 pins only.
+- PR #1516 also means a teardown no longer drives only `ACTIVE` rows: it drives the
+  parked FAILED builds as well. The sentence in D8 about a frozen reservation's settle
+  is true of rows that fail again, but its premise is out of date.
+- PR #1516 changes WIRE-TEARDOWN-6 as "Where it does not converge, or converges only
+  with a condition" quotes it: a failed L1 or L2 build on a frozen reservation is now
+  parked and removed by the teardown. What stays as it was is an L1 or L2 row held by
+  another retry pass's live claim at the teardown, which the specification lists as
+  left alone.
+- PR #1516 also rewrote WIRE-TEARDOWN-2 and WIRE-TEARDOWN-6 and added WIRE-LEDGER-17,
+  so the rule texts this record says it will amend must be reread in the
+  specifications before any phase is built from "Spec rule edits for the implementing
+  pull requests".
+
+Line-number citations in the body are as of `821eed1c`.
+
 ## Smallest safe first step
 
 The owner may stop after any phase. Sizes are pull requests and rough scope: small is a
@@ -968,3 +1010,5 @@ Each has this record's recommendation.
   order, and a freeze ends a pass; the owed and parked states shown, and Retry applies
   them; the reservation-wide allocation check; every step bounded and the term set to
   the one-row budget; the row claim kept for good; sizes per phase.
+- Revision 4: merged with main; added the list of what has shipped since the record was
+  written; no decision changed.
