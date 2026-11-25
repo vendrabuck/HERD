@@ -46,9 +46,6 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 SVC = "app.services.reservation_service"
 INV = "http://inventory:8000"
 INTERNAL_TOKEN = "internal-test-token"
-NOW = datetime.now(timezone.utc)
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
 
 OWNER = uuid.uuid4()
 PHYS_A = uuid.uuid4()
@@ -56,6 +53,15 @@ PHYS_B = uuid.uuid4()
 INSTANCE = uuid.uuid4()
 DYN_TEMPLATE = uuid.uuid4()
 HYPERVISOR = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 @pytest.fixture(autouse=True)

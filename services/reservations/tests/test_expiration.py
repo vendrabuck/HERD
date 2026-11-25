@@ -24,10 +24,14 @@ async def _outbox_rows(subject=None):
         return (await session.execute(stmt.order_by(OutboxEvent.created_at))).scalars().all()
 
 
-NOW = datetime.now(timezone.utc)
-PAST = NOW - timedelta(hours=2)
-FUTURE = NOW + timedelta(hours=2)
-FAR_FUTURE = NOW + timedelta(hours=4)
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, PAST, FUTURE, FAR_FUTURE
+    NOW = datetime.now(timezone.utc)
+    PAST = NOW - timedelta(hours=2)
+    FUTURE = NOW + timedelta(hours=2)
+    FAR_FUTURE = NOW + timedelta(hours=4)
 
 
 @pytest.fixture(autouse=True)

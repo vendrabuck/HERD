@@ -44,10 +44,16 @@ from sqlalchemy import select
 
 from tests._harness import TestSessionLocal
 
-NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 def _make_device(device_id, topology="PHYSICAL", status="AVAILABLE", exclusive=True):
