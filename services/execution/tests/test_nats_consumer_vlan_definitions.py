@@ -1565,9 +1565,11 @@ async def test_record_allocation_defined_appends_to_the_row_as_it_stands_not_a_s
 
     alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2, SW_L2_B], [])
     async with TestSessionLocal() as stale:
-        await stale.get(VlanAssignment, alloc)
+        # Held, so the session's weak-referencing identity map keeps the copy.
+        copy = await stale.get(VlanAssignment, alloc)
         async with TestSessionLocal() as other:
             assert await record_allocation_defined(other, alloc, SW_L2_B) is True
+        assert copy.defined_switch_ids == [], "the session still holds the copy from before"
         assert await record_allocation_defined(stale, alloc, SW_L2) is True
     row = (await _allocations_by_id([alloc]))[alloc]
     assert row.defined_switch_ids == [SW_L2, SW_L2_B]
@@ -1578,7 +1580,8 @@ async def test_trim_removes_only_the_deleted_switches_from_the_row_as_it_stands(
 
     alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2, SW_MID])
     async with TestSessionLocal() as stale:
-        await stale.get(VlanAssignment, alloc)
+        # Held, so the session's weak-referencing identity map keeps the copy.
+        copy = await stale.get(VlanAssignment, alloc)
         async with TestSessionLocal() as other:
             await other.execute(
                 update(VlanAssignment)
@@ -1586,6 +1589,7 @@ async def test_trim_removes_only_the_deleted_switches_from_the_row_as_it_stands(
                 .values(defined_switch_ids=[SW_L2, SW_MID, SW_L2_B])
             )
             await other.commit()
+        assert copy.defined_switch_ids == [SW_L2, SW_MID], "the copy from before"
         await trim_allocation_definitions(stale, alloc, [SW_L2])
     row = (await _allocations_by_id([alloc]))[alloc]
     assert row.defined_switch_ids == [SW_MID, SW_L2_B]
