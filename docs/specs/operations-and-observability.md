@@ -1479,9 +1479,12 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
   Pinned by: `services/reservations/tests/test_rbac_denial.py` (`test_non_admin_denied`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_rejects_inverted_window`, `test_build_report_span_over_max_raises`, `test_build_report_span_at_max_succeeds`, `test_build_report_span_guard_disabled_when_zero`); `services/reservations/tests/test_coverage_gaps.py` (`test_csv_report_inverted_window_returns_422`); `services/reservations/tests/test_report_utc_days.py` (`test_report_routes_answer_422_for_a_bound_with_no_utc_equivalent`, `test_report_routes_never_answer_5xx_for_extreme_bounds_seeded_sweep`); `tests/integration/test_reporting.py` (`test_utilization_report_non_admin_forbidden`)
 - **OPS-REPORT-2.** A reservation counts for the hours it overlaps the window, clipped to
-  the window; one with no overlap is skipped. \
+  the window; one with no overlap is skipped. The report query loads only reservations
+  that end after the window's start and start before its end, in a status the user,
+  device, or fleet section counts; a zero-length reservation inside the window is loaded
+  and skipped. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`, `test_a_row_with_no_overlap_is_skipped`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`, `test_a_row_with_no_overlap_is_skipped`, `test_the_report_query_loads_only_rows_that_overlap_the_window`, `test_the_report_query_loads_only_the_statuses_a_section_counts`)
 - **OPS-REPORT-3.** Without `status`, the user, device, topology type, day, group, and
   purpose sections count only `COMPLETED` reservations and the fleet section counts
   `ACTIVE` and `COMPLETED`; a given `status` list applies to every section. \
@@ -1515,7 +1518,9 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   count every device on the reservation's fork wiring that it did not reserve, with the
   reservation's hours and confirmed category; a reserved device on a path counts once,
   as reserved, and a suggestion-only reservation adds transit hours but no transit
-  purpose rows. \
+  purpose rows. In a 200 answer from cabling, an entry whose reservation id is not a UUID
+  string is ignored, a device id string that is not a UUID is ignored while the entry's
+  other device ids still count, and a null device list adds no transit devices. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`, `_fetch_transit_devices`) \
   Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`)
 - **OPS-REPORT-8.** Transit devices are read from cabling in chunks of 500 reservations;
@@ -1531,9 +1536,18 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 - **OPS-REPORT-10.** The fleet section lists every device inventory returns (paged by 500,
   with the caller's token, stopping at 100,000), each with its hours over the whole
   window as `utilization_pct`, unclamped; devices with no hours are the idle count, and a
-  deleted device stays only in the device section. \
+  deleted device stays only in the device section. The fleet section lists its devices
+  by `utilization_pct` (rounded to two decimals), highest first, then by `name` in code
+  point order; devices equal in both keep inventory's order. The device fetch stops after
+  a page shorter than 500, or, when inventory's `total` is a JSON integer (a number
+  written without a fraction or exponent; a boolean reads as 1 or 0), after the page
+  that brings the devices held to at least `total`; any other `total` is ignored. So a
+  fleet whose size is an exact multiple of 500, reported in `total`, takes no extra
+  request. The fetch asks for at most 200 pages (100,000 devices); when the 200th page is
+  full and does not reach a JSON integer `total`, the fleet is null as if inventory
+  could not answer. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_stops_at_100_000_devices`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fleet_devices_are_listed_busiest_first_then_by_name`, `test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total`, `test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total`, `test_fetch_fleet_devices_stops_at_100_000_devices`, `test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total`, `test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with
   `fleet` null. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`) \
