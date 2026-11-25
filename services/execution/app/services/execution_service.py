@@ -694,7 +694,7 @@ async def _drive_run(
     # Fetch the driver's metadata for the dry-run gate (cheap: cached row read).
     driver_metadata = await get_driver_metadata(db, driver_id)
 
-    # Execute in sandbox. The sandbox blocks on subprocess.run, so it runs in
+    # Execute in sandbox. The sandbox blocks on its driver child, so it runs in
     # a worker thread: otherwise a slow driver would stall the event loop,
     # and the health scheduler's bounded-concurrency polls (issue #24) could
     # never actually overlap. The run_tick semaphore bounds the scheduler's

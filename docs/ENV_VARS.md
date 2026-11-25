@@ -547,7 +547,7 @@ Knobs read by `tests/e2e/conftest.py` and `pytest tests/e2e/`, not by the runnin
 
 Each service computes its own SQLAlchemy URL from `POSTGRES_*` vars. You do not normally set `DATABASE_URL` directly; it's derived. If you need to point a service at a different DB, override with `DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db`.
 
-Every DB-backed service also reads `DB_SCHEMA`, the Postgres schema it owns, defaulting to its own name: `auth`, `inventory`, `reservations`, `cabling`, `acl`, `execution`, `ai_orchestrator`, `user_profile`, `notifications`, `integration`, `secrets`. `docker-compose.yml` pins each one explicitly except ai-orchestrator's, which takes the in-code default. Changing a value means the matching `CREATE SCHEMA` in `infra/postgres/init.sql` has to change too, and that file runs only on a fresh Postgres volume, so this is not a knob to turn on a live stack. The `config` service has no database and no `DB_SCHEMA`.
+Every DB-backed service also reads `DB_SCHEMA`, the Postgres schema it owns, defaulting to its own name: `auth`, `inventory`, `reservations`, `cabling`, `acl`, `execution`, `ai_orchestrator`, `user_profile`, `notifications`, `integration`, `secrets`. `docker-compose.yml` pins each one explicitly. Changing a value means the matching `CREATE SCHEMA` in `infra/postgres/init.sql` has to change too, and that file runs only on a fresh Postgres volume, so this is not a knob to turn on a live stack. The `config` service has no database and no `DB_SCHEMA`.
 
 ## Adding a new env var
 
