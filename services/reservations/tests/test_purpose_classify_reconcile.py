@@ -58,7 +58,13 @@ _LEGACY_FEATURE_OFF_DETAIL = "Purpose classification is disabled"
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 USER_ID = uuid.uuid4()
-NOW = datetime.now(timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -97,8 +103,8 @@ async def _insert(
     purpose: str = "a support case replication run",
     status: ReservationStatus = ReservationStatus.COMPLETED,
     purpose_category: str | None = None,
-    start_time: datetime = NOW - timedelta(hours=3),
-    end_time: datetime = NOW - timedelta(hours=1),
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
 ) -> uuid.UUID:
     res = Reservation(
         user_id=user_id,
@@ -107,8 +113,8 @@ async def _insert(
         topology_id=topology_id,
         topology_type=TopologyType.PHYSICAL,
         purpose=purpose,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=start_time if start_time is not None else NOW - timedelta(hours=3),
+        end_time=end_time if end_time is not None else NOW - timedelta(hours=1),
         status=status,
         purpose_category=purpose_category,
         purpose_classify_requested_at=purpose_classify_requested_at,

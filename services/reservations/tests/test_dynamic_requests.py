@@ -40,9 +40,14 @@ DEVICE_A = str(uuid.uuid4())
 TEMPLATE_ID = str(uuid.uuid4())
 INTERNAL_TOKEN = "internal-test-token"
 
-NOW = datetime.now(timezone.utc)
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 async def override_get_db():

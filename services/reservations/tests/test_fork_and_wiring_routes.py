@@ -65,7 +65,6 @@ OTHER_ID = str(uuid.uuid4())
 ADMIN_ID = str(uuid.uuid4())
 VERSION_ID = str(uuid.uuid4())
 TOKEN = "fork-routes-internal-token"
-NOW = datetime.now(timezone.utc)
 
 CANVAS = {"nodes": [{"id": "n1"}], "edges": []}
 FORK_BODIES = {ForkCanvasBody: {"canvas_data": CANVAS}, ForkSaveBody: {"canvas_data": CANVAS}}
@@ -128,6 +127,13 @@ OWN_TESTS: dict[tuple[str, str], str] = {}
 # GET ONLY and never from the wiring path (TOPO-FORK-25 is the read it redacts).
 FORWARDS_BEARER = {("GET", "/{reservation_id}/fork")}
 CALLER_BEARER = "Bearer fake-token"  # tests._harness.override_bearer
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 def _is_path_param(segment: str) -> bool:

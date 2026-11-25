@@ -857,10 +857,15 @@ async def refuse(login: FederatedLogin) -> None:
         assert not db.in_transaction()
 
 
-_CLOCK_BASE = datetime.now(timezone.utc)
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global _CLOCK_BASE
+    _CLOCK_BASE = datetime.now(timezone.utc)
 
 
-def shift_capture_clock(monkeypatch, seconds: float, base: datetime = _CLOCK_BASE) -> None:
+def shift_capture_clock(monkeypatch, seconds: float) -> None:
+    base = _CLOCK_BASE
     monkeypatch.setattr(
         federated_identity_service, "_utcnow", lambda: base + timedelta(seconds=seconds)
     )

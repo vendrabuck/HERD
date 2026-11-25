@@ -27,7 +27,6 @@ from sqlalchemy import select, update
 from tests._harness import TestSessionLocal
 
 SVC = "app.services.reservation_service"
-NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 DEV = uuid.uuid4()
 DEV2 = uuid.uuid4()
@@ -51,6 +50,13 @@ NON_TERMINAL = tuple(s for s in ReservationStatus if s not in TERMINAL)
 # Statuses whose row holds its exclusive devices (issue #897): a cancel that leaves
 # one of these releases them, a cancel that leaves anything else does not.
 DEVICE_HOLDING = (PROVISION, ACTIVE)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 async def _set_status_on_second_session(rid, status):
