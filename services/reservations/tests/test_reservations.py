@@ -32,11 +32,16 @@ DEVICE_A = str(uuid.uuid4())
 DEVICE_B = str(uuid.uuid4())
 DEVICE_CLOUD = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
-# Immediate ("start now") window: start_time within the start-grace of now, so
-# create provisions immediately (status ACTIVE) rather than scheduling PENDING.
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    # Immediate ("start now") window: start_time within the start-grace of now, so
+    # create provisions immediately (status ACTIVE) rather than scheduling PENDING.
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 def override_auth():

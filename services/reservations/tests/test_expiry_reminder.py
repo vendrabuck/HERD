@@ -23,7 +23,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-NOW = datetime.now(timezone.utc)
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 async def _expiring_soon_rows():
