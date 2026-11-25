@@ -585,7 +585,9 @@ async def _reattempt_l2_rows(
     number of an allocation this pass read as not ACTIVE) and
     record_l2_membership_active heals the row's allocation on success. The read is made
     in a session closed before the driver call: an allocation released after it is
-    still driven with its number, and the join's guard then fails the row. If
+    still driven with its number, and the join then loses at its guard and is undone or
+    left owing the removal (record_l2_membership_active). A row that owes that removal
+    is a release-direction row, so it is never re-resolved here. If
     re-resolution fails again, the row is NOT driven: it is re-parked FAILED with the
     no-allocation reason (attempts accumulate) and reported "still_failed".
 

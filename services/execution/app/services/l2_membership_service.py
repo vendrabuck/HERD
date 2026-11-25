@@ -71,11 +71,13 @@ STALE_JOIN_SUPERSEDED_PENDING_REMOVAL = (
 )
 
 # Issue #1413: a join whose allocation is no longer ACTIVE when its membership would be
-# recorded is failed under this reason, intended ACTIVE, still pointing at the released
-# allocation; the build retry resolves a fresh allocation on a later pass
-# (wiring_retry_service._reattempt_l2_rows). The define pre-pass parks the joins of a
-# switch whose definition lost to a release under it too. Deliberately outside the
-# non-retryable prefixes.
+# recorded, and whose add was then undone (or needed no undo), is failed under this
+# reason, intended ACTIVE, still pointing at the released allocation; the build retry
+# resolves a fresh allocation on a later pass (wiring_retry_service._reattempt_l2_rows).
+# A row that owed such an undo is turned back into this state once its removal
+# succeeds (settle_undone_join). The define pre-pass parks the joins of a switch whose
+# definition lost to a release under it too. Deliberately outside the non-retryable
+# prefixes.
 JOIN_LOST_ALLOCATION_RELEASED = (
     "VLAN allocation released before the join was recorded; pending re-allocation"
 )
@@ -709,6 +711,11 @@ async def record_l2_failed(
     INSERT itself (`wiring_due.frozen_build_failure_values`). A row with a nil
     allocation, a pinned-reason failure, a release failure, and every write on a
     reservation that is not frozen are unchanged; the row-id path is unchanged.
+
+    Issue #1413: a row that owes the removal of a lost join's add
+    (JOIN_UNDO_PENDING_REMOVAL) keeps naming its released allocation. A key-based BUILD
+    failure leaves such a row as it is (it is returned unchanged), and a RELEASE failure,
+    by key or by row id, keeps that reason instead of `last_error`.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)

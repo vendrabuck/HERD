@@ -2956,7 +2956,8 @@ async def _define_pending_for_allocations(
     a failure with attempts 0 and JOIN_LOST_ALLOCATION_RELEASED, so the caller parks
     the joins on those switches instead of driving them on the released number. Joins
     on the allocation's switches that were already defined are not failures here: they
-    are still driven on that number, and the join's own guard fails each one.
+    are still driven on that number, and each loses at the join's guard and is undone
+    like any lost join (_undo_lost_join).
     """
     from app.models.vlan_assignment import VlanAssignment
     from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
@@ -2998,8 +2999,8 @@ async def _define_pending_for_allocations(
                 # already chosen the switches it deletes from). Undo this create, and
                 # park the joins of this switch and of every switch of the allocation
                 # not yet defined, rather than drive them on the released number (joins
-                # on switches already defined are still driven, and their guard fails
-                # them).
+                # on switches already defined are still driven, lose at the join's
+                # guard, and are undone).
                 not_defined = pending[index:]
                 for parked in not_defined:
                     failures[parked] = (0, JOIN_LOST_ALLOCATION_RELEASED)
