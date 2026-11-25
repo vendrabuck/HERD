@@ -1,5 +1,6 @@
-"""Postgres-live proof that a join and a definition never commit onto a released VLAN
-allocation (issue #1413), the join side of the release compare-and-swap of #1357.
+"""Postgres-live proof that a join never records an ACTIVE membership, and a define never
+records a switch, on a released VLAN allocation (issue #1413), the join side of the
+release compare-and-swap of #1357.
 
 The release (`vlan_service.release_allocation_if_orphaned`) matches its row only while it
 is ACTIVE with no ACTIVE membership. Before #1413 nothing on the other side checked the
@@ -17,8 +18,9 @@ the release winner re-read the row was never undefined. Now:
     ACTIVE; a define that lost to a release undoes its create_vlan; two defines of one
     allocation keep both switches; the release winner's trim removes only what it
     deleted from the list as it stands;
-  - a failed join on a released allocation is re-resolved by the retry before any
-    add_to_vlan, which never names the released number.
+  - two joins of one allocation hold their share locks at once;
+  - a failed join on an allocation the retry reads as released is re-resolved before
+    its add_to_vlan, which names the fresh allocation's number.
 
 The SQLite suites (test_l2_membership_service.py, test_nats_consumer_vlan_definitions.py,
 test_wiring_retry_l2.py) pin each guard's predicate on one connection; here each party

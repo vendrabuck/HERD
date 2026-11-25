@@ -207,7 +207,7 @@ make test-e2e        # Run E2E browser tests (Selenium + Playwright, requires ru
 make coverage        # Run all backend tests with coverage report
 make lint            # ruff check + eslint
 make format          # ruff format + ruff check --fix
-make master          # Full validation: uv.lock check + format + lint + unit + frontend + build + live LDAP + ephemeral stack + contract + integration + e2e + LDAP-mode stack tests + the nineteen Postgres-live suites (no coverage)
+make master          # Full validation: uv.lock check + format + lint + unit + frontend + build + live LDAP + ephemeral stack + contract + integration + e2e + LDAP-mode stack tests + the twenty Postgres-live suites (no coverage)
 make master-clean    # Same as master, but removes this checkout's dev and gate images first and rebuilds both with no cache
 make everything      # Same surface as master plus: format-check (no mutate), backend + frontend coverage, the CI checks master skips (vitest under America/Los_Angeles, package-lock sync, image versus uv.lock), the NOS lab dialect tests, seed, a seeded e2e pass, headless locust load; on success the seeded gate stack is left running (make gate-down to stop)
 make check-image-lock # Check the built ai-orchestrator image installs exactly what uv.lock pins

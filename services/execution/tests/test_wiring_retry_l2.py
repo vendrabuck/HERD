@@ -698,7 +698,7 @@ async def test_a_retry_join_that_loses_its_allocation_writes_only_the_row_it_loa
         assert row.vlan_assignment_id == va
 
 
-# --- a failed join never drives a released allocation's number (issue #1413) ---
+# --- a failed join on an allocation read as released is re-resolved (issue #1413) ---
 
 
 async def _seed_released_alloc() -> tuple[uuid.UUID, int]:

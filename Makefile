@@ -1191,9 +1191,10 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # release) works the same way on the migrated execution schema: random
 # reservation ids, seeded foreign rows asserted unchanged, its own rows deleted
 # in a finally. Each FAILED row it leaves has at least 1,000,000 attempts, so the
-# stack's own retry tick never selects it; it runs no tick itself. A party it
-# holds inside its transaction waits for the other on a row lock for well under
-# a second.
+# stack's own retry tick does not select it at any cap below that (the default is
+# 10); it runs no tick itself. The test stops one party inside its transaction
+# with a gate, holding its row lock, and the other party waits on that lock for
+# well under a second before the gate lets the first go.
 # The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
 # provisioning races) needs the migrated auth schema with migration 0010's two
 # tables. It commits its own users, identities, and flows under random tags,

@@ -581,8 +581,11 @@ async def _reattempt_l2_rows(
     ACTIVE when this pass reads the rows (a join that lost to a release, or any failed
     join whose allocation was released since) is re-resolved through
     _resolve_add_allocations before the op is built, so the retry drives add_to_vlan
-    with the REAL fabric VLAN of an ACTIVE allocation (not 0, never a released number)
-    and record_l2_membership_active heals the row's allocation on success. If
+    with the REAL fabric VLAN of an allocation resolved as ACTIVE (not 0, and never the
+    number of an allocation this pass read as not ACTIVE) and
+    record_l2_membership_active heals the row's allocation on success. The read is made
+    in a session closed before the driver call: an allocation released after it is
+    still driven with its number, and the join's guard then fails the row. If
     re-resolution fails again, the row is NOT driven: it is re-parked FAILED with the
     no-allocation reason (attempts accumulate) and reported "still_failed".
 
@@ -685,7 +688,7 @@ async def _reattempt_l2_rows(
         # A build-direction row whose allocation is unusable: no number at all, or an
         # allocation that is not ACTIVE (issue #1413: a join that lost to a release, or
         # any failed join whose allocation was released since). Re-resolve before the
-        # driver call so add_to_vlan never names a released number.
+        # driver call so add_to_vlan never names an allocation read here as not ACTIVE.
         return row.intended != "RELEASED" and (
             _has_no_vlan_number(row) or row.vlan_assignment_id not in active_va_ids
         )

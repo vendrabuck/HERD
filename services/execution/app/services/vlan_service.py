@@ -33,7 +33,8 @@ release_allocation_if_orphaned (issue #1357). Nothing else sets its status.
 The other side of that release (issue #1413) is here too: hold_active_allocation is
 the share lock a join takes before it writes an ACTIVE membership, and
 record_allocation_defined and trim_allocation_definitions are the only writes of
-defined_switch_ids, each under the allocation's row lock.
+defined_switch_ids after the INSERT (which stores it empty), each under the
+allocation's row lock.
 """
 
 import logging
@@ -280,12 +281,14 @@ async def record_allocation_defined(
     """Add switch_id to an ACTIVE allocation's defined_switch_ids after a gated
     create_vlan success; True when recorded (issue #1413).
 
-    The row is read FOR UPDATE with its status ACTIVE, so the read and the write are one
-    critical section: two defines of one allocation cannot drop each other's switch, and
-    a define cannot add a switch to a RELEASED allocation (the release takes the same
-    lock). False when the row is RELEASED or absent: nothing is written and the session
-    is rolled back. The caller then owns the definition create_vlan left on the switch.
-    The list stays sorted and free of duplicates, as before. Commits on success.
+    The row is read FOR UPDATE with its status ACTIVE, so on Postgres the read and the
+    write are one critical section: two defines of one allocation cannot drop each
+    other's switch, and a define cannot add a switch to a RELEASED allocation (the
+    release takes the same lock). On SQLite (the unit-test database) the lock clause
+    renders nothing. False when the row is RELEASED or absent: nothing is written and
+    the session is rolled back. The caller then owns the definition create_vlan left on
+    the switch. The list stays sorted and free of duplicates, as before. Commits on
+    success.
     """
     row = (
         await db.execute(
