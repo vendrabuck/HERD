@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from app.config import settings
 from app.models.reservation import ReservationStatus, TopologyType
@@ -18,6 +19,25 @@ def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+# The instants a datetime can name once converted to UTC; an offset near either end
+# names one outside it (0001-01-01T00:00:00+05:00 is before year 1 in UTC).
+UTC_RANGE_TEXT = "0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z"
+
+
+def to_utc_instant(dt: datetime) -> datetime:
+    """The instant `dt` names, as an aware UTC datetime.
+
+    The conversion the list filters, the report bounds (issue #1523), and the PATCH
+    window share. An aware value is converted; a naive one is taken as UTC, never
+    as the host's local zone (which is what astimezone would assume). Raises
+    OverflowError when the instant has no UTC equivalent; the caller turns that
+    into a 422.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def check_max_duration(start: datetime, end: datetime) -> None:
@@ -131,6 +151,26 @@ class ReservationUpdate(BaseModel):
     end_time: datetime | None = None
     purpose: str | None = Field(default=None, max_length=2000)
     device_ids: list[uuid.UUID] | None = Field(default=None, max_length=200)
+
+    @field_validator("end_time")
+    @classmethod
+    def end_time_as_utc_instant(cls, v: datetime | None) -> datetime | None:
+        """Convert a new end time to the UTC instant it names, once, at the boundary.
+
+        update_reservation compares this value with the stored start, the stored
+        end, and now, conflict-checks the span it adds, and stores it, so each of
+        those sees the instant whatever offset the client wrote (RES-PATCH-3). A
+        value with no UTC equivalent is a 422 with the list filters' wording.
+        """
+        if v is None:
+            return None
+        try:
+            return to_utc_instant(v)
+        except OverflowError:
+            raise PydanticCustomError(
+                "value_error",
+                f"end_time must fall between {UTC_RANGE_TEXT} once converted to UTC",
+            ) from None
 
     @field_validator("device_ids")
     @classmethod

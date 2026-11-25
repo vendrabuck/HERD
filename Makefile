@@ -1142,7 +1142,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (nineteen today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1248,6 +1248,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_reservation_status_cas_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_patch_race_live_pg.py -v) && \
+	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_reservation_patch_end_time_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_sort_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
