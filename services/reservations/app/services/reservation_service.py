@@ -23,7 +23,7 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
-from sqlalchemy import String, and_, cast, exists, false, func, or_, select, update
+from sqlalchemy import String, and_, cast, exists, false, func, null, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -37,7 +37,12 @@ from app.models.reservation import (
     ReservationStatus,
     TopologyType,
 )
-from app.schemas.reservation import ReservationCreate, ReservationUpdate, check_max_duration
+from app.schemas.reservation import (
+    ReservationCreate,
+    ReservationUpdate,
+    check_max_duration,
+    to_utc_instant,
+)
 from app.services.purpose_service import (
     stamp_purpose_classify_requested,
     validate_purpose_category,
@@ -870,6 +875,64 @@ async def _clear_pending_fork_prune(
             },
             exc_info=True,
         )
+
+
+def _prune_marker_actionable(marker: object) -> bool:
+    """Whether a pending fork-prune marker holds something to prune: a non-empty list.
+
+    The ONE predicate for "this marker is pending" beside the column's SQL NULL. Every
+    other stored value (the JSON "null" a writer older than issue #1522 stored, an
+    empty list, any non-list shape) holds nothing to retry and is healed to SQL NULL by
+    `_heal_non_actionable_prune_marker`.
+    """
+    return isinstance(marker, list) and len(marker) > 0
+
+
+async def _heal_non_actionable_prune_marker(reservation_id: uuid.UUID) -> bool:
+    """Store SQL NULL for a marker that holds nothing actionable (issue #1522).
+
+    The pending-prune reconciler selects `IS NOT NULL` markers, so a JSON "null", an
+    empty list, or a corrupt non-list value stays in its oldest-first batch forever
+    unless something writes SQL NULL. Current writers never store those forms and
+    migration 0018 repaired the stored ones once; this repairs any the reconciler
+    still selects (a process on the previous code, an image rollback, a hand edit).
+
+    Under the row lock the marker is read again, and nulled only if it is still not
+    actionable: a device-set PATCH may have unioned real ids into it since the
+    reconciler's SELECT, and those must survive. The write is a Core UPDATE of
+    `sql.null()` guarded by `IS NOT NULL`, never an attribute assignment: a JSON
+    "null" loads as None, so assigning None is no change and the ORM would emit no
+    UPDATE at all. Returns True when it nulled the marker. Best-effort like the clear:
+    a failure is logged and the next tick retries.
+    """
+    col = Reservation.pending_fork_prune_device_ids
+    try:
+        async with AsyncSessionLocal() as db:
+            current = (
+                await db.execute(
+                    select(col).where(Reservation.id == reservation_id).with_for_update()
+                )
+            ).first()
+            if current is None or _prune_marker_actionable(current[0]):
+                return False
+            result = await db.execute(
+                update(Reservation)
+                .where(Reservation.id == reservation_id, col.is_not(None))
+                .values(pending_fork_prune_device_ids=null())
+            )
+            await db.commit()
+            return result.rowcount == 1
+    except Exception:
+        logger.error(
+            "Healing the pending fork-prune marker failed for reservation %s",
+            reservation_id,
+            extra={
+                "action": "reservation_fork_prune_marker_heal_failed",
+                "reservation_id": str(reservation_id),
+            },
+            exc_info=True,
+        )
+        return False
 
 
 async def _fork_may_still_appear(reservation_id: uuid.UUID) -> bool:
@@ -2570,31 +2633,25 @@ async def update_reservation(
 
     end_time_changed = False
     if data.end_time is not None:
-        # Normalize timezone awareness for comparison (SQLite returns naive datetimes)
-        new_end = data.end_time.replace(tzinfo=None) if data.end_time.tzinfo else data.end_time
-        start = (
-            reservation.start_time.replace(tzinfo=None)
-            if reservation.start_time.tzinfo
-            else reservation.start_time
-        )
-        old_end = (
-            reservation.end_time.replace(tzinfo=None)
-            if reservation.end_time.tzinfo
-            else reservation.end_time
-        )
+        # Every comparison and the write below use instants: ReservationUpdate has
+        # already converted the new end to UTC (an offset converted, naive taken as
+        # UTC), and the stored bounds are read the same way (SQLite returns them
+        # naive). The bounds are compared as instants.
+        new_end = data.end_time
+        start = to_utc_instant(reservation.start_time)
+        old_end = to_utc_instant(reservation.end_time)
 
         if new_end <= start:
             raise ValueError("end_time must be after start_time")
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        if new_end <= now:
+        if new_end <= datetime.now(timezone.utc):
             raise ValueError("end_time must be in the future")
 
         # The duration cap applies to the EFFECTIVE window after the edit, with
         # create's own check and wording (issue #995). Only a PATCH that sets the
         # end time is judged, so a row already longer than the cap stays editable
         # in its other fields.
-        check_max_duration(reservation.start_time, data.end_time)
+        check_max_duration(start, new_end)
 
         # If extending, check for conflicts in the extended window
         if new_end > old_end:
@@ -2608,15 +2665,15 @@ async def update_reservation(
             await _assert_no_window_conflicts(
                 db,
                 device_ids,
-                reservation.end_time,
-                data.end_time,
+                old_end,
+                new_end,
                 exclude_id=reservation.id,
                 exclusive_device_ids=exclusive_ids,
                 window_label="extended window",
             )
 
         end_time_changed = new_end != old_end
-        reservation.end_time = data.end_time
+        reservation.end_time = new_end
 
     if data.purpose is not None:
         reservation.purpose = data.purpose
@@ -2704,16 +2761,15 @@ async def update_reservation(
 
                 await _acquire_device_locks(db, added_ids)
 
-                # Use reservation end_time (possibly updated above)
-                check_end = data.end_time if data.end_time is not None else reservation.end_time
-                # Normalize timezone for SQLite compatibility
-                now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-                start_naive = (
-                    reservation.start_time.replace(tzinfo=None)
-                    if reservation.start_time.tzinfo
-                    else reservation.start_time
+                # The window [max(now, start), end) as aware UTC instants, the end
+                # possibly updated above. A naive value bound to a timestamptz is
+                # read in the process's local zone, so none is bound here.
+                check_end = to_utc_instant(
+                    data.end_time if data.end_time is not None else reservation.end_time
                 )
-                check_start = now_naive if now_naive > start_naive else reservation.start_time
+                check_start = max(
+                    datetime.now(timezone.utc), to_utc_instant(reservation.start_time)
+                )
 
                 await _assert_no_window_conflicts(
                     db,

@@ -338,7 +338,7 @@ name looks like a credential.
 - **OPS-LOG-1.** Each line carries `timestamp`, `level`, `service`, `logger`, and
   `message`, plus `exception` when the record has exception info. \
   Enforced in: `services/common/herd_common/logging.py` (`JSONFormatter`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_json_formatter_basic_output`, `test_json_formatter_includes_exception`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_json_formatter_basic_output`, `test_json_formatter_includes_exception`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-2.** Every `extra=` key that is not one of the standard library's own
   record attributes is emitted, and an extra whose value is None is omitted. \
   Enforced in: `services/common/herd_common/logging.py` (`RESERVED_LOG_RECORD_ATTRS`, `JSONFormatter`) \
@@ -367,17 +367,17 @@ name looks like a credential.
 - **OPS-LOG-7.** Every request logs one `herd.access` line with `method`, `path` (no
   query string), `status_code`, and `duration_ms`; no header or body is logged. \
   Enforced in: `services/common/herd_common/logging.py` (`RequestLoggingMiddleware`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-8.** `setup_logging` installs the one JSON handler on the root logger at
   `LOG_LEVEL` (INFO when the name is unknown) and holds `uvicorn.access`,
   `uvicorn.error`, and `sqlalchemy.engine` at WARNING. \
   Enforced in: `services/common/herd_common/logging.py` (`setup_logging`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`)
+  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
 - **OPS-LOG-9.** The config service does not use this formatter: it logs through the
   standard library with no handler of its own, so its lines are plain text and its INFO
   lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
   Enforced in: `services/config/app/main.py` (`logger`) \
-  Pinned by: none
+  Pinned by: `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_config_logs_through_the_standard_library_with_no_handler_of_its_own`)
 - **OPS-LOG-10.** Key-name redaction cannot see inside a string value, so a driver run's
   start line logs the names of the context and method arguments, never their values. By
   decision; issues #872 and #905. \
@@ -1471,22 +1471,37 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
 
 - **OPS-REPORT-1.** Both report routes are admin only; `start` and `end` are required, an
   `end` not after `start` is 422, and a window longer than `UTILIZATION_MAX_SPAN_DAYS`
-  (default 366; 0 disables) is 422 naming the limit. \
-  Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`); `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_rbac_denial.py` (`test_non_admin_denied`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_rejects_inverted_window`, `test_build_report_span_over_max_raises`, `test_build_report_span_at_max_succeeds`, `test_build_report_span_guard_disabled_when_zero`); `services/reservations/tests/test_coverage_gaps.py` (`test_csv_report_inverted_window_returns_422`); `tests/integration/test_reporting.py` (`test_utilization_report_non_admin_forbidden`)
+  (default 366; 0 disables) is 422 naming the limit. A bound whose instant has no UTC
+  equivalent (an offset near year 1 or year 9999, such as `0001-01-01T00:00:00+05:00`)
+  is 422 `<start or end> must fall between 0001-01-01T00:00:00Z and
+  9999-12-31T23:59:59.999999Z once converted to UTC`, checked `start` first; no value of
+  `start` or `end` answers 5xx (issue #1523). \
+  Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
+  Pinned by: `services/reservations/tests/test_rbac_denial.py` (`test_non_admin_denied`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_rejects_inverted_window`, `test_build_report_span_over_max_raises`, `test_build_report_span_at_max_succeeds`, `test_build_report_span_guard_disabled_when_zero`); `services/reservations/tests/test_coverage_gaps.py` (`test_csv_report_inverted_window_returns_422`); `services/reservations/tests/test_report_utc_days.py` (`test_report_routes_answer_422_for_a_bound_with_no_utc_equivalent`, `test_report_routes_never_answer_5xx_for_extreme_bounds_seeded_sweep`); `tests/integration/test_reporting.py` (`test_utilization_report_non_admin_forbidden`)
 - **OPS-REPORT-2.** A reservation counts for the hours it overlaps the window, clipped to
-  the window; one with no overlap is skipped. \
+  the window; one with no overlap is skipped. The report query loads only reservations
+  that end after the window's start and start before its end, in a status the user,
+  device, or fleet section counts; a zero-length reservation inside the window is loaded
+  and skipped. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_build_report_clamps_window`, `test_build_report_skips_zero_hours`); `services/reservations/tests/test_reporting_edges.py` (`test_build_report_clips_hours_to_window`, `test_a_row_with_no_overlap_is_skipped`, `test_the_report_query_loads_only_rows_that_overlap_the_window`, `test_the_report_query_loads_only_the_statuses_a_section_counts`)
 - **OPS-REPORT-3.** Without `status`, the user, device, topology type, day, group, and
   purpose sections count only `COMPLETED` reservations and the fleet section counts
   `ACTIVE` and `COMPLETED`; a given `status` list applies to every section. \
-  Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `FLEET_DEFAULT_STATUS_FILTER`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_counts_active_but_legacy_default_does_not`, `test_explicit_filter_applies_to_fleet_too`, `test_report_route_fleet_defaults_count_active`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_filters_status`)
-- **OPS-REPORT-4.** The day section splits each reservation's hours at UTC midnight and
-  counts a reservation once per day it touches. \
-  Enforced in: `services/reservations/app/services/reporting_service.py` (`_split_hours_per_day`) \
-  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`)
+  Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`, `FLEET_DEFAULT_STATUS_FILTER`) \
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_counts_active_but_legacy_default_does_not`, `test_explicit_filter_applies_to_fleet_too`, `test_report_route_fleet_defaults_count_active`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_filters_status`); `services/reservations/tests/test_utilization_report_routes.py` (`test_each_section_counts_the_rule_s_statuses_on_both_routes`)
+- **OPS-REPORT-4.** The day section splits each reservation's hours at UTC midnight,
+  labels each slice with its UTC date, and counts a reservation once per day it touches.
+  `start` and `end` may carry any UTC offset, and a value without one is UTC (never the
+  host's zone): both routes convert the bounds to UTC before anything reads them, and
+  the split converts on its own, so its slices are positive, contiguous, and sum to the
+  overlap, the day hours sum to `total_hours` within the four-decimal rounding of each
+  value (each day bucket and the total are rounded on their own), and the report echoes
+  the window in UTC (issue #1523). The split also holds on the first and the last
+  representable UTC day: a slice on 9999-12-31 runs to the window's end, and a day
+  before year 1000 is labeled with four digits (`0001-01-01`). \
+  Enforced in: `services/reservations/app/services/reporting_service.py` (`_split_hours_per_day`, `_as_utc`, `build_utilization_report`); `services/reservations/app/routers/reservations.py` (`_as_utc`, `get_utilization_report`, `get_utilization_report_csv`) \
+  Pinned by: `services/reservations/tests/test_reporting_edges.py` (`test_split_hours_across_midnight`, `test_split_hours_three_days_full_middle`, `test_build_report_day_buckets_count_unique_reservations_per_day`); `services/reservations/tests/test_reporting_service.py` (`test_build_report_aggregates_by_day_across_midnight`); `services/reservations/tests/test_report_utc_days.py` (`test_split_hours_negative_offset_start_late_in_local_day`, `test_split_hours_positive_offset_labels_the_utc_dates`, `test_split_hours_mixed_offsets_crossing_several_utc_midnights`, `test_split_hours_start_exactly_at_utc_midnight_in_an_offset`, `test_split_hours_naive_bounds_are_utc_under_a_minus_eight_host_zone`, `test_split_hours_last_representable_day_has_no_next_midnight`, `test_split_hours_labels_a_year_before_1000_with_four_digits`, `test_split_hours_naive_start_with_an_offset_end`, `test_split_hours_property_any_offsets_any_window`, `test_build_report_by_day_sums_to_total_for_any_offset_window`, `test_build_report_takes_a_naive_and_an_offset_bound_and_echoes_utc`, `test_report_route_by_day_is_split_at_utc_midnight_for_any_offset`, `test_report_route_hands_utc_bounds_downstream`, `test_report_routes_take_a_naive_bound_as_utc_not_the_host_zone`, `test_report_routes_answer_a_window_at_the_edges_of_the_range`); `tests/integration/test_reporting.py` (`test_utilization_report_by_day_sums_to_total_with_an_offset_start`)
 - **OPS-REPORT-5.** The group section rolls each user's hours into every group the user
   belongs to (a user in two groups counts in both) and a user in none into `Ungrouped`;
   when auth cannot answer, every user is `Ungrouped` and the report still answers 200. \
@@ -1503,25 +1518,36 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   count every device on the reservation's fork wiring that it did not reserve, with the
   reservation's hours and confirmed category; a reserved device on a path counts once,
   as reserved, and a suggestion-only reservation adds transit hours but no transit
-  purpose rows. \
+  purpose rows. In a 200 answer from cabling, an entry whose reservation id is not a UUID
+  string is ignored, a device id string that is not a UUID is ignored while the entry's
+  other device ids still count, and a null device list adds no transit devices. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`, `_fetch_transit_devices`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`)
 - **OPS-REPORT-8.** Transit devices are read from cabling in chunks of 500 reservations;
   a transport error or non-200 from any chunk fails the report closed with 503
   `{"error": "transit_gear_unavailable"}`, and `include_transit=false` makes no cabling
   call. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`_fetch_transit_devices`, `_TRANSIT_BATCH_CHUNK_SIZE`, `TransitGearUnavailable`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
 - **OPS-REPORT-9.** The routes map that failure to 503 `{"error":
   "transit_gear_unavailable"}`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: none
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
 - **OPS-REPORT-10.** The fleet section lists every device inventory returns (paged by 500,
   with the caller's token, stopping at 100,000), each with its hours over the whole
   window as `utilization_pct`, unclamped; devices with no hours are the idle count, and a
-  deleted device stays only in the device section. \
+  deleted device stays only in the device section. The fleet section lists its devices
+  by `utilization_pct` (rounded to two decimals), highest first, then by `name` in code
+  point order; devices equal in both keep inventory's order. The device fetch stops after
+  a page shorter than 500, or, when inventory's `total` is a JSON integer (a number
+  written without a fraction or exponent; a boolean reads as 1 or 0), after the page
+  that brings the devices held to at least `total`; any other `total` is ignored. So a
+  fleet whose size is an exact multiple of 500, reported in `total`, takes no extra
+  request. The fetch asks for at most 200 pages (100,000 devices); when the 200th page is
+  full and does not reach a JSON integer `total`, the fleet is null as if inventory
+  could not answer. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fetch_fleet_devices_paginates_past_500`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fleet_devices_are_listed_busiest_first_then_by_name`, `test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total`, `test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total`, `test_fetch_fleet_devices_stops_at_100_000_devices`, `test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total`, `test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with
   `fleet` null. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`) \
@@ -1533,9 +1559,10 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_fetch_execution_run_count_returns_total`, `test_fetch_execution_run_count_swallows_http_errors`, `test_fetch_execution_run_count_returns_none_on_non_200`)
 - **OPS-REPORT-13.** The CSV route serves one `section` (`user`, `device`, `fleet`,
   `purpose`, `user_purpose`, `device_purpose`, `purpose_suggested`; anything else is
-  422) as `text/csv` with a dated attachment name; hours have four decimals. \
+  422) as `text/csv` with an attachment name dated with the UTC dates of `start` and
+  `end`; hours have four decimals. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`); `services/reservations/app/services/reporting_service.py` (`report_to_csv`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `services/reservations/tests/test_report_utc_days.py` (`test_csv_route_reproduction_matches_json_and_names_utc_dates`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
 - **OPS-REPORT-14.** The `fleet` CSV is 503 `Inventory service is unreachable` when
   inventory cannot answer; the other sections make no inventory call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`) \
@@ -1872,7 +1899,7 @@ fixed set (OPS-VALID-7).
   included (a 16 MB chain cost 1,693 ms and 802 MB against 1.8 ms and 17 MB), and
   searched it for locations. \
   Enforced in: `services/common/herd_common/validation_errors.py` (`_raw_text_holds_a_lone_surrogate`, `_escapes_hold_a_lone_surrogate`, `_HIGH_NOT_PAIRED`, `_LOW_ESCAPES`, `_HIGH_ESCAPES`, `holds_lone_surrogate`) \
-  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_structural_body_costs_a_small_part_of_its_parse`, `test_an_escape_heavy_body_costs_linear_work_in_two_copies`, `test_a_body_with_no_surrogate_marker_is_passed_after_two_searches`, `test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_holds_lone_surrogate`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`, `test_holds_lone_surrogate_answers_at_every_depth_where_serializing_stops`, `test_the_walk_finds_a_lone_surrogate_wherever_it_sits`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
+  Pinned by: `services/common/tests/test_validation_errors.py` (`test_a_structural_body_costs_a_small_part_of_its_parse`, `test_an_escape_heavy_body_costs_linear_work_in_two_copies`, `test_a_utf16_body_costs_its_decode_and_the_escape_passes`, `test_a_body_with_no_surrogate_marker_is_passed_after_two_searches`, `test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check`, `test_holds_lone_surrogate_costs_about_one_serialization`, `test_holds_lone_surrogate`, `test_holds_lone_surrogate_on_a_value_too_deep_to_serialize`, `test_holds_lone_surrogate_answers_at_every_depth_where_serializing_stops`, `test_the_walk_finds_a_lone_surrogate_wherever_it_sits`); `services/inventory/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`, `test_a_deep_and_wide_csv_json_cell_costs_about_one_parse`); `services/cabling/tests/test_lone_surrogate_cost.py` (`test_a_deep_and_wide_json_import_file_costs_about_one_parse`); `services/secrets/tests/test_lone_surrogate_cost.py` (`test_deserializing_deep_and_wide_data_costs_about_one_parse`); `services/config/tests/test_lone_surrogate_cost.py` (`test_the_save_check_on_deep_and_wide_values_costs_about_one_parse`)
 
 - **OPS-VALID-9.** Every service, config included, refuses a request body larger than
   its route's limit with 413 (issue #1466). Before this rule nothing bounded a body:
@@ -1984,8 +2011,8 @@ fixed set (OPS-VALID-7).
   | Route | Service | Extra bytes | Limit with the defaults |
   |---|---|---|---|
   | `POST /drivers`, `PUT /drivers/{driver_id}/file` | inventory | `DRIVER_MAX_SIZE_BYTES` (10485760) | 10747904 |
-  | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`: the routes read the whole upload with no bound of their own (issue #1417, open), so this is the only bound on an import file | 10747904 |
-  | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`, for the same reason | 10747904 |
+  | `POST /devices/import`, `POST /templates/import` | inventory | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routers/bulk.py`; `_read_capped` applies the same number to the file itself (INV-BULK-23) | 10747904 |
+  | `POST /topologies/import` | cabling | `IMPORT_UPLOAD_BYTES`, 10485760 fixed in `app/routes/bulk.py`; `_read_capped` applies the same number to the file itself (TOPO-BULK-20) | 10747904 |
   | `POST /generate` | ai-orchestrator | `UPLOAD_MAX_FILES` times `UPLOAD_MAX_FILE_BYTES` (5 times 5242880), the aggregate `_read_uploads` enforces | 26476544 |
   | `POST /internal/validate-package` | execution | the base64 length of `VALIDATE_PACKAGE_MAX_BYTES` (13981016 for 10485760), the JSON `package_b64` the validator decodes | 14243160 |
   | `PUT /topologies/{topology_id}`, `POST /templates`, `PUT /templates/{template_id}` | cabling | `LARGE_JSON_BODY_BYTES`: a canvas. In the shape the topology editor's Save sends (UUID node and edge ids, the seven persisted device keys plus `label` and `topologyType`, React Flow's `measured`, `selected`, and `dragging`, and each link's port ids, port names, `portsCabled`, `pathValid`, and `pathHopCount`) a device node is about 520 bytes and a link about 460: 1,000 devices and 4,000 links are 2361613 bytes, a 250-device reservation's canvas with 1,000 links is 590443, already over the default, and this limit holds 1,887 devices with four links each (1,776 within the 4 MiB allowance alone) | 4456448 |
@@ -2139,7 +2166,7 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 401 | `Invalid subject in token` | a preferences route with a missing or non-UUID subject | OPS-PREF-1 |
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
-| 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, a validation list | a bad report window or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
+| 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, `<start or end> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, a validation list | a bad report window, a bound with no UTC equivalent, or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
 | 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices | OPS-REPORT-8, OPS-REPORT-9 |
 | 503 | `Inventory service is unreachable` | the fleet CSV when inventory cannot answer | OPS-REPORT-14 |
 
@@ -2327,17 +2354,16 @@ None at present.
   form) can still be refused by the service it is forwarded to, which answers 413 and
   the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
   that growth. Recorded in issue #1466.
-- The bulk import routes of inventory and cabling read the whole upload with no bound
-  of their own, so the body limit's 10 MiB import file bound is their only one
-  (OPS-VALID-10). Recorded in issue #1417.
+- A bulk import file of up to 10 MiB is still decoded and parsed on the event loop,
+  the loop every reservation and topology read depends on; `_read_capped` bounds what
+  is copied out of the spool, not that parse (INV-BULK-23, TOPO-BULK-20). Step 2 of
+  issue #1417, moving the parse off the event loop, is not done.
 
 ### Rules with no test
 
 - OPS-BUILD-1: the Makefile's build identifier and date.
-- OPS-LOG-9: the config service's plain-text logging.
 - OPS-SET-9: settings read once at import.
 - OPS-OUTBOX-14: the relay does not republish an acknowledged event.
 - OPS-NATS-13: JetStream store durability under `make prod`.
 - OPS-HEALTH-10: the device check writes no health status row and stages no event.
 - OPS-NATS-15: reservations' declaration of `HERD_RESERVATIONS`.
-- OPS-REPORT-9: the routes' mapping of a transit failure to 503.

@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+import respx
+from app.config import settings
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.main import app
@@ -270,6 +272,73 @@ def test_build_fleet_section_skips_device_with_unusable_id():
     assert section.devices[0].device_id == DEVICE_X
 
 
+def test_fleet_devices_are_listed_busiest_first_then_by_name():
+    """OPS-REPORT-10's order: `utilization_pct` highest first, then `name` in code point
+    order. Inventory lists the idle device first, then the less busy one, then the
+    five equally busy ones in the reverse of their expected order. `B` comes before
+    `a` by code point, though not in a case-blind order, and `d10` comes before `d9`,
+    though not in a length-first or a natural (digits as numbers) order."""
+    idle, mid, zz, lower_a, upper_b, d9, d10 = (uuid.uuid4() for _ in range(7))
+    section = _build_fleet_section(
+        [
+            _inventory_device(idle, "idle"),
+            _inventory_device(mid, "mid"),
+            _inventory_device(zz, "zz"),
+            _inventory_device(d9, "d9"),
+            _inventory_device(d10, "d10"),
+            _inventory_device(lower_a, "a"),
+            _inventory_device(upper_b, "B"),
+        ],
+        {zz: 6.0, lower_a: 6.0, upper_b: 6.0, d9: 6.0, d10: 6.0, mid: 3.0},
+        {zz: 1, lower_a: 2, upper_b: 1, d9: 1, d10: 1, mid: 1},
+        WINDOW_START,
+        WINDOW_END,
+    )
+    assert [(d.name, d.utilization_pct) for d in section.devices] == [
+        ("B", 25.0),
+        ("a", 25.0),
+        ("d10", 25.0),
+        ("d9", 25.0),
+        ("zz", 25.0),
+        ("mid", 12.5),
+        ("idle", 0.0),
+    ]
+
+
+def test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie():
+    """OPS-REPORT-10's order compares `utilization_pct` rounded to two decimals. Over
+    the 24 hour window `ba` is 50 percent, `bb` 50.0042 before rounding, and `bc`
+    50.01: rounded to two decimals `bc` (50.01) comes first and `bb` (50.0) follows `ba`
+    by name, while rounding to one decimal would put all three at 50.0 (`ba`, `bb`,
+    `bc`), and to three or more, or not at all, would put `bb` before `ba`. Three idle
+    devices all named `twin` are equal in both keys and keep inventory's order, which
+    is neither their ascending nor their descending id order."""
+    ba, bb, bc = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    twins = sorted((uuid.uuid4() for _ in range(3)), key=str)
+    section = _build_fleet_section(
+        [
+            _inventory_device(twins[1], "twin"),
+            _inventory_device(bb, "bb"),
+            _inventory_device(twins[0], "twin"),
+            _inventory_device(ba, "ba"),
+            _inventory_device(twins[2], "twin"),
+            _inventory_device(bc, "bc"),
+        ],
+        {ba: 12.0, bb: 12.001, bc: 12.0024},
+        {ba: 1, bb: 1, bc: 1},
+        WINDOW_START,
+        WINDOW_END,
+    )
+    assert [(d.device_id, d.name, d.utilization_pct) for d in section.devices] == [
+        (bc, "bc", 50.01),
+        (ba, "ba", 50.0),
+        (bb, "bb", 50.0),
+        (twins[1], "twin", 0.0),
+        (twins[0], "twin", 0.0),
+        (twins[2], "twin", 0.0),
+    ]
+
+
 # --- inventory fetch ---
 
 
@@ -310,6 +379,236 @@ async def test_fetch_fleet_devices_paginates_past_500():
     assert len(result) == 600
     assert instance.get.await_count == 2
     assert instance.get.await_args_list[1].kwargs["params"] == {"skip": 500, "limit": 500}
+
+
+class _RunawayPaging(Exception):
+    """Raised by the fake inventory past the request count the 100,000 stop allows."""
+
+
+# OPS-REPORT-10 stops paging at 100,000 devices: 200 pages of 500.
+MAX_PAGES = 100_000 // 500
+CALLER_BEARER = "Bearer fleet-caller-token"
+INVENTORY_DEVICES_URL = f"{settings.inventory_service_url}/devices"
+
+
+def _fake_inventory(router, devices: list[dict], total) -> list[httpx.Request]:
+    """Serve `devices` from inventory's GET /devices by `skip` and `limit`, reporting
+    `total` (left out of the body when it is the string "absent"). Returns the list
+    the requests are recorded in. A request past MAX_PAGES raises _RunawayPaging,
+    which the fetch does not catch, so a loop whose stop is broken fails fast."""
+    seen: list[httpx.Request] = []
+
+    def _page(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) > MAX_PAGES:
+            raise _RunawayPaging(f"request {len(seen)} for the fleet")
+        skip = int(request.url.params["skip"])
+        limit = int(request.url.params["limit"])
+        body = {"items": devices[skip : skip + limit], "skip": skip, "limit": limit}
+        if total != "absent":
+            body["total"] = total
+        return httpx.Response(200, json=body)
+
+    router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=_page)
+    return seen
+
+
+def _assert_paged_by_500_with_the_callers_token(requests: list[httpx.Request]) -> None:
+    for page, sent in enumerate(requests):
+        assert sent.method == "GET"
+        assert str(sent.url) == f"{INVENTORY_DEVICES_URL}?skip={page * 500}&limit=500"
+        assert sent.headers["Authorization"] == CALLER_BEARER
+        assert "X-Internal-Token" not in sent.headers
+        assert sent.extensions["timeout"] == {
+            "connect": 10.0,
+            "read": 10.0,
+            "write": 10.0,
+            "pool": 10.0,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("held", "total"),
+    [
+        (0, 0),
+        (1, 1),
+        (499, 499),
+        (500, 500),
+        (501, 501),
+        (1000, 1000),
+        (1001, 1001),
+        (700, 1200),
+        (700, "absent"),
+        (700, "700"),
+        (700, None),
+    ],
+    ids=[
+        "empty",
+        "one",
+        "one-short-of-a-page",
+        "exactly-one-page",
+        "one-past-a-page",
+        "exactly-two-pages",
+        "one-past-two-pages",
+        "total-larger-than-held",
+        "total-absent",
+        "total-not-an-int",
+        "total-null",
+    ],
+)
+async def test_fetch_fleet_devices_lists_every_device_inventory_returns(held, total):
+    """OPS-REPORT-10: every device inventory returns, in its order, paged by 500 with
+    the caller's token. The boundaries are an empty fleet, a page edge on each side,
+    and an inventory whose `total` is larger than what it holds, absent, not an int,
+    or null: there a short page is the only sign the list is done. A fetch that stopped
+    early lists too few devices; one that never stopped reaches the 100,000 stop and
+    returns no list, or, with that stop broken too, raises _RunawayPaging. Each request
+    is also checked for a 10 second timeout and for no `X-Internal-Token` header; those
+    two are pinned as built (the spec's upstream table lists the timeout), and no
+    OPS-REPORT rule states them."""
+    devices = [_inventory_device(uuid.uuid4(), f"dev-{i:04d}") for i in range(held)]
+    with respx.mock(assert_all_called=False) as router:
+        requests = _fake_inventory(router, devices, total)
+        result = await fetch_fleet_devices(CALLER_BEARER)
+
+    assert result == devices
+    assert len(requests) >= max(1, -(-held // 500))
+    _assert_paged_by_500_with_the_callers_token(requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [500, 1000], ids=["one-page", "two-pages"])
+async def test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total(held):
+    """OPS-REPORT-10: a fleet whose size is an exact multiple of 500, reported in
+    `total`, takes no extra request. The request after the last full page would be
+    answered 503, which nulls the fleet, so a fetch that asked for it lists nothing."""
+    devices = [_inventory_device(uuid.uuid4(), f"dev-{i:04d}") for i in range(held)]
+    answers = [
+        httpx.Response(200, json={"items": devices[skip : skip + 500], "total": held})
+        for skip in range(0, held, 500)
+    ] + [httpx.Response(503, json={"detail": "down"})]
+    with respx.mock(assert_all_called=False) as router:
+        route = router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=answers)
+        result = await fetch_fleet_devices(CALLER_BEARER)
+
+    assert result == devices
+    assert route.call_count == held // 500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("total", "pages", "listed"),
+    [
+        (300, 1, 500),
+        (500, 1, 500),
+        (501, 2, 1000),
+        (True, 1, 500),
+        (False, 1, 500),
+        ("500", 3, 1000),
+        (500.0, 3, 1000),
+    ],
+    ids=[
+        "total-below-the-first-page",
+        "total-at-the-first-page",
+        "total-one-past",
+        "boolean-true",
+        "boolean-false",
+        "string",
+        "with-a-fraction",
+    ],
+)
+async def test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total(
+    total, pages, listed
+):
+    """OPS-REPORT-10: with a JSON integer `total`, the fetch stops after the page that
+    brings the devices held to at least `total`, even when inventory holds more (1,000
+    here) and the page is full; the devices past that page are not asked for. A
+    boolean reads as 1 or 0, so it stops the fetch after the first page. A `total` that
+    is a string, or a number written with a fraction (`500.0`), is ignored, so only the
+    short (empty) third page ends the fetch."""
+    devices = [_inventory_device(uuid.uuid4(), f"dev-{i:04d}") for i in range(1000)]
+    with respx.mock(assert_all_called=False) as router:
+        requests = _fake_inventory(router, devices, total)
+        result = await fetch_fleet_devices(CALLER_BEARER)
+
+    assert result == devices[:listed]
+    assert len(requests) == pages
+    _assert_paged_by_500_with_the_callers_token(requests)
+
+
+@pytest.mark.asyncio
+async def test_fetch_fleet_devices_stops_at_100_000_devices():
+    """OPS-REPORT-10's "stopping at 100,000": an inventory that answers a full page to
+    every request and never reports a total gets exactly 200 requests, the last at
+    skip 99,500. What the fetch then returns is pinned by the test below. Each request
+    is checked as in the test above, its 10 second timeout and the absence of
+    `X-Internal-Token` pinned as built, with no OPS-REPORT rule stating them."""
+    page = [_inventory_device(uuid.uuid4(), f"dev-{i:03d}") for i in range(500)]
+    with respx.mock(assert_all_called=False) as router:
+        requests: list[httpx.Request] = []
+
+        def _full_page(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) > MAX_PAGES + 1:
+                raise _RunawayPaging(f"request {len(requests)} for the fleet")
+            return httpx.Response(200, json={"items": page})
+
+        router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=_full_page)
+        await fetch_fleet_devices(CALLER_BEARER)
+
+    assert len(requests) == MAX_PAGES
+    _assert_paged_by_500_with_the_callers_token(requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("last_page_size", "total", "nulled"),
+    [
+        (500, "absent", True),
+        (500, 100_001, True),
+        (500, "100000", True),
+        (500, 100_000, False),
+        (499, "absent", False),
+    ],
+    ids=[
+        "full-no-total",
+        "full-short-of-total",
+        "full-string-total",
+        "full-reaches-total",
+        "short-no-total",
+    ],
+)
+async def test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total(
+    last_page_size, total, nulled
+):
+    """OPS-REPORT-10's cap: inventory answers 199 full pages, then a 200th of
+    `last_page_size` devices, with the given `total` (left out when "absent"). When the
+    200th page is full and does not reach a JSON integer `total` the fetch returns None,
+    the value it returns when inventory cannot answer; when the 200th page is short, or
+    reaches `total`, it returns every device. Either way it makes exactly 200 requests
+    (a 201st raises _RunawayPaging)."""
+    page = [_inventory_device(uuid.uuid4(), f"dev-{i:03d}") for i in range(500)]
+    with respx.mock(assert_all_called=False) as router:
+        requests: list[httpx.Request] = []
+
+        def _page(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) > MAX_PAGES:
+                raise _RunawayPaging(f"request {len(requests)} for the fleet")
+            body = {"items": page if len(requests) < MAX_PAGES else page[:last_page_size]}
+            if total != "absent":
+                body["total"] = total
+            return httpx.Response(200, json=body)
+
+        router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=_page)
+        result = await fetch_fleet_devices(CALLER_BEARER)
+
+    assert len(requests) == MAX_PAGES
+    if nulled:
+        assert result is None
+    else:
+        assert result == page * (MAX_PAGES - 1) + page[:last_page_size]
 
 
 @pytest.mark.asyncio
@@ -532,3 +831,49 @@ async def test_csv_route_other_sections_skip_inventory_fetch(admin_client):
         )
     assert resp.status_code == 200
     fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["json", "csv"])
+async def test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory(
+    admin_client, route
+):
+    """OPS-REPORT-10's cap through both routes, with respx as inventory: every request
+    gets a full page and no `total`. After 200 requests the JSON report answers 200
+    with `fleet` null (OPS-REPORT-11) and the fleet CSV answers 503 `Inventory service
+    is unreachable` (OPS-REPORT-14), as when inventory cannot answer. A request past
+    the 200th raises _RunawayPaging, so a fetch with no stop fails fast."""
+    page = [_inventory_device(uuid.uuid4(), f"dev-{i:03d}") for i in range(500)]
+    with respx.mock(assert_all_called=False) as router:
+        requests: list[httpx.Request] = []
+
+        def _full_page(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) > MAX_PAGES:
+                raise _RunawayPaging(f"request {len(requests)} for the fleet")
+            return httpx.Response(200, json={"items": page})
+
+        inventory = router.get(url__startswith=INVENTORY_DEVICES_URL).mock(side_effect=_full_page)
+        router.get(url__startswith=f"{settings.execution_service_url}/runs").mock(
+            return_value=httpx.Response(200, json={"total": 0})
+        )
+        if route == "json":
+            resp = await admin_client.get(
+                "/reports/utilization",
+                params=_window_params(),
+                headers={"Authorization": CALLER_BEARER},
+            )
+        else:
+            resp = await admin_client.get(
+                "/reports/utilization.csv",
+                params=_window_params(section="fleet"),
+                headers={"Authorization": CALLER_BEARER},
+            )
+
+    assert inventory.call_count == MAX_PAGES
+    if route == "json":
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["fleet"] is None
+    else:
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "Inventory service is unreachable"

@@ -1037,7 +1037,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   does not verify is 401. A service caller that forwards no bearer (execution,
   ai-orchestrator) gets every row as stored. \
   Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_redact_fork_connection`, `_decode_on_behalf_of`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_cabling_fork_call`) \
-  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`)
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named`)
 - **TOPO-CLAIM-1.** A wire to build whose `(device, port)` endpoint is already in a wire
   of another `ACTIVE` fork refuses the save or create with 409
   `{message, conflicts: [{reservation_id, device_id, port}]}`, conflicts sorted;
@@ -1100,7 +1100,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_fork_devices_batch.py` (`test_batch_returns_sorted_distinct_ids_active_and_archived`, `test_batch_id_with_no_fork_is_absent`, `test_batch_empty_list_is_422`, `test_batch_over_cap_is_422`, `test_batch_exactly_at_cap_is_accepted`)
 
 **Out of scope.** When reservations creates, saves, prunes, or archives a fork, and the
-user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-19). What execution
+user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-20). What execution
 builds from the wires and routes is `provisioning-and-wiring.md`.
 
 ### 8.13 Topology templates
@@ -1289,6 +1289,18 @@ is the user guide.
   escaped pair is imported. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_non_utf8_import_file_is_422_naming_the_encoding`, `test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_json_import_with_a_surrogate_pair_escape_is_not_refused`)
+- **TOPO-BULK-20.** A topology import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB)
+  answers 413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"],
+  "msg": "Request body is larger than <limit> bytes"}`, and nothing is parsed or written.
+  The route's own `extends_body_limit` bound covers the whole multipart envelope; this is
+  the exact per-file bound, applied to the bytes read: the read asks for one byte past
+  the bound, so a file one byte over it is refused, and the cap does not grow when an
+  operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does. Starlette has
+  already received and spooled the upload by then, so this bounds what is copied out of
+  the spool into memory and not the upload itself; a file up to 10 MiB is still decoded
+  and parsed on the event loop. The same rule on inventory is INV-BULK-23. \
+  Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 

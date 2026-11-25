@@ -7,13 +7,13 @@ import pytest
 pytestmark = pytest.mark.asyncio
 
 
-async def _create_short_reservation(client, device_id: str) -> dict:
+async def _create_short_reservation(client, device_id: str, hours: int = 1) -> dict:
     now = datetime.now(timezone.utc)
     body = {
         "device_ids": [device_id],
         "purpose": "reporting integration test",
         "start_time": now.isoformat(),
-        "end_time": (now + timedelta(hours=1)).isoformat(),
+        "end_time": (now + timedelta(hours=hours)).isoformat(),
     }
     resp = await client.post("/reservations/", json=body)
     assert resp.status_code == 201, resp.text
@@ -50,6 +50,66 @@ async def test_utilization_report_reflects_reservation(admin_client, fresh_devic
         # must exist once the report has any users).
         assert len(data["by_group"]) >= 1
         assert all("group_name" in b and "hours" in b for b in data["by_group"])
+    finally:
+        await admin_client.delete(f"/reservations/{reservation['id']}")
+
+
+# Each offset with the UTC hours at which a start written in it has a local date that
+# is not its UTC date: -12:00 puts it on the day before while the UTC hour is under 12,
+# +14:00 on the day after from 10:00 UTC on. Both are real zones.
+_OFFSET_WINDOWS = ((timedelta(hours=-12), range(0, 12)), (timedelta(hours=14), range(10, 24)))
+
+
+def _next_start_in_utc_hours(after: datetime, utc_hours: range) -> datetime:
+    """The first instant at least 10 minutes after `after` whose UTC hour is in `utc_hours`.
+
+    It steps to 10 minutes past the next hour until the hour fits, so the answer is
+    always less than 24 hours and 10 minutes after `after`.
+    """
+    candidate = after + timedelta(minutes=10)
+    while candidate.hour not in utc_hours:
+        candidate = candidate.replace(minute=10, second=0, microsecond=0) + timedelta(hours=1)
+    return candidate
+
+
+async def test_utilization_report_by_day_sums_to_total_with_an_offset_start(
+    admin_client, fresh_device
+):
+    """Issue #1523, OPS-REPORT-4: a start whose local date is not its UTC date.
+
+    One window per offset, -12:00 and +14:00, on every run whatever the hour: each
+    starts at the next instant within a day of now whose local date differs from its
+    UTC date, and lasts an hour. The reservation runs 26 hours from now, so it covers
+    both windows and is clipped to each window's start, the bound the day split used
+    to read local date fields from. Other tests' ACTIVE rows may share a window; the
+    invariant holds for all of them.
+    """
+    reservation = await _create_short_reservation(admin_client, fresh_device["id"], hours=26)
+    try:
+        now = datetime.now(timezone.utc)
+        for offset, utc_hours in _OFFSET_WINDOWS:
+            start_utc = _next_start_in_utc_hours(now, utc_hours)
+            end_utc = start_utc + timedelta(hours=1)
+            start = start_utc.astimezone(timezone(offset))
+            assert start.date() != start_utc.date(), start.isoformat()
+            resp = await admin_client.get(
+                "/reservations/reports/utilization",
+                params={"start": start.isoformat(), "end": end_utc.isoformat(), "status": "ACTIVE"},
+            )
+            assert resp.status_code == 200, (start.isoformat(), resp.text)
+            data = resp.json()
+            echoed = datetime.fromisoformat(data["window_start"].replace("Z", "+00:00"))
+            assert echoed == start_utc
+            assert echoed.utcoffset() == timedelta(0)
+            # This test's reservation covers the whole hour.
+            assert data["total_hours"] >= 1.0 - 1e-4, (start.isoformat(), data["total_hours"])
+            utc_days = {start_utc.date().isoformat(), end_utc.date().isoformat()}
+            assert {b["day"] for b in data["by_day"]} <= utc_days, start.isoformat()
+            assert all(b["hours"] > 0 for b in data["by_day"])
+            # Each bucket and the total are rounded to four places on their own.
+            assert sum(b["hours"] for b in data["by_day"]) == pytest.approx(
+                data["total_hours"], abs=1e-4 * (len(data["by_day"]) + 1)
+            ), start.isoformat()
     finally:
         await admin_client.delete(f"/reservations/{reservation['id']}")
 

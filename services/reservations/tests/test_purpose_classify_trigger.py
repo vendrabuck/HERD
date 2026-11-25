@@ -27,6 +27,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests._harness import override_bearer
+from tests._purpose_classify_answers import ANSWER_IDS, ANSWERS, deliver
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -52,7 +53,13 @@ async def _override_get_db():
 USER_ID = uuid.uuid4()
 ADMIN_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
-NOW = datetime.now(timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -91,13 +98,19 @@ def _suggestion_response(top_category: str = "qa_regression") -> httpx.Response:
     )
 
 
+# _insert's default request stamp, resolved against the test's NOW when _insert runs.
+_FIVE_MINUTES_AGO = object()
+
+
 async def _insert(
     *,
-    purpose_classify_requested_at: datetime | None = NOW - timedelta(minutes=5),
+    purpose_classify_requested_at: datetime | None | object = _FIVE_MINUTES_AGO,
     purpose_classify_attempts: int = 0,
     purpose_suggestion: dict | None = None,
     status: ReservationStatus = ReservationStatus.COMPLETED,
 ) -> uuid.UUID:
+    if purpose_classify_requested_at is _FIVE_MINUTES_AGO:
+        purpose_classify_requested_at = NOW - timedelta(minutes=5)
     res = Reservation(
         user_id=USER_ID,
         owner_name="owner",
@@ -289,3 +302,45 @@ async def test_trigger_is_admin_only():
     async with _client_as(OTHER_ID, role="user") as ac:
         resp = await ac.post(f"/admin/purpose-review/{rid}/classify")
     assert resp.status_code == 403
+
+
+async def _snapshot(rid: uuid.UUID) -> dict:
+    """Every mapped column of the row, read on a fresh session."""
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        return {a.key: getattr(res, a.key) for a in Reservation.__mapper__.column_attrs}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ANSWERS, ids=ANSWER_IDS)
+async def test_trigger_answers_the_outcome_word_for_every_answer(answer):
+    """RES-PURPOSE-13 over every answer class in `tests/_purpose_classify_answers.py`:
+    Classify now answers 503 `{"error": "purpose_classification_disabled"}` for a
+    feature-off answer and 200 with exactly the reservation id, the rule's outcome
+    word, and the stored suggestion (null unless one was stored) for every other. The
+    row's attempt count moves by one exactly where RES-PURPOSE-7 counts an attempt,
+    and a second eligible row is left as it was."""
+    bystander = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=30))
+    rid = await _insert()
+    bystander_before = await _snapshot(bystander)
+    call = AsyncMock(side_effect=lambda *a, **k: deliver(answer))
+    with patch("app.services.purpose_service.call_service", call):
+        async with _client_as(ADMIN_ID) as ac:
+            resp = await ac.post(f"/admin/purpose-review/{rid}/classify")
+
+    if answer.outcome == "feature_off":
+        assert resp.status_code == 503, resp.text
+        assert resp.json() == {"detail": {"error": "purpose_classification_disabled"}}
+    else:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "reservation_id": str(rid),
+            "outcome": answer.outcome,
+            "purpose_suggestion": answer.stores,
+        }
+    call.assert_awaited_once()
+    assert call.await_args.kwargs["json_body"]["reservation_id"] == str(rid)
+    res = await _get(rid)
+    assert res.purpose_suggestion == answer.stores
+    assert res.purpose_classify_attempts == (1 if answer.counts_attempt else 0)
+    assert await _snapshot(bystander) == bystander_before

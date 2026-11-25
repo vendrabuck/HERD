@@ -36,7 +36,6 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 
 SVC = "app.services.reservation_service"
 EXP = "app.tasks.expiration"
-NOW = datetime.now(timezone.utc)
 OWNER = uuid.uuid4()
 HELD = uuid.uuid4()
 OTHER = uuid.uuid4()
@@ -45,6 +44,13 @@ PENDING = ReservationStatus.PENDING
 PROVISION = ReservationStatus.PENDING_PROVISION
 ACTIVE = ReservationStatus.ACTIVE
 CANCELLED = ReservationStatus.CANCELLED
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -298,7 +304,16 @@ async def test_patch_losing_its_status_guard_keeps_nothing(seams, caplog, observ
     assert row.status == winner
     assert {str(d) for d in row.device_ids} == {str(HELD), str(OTHER)}
     assert row.purpose == "t"
-    assert row.pending_fork_prune_device_ids in (None, [])
+    # SQL-level NULL (issue #1522): a JSON "null" would also load as None.
+    async with Session() as s:
+        marker_is_null = (
+            await s.execute(
+                select(Reservation.pending_fork_prune_device_ids.is_(None)).where(
+                    Reservation.id == rid
+                )
+            )
+        ).scalar_one()
+    assert marker_is_null is True
     assert inv.calls == []
     prune.assert_not_called()
     assert await _subjects() == []

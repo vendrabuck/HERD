@@ -38,7 +38,7 @@ still refused, with a structured 409 `driver_cannot_configure` detail naming the
 connection type and driver.
 
 This gate has two independent layers. Inventory's `_assert_driver_can_configure`
-(`services/manage_guard.py`) checks it first, before any call reaches execution or a job
+(`services/inventory/app/services/manage_guard.py`) checks it first, before any call reaches execution or a job
 row is created. Execution carries its own copy of the same check (`_assert_action_permitted`
 in `services/execution/app/services/execution_service.py`, issue #870): both
 `POST /execute` and `POST /execute/internal` refuse a `configure` action against a
@@ -596,6 +596,14 @@ Driver code runs in a separate subprocess with these limits enforced:
 A driver that exceeds the wall-clock timeout is recorded with status `TIMEOUT` (not
 `FAILED`) and the error `Execution timed out after <N>s`; a `TIMEOUT` run can be retried
 like a `FAILED` one.
+The child runs in a process group of its own, and when the call ends, for any reason,
+the whole group is killed: a helper process the driver started (an `ssh` client, an
+`expect` script, a vendor CLI) does not outlive the call, even after a successful one.
+A helper that puts itself in a new session or process group (as a process that
+daemonizes itself does) is not killed; a driver must stop such a helper itself. If such a
+helper still holds the driver's stdout or stderr open when the driver exits, the call
+waits for it and ends with `Execution timed out after <N>s`, even after a successful
+driver method.
 A driver killed by a resource limit (for example out-of-memory or CPU exhaustion) is
 recorded as failed with the terminating signal.
 

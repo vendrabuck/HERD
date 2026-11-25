@@ -31,13 +31,29 @@ Two shapes of bound, both relative, never a threshold in seconds:
 - `cpu_ratio`: the code against a reference on the same input (a parse it saves, one C
   pass), which catches a constant-factor slowdown that growth cannot see. Use it only
   when the comparison IS the property, with the bound's margin recorded beside it.
+
+One measure reads no clock at all (#1512): `call_profile` counts what one call does,
+under a `sys.monitoring` tool of its own: the calls of C callables (functions,
+methods, types) that code in the profiled function's directory (its package) makes,
+by callable, and the regex calls among them by pattern; the Python functions started
+there, by name, and the code objects of those started anywhere else; and the Python
+steps taken there (lines, jumps, and generator resumes). It is exact and the same on
+every build measured, so a test can compare code with a frozen budget of the same C
+passes by counts, where a CPU-time ratio of two equal costs is noise around 1.
 """
 
 from __future__ import annotations
 
 import gc
+import os
+import re
+import sys
+import threading
 import time
+import types
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -113,6 +129,169 @@ def growth_ratios(
         if gc_was_enabled:
             gc.enable()
     return n, times, _ratios(times)
+
+
+@dataclass(frozen=True)
+class CallProfile:
+    """What one call did, as `call_profile` counts it."""
+
+    c_calls: Counter[str]
+    python_calls: Counter[str]
+    outside_starts: tuple[types.CodeType, ...]
+    steps: int
+    call_events: int
+    patterns: Counter[tuple[str, str | bytes, int]]
+
+
+# The `sys.monitoring` tool ids `call_profile` may claim, in order: the profiler's, then
+# the two CPython leaves unnamed. The debugger's (0), coverage's (1), and the
+# optimizer's (5) are left to their owners.
+_TOOL_IDS = (2, 3, 4)
+
+
+def call_profile(fn: Callable[..., object], *args: object) -> CallProfile:
+    """Count what `fn(*args)` does in this thread; no clock is read.
+
+    Its home is the directory of `fn`'s own file and every directory below it (for a
+    function of `herd_common`, the whole package), so a helper moved to another module
+    of the package is counted exactly as before the move. This helper's own code is
+    never counted, though it sits in `tests/`.
+
+    - `c_calls`: each call of a callable that is not a Python function or method (a
+      builtin function, a method of a builtin type, a type), made by code in its home,
+      by `__qualname__`: `bytes.count`, `Pattern.search`, `sum`. A C call made by code
+      outside the home is not counted, nor are its steps.
+    - `python_calls`: each Python function in its home started, by `co_name`, `fn`
+      itself included; a generator counts once, when it first starts.
+    - `outside_starts`: the code object of each Python function outside its home
+      started during the call, in order, one entry per start, whether the home called
+      it or a C function called back into it. A caller compares them by identity
+      (`code is json.detect_encoding.__code__`), so outside code cannot pass under the
+      name of a function it allows.
+    - `steps`: the LINE, JUMP, and PY_RESUME events of code in its home. A loop on one
+      line fires one LINE event in all but one JUMP per iteration, so any Python loop in
+      the home grows `steps` with its number of iterations.
+    - `call_events`: every CALL event made by code in its home, Python callees
+      included, so a caller can tell that CALL events arrived at all.
+    - `patterns`: each call counted in `c_calls` whose callable's qualname starts with
+      `Pattern.` (a method of a compiled regex), by (qualname, pattern, flags), so a
+      regex run more often, or in place of another, changes a count.
+
+    Not seen: operators (`in`, `==`, slicing, `+`), which are bytecode, not calls; the
+    work inside one C call (`bytes.count` of a longer substring is still one call); the
+    calls one C function makes to another; and code outside the home resumed, not
+    started, during the call: a generator (or coroutine) of outside code first started
+    before the profile and resumed from the home, by a `for` loop, an `in` test, or
+    unpacking (bytecode, no call), or by `next` or `send` (a C call, counted, but not
+    the work the generator then does). Its PY_RESUME events are dropped with every
+    other event of outside code.
+
+    The events come from a `sys.monitoring` tool id of this helper's own, claimed for
+    the call and released after it (its events cleared, its callbacks unregistered).
+    The garbage collector is off during the call and is left as it was found, also when
+    the call or the hook's own setup raises. Coverage measures through `sys.settrace`
+    (its C tracer, the default before Python 3.14) or through its own tool id
+    (`sys.monitoring.COVERAGE_ID`, the default from 3.14); every tool and the trace
+    function receive each event independently, so neither changes what the other sees,
+    and this helper never calls `sys.settrace` or `sys.setprofile`. Events of other
+    threads are dropped. It raises `RuntimeError` when every id in `_TOOL_IDS` is taken,
+    and `AssertionError` (a `raise`, so `python -O` keeps it) when it saw no start of
+    `fn`'s own code, so an empty profile never reaches a caller.
+    """
+    monitoring = sys.monitoring
+    events = monitoring.events
+    tool = next((tid for tid in _TOOL_IDS if monitoring.get_tool(tid) is None), None)
+    if tool is None:
+        raise RuntimeError(f"call_profile: sys.monitoring tool ids {_TOOL_IDS} are all taken")
+    home = os.path.dirname(os.path.abspath(fn.__code__.co_filename)) + os.sep
+    in_home: dict[str, bool] = {}
+    thread = threading.get_ident()
+    own = call_profile.__code__
+    c_calls: Counter[str] = Counter()
+    python_calls: Counter[str] = Counter()
+    outside_starts: list[types.CodeType] = []
+    patterns: Counter[tuple[str, str | bytes, int]] = Counter()
+    started = False
+    steps = 0
+    call_events = 0
+
+    def at_home(code: types.CodeType) -> bool:
+        name = code.co_filename
+        if name not in in_home:
+            in_home[name] = os.path.abspath(name).startswith(home)
+        return in_home[name]
+
+    def on_call(code: types.CodeType, _offset: int, callee: object, arg0: object) -> None:
+        nonlocal call_events
+        if threading.get_ident() != thread or code is own or not at_home(code):
+            return
+        call_events += 1
+        if isinstance(callee, (types.FunctionType, types.MethodType)):
+            return
+        name = getattr(callee, "__qualname__", type(callee).__qualname__)
+        c_calls[name] += 1
+        if name.startswith("Pattern."):
+            owner = getattr(callee, "__self__", None)
+            owner = owner if isinstance(owner, re.Pattern) else arg0
+            if isinstance(owner, re.Pattern):
+                patterns[name, owner.pattern, owner.flags] += 1
+
+    def on_start(code: types.CodeType, _offset: int) -> None:
+        nonlocal started
+        if threading.get_ident() != thread:
+            return
+        if at_home(code):
+            python_calls[code.co_name] += 1
+            started = started or code is fn.__code__
+        else:
+            outside_starts.append(code)
+
+    def on_step(code: types.CodeType, *_where: int) -> None:
+        nonlocal steps
+        if threading.get_ident() == thread and code is not own and at_home(code):
+            steps += 1
+
+    callbacks = {
+        events.CALL: on_call,
+        events.PY_START: on_start,
+        events.LINE: on_step,
+        events.JUMP: on_step,
+        events.PY_RESUME: on_step,
+    }
+    mask = 0
+    for event in callbacks:
+        mask |= event
+    gc_was_enabled = gc.isenabled()
+    monitoring.use_tool_id(tool, "herd cost call_profile")
+    try:
+        for event, callback in callbacks.items():
+            monitoring.register_callback(tool, event, callback)
+        gc.disable()
+        try:
+            monitoring.set_events(tool, mask)
+            fn(*args)
+        finally:
+            try:
+                monitoring.set_events(tool, 0)
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+    finally:
+        for event in callbacks:
+            monitoring.register_callback(tool, event, None)
+        monitoring.free_tool_id(tool)
+    if not started:
+        raise AssertionError(
+            f"call_profile saw no start of {fn.__qualname__}: no events were recorded"
+        )
+    return CallProfile(
+        c_calls=c_calls,
+        python_calls=python_calls,
+        outside_starts=tuple(outside_starts),
+        steps=steps,
+        call_events=call_events,
+        patterns=patterns,
+    )
 
 
 def _once(fn: Callable[[], object]) -> float:

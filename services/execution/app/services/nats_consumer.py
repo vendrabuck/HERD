@@ -188,7 +188,7 @@ def _wiring_load_failure(exc: BaseException, switch_id: str) -> tuple[str, int]:
 async def _run_sandbox(*args, **kwargs):
     """Run the synchronous driver sandbox off the event loop (issue #317).
 
-    execute_driver_method blocks on subprocess.run for up to
+    execute_driver_method blocks on its driver child for up to
     recipe_timeout_seconds. Running it inline on the consumer's event-loop task
     stalls the loop, starving the outbox relay, the health scheduler, and the
     per-message ack heartbeat, and serializes every replica's provisioning on one

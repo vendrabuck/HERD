@@ -27,7 +27,6 @@ from sqlalchemy import select, update
 from tests._harness import TestSessionLocal
 
 SVC = "app.services.reservation_service"
-NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 DEV = uuid.uuid4()
 DEV2 = uuid.uuid4()
@@ -37,6 +36,27 @@ PROVISION = ReservationStatus.PENDING_PROVISION
 ACTIVE = ReservationStatus.ACTIVE
 CANCELLED = ReservationStatus.CANCELLED
 COMPLETED = ReservationStatus.COMPLETED
+FAILED = ReservationStatus.FAILED
+
+# The statuses that end a reservation (docs/specs/reservations.md section 4), stated
+# here on their own and NOT read from the product's tuple, so a defect in that tuple
+# cannot also bend the test. Every other member of the enum is non-terminal by
+# construction: a status added later lands in NON_TERMINAL, where the cancel race
+# tests expect it to be retried and cancelled; if the product treats it as terminal
+# (lists it in _TERMINAL_STATUSES), those tests fail until it is moved into TERMINAL
+# here. A new status listed in neither place is tested as live and passes.
+TERMINAL = (COMPLETED, CANCELLED, FAILED)
+NON_TERMINAL = tuple(s for s in ReservationStatus if s not in TERMINAL)
+# Statuses whose row holds its exclusive devices (issue #897): a cancel that leaves
+# one of these releases them, a cancel that leaves anything else does not.
+DEVICE_HOLDING = (PROVISION, ACTIVE)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 async def _set_status_on_second_session(rid, status):
@@ -54,6 +74,12 @@ async def _subjects():
 async def _row(rid):
     async with TestSessionLocal() as s:
         return (await s.execute(select(Reservation).where(Reservation.id == rid))).scalar_one()
+
+
+async def _columns(rid):
+    """Every mapped column of the row, read on a fresh session."""
+    row = await _row(rid)
+    return {a.key: getattr(row, a.key) for a in Reservation.__mapper__.column_attrs}
 
 
 async def _insert(status, device_ids=(DEV,)):
@@ -244,7 +270,11 @@ async def test_lost_create_revert_skips_a_device_a_newer_booking_holds(seams):
 
 
 def _racing_claim(rid, winner_status):
-    """Wrap the real CAS so the winner's write lands first, on a second session."""
+    """Wrap the real CAS so the winner's write lands first, on a second session.
+
+    `wrapper.attempts` records each CAS as (expected statuses, new status, won), and
+    `wrapper.after_winner` holds every column of the row just after the winner's commit.
+    """
     real = svc._claim_status_transition
     fired = {"n": 0}
 
@@ -252,23 +282,82 @@ def _racing_claim(rid, winner_status):
         if fired["n"] == 0:
             fired["n"] += 1
             await _set_status_on_second_session(rid, winner_status)
-        return await real(db, reservation_id, expected, new_status)
+            wrapper.after_winner = await _columns(rid)
+        expected = tuple(expected)
+        won = await real(db, reservation_id, expected, new_status)
+        wrapper.attempts.append((expected, new_status, won))
+        return won
 
+    wrapper.attempts = []
+    wrapper.after_winner = None
     return wrapper
 
 
-async def test_cancel_loses_to_a_concurrent_completion_is_a_noop(seams):
-    rid = await _insert(ACTIVE)
+@pytest.mark.parametrize("winner", TERMINAL, ids=lambda s: s.value)
+@pytest.mark.parametrize("loaded", NON_TERMINAL, ids=lambda s: f"from_{s.value}")
+async def test_cancel_loses_to_any_terminal_winner_is_a_noop(seams, loaded, winner):
+    """RES-CANCEL-4: a row a concurrent writer ENDED is left exactly as the winner wrote it.
+
+    The cancel loaded a live row; before its CAS lands, another writer moves the row to
+    a terminal status. The cancel loses, re-reads, sees the end, and stops: no second
+    CAS (a CANCELLED winner must not be cancelled again, a FAILED one must not be
+    overwritten), no event, no field written, no inventory call, no fork archive.
+    "No field written" is checked on every mapped column of the row against a
+    snapshot taken right after the winner's commit.
+    """
+    rid = await _insert(loaded)
     inv = Inventory()
+    claim = _racing_claim(rid, winner)
     with (
         patch(f"{SVC}._update_device_statuses", new=inv),
-        patch(f"{SVC}._claim_status_transition", new=_racing_claim(rid, COMPLETED)),
+        patch(f"{SVC}._claim_status_transition", new=claim),
     ):
         async with TestSessionLocal() as db:
             out = await cancel_reservation(db, rid, USER_ID, "tok")
-    assert out.status == COMPLETED
+        svc._archive_reservation_fork_best_effort.assert_not_awaited()
+    assert out.status == winner
+    assert claim.attempts == [((loaded,), CANCELLED, False)]
+    assert claim.after_winner["status"] == winner
+    assert await _columns(rid) == claim.after_winner
     assert await _subjects() == []
     assert inv.calls == []
+
+
+@pytest.mark.parametrize(
+    ("loaded", "winner"),
+    [(a, b) for a in NON_TERMINAL for b in NON_TERMINAL if a != b],
+    ids=lambda s: s.value,
+)
+async def test_cancel_loses_to_a_non_terminal_winner_retries_and_cancels(seams, loaded, winner):
+    """RES-CANCEL-4, the complement: a row that only MOVED is still cancelled.
+
+    The winner wrote a live status (for example the restart backstop's revert of
+    PENDING_PROVISION to PENDING, RES-SWEEP-7), so the cancel retries from the fresh
+    status, wins, and stages exactly one reservation.cancelled; it releases devices
+    only if the status it left holds them. A winner that wrote the status the cancel
+    loaded is no race at all (the first CAS wins), so those pairs are left out.
+    """
+    rid = await _insert(loaded)
+    inv = Inventory()
+    claim = _racing_claim(rid, winner)
+    with (
+        patch(f"{SVC}._update_device_statuses", new=inv),
+        patch(f"{SVC}._claim_status_transition", new=claim),
+    ):
+        async with TestSessionLocal() as db:
+            out = await cancel_reservation(db, rid, USER_ID, "tok")
+    assert out.status == CANCELLED
+    assert claim.attempts == [
+        ((loaded,), CANCELLED, False),
+        ((winner,), CANCELLED, True),
+    ]
+    row = await _row(rid)
+    assert row.status == CANCELLED
+    assert row.modified_by == USER_ID
+    assert row.purpose_classify_requested_at is not None
+    assert await _subjects() == ["herd.reservations.cancelled"]
+    expected_release = [([str(DEV)], "AVAILABLE")] if winner in DEVICE_HOLDING else []
+    assert inv.calls == expected_release
 
 
 async def test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward(seams):
@@ -341,14 +430,17 @@ async def test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing(
     """Three lost CASes on a row that stays non-terminal: no silent give-up."""
     rid = await _insert(ACTIVE)
     inv = Inventory()
+    claim = AsyncMock(return_value=False)
     with (
         patch(f"{SVC}._update_device_statuses", new=inv),
-        patch(f"{SVC}._claim_status_transition", new=AsyncMock(return_value=False)),
+        patch(f"{SVC}._claim_status_transition", new=claim),
         caplog.at_level("WARNING"),
     ):
         async with TestSessionLocal() as db:
             out = await cancel_reservation(db, rid, USER_ID, "tok")
     assert out.status == ACTIVE
+    # Three compare-and-swap attempts in all (the first and two retries), then it stops.
+    assert claim.await_count == 3
     warned = [
         r for r in caplog.records if getattr(r, "action", "") == "reservation_cancel_cas_exhausted"
     ]

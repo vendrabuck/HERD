@@ -14,12 +14,17 @@ from app.dependencies.auth import get_current_user_payload, require_admin
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus
 from app.routers.reservations import bearer_scheme
+from app.schemas.reservation import ProvisionResultRequest
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
+from fastapi import FastAPI
+from fastapi.routing import RouteContext
+from fastapi.security import HTTPAuthorizationCredentials
 from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
+from tests._route_table import otherwise_valid_request, path_segments, routes_where
 
 USER_ID = str(uuid.uuid4())
 OTHER_USER_ID = str(uuid.uuid4())
@@ -27,11 +32,16 @@ DEVICE_A = str(uuid.uuid4())
 DEVICE_B = str(uuid.uuid4())
 DEVICE_CLOUD = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
-# Immediate ("start now") window: start_time within the start-grace of now, so
-# create provisions immediately (status ACTIVE) rather than scheduling PENDING.
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    # Immediate ("start now") window: start_time within the start-grace of now, so
+    # create provisions immediately (status ACTIVE) rather than scheduling PENDING.
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 def override_auth():
@@ -660,11 +670,15 @@ async def _insert_reservation_row(
     start_offset: timedelta = timedelta(minutes=-30),
     end_offset: timedelta = timedelta(hours=1),
     topology_id: uuid.UUID | None = None,
+    user_id: str = USER_ID,
+    device_ids: tuple[str, ...] = (DEVICE_A,),
 ) -> str:
     """Insert a reservation row directly, bypassing the create router.
 
     Lets each test pin status + window precisely without invoking the inventory
-    mocks that `_create_test_reservation` requires.
+    mocks that `_create_test_reservation` requires. The owner and device set are
+    parameters so a lookup test can seed a reservation that must NOT match
+    (another owner, another device) beside the one that must (#1529).
     """
     rid = uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -672,9 +686,9 @@ async def _insert_reservation_row(
         session.add(
             Reservation(
                 id=rid,
-                user_id=uuid.UUID(USER_ID),
+                user_id=uuid.UUID(user_id),
                 owner_name="testuser",
-                device_ids=[DEVICE_A],
+                device_ids=list(device_ids),
                 topology_id=topology_id,
                 topology_type=TopologyType.PHYSICAL,
                 purpose="internal-status-test",
@@ -1037,6 +1051,281 @@ async def test_internal_active_no_collision_with_int_status_path(internal_client
     # before even reaching the handler. We get a 200 with our own schema body.
     assert resp.status_code == 200
     assert "owns_active" in resp.json()
+
+
+# --- Device lookups answer only from the reservation holding the device (#1529) ---
+#
+# RES-INTERNAL-3, -4, and -5 each test membership with an EXISTS over
+# reservation_devices that must be correlated to the outer reservation. Without
+# the correlation, a reservation that passes the lookup's other filters matches
+# as soon as ANY reservation holds the queried device, so every test below seeds
+# two reservations, both in window and ACTIVE unless the by-device test sets
+# another status: USER_ID holds only DEVICE_A and OTHER_USER_ID holds only
+# DEVICE_B. Each device is then queried, and the answer must come from its
+# holder alone.
+
+HOLDER = {DEVICE_A: USER_ID, DEVICE_B: OTHER_USER_ID}
+QUERIED_DEVICE = pytest.mark.parametrize(
+    "device_id", [DEVICE_A, DEVICE_B], ids=["device_a", "device_b"]
+)
+
+
+async def _seed_one_holder_per_device(
+    status: ReservationStatus = ReservationStatus.ACTIVE,
+) -> dict[str, str]:
+    """Seed one reservation per device in HOLDER; map each device to its row's id."""
+    return {
+        device: await _insert_reservation_row(status=status, user_id=owner, device_ids=(device,))
+        for device, owner in HOLDER.items()
+    }
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+@pytest.mark.parametrize("user_id", [USER_ID, OTHER_USER_ID], ids=["user", "other_user"])
+async def test_internal_active_answers_only_from_the_users_reservation_holding_the_device(
+    internal_client, device_id, user_id
+):
+    """RES-INTERNAL-3: each user owns an ACTIVE in-window reservation, but only one
+    of them holds the queried device; the other user's answer is false."""
+    await _seed_one_holder_per_device()
+    resp = await internal_client.get(
+        "/internal/active",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        params={"user_id": user_id, "device_id": device_id},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"owns_active": HOLDER[device_id] == user_id}
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+async def test_active_users_lists_only_the_owner_of_the_reservation_holding_the_device(
+    internal_client, device_id
+):
+    """RES-INTERNAL-4: the owner of an ACTIVE in-window reservation on another
+    device is not a holder of the queried one."""
+    await _seed_one_holder_per_device()
+    resp = await internal_client.get(
+        "/internal/active-users",
+        params={"device_id": device_id},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == [HOLDER[device_id]]
+
+
+@pytest.mark.asyncio
+@QUERIED_DEVICE
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+async def test_internal_by_device_returns_only_the_reservation_holding_the_device(
+    internal_client, device_id, status
+):
+    """RES-INTERNAL-5: by-device returns the reservation holding the device in every
+    status, and never a reservation in that same status on another device."""
+    rids = await _seed_one_holder_per_device(status)
+    resp = await internal_client.get(
+        f"/internal/by-device/{device_id}", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [item["id"] for item in items] == [rids[device_id]]
+    assert items[0]["user_id"] == HOLDER[device_id]
+    assert items[0]["device_id"] == device_id
+    assert items[0]["status"] == status.value
+
+
+# --- owns_active and active-users: the status and the window, enumerated (#1529) ---
+#
+# RES-INTERNAL-3 and -4 answer only from an ACTIVE reservation whose window
+# contains now. The row under test is USER_ID's on DEVICE_A, in the status and
+# window each case sets. Beside it OTHER_USER_ID holds DEVICE_A through an ACTIVE
+# reservation in window. That row must match for active-users and for owns_active
+# asked as OTHER_USER_ID; for owns_active asked as USER_ID it must NOT match, and
+# it differs from a matching row only in its owner. Either way the row under test
+# is decided by its own status or window alone. "ended" is a reservation still ACTIVE
+# after its end (the sweep has not completed it yet); a released one is
+# COMPLETED with its window unchanged, which the status cases cover. Each bound
+# is missed by a minute, never at the boundary instant.
+
+WINDOWS = {
+    "current": (timedelta(minutes=-30), timedelta(hours=1)),
+    "ended": (timedelta(hours=-2), timedelta(minutes=-1)),
+    "not_started": (timedelta(minutes=1), timedelta(hours=2)),
+}
+EVERY_STATUS = pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+EVERY_WINDOW = pytest.mark.parametrize("window", list(WINDOWS))
+
+
+async def _seed_row_under_test_beside_a_holder(
+    *, status: ReservationStatus = ReservationStatus.ACTIVE, window: str = "current"
+) -> None:
+    start_offset, end_offset = WINDOWS[window]
+    await _insert_reservation_row(
+        status=status,
+        start_offset=start_offset,
+        end_offset=end_offset,
+        user_id=USER_ID,
+        device_ids=(DEVICE_A,),
+    )
+    await _insert_reservation_row(user_id=OTHER_USER_ID, device_ids=(DEVICE_A,))
+
+
+async def _owns_active(client: AsyncClient, user_id: str) -> dict:
+    resp = await client.get(
+        "/internal/active",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        params={"user_id": user_id, "device_id": DEVICE_A},
+    )
+    assert resp.status_code == 200
+    return resp.json()
+
+
+async def _active_users(client: AsyncClient) -> list[str]:
+    resp = await client.get(
+        "/internal/active-users",
+        params={"device_id": DEVICE_A},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+    )
+    assert resp.status_code == 200
+    return sorted(resp.json())
+
+
+@pytest.mark.asyncio
+@EVERY_STATUS
+async def test_internal_active_is_true_only_for_an_active_reservation(internal_client, status):
+    await _seed_row_under_test_beside_a_holder(status=status)
+    assert await _owns_active(internal_client, USER_ID) == {
+        "owns_active": status is ReservationStatus.ACTIVE
+    }
+    assert await _owns_active(internal_client, OTHER_USER_ID) == {"owns_active": True}
+
+
+@pytest.mark.asyncio
+@EVERY_WINDOW
+async def test_internal_active_is_true_only_while_the_window_contains_now(internal_client, window):
+    await _seed_row_under_test_beside_a_holder(window=window)
+    assert await _owns_active(internal_client, USER_ID) == {"owns_active": window == "current"}
+    assert await _owns_active(internal_client, OTHER_USER_ID) == {"owns_active": True}
+
+
+@pytest.mark.asyncio
+@EVERY_STATUS
+async def test_active_users_lists_only_owners_of_active_reservations(internal_client, status):
+    await _seed_row_under_test_beside_a_holder(status=status)
+    expected = [OTHER_USER_ID] + ([USER_ID] if status is ReservationStatus.ACTIVE else [])
+    assert await _active_users(internal_client) == sorted(expected)
+
+
+@pytest.mark.asyncio
+@EVERY_WINDOW
+async def test_active_users_lists_only_owners_whose_window_contains_now(internal_client, window):
+    await _seed_row_under_test_beside_a_holder(window=window)
+    expected = [OTHER_USER_ID] + ([USER_ID] if window == "current" else [])
+    assert await _active_users(internal_client) == sorted(expected)
+
+
+# --- RES-INTERNAL-1 on every internal route (#1529) ---
+#
+# The routes are read from the app through FastAPI's iter_route_contexts, which
+# flattens included routers: every route with a path segment equal to "internal",
+# for each method it declares except HEAD and OPTIONS. A new internal route is
+# covered without editing this section only when its path and query parameters
+# are all required UUIDs and its body model, if any, is in INTERNAL_BODIES; any
+# other parameter fails both tests with a message naming what to add, and so does
+# an unknown body model. Each request is otherwise valid, so the token is the
+# only thing wrong, and the token is checked before any lookup, so no row is
+# needed.
+#
+# Limits: a route whose path has no "internal" segment is not read, however it is
+# guarded; a mounted sub-application is not read (iter_route_contexts does not
+# descend into a Mount, and an entry without methods is skipped); HEAD and OPTIONS
+# are not requested; a header, cookie, or dependency the route needs besides the
+# token is not supplied, so such a route fails on the error list rather than
+# with a hint.
+
+INTERNAL_BODIES = {ProvisionResultRequest: {"succeeded": True, "device_ids": [], "error": None}}
+KNOWN_INTERNAL_ROUTES = {
+    ("GET", "/internal/{reservation_id}"),
+    ("GET", "/internal/active"),
+    ("GET", "/internal/active-users"),
+    ("GET", "/internal/held-devices"),
+    ("GET", "/internal/by-topology/{topology_id}"),
+    ("GET", "/internal/by-device/{device_id}"),
+    ("POST", "/internal/{reservation_id}/provision-result"),
+}
+
+
+def _is_internal_path(path: str) -> bool:
+    return "internal" in path_segments(path)
+
+
+def _internal_routes(routes=None) -> list[tuple[str, RouteContext]]:
+    """(method, route) for every internal route of `routes` (the app's by default)."""
+    return routes_where(_is_internal_path, routes)
+
+
+EVERY_INTERNAL_ROUTE = pytest.mark.parametrize(
+    ("method", "route"),
+    _internal_routes(),
+    ids=[f"{method} {route.path}" for method, route in _internal_routes()],
+)
+
+
+def _otherwise_valid_request(route: RouteContext) -> dict:
+    """The URL, query, and body that pass validation for `route`."""
+    return otherwise_valid_request(
+        route,
+        bodies=INTERNAL_BODIES,
+        bodies_name="INTERNAL_BODIES",
+        where="_otherwise_valid_request in services/reservations/tests/test_reservations.py",
+    )
+
+
+def test_internal_routes_are_read_from_the_app():
+    """The derived list is not vacuous: it holds every route in the spec's table."""
+    derived = {(method, route.path) for method, route in _internal_routes()}
+    assert KNOWN_INTERNAL_ROUTES <= derived
+
+
+def test_internal_routes_match_a_segment_and_skip_head_and_mounts():
+    """The selection rules in the block comment, on a small app of their edge cases."""
+    probe = FastAPI()
+
+    @probe.api_route("/internal/x", methods=["GET", "HEAD"])
+    async def internal_x():
+        return {}
+
+    @probe.get("/x/{item_id}/internal-notes")
+    async def notes(item_id: uuid.UUID):
+        return {}
+
+    probe.mount("/internal/sub", FastAPI())
+    assert [(m, r.path) for m, r in _internal_routes(probe.routes)] == [("GET", "/internal/x")]
+
+
+@pytest.mark.asyncio
+@EVERY_INTERNAL_ROUTE
+async def test_every_internal_route_answers_422_without_the_token_header(
+    internal_client, method, route
+):
+    resp = await internal_client.request(method, **_otherwise_valid_request(route))
+    assert resp.status_code == 422
+    errors = resp.json()["detail"]
+    assert all({"loc", "msg", "type"} <= error.keys() for error in errors)
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (["header", "x-internal-token"], "missing")
+    ]
+
+
+@pytest.mark.asyncio
+@EVERY_INTERNAL_ROUTE
+async def test_every_internal_route_answers_403_to_a_wrong_token(internal_client, method, route):
+    resp = await internal_client.request(
+        method, headers={"X-Internal-Token": "wrong-token"}, **_otherwise_valid_request(route)
+    )
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Invalid internal token"}
 
 
 # --- Cancel edge cases ---
@@ -3852,6 +4141,15 @@ _CALENDAR_LOOKUP_FAILURES = {
     "device_ids_missing": dict(response=_resp(200, {})),
     "device_ids_not_a_list": dict(response=_resp(200, {"device_ids": "x"})),
     "device_ids_not_strings": dict(response=_resp(200, {"device_ids": [1, 2]})),
+    "transport_timeout": dict(exc=httpx.ReadTimeout("inventory slow")),
+    # A non-200 is refused on its status alone: each of these carries a body of
+    # the accepted shape that names the seeded device (issue #1533).
+    **{
+        f"status_{code}_with_a_well_formed_body": dict(
+            response=_resp(code, {"device_ids": [DEVICE_A]})
+        )
+        for code in (201, 204, 302, 304, 400, 404, 429, 500, 502, 503)
+    },
 }
 
 
@@ -3914,6 +4212,263 @@ async def test_create_visibility_precheck_still_skips_on_a_misshapen_answer(non_
     with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
         resp = await _create_test_reservation(non_admin_client, device_ids=[DEVICE_A])
     assert resp.status_code == 201
+
+
+# --- calendar visibility is the caller's, row by row; PATCH pre-check scope (issue #1533) ---
+
+CALLER_ID = str(uuid.uuid4())
+CALLER_TOKEN = "caller-jwt-1533"
+# Visible to OTHER_USER_ID only, never to CALLER_ID.
+DEVICE_X = str(uuid.uuid4())
+_ROLES = ("user", "admin", "superadmin")
+_ADMIN_ROLES = ("admin", "superadmin")
+_EDITABLE = (ReservationStatus.ACTIVE, ReservationStatus.PENDING)
+
+
+def _client_as(sub: str, role: str, token: str = CALLER_TOKEN) -> AsyncClient:
+    payload = {"sub": sub, "username": f"{role}-1533", "role": role}
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user_payload] = lambda: payload
+    app.dependency_overrides[bearer_scheme] = lambda: HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials=token
+    )
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+def _visibility_by_user(answers: dict[str, list[str]]):
+    """A stand-in httpx.AsyncClient whose GET answers 200 with the device ids that
+    `answers` gives for the queried `user_id` (an unknown user sees none)."""
+    mock_client = _visible_devices_client(response=None)
+
+    async def get(url, **kwargs):
+        user_id = kwargs.get("params", {}).get("user_id")
+        return _resp(200, {"device_ids": answers.get(user_id, [])})
+
+    mock_client.get.side_effect = get
+    return mock_client
+
+
+def _outbound_calls(mock_client) -> list[str]:
+    """The client methods the router called, magic methods left out."""
+    return [name for name, _, _ in mock_client.method_calls if not name.startswith("__")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", _ROLES)
+async def test_calendar_visibility_is_the_callers_and_judged_per_row(role):
+    """RES-CAL-1 and RES-CAL-3: the calendar holds every user's overlapping rows;
+    for a non-admin only those whose own devices are ALL visible to the CALLER.
+
+    Inventory answers per user: the caller sees DEVICE_A and DEVICE_B, the other
+    user also sees DEVICE_X. The caller's own row on DEVICE_A and the other
+    user's row on DEVICE_B come back; the other user's row on DEVICE_A plus
+    DEVICE_X and the caller's row on DEVICE_X do not. The one lookup is a GET of
+    inventory's visible-devices URL for the caller's user id, carrying the
+    caller's bearer token and no internal token. Admins and superadmins get all
+    four rows and never ask.
+    """
+    rows = [
+        await _insert_reservation_for_user(
+            user_id=owner,
+            device_ids=devices,
+            start_offset=timedelta(minutes=start_min),
+            end_offset=timedelta(minutes=start_min + 30),
+        )
+        for owner, devices, start_min in (
+            (CALLER_ID, [DEVICE_X], 180),
+            (OTHER_USER_ID, [DEVICE_A, DEVICE_X], 120),
+            (OTHER_USER_ID, [DEVICE_B], 60),
+            (CALLER_ID, [DEVICE_A], -30),
+        )
+    ]
+    caller_x, other_a_x, other_b, caller_a = rows
+    mock_client = _visibility_by_user(
+        {CALLER_ID: [DEVICE_A, DEVICE_B], OTHER_USER_ID: [DEVICE_A, DEVICE_B, DEVICE_X]}
+    )
+    from app.config import settings
+
+    try:
+        async with _client_as(CALLER_ID, role) as ac:
+            with patch("app.routers.reservations.httpx.AsyncClient", return_value=mock_client):
+                cal = await ac.get("/calendar", params=_calendar_params())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert cal.status_code == 200, cal.text
+    got = [r["id"] for r in cal.json()]
+    if role in _ADMIN_ROLES:
+        assert got == [caller_a, other_b, other_a_x, caller_x]
+        assert _outbound_calls(mock_client) == []
+        return
+    assert got == [caller_a, other_b]
+    assert _outbound_calls(mock_client) == ["get"]
+    call = mock_client.get.call_args
+    assert call.args == (f"{settings.inventory_service_url}/device-groups/visible-devices",)
+    assert call.kwargs["params"] == {"user_id": CALLER_ID}
+    assert call.kwargs["headers"]["Authorization"] == f"Bearer {CALLER_TOKEN}"
+    assert "X-Internal-Token" not in call.kwargs["headers"]
+
+
+async def _insert_editable_row(
+    status: ReservationStatus, devices: list[str], topology_id: str | None = None
+) -> str:
+    """One CALLER_ID row in an editable status: ACTIVE now, or PENDING later."""
+    if status == ReservationStatus.ACTIVE:
+        start, end = timedelta(minutes=-30), timedelta(hours=3)
+    else:
+        start, end = timedelta(hours=2), timedelta(hours=5)
+    rid = await _insert_reservation_for_user(
+        user_id=CALLER_ID, device_ids=devices, status=status, start_offset=start, end_offset=end
+    )
+    if topology_id is not None:
+        async with TestSessionLocal() as session:
+            row = await session.get(Reservation, uuid.UUID(rid))
+            row.topology_id = uuid.UUID(topology_id)
+            await session.commit()
+    return rid
+
+
+async def _stored(rid: str) -> Reservation:
+    async with TestSessionLocal() as session:
+        return await session.get(Reservation, uuid.UUID(rid))
+
+
+def _patch_mocks(*, visible: set[str], validate=None):
+    """The router's visibility helper plus the service's inventory and cabling helpers."""
+    return (
+        patch(
+            "app.routers.reservations._fetch_visible_device_ids_strict",
+            new=AsyncMock(return_value=visible),
+        ),
+        patch(
+            "app.services.reservation_service._fetch_devices",
+            new=AsyncMock(return_value=[make_device_response(d) for d in (DEVICE_A, DEVICE_B)]),
+        ),
+        patch(
+            "app.services.reservation_service._validate_topology_connectivity",
+            new=validate if validate is not None else AsyncMock(),
+        ),
+        patch("app.services.reservation_service._update_device_statuses", new=AsyncMock()),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
+@pytest.mark.parametrize("role", _ROLES)
+@pytest.mark.parametrize("field", ["end_time", "purpose"])
+async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field, role, status):
+    """RES-PATCH-7 applies to a non-admin's new device_ids only: a PATCH of only
+    end_time or only purpose, by any role, answers 200 with the field written and
+    never asks inventory for visibility, even though the lookup would answer with
+    a set that leaves out the row's own device."""
+    rid = await _insert_editable_row(status, [DEVICE_A])
+    before = await _stored(rid)
+    end = before.end_time.replace(tzinfo=timezone.utc)
+    body = (
+        {"end_time": (end - timedelta(hours=1)).isoformat()}
+        if field == "end_time"
+        else {"purpose": "purpose set by #1533"}
+    )
+    visible_mock, fetch, validate, statuses = _patch_mocks(visible={DEVICE_B})
+    try:
+        async with _client_as(CALLER_ID, role) as ac:
+            with visible_mock as lookup, fetch, validate, statuses:
+                resp = await ac.patch(f"/{rid}", json=body)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200, resp.text
+    lookup.assert_not_awaited()
+    after = await _stored(rid)
+    if field == "end_time":
+        assert after.end_time.replace(tzinfo=timezone.utc) == end - timedelta(hours=1)
+        assert after.purpose == before.purpose
+    else:
+        assert after.purpose == "purpose set by #1533"
+        assert after.end_time == before.end_time
+
+
+# The visibility lookup's answer for a PATCH asking for [DEVICE_A, DEVICE_B] on a row
+# that already holds DEVICE_A.
+_PATCH_VISIBLE_SETS = {
+    "both_visible": {DEVICE_A, DEVICE_B},
+    "added_device_invisible": {DEVICE_A},
+    "held_device_invisible": {DEVICE_B},
+    "nothing_visible": set(),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
+@pytest.mark.parametrize("role", _ROLES)
+@pytest.mark.parametrize("visible_case", sorted(_PATCH_VISIBLE_SETS))
+async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(visible_case, role, status):
+    """RES-PATCH-7: a non-admin's new device_ids must ALL be visible to them. The
+    owner's row holds DEVICE_A and the PATCH asks for DEVICE_A plus DEVICE_B, so
+    the new device_ids are both devices, the one already held included.
+
+    A non-admin is checked once, for their own user id with their own token. They
+    get 200 only when both devices are visible; when the added DEVICE_B is not
+    visible, when the already-held DEVICE_A is not visible, or when the lookup
+    answers that nothing is visible, they get the 403 with the pinned wording, the
+    device fetch is never awaited, and the stored device set is unchanged. An
+    admin or superadmin is never checked and gets 200 in every case."""
+    rid = await _insert_editable_row(status, [DEVICE_A])
+    visible = _PATCH_VISIBLE_SETS[visible_case]
+    visible_mock, fetch, validate, statuses = _patch_mocks(visible=visible)
+    try:
+        async with _client_as(CALLER_ID, role) as ac:
+            with visible_mock as lookup, fetch as fetch_mock, validate, statuses:
+                resp = await ac.patch(f"/{rid}", json={"device_ids": [DEVICE_A, DEVICE_B]})
+    finally:
+        app.dependency_overrides.clear()
+
+    stored = {str(d) for d in (await _stored(rid)).device_ids}
+    if role in _ADMIN_ROLES:
+        lookup.assert_not_awaited()
+    else:
+        lookup.assert_awaited_once_with(uuid.UUID(CALLER_ID), CALLER_TOKEN)
+    if role not in _ADMIN_ROLES and visible_case != "both_visible":
+        assert resp.status_code == 403
+        assert resp.json() == {"detail": "You do not have access to one or more requested devices"}
+        fetch_mock.assert_not_awaited()
+        assert stored == {DEVICE_A}
+        return
+    assert resp.status_code == 200, resp.text
+    assert stored == {DEVICE_A, DEVICE_B}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
+async def test_patch_topology_membership_break_is_400_with_the_structured_body(status):
+    """RES-PATCH-8 and the error table: when the membership check refuses a
+    device-set change on a topology-backed row (`_validate_topology_connectivity`
+    raising `TopologyDeviceNotMember`), PATCH answers 400 with
+    `{"error": "topology_device_not_member", "device_ids": [...]}` naming the
+    devices the membership check named, after one validation call with the
+    routing pass skipped; the stored device set is unchanged and no device status
+    is written."""
+    topo_id = str(uuid.uuid4())
+    foreign = [str(uuid.uuid4()), str(uuid.uuid4())]
+    rid = await _insert_editable_row(status, [DEVICE_A], topology_id=topo_id)
+    validate_mock = AsyncMock(side_effect=TopologyDeviceNotMember(foreign))
+    visible_mock, fetch, validate, statuses = _patch_mocks(
+        visible={DEVICE_A, DEVICE_B}, validate=validate_mock
+    )
+    try:
+        async with _client_as(CALLER_ID, "user") as ac:
+            with visible_mock, fetch, validate, statuses as statuses_mock:
+                resp = await ac.patch(f"/{rid}", json={"device_ids": [DEVICE_A, DEVICE_B]})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": {"error": "topology_device_not_member", "device_ids": foreign}}
+    validate_mock.assert_awaited_once_with(
+        uuid.UUID(topo_id), [uuid.UUID(DEVICE_A), uuid.UUID(DEVICE_B)], check_routes=False
+    )
+    statuses_mock.assert_not_awaited()
+    assert {str(d) for d in (await _stored(rid)).device_ids} == {DEVICE_A}
 
 
 # --- PATCH applies the maximum duration (issue #995) ---

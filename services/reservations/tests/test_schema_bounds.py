@@ -12,8 +12,13 @@ import pytest
 from app.schemas.reservation import DynamicRequestSpec, ReservationCreate, ReservationUpdate
 from pydantic import ValidationError
 
-_START = datetime.now(timezone.utc) + timedelta(minutes=1)
-_END = _START + timedelta(hours=1)
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global _START, _END
+    _START = datetime.now(timezone.utc) + timedelta(minutes=1)
+    _END = _START + timedelta(hours=1)
 
 
 def _create(**overrides):

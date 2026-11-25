@@ -5,6 +5,7 @@ Complements test_reporting_service.py with cases the v0 acceptance tests skip:
 - build_utilization_report invariants (empty result set, status filter,
   reservation that lies fully outside the window, malformed device_id strings,
   naive datetime handling).
+- What the report query loads: rows that overlap the window, in a counted status.
 - fetch_user_groups_map resilience (404 per user, malformed JSON body).
 - report_to_csv shape regressions (header line per section, empty buckets).
 """
@@ -25,6 +26,7 @@ from app.services.reporting_service import (
     rollup_by_group,
 )
 from herd_common.enums import TopologyType
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -191,6 +193,209 @@ async def test_build_report_clips_hours_to_window(db_session):
         db_session, NOW - timedelta(hours=5), NOW - timedelta(hours=2), None
     )
     assert report.by_user[0].hours == pytest.approx(3.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_offset", "end_offset"),
+    [
+        (timedelta(hours=-3), timedelta(0)),
+        (timedelta(hours=24), timedelta(hours=27)),
+        (timedelta(hours=5), timedelta(hours=5)),
+        (timedelta(days=-30), timedelta(days=-29)),
+        (timedelta(days=30), timedelta(days=31)),
+    ],
+    ids=[
+        "ends-at-window-start",
+        "starts-at-window-end",
+        "zero-length-inside",
+        "far-before",
+        "far-after",
+    ],
+)
+async def test_a_row_with_no_overlap_is_skipped(db_session, start_offset, end_offset):
+    """OPS-REPORT-2: "one with no overlap is skipped". Beside one counted row, a row
+    that overlaps the 24-hour window for no time at all (far before or after it,
+    touching either bound, or of zero length inside it) shows in none of the totals or
+    the user, device, topology type, day, and purpose sections. The two rows have
+    different users and devices."""
+    window_start = NOW - timedelta(days=1)
+    window_end = NOW
+    counted_device = uuid.uuid4()
+    skipped_device = uuid.uuid4()
+    db_session.add(
+        _res(
+            USER_A,
+            "alice",
+            [str(counted_device)],
+            window_start + timedelta(hours=1),
+            window_start + timedelta(hours=3),
+        )
+    )
+    db_session.add(
+        _res(
+            USER_B,
+            "bob",
+            [str(skipped_device)],
+            window_start + start_offset,
+            window_start + end_offset,
+        )
+    )
+    await db_session.commit()
+
+    report = await build_utilization_report(
+        db_session, window_start, window_end, [ReservationStatus.COMPLETED]
+    )
+
+    assert report.total_reservations == 1
+    assert report.total_hours == pytest.approx(2.0)
+    assert [(b.user_id, b.hours, b.reservation_count) for b in report.by_user] == [(USER_A, 2.0, 1)]
+    assert [(b.device_id, b.hours) for b in report.by_device] == [(counted_device, 2.0)]
+    assert [(b.topology_type, b.reservation_count) for b in report.by_topology_type] == [
+        (TopologyType.PHYSICAL, 1)
+    ]
+    assert [(b.day, b.hours) for b in report.by_day] == [
+        ((window_start + timedelta(hours=1)).date().isoformat(), 2.0)
+    ]
+    assert [(b.purpose_category, b.reservations) for b in report.by_purpose] == [
+        ("unclassified", 1)
+    ]
+
+
+async def _loaded_reservations(db_session, *args, **kwargs) -> list[Reservation]:
+    """Run build_utilization_report and return the Reservation rows its query loaded.
+
+    The session forgets every row first, so each row the query returns is loaded fresh
+    and fires the ORM `load` event. The report skips a row with no overlap in Python,
+    so what the query loads is not visible in the report itself."""
+    db_session.expunge_all()
+    loaded: list[Reservation] = []
+
+    def _on_load(target, _context):
+        loaded.append(target)
+
+    event.listen(Reservation, "load", _on_load)
+    try:
+        await build_utilization_report(db_session, *args, **kwargs)
+    finally:
+        event.remove(Reservation, "load", _on_load)
+    return loaded
+
+
+@pytest.mark.asyncio
+async def test_the_report_query_loads_only_rows_that_overlap_the_window(db_session):
+    """OPS-REPORT-2: the report query loads only reservations that end after the
+    window's start and start before its end, and loads a zero-length one inside the
+    window (which the report then skips). Loaded: rows inside, of zero length inside,
+    across either bound, and across the whole window. Not loaded: a row ending exactly
+    at the start, one starting exactly at the end, and one far before and one far after
+    the window. Every row is COMPLETED, the status asked for."""
+    window_start = NOW - timedelta(days=1)
+    window_end = NOW
+
+    def _row(start, end):
+        return _res(USER_A, "alice", [str(uuid.uuid4())], start, end)
+
+    hour = timedelta(hours=1)
+    loaded_rows = [
+        _row(window_start + hour, window_start + 2 * hour),
+        _row(window_start + 5 * hour, window_start + 5 * hour),
+        _row(window_start - hour, window_start + hour),
+        _row(window_end - hour, window_end + hour),
+        _row(window_start - hour, window_end + hour),
+    ]
+    skipped_rows = [
+        _row(window_start - hour, window_start),
+        _row(window_end, window_end + hour),
+        _row(window_start - timedelta(days=30), window_start - timedelta(days=29)),
+        _row(window_end + timedelta(days=29), window_end + timedelta(days=30)),
+    ]
+    db_session.add_all([*loaded_rows, *skipped_rows])
+    await db_session.commit()
+
+    loaded = await _loaded_reservations(
+        db_session, window_start, window_end, [ReservationStatus.COMPLETED]
+    )
+
+    assert sorted(str(r.id) for r in loaded) == sorted(str(r.id) for r in loaded_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_filter", "fleet_status_filter", "fleet_devices", "expected"),
+    [
+        ([ReservationStatus.COMPLETED], None, None, {ReservationStatus.COMPLETED}),
+        (
+            [ReservationStatus.COMPLETED],
+            [ReservationStatus.ACTIVE, ReservationStatus.COMPLETED],
+            None,
+            {ReservationStatus.COMPLETED},
+        ),
+        (
+            [ReservationStatus.COMPLETED],
+            [ReservationStatus.ACTIVE, ReservationStatus.COMPLETED],
+            [],
+            {ReservationStatus.ACTIVE, ReservationStatus.COMPLETED},
+        ),
+        (
+            [ReservationStatus.PENDING, ReservationStatus.CANCELLED],
+            None,
+            [],
+            {ReservationStatus.PENDING, ReservationStatus.CANCELLED},
+        ),
+        (
+            [ReservationStatus.CANCELLED],
+            [ReservationStatus.ACTIVE],
+            [],
+            {ReservationStatus.ACTIVE, ReservationStatus.CANCELLED},
+        ),
+        ([ReservationStatus.COMPLETED], [], [], set(ReservationStatus)),
+        (None, None, None, set(ReservationStatus)),
+    ],
+    ids=[
+        "user-and-device-sections-only",
+        "no-fleet-section",
+        "fleet-section-adds-its-statuses",
+        "fleet-section-takes-the-same-statuses",
+        "user-section-status-outside-the-fleet-list",
+        "fleet-section-counts-every-status",
+        "every-status-counted",
+    ],
+)
+async def test_the_report_query_loads_only_the_statuses_a_section_counts(
+    db_session, status_filter, fleet_status_filter, fleet_devices, expected
+):
+    """OPS-REPORT-2: the report query loads only reservations in a status the user,
+    device, or fleet section counts. One row per status lies inside the window. With no
+    inventory list there is no fleet section, so a fleet status list adds nothing. With
+    one (empty here) the query loads the statuses of both sections, also when neither
+    list contains the other: the fleet section counts its own list, the user section's
+    when its list is left out (None), and every status when its list is empty. With no
+    user status list every status is counted and loaded."""
+    window_start = NOW - timedelta(days=1)
+    for status in ReservationStatus:
+        db_session.add(
+            _res(
+                USER_A,
+                "alice",
+                [str(uuid.uuid4())],
+                window_start + timedelta(hours=1),
+                window_start + timedelta(hours=2),
+                status=status,
+            )
+        )
+    await db_session.commit()
+
+    loaded = await _loaded_reservations(
+        db_session,
+        window_start,
+        NOW,
+        status_filter,
+        fleet_status_filter=fleet_status_filter,
+        fleet_devices=fleet_devices,
+    )
+
+    assert sorted(r.status.value for r in loaded) == sorted(s.value for s in expected)
 
 
 @pytest.mark.asyncio

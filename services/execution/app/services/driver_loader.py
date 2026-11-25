@@ -295,7 +295,7 @@ def read_driver_metadata(driver_dir: Path) -> dict:
 def extract_config_schema_json(driver_dir: Path) -> str | None:
     """Extract the driver-published config schema and return it JSON-encoded.
 
-    Synchronous: it waits on the sandbox's ``subprocess.run`` (and, with
+    Synchronous: it waits on the sandbox's driver child (and, with
     ALLOW_DRIVER_PIP_INSTALL on, a ``pip install`` before it), so load_driver runs
     it on a worker thread through _SchemaExtraction, never on the event loop
     (issue #1498).

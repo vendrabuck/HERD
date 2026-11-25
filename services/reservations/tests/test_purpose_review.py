@@ -4,7 +4,9 @@ backfill (issue #646 phase 2, ADR 0013 point 10).
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from app.config import settings
 from app.database import get_db
@@ -12,15 +14,23 @@ from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import bearer_scheme
+from app.schemas.reservation import PurposeReviewAcceptBody
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
+from tests._route_table import path_segments, routes_where
 
 OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
 ADMIN_ID = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 def _client_as(sub: str, role: str = "user") -> AsyncClient:
@@ -35,10 +45,13 @@ def _client_as(sub: str, role: str = "user") -> AsyncClient:
 
 
 def _suggestion(top_category: str = "qa_regression") -> dict:
+    # The first distribution entry is deliberately NOT top_category (issue #1525), so a
+    # read of the distribution in place of `top_category` (RES-PURPOSE-10) shows.
+    first = "other" if top_category != "other" else "training"
     return {
         "distribution": [
+            {"category": first, "probability": 0.3},
             {"category": top_category, "probability": 0.7},
-            {"category": "other", "probability": 0.3},
         ],
         "top_category": top_category,
         "pass": "end",
@@ -58,9 +71,12 @@ async def _insert_reservation(
     purpose_suggestion_dismissed_at: datetime | None = None,
     purpose_classify_requested_at: datetime | None = None,
     purpose_classify_attempts: int = 0,
+    purpose_suggested_at: datetime | None = None,
+    reservation_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     async with TestSessionLocal() as db:
         res = Reservation(
+            id=reservation_id or uuid.uuid4(),
             user_id=uuid.UUID(owner),
             owner_name="owner",
             device_ids=[str(uuid.uuid4()), str(uuid.uuid4())],
@@ -71,7 +87,7 @@ async def _insert_reservation(
             status=status,
             purpose_category=purpose_category,
             purpose_suggestion=purpose_suggestion,
-            purpose_suggested_at=NOW if purpose_suggestion else None,
+            purpose_suggested_at=purpose_suggested_at or (NOW if purpose_suggestion else None),
             purpose_suggestion_dismissed_at=purpose_suggestion_dismissed_at,
             purpose_classify_requested_at=purpose_classify_requested_at,
             purpose_classify_attempts=purpose_classify_attempts,
@@ -85,6 +101,13 @@ async def _insert_reservation(
 async def _get_reservation(rid: uuid.UUID) -> Reservation:
     async with TestSessionLocal() as db:
         return await db.get(Reservation, rid)
+
+
+async def _snapshot(rid: uuid.UUID) -> dict:
+    """Every mapped column of the row, read on a fresh session."""
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        return {a.key: getattr(res, a.key) for a in Reservation.__mapper__.column_attrs}
 
 
 # --- GET /admin/purpose-review: the review-list filter ---------------------------------
@@ -403,3 +426,293 @@ async def test_backfill_is_admin_only():
     async with _client_as(OTHER_ID, role="user") as ac:
         resp = await ac.post("/admin/purpose/backfill")
     assert resp.status_code == 403
+
+
+# --- Issue #1525: accept and dismiss touch only the named row; the list's order ---------
+
+
+def _without(snapshot: dict, *keys: str) -> dict:
+    return {k: v for k, v in snapshot.items() if k not in keys}
+
+
+async def _two_suggested_rows() -> list[uuid.UUID]:
+    """Two rows that differ in their id and their suggestion's top category only. Both
+    carry an owner's category that disagrees with the suggestion, so both are on the
+    review list and a write that clears or replaces the category shows."""
+    return [
+        await _insert_reservation(
+            purpose_category="customer_demo_poc", purpose_suggestion=_suggestion("qa_regression")
+        ),
+        await _insert_reservation(
+            purpose_category="customer_demo_poc", purpose_suggestion=_suggestion("training")
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_index", [0, 1])
+async def test_accept_changes_only_the_named_row(target_index):
+    """RES-PURPOSE-10 with a second suggested row present, for each insertion position
+    of the named row: the named row takes its own suggestion's top category, the
+    accepting admin as setter, and a set time; every other mapped column of it but
+    `updated_at`, and every mapped column of the other row, stay as they were."""
+    rows = await _two_suggested_rows()
+    target, other = rows[target_index], rows[1 - target_index]
+    target_top = (await _get_reservation(target)).purpose_suggestion["top_category"]
+    target_before, other_before = await _snapshot(target), await _snapshot(other)
+
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post(
+            f"/admin/purpose-review/{target}/accept", json={"purpose_category": None}
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == str(target)
+    assert resp.json()["purpose_category"] == target_top
+
+    after = await _snapshot(target)
+    assert after["purpose_category"] == target_top
+    assert after["purpose_category_set_by"] == uuid.UUID(ADMIN_ID)
+    assert after["purpose_category_set_at"] is not None
+    written = (
+        "purpose_category",
+        "purpose_category_set_by",
+        "purpose_category_set_at",
+        "updated_at",
+    )
+    assert _without(after, *written) == _without(target_before, *written)
+    assert await _snapshot(other) == other_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_index", [0, 1])
+async def test_dismiss_changes_only_the_named_row(target_index):
+    """RES-PURPOSE-11 with a second suggested row present, for each insertion position
+    of the named row: the named row gets `purpose_suggestion_dismissed_at`, and no
+    other mapped column of it but `updated_at` changes; every mapped column of the
+    other row stays as it was."""
+    rows = await _two_suggested_rows()
+    target, other = rows[target_index], rows[1 - target_index]
+    target_before, other_before = await _snapshot(target), await _snapshot(other)
+
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post(f"/admin/purpose-review/{target}/dismiss")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == str(target)
+
+    after = await _snapshot(target)
+    assert after["purpose_suggestion_dismissed_at"] is not None
+    written = ("purpose_suggestion_dismissed_at", "updated_at")
+    assert _without(after, *written) == _without(target_before, *written)
+    assert await _snapshot(other) == other_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "dismiss"])
+async def test_accept_and_dismiss_of_an_unknown_id_is_404_beside_suggested_rows(action):
+    """An id that names no row is 404 `Reservation not found` even with two suggested
+    rows present, and no mapped column of either row changes."""
+    rows = await _two_suggested_rows()
+    before = {rid: await _snapshot(rid) for rid in rows}
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post(
+            f"/admin/purpose-review/{uuid.uuid4()}/{action}", json={"purpose_category": None}
+        )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Reservation not found"
+    for rid in rows:
+        assert await _snapshot(rid) == before[rid]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "dismiss"])
+@pytest.mark.parametrize("target_index", [0, 1])
+async def test_accept_and_dismiss_read_the_named_rows_suggestion(action, target_index):
+    """The 409 for a row with no suggestion is decided on the named row: with a second
+    row that has a suggestion, the named row in either insertion position still gets
+    409 `Reservation has no suggestion to accept`, and no mapped column of either row
+    changes."""
+    rows = []
+    for index in range(2):
+        suggestion = None if index == target_index else _suggestion("qa_regression")
+        rows.append(await _insert_reservation(purpose_suggestion=suggestion))
+    target = rows[target_index]
+    before = {rid: await _snapshot(rid) for rid in rows}
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        resp = await ac.post(
+            f"/admin/purpose-review/{target}/{action}", json={"purpose_category": None}
+        )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == "Reservation has no suggestion to accept"
+    for rid in rows:
+        assert await _snapshot(rid) == before[rid]
+
+
+@pytest.mark.asyncio
+async def test_review_list_is_newest_suggestion_first_then_by_id():
+    """RES-PURPOSE-15: the review list is ordered by `purpose_suggested_at`, newest
+    first, then by reservation id. Rows are inserted in an order that is neither the
+    expected one nor its reverse, and the two rows that share the newest time are
+    inserted larger id first, so the result is the expected order only through the
+    ORDER BY. Paging by two returns the same order with no row repeated or skipped."""
+    low_id, high_id = sorted([uuid.uuid4(), uuid.uuid4()])
+    three_hours = await _insert_reservation(
+        purpose_suggestion=_suggestion(), purpose_suggested_at=NOW - timedelta(hours=3)
+    )
+    one_hour = await _insert_reservation(
+        purpose_suggestion=_suggestion(), purpose_suggested_at=NOW - timedelta(hours=1)
+    )
+    two_hours = await _insert_reservation(
+        purpose_suggestion=_suggestion(), purpose_suggested_at=NOW - timedelta(hours=2)
+    )
+    for rid in (high_id, low_id):
+        await _insert_reservation(
+            reservation_id=rid,
+            purpose_suggestion=_suggestion(),
+            purpose_suggested_at=NOW - timedelta(minutes=30),
+        )
+    expected = [str(r) for r in (low_id, high_id, one_hour, two_hours, three_hours)]
+
+    async with _client_as(ADMIN_ID, role="admin") as ac:
+        whole = await ac.get("/admin/purpose-review")
+        pages = [
+            await ac.get("/admin/purpose-review", params={"skip": skip, "limit": 2})
+            for skip in (0, 2, 4)
+        ]
+    assert whole.status_code == 200, whole.text
+    assert [i["reservation_id"] for i in whole.json()["items"]] == expected
+    paged = []
+    for page in pages:
+        assert page.status_code == 200, page.text
+        assert page.json()["total"] == 5
+        paged += [i["reservation_id"] for i in page.json()["items"]]
+    assert paged == expected
+
+
+# Every purpose review route (RES-PURPOSE-14), read from the app (tests/_route_table.py):
+# every route whose FIRST path segment is exactly `admin` and whose SECOND segment is
+# exactly `purpose-review` or `purpose`, for each method it declares except HEAD and
+# OPTIONS, so a route added to the family is tested without editing this test. A
+# `reservation_id` path parameter gets the seeded row's id and an optional query
+# parameter is left out; any other path parameter, a required query parameter, or a
+# body model not in PURPOSE_REVIEW_BODIES fails the test with a message naming what to
+# add. (tests/_route_table.py's request builder is not used: it wants every query
+# parameter to be a required UUID, and the list route's are optional.)
+#
+# Limits: a purpose review route of any other shape (`/purpose-review`,
+# `/admin/purposes`, `/admin/x/purpose-review`) is not read, however it is guarded; a
+# mounted sub-application is not read (iter_route_contexts does not descend into a
+# Mount); HEAD and OPTIONS are not requested. The probe test below shows each selection
+# limit on a small app.
+PURPOSE_REVIEW_BODIES = {PurposeReviewAcceptBody: {"purpose_category": None}}
+_FAMILY_SECOND_SEGMENTS = {"purpose-review", "purpose"}
+
+
+def _is_purpose_review_path(path: str) -> bool:
+    segments = path_segments(path)
+    return len(segments) >= 2 and segments[0] == "admin" and segments[1] in _FAMILY_SECOND_SEGMENTS
+
+
+def _purpose_review_routes(routes=None):
+    return routes_where(_is_purpose_review_path, routes)
+
+
+def _request_for(route, reservation_id: uuid.UUID) -> dict:
+    where = "_request_for in services/reservations/tests/test_purpose_review.py"
+    for param in route.dependant.path_params:
+        assert param.alias == "reservation_id", (
+            f"{route.path}: path parameter {param.alias!r}; give it a value in {where}"
+        )
+    for param in route.dependant.query_params:
+        assert not param.field_info.is_required(), (
+            f"{route.path}: required query parameter {param.alias!r}; supply it in {where}"
+        )
+    request: dict = {"url": route.path.replace("{reservation_id}", str(reservation_id))}
+    for body in route.dependant.body_params:
+        model = body.field_info.annotation
+        assert model in PURPOSE_REVIEW_BODIES, (
+            f"{route.path}: add a minimal valid {model.__name__} body to PURPOSE_REVIEW_BODIES"
+        )
+        request["json"] = PURPOSE_REVIEW_BODIES[model]
+    return request
+
+
+def test_the_purpose_review_selection_on_a_small_app():
+    """The selection rule and its limits in the comment above, on a small app."""
+    probe = FastAPI()
+
+    @probe.api_route("/admin/purpose-review", methods=["GET", "HEAD", "OPTIONS"])
+    async def listing():
+        return {}
+
+    @probe.post("/admin/purpose/backfill")
+    async def backfill():
+        return {}
+
+    @probe.get("/purpose-review")
+    async def no_admin_segment():
+        return {}
+
+    @probe.get("/admin/purposes")
+    async def other_second_segment():
+        return {}
+
+    @probe.get("/admin/x/purpose-review")
+    async def nested():
+        return {}
+
+    sub = FastAPI()
+
+    @sub.get("/x")
+    async def mounted():
+        return {}
+
+    probe.mount("/admin/purpose-review/sub", sub)
+    assert [(m, r.path) for m, r in _purpose_review_routes(probe.routes)] == [
+        ("GET", "/admin/purpose-review"),
+        ("POST", "/admin/purpose/backfill"),
+    ]
+
+
+def test_the_app_has_the_five_purpose_review_routes():
+    """The read finds at least the five routes section 5 lists, so the parametrized
+    test below cannot run over an empty or partial table unnoticed."""
+    found = {(m, r.path) for m, r in _purpose_review_routes()}
+    assert found >= {
+        ("GET", "/admin/purpose-review"),
+        ("POST", "/admin/purpose-review/{reservation_id}/accept"),
+        ("POST", "/admin/purpose-review/{reservation_id}/dismiss"),
+        ("POST", "/admin/purpose-review/{reservation_id}/classify"),
+        ("POST", "/admin/purpose/backfill"),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "route"),
+    _purpose_review_routes(),
+    ids=[f"{m} {r.path}" for m, r in _purpose_review_routes()],
+)
+async def test_every_purpose_review_route_refuses_a_non_admin(method, route):
+    """RES-PURPOSE-14: a signed-in user without the admin role gets 403 `Admin or
+    superadmin role required` from every purpose review route, no orchestrator call is
+    made, and no mapped column of either seeded row changes (one of them is a terminal
+    row backfill would stamp). The named row is stamped and carries a suggestion, and
+    accept gets a valid body, so without the role check none of today's five routes
+    answers 403: list, accept, dismiss, and backfill answer 200 and classify answers
+    409 `already_suggested`."""
+    rid = await _insert_reservation(
+        purpose_suggestion=_suggestion("qa_regression"),
+        purpose_classify_requested_at=NOW - timedelta(minutes=5),
+    )
+    unstamped = await _insert_reservation(status=ReservationStatus.COMPLETED)
+    before = {r: await _snapshot(r) for r in (rid, unstamped)}
+    request = _request_for(route, rid)
+    call = AsyncMock(return_value=httpx.Response(500))
+    with patch("app.services.purpose_service.call_service", call):
+        async with _client_as(OTHER_ID, role="user") as ac:
+            resp = await ac.request(method, **request)
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"detail": "Admin or superadmin role required"}
+    call.assert_not_awaited()
+    for r in (rid, unstamped):
+        assert await _snapshot(r) == before[r]

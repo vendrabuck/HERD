@@ -26,9 +26,14 @@ ADMIN_ID = str(uuid.uuid4())
 DEVICE_A = str(uuid.uuid4())
 MOCK_TEMPLATE_ID = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 def _client_as(sub: str, role: str = "user") -> AsyncClient:
@@ -332,3 +337,152 @@ async def test_patch_purpose_category_null_clears_all_three_fields():
         assert res.purpose_category is None
         assert res.purpose_category_set_by is None
         assert res.purpose_category_set_at is None
+
+
+# --- PATCH /{id}/purpose-category writes the named row and no other (issue #1533) ------
+
+SUPERADMIN_ID = str(uuid.uuid4())
+PRIOR_SETTER_ID = str(uuid.uuid4())
+BYSTANDER_SETTER_ID = str(uuid.uuid4())
+_CALLERS = {
+    "owner": (OWNER_ID, "user"),
+    "admin": (ADMIN_ID, "admin"),
+    "superadmin": (SUPERADMIN_ID, "superadmin"),
+}
+
+
+async def _insert_classified_row(
+    *, status: ReservationStatus, category: str, set_by: str, set_at: datetime, purpose: str
+) -> uuid.UUID:
+    """An OWNER_ID row that already carries a category set by `set_by` at `set_at`."""
+    async with TestSessionLocal() as db:
+        res = Reservation(
+            user_id=uuid.UUID(OWNER_ID),
+            owner_name="owner",
+            device_ids=[str(uuid.uuid4())],
+            topology_type=TopologyType.PHYSICAL,
+            purpose=purpose,
+            start_time=NOW - timedelta(hours=1),
+            end_time=NOW + timedelta(hours=2),
+            status=status,
+            purpose_category=category,
+            purpose_category_set_by=uuid.UUID(set_by),
+            purpose_category_set_at=set_at,
+        )
+        db.add(res)
+        await db.commit()
+        await db.refresh(res)
+        return res.id
+
+
+async def _target_row(status: ReservationStatus) -> uuid.UUID:
+    return await _insert_classified_row(
+        status=status,
+        category="training",
+        set_by=PRIOR_SETTER_ID,
+        set_at=NOW - timedelta(days=3),
+        purpose="target",
+    )
+
+
+async def _bystander_row(status: ReservationStatus) -> uuid.UUID:
+    """Same owner and status as the target; every classification field differs."""
+    return await _insert_classified_row(
+        status=status,
+        category="customer_demo_poc",
+        set_by=BYSTANDER_SETTER_ID,
+        set_at=NOW - timedelta(days=5),
+        purpose="bystander",
+    )
+
+
+async def _snapshot(rid: uuid.UUID) -> dict:
+    """Every mapped column of the row, plus its device set."""
+    async with TestSessionLocal() as db:
+        res = await db.get(Reservation, rid)
+        snap = {attr.key: getattr(res, attr.key) for attr in Reservation.__mapper__.column_attrs}
+        snap["device_ids"] = sorted(str(d) for d in res.device_ids)
+        return snap
+
+
+_WRITTEN = {"purpose_category", "purpose_category_set_by", "purpose_category_set_at", "updated_at"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["performance_benchmark", None], ids=["set", "clear"])
+@pytest.mark.parametrize("caller", sorted(_CALLERS))
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+async def test_patch_purpose_category_writes_only_the_named_row(status, caller, value):
+    """RES-PURPOSE-2: the owner, an admin, or a superadmin sets or clears the
+    category of the reservation named in the path, in every status. With a second
+    reservation of the same owner and status present, the named row gets the new
+    category with the caller as setter and a time taken during the request (all
+    three null on a clear), and its columns other than those three and
+    updated_at are unchanged; every column of the second row is unchanged."""
+    target = await _target_row(status)
+    bystander = await _bystander_row(status)
+    target_before = await _snapshot(target)
+    bystander_before = await _snapshot(bystander)
+    sub, role = _CALLERS[caller]
+
+    t0 = datetime.now(timezone.utc)
+    async with _client_as(sub, role=role) as ac:
+        resp = await ac.patch(f"/{target}/purpose-category", json={"purpose_category": value})
+    t1 = datetime.now(timezone.utc)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == str(target)
+    assert resp.json()["purpose_category"] == value
+    after = await _snapshot(target)
+    assert after["purpose_category"] == value
+    if value is None:
+        assert after["purpose_category_set_by"] is None
+        assert after["purpose_category_set_at"] is None
+    else:
+        assert after["purpose_category_set_by"] == uuid.UUID(sub)
+        assert t0 <= after["purpose_category_set_at"].replace(tzinfo=timezone.utc) <= t1
+    assert {k: v for k, v in after.items() if k not in _WRITTEN} == {
+        k: v for k, v in target_before.items() if k not in _WRITTEN
+    }
+    assert await _snapshot(bystander) == bystander_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", list(ReservationStatus), ids=lambda s: s.value)
+async def test_patch_purpose_category_by_a_third_user_is_403_and_writes_nothing(status):
+    """RES-PURPOSE-2: a user who is neither the owner nor an admin gets 403 with the
+    pinned wording in every status, and neither of the two rows changes."""
+    target = await _target_row(status)
+    bystander = await _bystander_row(status)
+    before = {rid: await _snapshot(rid) for rid in (target, bystander)}
+    async with _client_as(OTHER_ID) as ac:
+        resp = await ac.patch(
+            f"/{target}/purpose-category", json={"purpose_category": "performance_benchmark"}
+        )
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "detail": "Only the reservation owner or an admin may set its purpose category"
+    }
+    assert {rid: await _snapshot(rid) for rid in (target, bystander)} == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows", [1, 2])
+@pytest.mark.parametrize("caller", sorted(_CALLERS))
+async def test_patch_purpose_category_unknown_id_is_404_and_writes_nothing(caller, rows):
+    """The error table's 404 row, which cites RES-PURPOSE-2: an id no reservation
+    has answers 404 `Reservation not found` for the seeded rows' owner, an admin,
+    and a superadmin, with one or two other rows present, and no seeded row
+    changes."""
+    seeded = [await _target_row(ReservationStatus.ACTIVE)]
+    if rows == 2:
+        seeded.append(await _bystander_row(ReservationStatus.ACTIVE))
+    before = {rid: await _snapshot(rid) for rid in seeded}
+    sub, role = _CALLERS[caller]
+    async with _client_as(sub, role=role) as ac:
+        resp = await ac.patch(
+            f"/{uuid.uuid4()}/purpose-category", json={"purpose_category": "performance_benchmark"}
+        )
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Reservation not found"}
+    assert {rid: await _snapshot(rid) for rid in seeded} == before

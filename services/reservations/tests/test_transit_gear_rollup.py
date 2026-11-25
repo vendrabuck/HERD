@@ -11,12 +11,15 @@ to return {} by default, so every test below overrides it (or the lower-level
 transport) explicitly for the behavior it wants to prove.
 """
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+import respx
+from app.config import settings
 from app.models.reservation import Base, Reservation, ReservationStatus
 from app.services.reporting_service import TransitGearUnavailable, build_utilization_report
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
@@ -398,3 +401,133 @@ async def test_non_200_raises_transit_gear_unavailable(db_session):
             await build_utilization_report(
                 db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
             )
+
+
+# --- The real transport under respx (#1526) -----------------------------------------
+#
+# The tests above patch _cabling_fork_devices_batch, so it never runs in them. Below it
+# runs, with call_service, and respx answers under httpx.
+
+INTERNAL_TOKEN = "transit-internal-token"
+BATCH_URL = f"{settings.cabling_service_url}/internal/forks/devices/batch"
+
+
+@pytest.fixture
+def cabling(monkeypatch):
+    """respx under httpx with the internal token set; the test adds cabling's answer."""
+    monkeypatch.setattr(settings, "internal_api_token", INTERNAL_TOKEN)
+    with respx.mock(assert_all_called=False) as router:
+        yield router
+
+
+async def _seed_chunks(db_session, count: int) -> list[Reservation]:
+    """`count` COMPLETED rows in the window, each reserving one device of its own, plus
+    a CANCELLED row in the window that must not be sent to cabling."""
+    rows = [
+        _reservation(USER_A, "alice", [str(uuid.uuid4())], NOW - timedelta(hours=1), NOW)
+        for _ in range(count)
+    ]
+    cancelled = _reservation(
+        USER_B,
+        "bob",
+        [str(uuid.uuid4())],
+        NOW - timedelta(hours=1),
+        NOW,
+        status=ReservationStatus.CANCELLED,
+    )
+    db_session.add_all([*rows, cancelled])
+    await db_session.commit()
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_transit_devices_of_every_chunk_are_merged(db_session, cabling):
+    """OPS-REPORT-7 and OPS-REPORT-8 over two chunks (500 and 1), parsed from the
+    real response bodies: one row of each chunk has a fork with its own transit
+    switch, and both switches are counted. The two requests carry, between them,
+    exactly the 501 counted rows' ids, one request 500 and the other 1 (their order is
+    not pinned), and each is a POST to the batch
+    path with the internal token, no `Authorization` header, and a 10 second timeout.
+    The timeout is pinned as built: the spec's upstream table lists it, but no
+    OPS-REPORT rule states it."""
+    rows = await _seed_chunks(db_session, 501)
+    reserved = {str(r.id): str(r.device_ids[0]) for r in rows}
+    switch_one, switch_two = uuid.uuid4(), uuid.uuid4()
+    unused_switches = [switch_one, switch_two]
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        # The first row each request names gets a fork through a switch of its own.
+        ids = json.loads(request.content)["reservation_ids"]
+        switch = unused_switches.pop(0)
+        return httpx.Response(200, json={"devices": {ids[0]: [reserved[ids[0]], str(switch)]}})
+
+    batch = cabling.post(BATCH_URL).mock(side_effect=_answer)
+    with _real_transit_lookup():
+        report = await build_utilization_report(
+            db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
+        )
+
+    transit = {
+        b.device_id: (b.transit_reservations, b.transit_hours)
+        for b in report.by_device
+        if b.transit_reservations
+    }
+    assert transit == {switch_one: (1, 1.0), switch_two: (1, 1.0)}
+    requests = [call.request for call in batch.calls]
+    sent_ids = [json.loads(r.content)["reservation_ids"] for r in requests]
+    assert sorted(len(ids) for ids in sent_ids) == [1, 500]
+    assert sorted(sent_ids[0] + sent_ids[1]) == sorted(str(r.id) for r in rows)
+    for sent in requests:
+        assert (sent.method, str(sent.url)) == ("POST", BATCH_URL)
+        assert sent.headers["X-Internal-Token"] == INTERNAL_TOKEN
+        assert "Authorization" not in sent.headers
+        assert sent.extensions["timeout"] == {
+            "connect": 10.0,
+            "read": 10.0,
+            "write": 10.0,
+            "pool": 10.0,
+        }
+
+
+TRANSIT_FAILURES = [
+    pytest.param(httpx.Response(201, json={"devices": {}}), id="201"),
+    pytest.param(httpx.Response(404, json={"devices": {}}), id="404"),
+    pytest.param(httpx.Response(500, json={"devices": {}}), id="500"),
+    pytest.param(httpx.ConnectError("refused"), id="ConnectError"),
+    pytest.param(httpx.ReadTimeout("slow"), id="ReadTimeout"),
+    pytest.param(httpx.RemoteProtocolError("garbled"), id="RemoteProtocolError"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_size", [500, 1], ids=["the-500-chunk", "the-1-chunk"])
+@pytest.mark.parametrize("failure", TRANSIT_FAILURES)
+async def test_a_failure_from_any_chunk_raises_transit_gear_unavailable(
+    db_session, cabling, failure, failing_size
+):
+    """OPS-REPORT-8: "a transport error or non-200 from any chunk fails the report
+    closed". The 501 counted rows make a chunk of 500 and a chunk of 1, told apart by
+    their size, not by the order they arrive in. The other chunk answers 200, and the
+    failing one answers each failure class through the real transport, so the helper's
+    own handling of an httpx error runs. Pinned: the failing chunk is asked and the
+    report raises TransitGearUnavailable. Not pinned: the order of the requests, and
+    whether the other chunk is asked at all once one has failed."""
+    await _seed_chunks(db_session, 501)
+    asked: list[int] = []
+
+    def _answer(request: httpx.Request) -> httpx.Response:
+        size = len(json.loads(request.content)["reservation_ids"])
+        asked.append(size)
+        if size != failing_size:
+            return httpx.Response(200, json={"devices": {}})
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    cabling.post(BATCH_URL).mock(side_effect=_answer)
+    with _real_transit_lookup():
+        with pytest.raises(TransitGearUnavailable):
+            await build_utilization_report(
+                db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
+            )
+    assert failing_size in asked

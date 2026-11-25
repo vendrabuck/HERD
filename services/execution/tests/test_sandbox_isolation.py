@@ -426,7 +426,7 @@ def test_child_command_is_isolated_and_env_carries_no_pythonpath(monkeypatch):
         seen["env"] = kw["env"]
         return _Done()
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", _capture_run)
+    monkeypatch.setattr(driver_sandbox, "_run_child", _capture_run)
     result = execute_driver_method(driver_dir, "status", {}, timeout=10)
 
     assert result["success"] is True
