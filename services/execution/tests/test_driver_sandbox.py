@@ -830,6 +830,29 @@ def test_an_exception_in_the_parent_after_the_spawn_still_kills_the_group(
     _assert_child_reaped(record["child"])
 
 
+def test_the_exit_watcher_is_joined_before_the_call_returns(monkeypatch):
+    """The exit watcher is joined before the child is reaped, so it can never
+    wait on a pid that a later process reuses. The watcher is held back for half
+    a second (the injected fault that opens the window) and the parent raises
+    before it sees the exit; the call must still not return while it runs."""
+    real_watch = driver_sandbox._watch_exit
+
+    def late_watch(pid, exit_w):
+        time.sleep(0.5)
+        real_watch(pid, exit_w)
+
+    def interrupted_collect(proc, exit_r, pgid, deadline):
+        raise _Interrupted
+
+    monkeypatch.setattr(driver_sandbox, "_watch_exit", late_watch)
+    monkeypatch.setattr(driver_sandbox, "_collect", interrupted_collect)
+    driver_dir = _make_driver_dir(VALID_L1_DRIVER)
+    with pytest.raises(_Interrupted):
+        execute_driver_method(driver_dir, "login", {}, timeout=20)
+    watchers = [t for t in threading.enumerate() if t.name == driver_sandbox._WATCHER_THREAD_NAME]
+    assert watchers == []
+
+
 async def test_a_cancelled_caller_does_not_leave_the_group_running(group_run):
     """Callers run the sandbox on a worker thread. Cancelling the awaiting task
     does not stop that thread: the call runs on to its timeout, which kills the

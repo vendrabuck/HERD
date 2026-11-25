@@ -49,8 +49,8 @@ def _watch_exit(pid: int, exit_w: int) -> None:
     Runs on a thread of its own. `os.waitid` with WNOWAIT returns when the child
     exits and leaves it a zombie, so its pid, and with it its group id, stays
     reserved until `_run_child` reaps it. A pidfd would do the same without a
-    thread, but the python-build-standalone interpreters (what uv installs, so
-    what CI and a uv checkout run) have no `os.pidfd_open`.
+    thread, but the python-build-standalone interpreters that uv installs (the
+    3.12.12 and 3.14.0 builds were checked) have no `os.pidfd_open`.
     """
     try:
         with contextlib.suppress(ChildProcessError):
