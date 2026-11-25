@@ -36,7 +36,6 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 
 SVC = "app.services.reservation_service"
 EXP = "app.tasks.expiration"
-NOW = datetime.now(timezone.utc)
 OWNER = uuid.uuid4()
 HELD = uuid.uuid4()
 OTHER = uuid.uuid4()
@@ -45,6 +44,13 @@ PENDING = ReservationStatus.PENDING
 PROVISION = ReservationStatus.PENDING_PROVISION
 ACTIVE = ReservationStatus.ACTIVE
 CANCELLED = ReservationStatus.CANCELLED
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)

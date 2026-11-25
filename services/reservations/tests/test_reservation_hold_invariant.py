@@ -21,7 +21,6 @@ from app.services.reservation_service import cancel_reservation, update_reservat
 
 from tests._harness import TestSessionLocal
 
-NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 HELD = uuid.uuid4()
 OTHER = uuid.uuid4()
@@ -31,6 +30,13 @@ PROVISION = ReservationStatus.PENDING_PROVISION
 ACTIVE = ReservationStatus.ACTIVE
 
 SVC = "app.services.reservation_service"
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 def _device(device_id, status="AVAILABLE"):

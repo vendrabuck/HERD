@@ -53,7 +53,13 @@ async def _override_get_db():
 USER_ID = uuid.uuid4()
 ADMIN_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
-NOW = datetime.now(timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -92,13 +98,19 @@ def _suggestion_response(top_category: str = "qa_regression") -> httpx.Response:
     )
 
 
+# _insert's default request stamp, resolved against the test's NOW when _insert runs.
+_FIVE_MINUTES_AGO = object()
+
+
 async def _insert(
     *,
-    purpose_classify_requested_at: datetime | None = NOW - timedelta(minutes=5),
+    purpose_classify_requested_at: datetime | None | object = _FIVE_MINUTES_AGO,
     purpose_classify_attempts: int = 0,
     purpose_suggestion: dict | None = None,
     status: ReservationStatus = ReservationStatus.COMPLETED,
 ) -> uuid.UUID:
+    if purpose_classify_requested_at is _FIVE_MINUTES_AGO:
+        purpose_classify_requested_at = NOW - timedelta(minutes=5)
     res = Reservation(
         user_id=USER_ID,
         owner_name="owner",
