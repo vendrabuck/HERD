@@ -51,10 +51,16 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 engine = create_async_engine(TEST_DATABASE_URL, echo=False)
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-NOW = datetime.now(timezone.utc)
 USER_ID = uuid.uuid4()
 DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)

@@ -26,9 +26,14 @@ ADMIN_ID = str(uuid.uuid4())
 DEVICE_A = str(uuid.uuid4())
 MOCK_TEMPLATE_ID = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
-START = NOW.isoformat()
-END = (NOW + timedelta(hours=3)).isoformat()
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, START, END
+    NOW = datetime.now(timezone.utc)
+    START = NOW.isoformat()
+    END = (NOW + timedelta(hours=3)).isoformat()
 
 
 def _client_as(sub: str, role: str = "user") -> AsyncClient:
