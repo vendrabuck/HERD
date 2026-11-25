@@ -31,10 +31,11 @@ What runs at import: every module-level statement, including those inside a modu
 keywords; the decorators and default values of every function and lambda defined at
 import; and every comprehension or generator expression there (a generator expression's
 body runs only when it is consumed, so one is treated as running at import, a
-conservative choice). A function or lambda BODY does not run at import, so a read there
-is not flagged, unless the function is a module-level `def` that import-time code calls
-by its bare name; then its body is scanned the same way, and so is every module-level
-`def` it calls by bare name in turn.
+conservative choice). A function BODY does not run at import, so a read there is not
+flagged, unless the function is a module-level `def` that import-time code calls by
+its bare name; then its body is scanned the same way, and so is every module-level
+`def` it calls by bare name in turn. A lambda BODY is never treated as running at
+import, not even when the lambda is called where it is defined (see Limits).
 
 Limits. The scan reads the source; it does not run it:
 
@@ -48,6 +49,13 @@ Limits. The scan reads the source; it does not run it:
 - argument and return annotations are not scanned;
 - `time.localtime()`, `time.gmtime()`, `time.ctime()`, and `time.asctime()` with no
   argument also read the clock and are not in the set;
+- the other clocks of the `time` module are not in the set: `process_time`,
+  `process_time_ns`, `thread_time`, `thread_time_ns`, `clock_gettime`, and
+  `clock_gettime_ns`, under any spelling;
+- a star import (`from datetime import *`, `from time import *`) binds no name the scan
+  follows, so a read through it is missed;
+- a lambda that is called where it is defined, `(lambda: datetime.now())()`, is not
+  followed: its body is never scanned;
 - a value computed by a fixture of a broader scope than function (`scope="module"`,
   `"class"`, `"package"`, or `"session"`) at its first use goes stale the same way and
   is not scanned.
