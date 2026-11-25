@@ -1142,7 +1142,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (nineteen today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1187,6 +1187,13 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # l2_port_assignments row it does not own unchanged and no execution_runs row
 # written for its foreign reservation, and deletes its own and its seeded rows
 # in a finally.
+# The execution suite added for issue #1413 (the join and define side of that
+# release) works the same way on the migrated execution schema: random
+# reservation ids, seeded foreign rows asserted unchanged, its own rows deleted
+# in a finally. Each FAILED row it leaves has at least 1,000,000 attempts, so the
+# stack's own retry tick never selects it; it runs no tick itself. A party it
+# holds inside its transaction waits for the other on a row lock for well under
+# a second.
 # The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
 # provisioning races) needs the migrated auth schema with migration 0010's two
 # tables. It commits its own users, identities, and flows under random tags,
@@ -1244,6 +1251,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_wiring_retry_due_predicate_live_pg.py -v) && \
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_vlan_release_cas_live_pg.py -v) && \
+	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_vlan_join_release_race_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_status_cas_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \

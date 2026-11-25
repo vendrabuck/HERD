@@ -2868,6 +2868,67 @@ async def _run_vlan_definition_op(
     return ok, attempts, err
 
 
+async def _undo_unrecorded_definition(
+    row,
+    switch_id: str,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Drive delete_vlan for a create_vlan the define pre-pass could not record because
+    the allocation `row` was released meanwhile (issue #1413).
+
+    The release winner deletes only the switches it read in defined_switch_ids, and this
+    switch was never added there, so this is the one delete it gets. It is judged by the
+    rule the release's own deletes use (WIRE-VLAN-11): when another ACTIVE allocation now
+    holds the number in the switch's current component, no delete runs. When that cannot
+    be judged (TransientUpstreamError from the fabric lookup) no delete runs and one line
+    is logged with the action `vlan_define_undo_unjudged`. A failed delete is logged and
+    the definition lingers, as with a release's failed delete. Anything else raised
+    propagates, as from the create before it.
+    """
+    from app.services.vlan_service import FabricResolver, find_superseding_allocation
+
+    try:
+        async with get_db_session() as db:
+            winner = await find_superseding_allocation(db, row, [switch_id], FabricResolver())
+    except TransientUpstreamError as exc:
+        logger.error(
+            "Not undoing create_vlan for VLAN %d on switch %s (allocation %s released "
+            "meanwhile): supersession could not be judged (%s); the definition lingers",
+            row.vlan_id,
+            switch_id,
+            row.id,
+            type(exc).__name__,
+            extra={
+                "action": "vlan_define_undo_unjudged",
+                "error_class": type(exc).__name__,
+                "vlan_assignment_id": str(row.id),
+            },
+        )
+        return
+    if winner is not None:
+        logger.warning(
+            "Not undoing create_vlan for VLAN %d on switch %s: allocation %s now holds "
+            "the number in the switch's component",
+            row.vlan_id,
+            switch_id,
+            winner,
+        )
+        return
+    ok, _attempts, err = await _run_vlan_definition_op(
+        switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+    )
+    if not ok:
+        logger.error(
+            "delete_vlan undoing VLAN %d on switch %s (allocation %s released meanwhile) "
+            "failed: %s; the empty VLAN definition lingers on the switch",
+            row.vlan_id,
+            switch_id,
+            row.id,
+            err,
+        )
+
+
 async def _define_pending_for_allocations(
     allocation_ids: set,
     ctx: "_FetchContext",
@@ -2886,8 +2947,18 @@ async def _define_pending_for_allocations(
     the failures; the caller parks that switch's dependent membership builds (no new
     row type, per the #442 decision) and a transit-only failure is only loudly logged
     here (there is no membership row to park; the pending set keeps it retried).
+
+    Issue #1413: the success is recorded through vlan_service.record_allocation_defined,
+    under the allocation's row lock and only while it is ACTIVE. When the allocation was
+    released after this pass read it, the switch is not recorded; the create just made
+    is undone by _undo_unrecorded_definition, the rest of that allocation's pending
+    switches are not defined, and each of them, the undone one included, is returned as
+    a failure with attempts 0 and JOIN_LOST_ALLOCATION_RELEASED, so the caller parks
+    their joins instead of driving them on a released number.
     """
     from app.models.vlan_assignment import VlanAssignment
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+    from app.services.vlan_service import record_allocation_defined
 
     failures: dict[str, tuple[int, str]] = {}
     nil = uuid.UUID(int=0)
@@ -2911,20 +2982,40 @@ async def _define_pending_for_allocations(
             for s in (row.switch_device_ids or [])
             if str(s) not in {str(d) for d in (row.defined_switch_ids or [])}
         ]
-        for switch_id in pending:
+        for index, switch_id in enumerate(pending):
             ok, attempts, err = await _run_vlan_definition_op(
                 switch_id, "create_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
             )
             if ok:
                 async with get_db_session() as db:
-                    fresh = (
-                        await db.execute(select(VlanAssignment).where(VlanAssignment.id == va_uuid))
-                    ).scalar_one_or_none()
-                    if fresh is not None:
-                        defined = {str(d) for d in (fresh.defined_switch_ids or [])}
-                        defined.add(switch_id)
-                        fresh.defined_switch_ids = sorted(defined)
-                        await db.commit()
+                    recorded = await record_allocation_defined(db, va_uuid, switch_id)
+                if recorded:
+                    continue
+                # Issue #1413: the allocation was released after this pass read it, so
+                # the switch is not added to a RELEASED row (whose release winner has
+                # already chosen the switches it deletes from). Undo this create, and
+                # park the joins of this switch and of every switch of the allocation
+                # not yet defined, rather than drive them on a released number.
+                not_defined = pending[index:]
+                for parked in not_defined:
+                    failures[parked] = (0, JOIN_LOST_ALLOCATION_RELEASED)
+                logger.warning(
+                    "create_vlan for VLAN %d on switch %s lost to the release of "
+                    "allocation %s (reservation %s); undoing it and parking the joins "
+                    "of switches %s",
+                    row.vlan_id,
+                    switch_id,
+                    va_uuid,
+                    row.reservation_id,
+                    not_defined,
+                    extra={
+                        "action": "vlan_define_lost_to_release",
+                        "vlan_assignment_id": str(va_uuid),
+                        "switch_ids": not_defined,
+                    },
+                )
+                await _undo_unrecorded_definition(row, switch_id, ctx, get_db_session)
+                break
             else:
                 failures[switch_id] = (attempts, err or "create_vlan failed")
                 logger.error(
@@ -3142,6 +3233,7 @@ async def _release_orphaned_allocations(
         FabricResolver,
         find_superseding_allocation,
         release_allocation_if_orphaned,
+        trim_allocation_definitions,
     )
 
     resolver = FabricResolver()
@@ -3258,13 +3350,12 @@ async def _release_orphaned_allocations(
                 err,
             )
         if remaining != defined:
+            # Issue #1413: remove what was deleted from the list as it stands now, under
+            # the row lock, never overwrite it with this pass's copy.
             async with get_db_session() as db:
-                fresh = (
-                    await db.execute(select(VlanAssignment).where(VlanAssignment.id == row.id))
-                ).scalar_one_or_none()
-                if fresh is not None:
-                    fresh.defined_switch_ids = remaining
-                    await db.commit()
+                await trim_allocation_definitions(
+                    db, row.id, [s for s in defined if s not in remaining]
+                )
 
 
 async def _apply_l2_memberships(
@@ -3302,7 +3393,9 @@ async def _apply_l2_memberships(
         switch. A create failure parks that switch's adds FAILED intended ACTIVE with
         the create error (the membership ledger row is the parking spot, no new row
         type) and their driver calls are skipped; removes are unaffected (a switch
-        with a live membership was necessarily already defined).
+        with a live membership was necessarily already defined). A switch whose
+        definition lost to a release of its allocation (issue #1413) parks its adds
+        the same way, under JOIN_LOST_ALLOCATION_RELEASED with no prefix.
       - Undefine: _release_orphaned_allocations drives delete_vlan on last-free.
 
     `retry_row_ids` (issue #814) is passed ONLY by the retry channels, which call this
@@ -3331,6 +3424,7 @@ async def _apply_l2_memberships(
         update_execution_run,
     )
     from app.services.l2_membership_service import (
+        JOIN_LOST_ALLOCATION_RELEASED,
         is_membership_active,
         membership_needs_remove,
         record_l2_failed,
@@ -3358,6 +3452,7 @@ async def _apply_l2_memberships(
                 park_error = (
                     err
                     if err.startswith(WIRING_UNRESOLVABLE_REASON)
+                    or err == JOIN_LOST_ALLOCATION_RELEASED
                     else f"create_vlan failed: {err}"
                 )
                 await record_l2_failed(
@@ -3669,7 +3764,15 @@ async def _apply_one_vlan_action(
             completed_at=datetime.now(timezone.utc),
         )
         if action == "add_to_vlan":
-            await record_l2_membership_active(db, res_uuid, vlan_assignment_id, switch_uuid, port)
+            await record_l2_membership_active(
+                db,
+                res_uuid,
+                vlan_assignment_id,
+                switch_uuid,
+                port,
+                row_id=retry_row_id,
+                claims=claims,
+            )
         else:
             await release_l2_membership(db, res_uuid, switch_uuid, port)
     else:

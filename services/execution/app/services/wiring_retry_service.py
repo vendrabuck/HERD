@@ -576,10 +576,13 @@ async def _reattempt_l2_rows(
     "still_failed"; each carries layer "l2" plus its switch/port/vlan.
 
     A build-direction row whose stored allocation is the nil-UUID placeholder (a row the
-    legacy device-set path parked when its allocation readback failed) or points at a
-    vlan_assignment that no longer exists is re-resolved through _resolve_add_allocations
-    before the op is built, so the retry drives add_to_vlan with the REAL fabric VLAN (not
-    0) and record_l2_membership_active heals the row's allocation on success. If
+    legacy device-set path parked when its allocation readback failed), points at a
+    vlan_assignment that no longer exists, or (issue #1413) points at one that is not
+    ACTIVE when this pass reads the rows (a join that lost to a release, or any failed
+    join whose allocation was released since) is re-resolved through
+    _resolve_add_allocations before the op is built, so the retry drives add_to_vlan
+    with the REAL fabric VLAN of an ACTIVE allocation (not 0, never a released number)
+    and record_l2_membership_active heals the row's allocation on success. If
     re-resolution fails again, the row is NOT driven: it is re-parked FAILED with the
     no-allocation reason (attempts accumulate) and reported "still_failed".
 
@@ -593,7 +596,9 @@ async def _reattempt_l2_rows(
     stale row whose allocation is the nil placeholder (or dangling) has no VLAN number
     the release channel could drive remove_from_vlan against and provably never reached
     the driver, so it flips RELEASED directly with no driver call and reads back
-    "released". A fetch failure drives NOTHING build-direction for that reservation
+    "released". A stale row on a RELEASED allocation still has that allocation's number,
+    so it is parked like any resolvable row and the release channel removes the port
+    from that number. A fetch failure drives NOTHING build-direction for that reservation
     this tick (fail-closed, issue #460); release-direction rows are unaffected.
 
     Per-row drive claim (issue #817), the _reattempt_rows shape: a row the other channel
@@ -647,6 +652,9 @@ async def _reattempt_l2_rows(
             .all()
         )
     vlan_by_va = {v.id: v.vlan_id for v in va_rows}
+    # Issue #1413: a build drives only an allocation read ACTIVE here; a release after
+    # this read is judged by record_l2_membership_active's guard.
+    active_va_ids = {v.id for v in va_rows if v.status == "ACTIVE"}
 
     superseded_ids: set[uuid.UUID] = set()
     superseded_va_ids: set[uuid.UUID] = set()
@@ -668,11 +676,18 @@ async def _reattempt_l2_rows(
                 if row.vlan_assignment_id and row.vlan_assignment_id != _NIL:
                     superseded_va_ids.add(row.vlan_assignment_id)
 
+    def _has_no_vlan_number(row: L2PortAssignment) -> bool:
+        # The nil placeholder or a vlan_assignment that no longer resolves: no number a
+        # remove_from_vlan could name. A RELEASED allocation still has its number.
+        return row.vlan_assignment_id == _NIL or row.vlan_assignment_id not in vlan_by_va
+
     def _add_needs_resolution(row: L2PortAssignment) -> bool:
-        # A build-direction row whose allocation is unusable: the nil placeholder or a
-        # vlan_assignment that no longer resolves. Re-resolve before driving the driver.
+        # A build-direction row whose allocation is unusable: no number at all, or an
+        # allocation that is not ACTIVE (issue #1413: a join that lost to a release, or
+        # any failed join whose allocation was released since). Re-resolve before the
+        # driver call so add_to_vlan never names a released number.
         return row.intended != "RELEASED" and (
-            row.vlan_assignment_id == _NIL or row.vlan_assignment_id not in vlan_by_va
+            _has_no_vlan_number(row) or row.vlan_assignment_id not in active_va_ids
         )
 
     async with httpx.AsyncClient() as client:
@@ -708,7 +723,7 @@ async def _reattempt_l2_rows(
                 if (str(row.switch_device_id), row.port) in intended_l2:
                     continue
                 blocked_build_ids.add(row.id)
-                if _add_needs_resolution(row):
+                if _has_no_vlan_number(row):
                     # Nil or dangling allocation: no VLAN number to remove and no
                     # driver call ever happened for this join; settle directly.
                     async with (

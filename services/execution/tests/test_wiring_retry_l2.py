@@ -613,3 +613,89 @@ async def test_reattempt_l2_rows_skips_id_deleted_before_refresh():
     assert ("add_to_vlan", "0/0/1") not in calls, (
         "the deleted row's driver call must not fire: its claim cannot be taken"
     )
+
+
+# --- a failed join never drives a released allocation's number (issue #1413) ---
+
+
+async def _seed_released_alloc() -> tuple[uuid.UUID, int]:
+    """A RELEASED allocation of RES_ID whose number differs from the one a fresh
+    allocation of RES_ID takes (its preferred number), so a drive of the released
+    number cannot pass for the fresh one."""
+    from app.services.vlan_service import _derive_vlan_id
+
+    preferred = _derive_vlan_id(RES_ID)
+    released_vlan = preferred + 1 if preferred < 4094 else preferred - 1
+    async with TestSessionLocal() as s:
+        va = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=released_vlan,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[],
+            status="RELEASED",
+        )
+        s.add(va)
+        await s.commit()
+        return va.id, released_vlan
+
+
+async def test_a_failed_join_on_a_released_allocation_is_re_resolved_before_its_drive():
+    """The row a lost join leaves (and any failed join whose allocation was released
+    since) is re-resolved: add_to_vlan names a fresh ACTIVE allocation's number, never
+    the released one, and the row heals onto that allocation."""
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+
+    released, released_vlan = await _seed_released_alloc()
+    rid = await _seed_l2_failed(
+        "0/0/1", "ACTIVE", released, attempts=1, err=JOIN_LOST_ALLOCATION_RELEASED
+    )
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn):
+        with patch("app.services.vlan_service.fetch_fabric_id", new=AsyncMock(return_value=FABRIC)):
+            result = await reattempt_reservation(RES_ID, _db_session_factory())
+
+    async with TestSessionLocal() as s:
+        fresh = (
+            await s.execute(select(VlanAssignment).where(VlanAssignment.status == "ACTIVE"))
+        ).scalar_one()
+        old = await s.get(VlanAssignment, released)
+    assert fresh.id != released and old.status == "RELEASED"
+    add_vlans = [c[2] for c in calls if c[0] == "add_to_vlan"]
+    assert add_vlans == [fresh.vlan_id]
+    assert released_vlan not in [c[2] for c in calls if c[2] is not None]
+    row = await _l2_row(rid)
+    assert (row.status, row.vlan_assignment_id) == ("ACTIVE", fresh.id)
+    assert result["results"][0]["outcome"] == "reconnected"
+    assert result["results"][0]["vlan"] == fresh.vlan_id
+
+
+async def test_a_stale_failed_join_on_a_released_allocation_is_removed_from_its_number():
+    """A failed join on a released allocation whose intent is gone still has that
+    allocation's number, which its add_to_vlan may have landed on: it is parked for the
+    release channel (not settled with no driver call), and the next pass drives
+    remove_from_vlan with the released number."""
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+    from app.services.nats_consumer import WIRING_STALE_BUILD_REASON
+
+    released, released_vlan = await _seed_released_alloc()
+    rid = await _seed_l2_failed(
+        "0/0/1", "ACTIVE", released, attempts=1, err=JOIN_LOST_ALLOCATION_RELEASED
+    )
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    parked = await _l2_row(rid)
+    assert (parked.status, parked.intended, parked.last_error) == (
+        "FAILED",
+        "RELEASED",
+        WIRING_STALE_BUILD_REASON,
+    )
+    assert calls == []
+
+    with _patches(execute_fn, fork_wires=[]):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    assert [c for c in calls if c[0] in ("add_to_vlan", "remove_from_vlan")] == [
+        ("remove_from_vlan", "0/0/1", released_vlan)
+    ]
+    assert (await _l2_row(rid)).status == "RELEASED"

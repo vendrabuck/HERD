@@ -69,6 +69,19 @@ STALE_JOIN_SUPERSEDED_PENDING_REMOVAL = (
     "superseded at record time by another reservation's membership; pending removal"
 )
 
+# Issue #1413: a join whose allocation is no longer ACTIVE when its membership would be
+# recorded is failed under this reason, intended ACTIVE, still pointing at the released
+# allocation; the build retry resolves a fresh allocation on a later pass
+# (wiring_retry_service._reattempt_l2_rows). The define pre-pass parks the joins of a
+# switch whose definition lost to a release under it too. Deliberately outside the
+# non-retryable prefixes.
+JOIN_LOST_ALLOCATION_RELEASED = (
+    "VLAN allocation released before the join was recorded; pending re-allocation"
+)
+
+# The log action of a join failed under JOIN_LOST_ALLOCATION_RELEASED.
+JOIN_LOST_ACTION = "l2_join_lost_to_allocation_release"
+
 
 async def _find_active(
     db: AsyncSession, switch_uuid: uuid.UUID, port: str, vlan_assignment_id: uuid.UUID
@@ -115,6 +128,9 @@ async def record_l2_membership_active(
     vlan_assignment_id: uuid.UUID | str,
     switch_device_id: uuid.UUID | str,
     port: str,
+    *,
+    row_id: uuid.UUID | None = None,
+    claims: WiringRowClaims | None = None,
 ) -> L2PortAssignment | None:
     """Insert an ACTIVE membership after a successful add_to_vlan.
 
@@ -128,6 +144,20 @@ async def record_l2_membership_active(
     has already snapshotted the ledger), so it is parked FAILED intended RELEASED
     (FROZEN_JOIN_PENDING_REMOVAL) for the release-direction retry channels, which run
     while frozen and drive the remove_from_vlan.
+
+    Issue #1413: before the ACTIVE write (the FAILED flip or the insert) the allocation
+    row is locked FOR SHARE while it is ACTIVE (vlan_service.hold_active_allocation),
+    and the lock is held to this call's commit, so a release of the allocation either
+    waits for that commit and then sees the membership, or committed first and this
+    join loses. A join that loses, its allocation RELEASED or absent, is rolled back
+    (the other reservations' rows parked above are not written) and failed through
+    record_l2_failed: intended ACTIVE, one attempt, JOIN_LOST_ALLOCATION_RELEASED, the
+    allocation it used kept on the row; one line is logged with the action
+    JOIN_LOST_ACTION. `row_id` and `claims` are the retry channel's, used only for that
+    failure write (the row-identity compare-and-swap of WIRE-LEDGER-8); the reconcile
+    passes neither and the write is the key-based upsert. The returned row is that
+    failure write's. The existing-ACTIVE short-circuit and the frozen park above take
+    no lock: neither writes an ACTIVE row.
     """
     res_uuid = _as_uuid(reservation_id)
     vlan_uuid = _as_uuid(vlan_assignment_id)
@@ -234,6 +264,36 @@ async def record_l2_membership_active(
             port,
         )
         return row
+
+    from app.services.vlan_service import hold_active_allocation
+
+    if not await hold_active_allocation(db, vlan_uuid):
+        await db.rollback()
+        logger.warning(
+            "Join for reservation %s on switch %s port %s lost to the release of VLAN "
+            "allocation %s; failed for the build retry to re-allocate",
+            res_uuid,
+            switch_uuid,
+            port,
+            vlan_uuid,
+            extra={
+                "action": JOIN_LOST_ACTION,
+                "reservation_id": str(res_uuid),
+                "vlan_assignment_id": str(vlan_uuid),
+            },
+        )
+        return await record_l2_failed(
+            db,
+            res_uuid,
+            vlan_uuid,
+            switch_uuid,
+            port,
+            1,
+            JOIN_LOST_ALLOCATION_RELEASED,
+            intended="ACTIVE",
+            row_id=row_id,
+            claims=claims,
+        )
 
     reusable = await _find_reusable_failed(db, res_uuid, switch_uuid, port)
     if reusable is not None:

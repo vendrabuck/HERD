@@ -13,8 +13,9 @@ behavior, but one SQLite connection cannot make two writers contend for a row. H
 each releaser is a real asyncio task on its own Postgres connection:
 
   - two releases of one allocation are held at the row lock together (a third
-    connection holds the row FOR UPDATE until both UPDATEs are seen waiting in
-    pg_stat_activity), then let go: exactly one releases it, one set of delete_vlan
+    connection holds the row FOR UPDATE until both releasers are seen waiting on it
+    in pg_stat_activity, in the row lock each takes before its guarded UPDATE since
+    issue #1413), then let go: exactly one releases it, one set of delete_vlan
     calls is driven, the other logs the lost race;
   - a membership committed after a releaser's orphan check keeps the allocation
     ACTIVE and drives nothing;
@@ -383,15 +384,16 @@ async def _cleanup(session_factory, h: _Harness):
 
 async def _waiting_on_lock(pg_engine, application_name: str) -> int:
     """How many of THIS test's releaser backends (tagged with `application_name`) wait
-    on a lock in their guarded UPDATE. Other sessions on the database, such as a live
-    gate stack's own, are never counted."""
+    on a lock in a statement naming vlan_assignments (since issue #1413 that is the row
+    lock the release takes before its guarded UPDATE). Other sessions on the database,
+    such as a live gate stack's own, are never counted."""
     async with pg_engine.connect() as conn:
         return (
             await conn.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE wait_event_type = 'Lock' AND datname = current_database() "
-                    "AND application_name = :app AND query ILIKE 'UPDATE vlan_assignments%'"
+                    "AND application_name = :app AND query ILIKE '%vlan_assignments%'"
                 ),
                 {"app": application_name},
             )
@@ -435,7 +437,7 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
         get_db = _session_ctx(async_sessionmaker(releaser_engine, expire_on_commit=False))
         with h.patches(release=_recorded), caplog.at_level(logging.INFO):
             async with pg_engine.connect() as holder:
-                # Hold the row so both guarded UPDATEs queue on its lock together.
+                # Hold the row so both releasers queue on its lock together.
                 await holder.execute(
                     select(VlanAssignment.id).where(VlanAssignment.id == alloc).with_for_update()
                 )
