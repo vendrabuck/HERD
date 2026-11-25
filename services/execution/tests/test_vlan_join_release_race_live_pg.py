@@ -648,6 +648,42 @@ async def test_a_join_holding_its_lock_makes_the_release_wait_and_lose(
         await _cleanup(session_factory, h)
 
 
+async def test_two_joins_of_one_allocation_do_not_wait_for_each_other(
+    session_factory, tagged, pending
+):
+    """The join's lock is a share lock: while one join holds it uncommitted, a second
+    join of the same allocation records its membership without waiting."""
+    h = _Harness()
+    (vlan_id,) = await _free_vlan_numbers(session_factory, 1)
+    try:
+        alloc = await _seed(session_factory, h, vlan_id, scope=h.switches, defined=h.switches)
+        before = await _foreign_snapshot(session_factory, h)
+        gate = pending.gate()
+        first_engine, _ = tagged("join-a")
+        second_engine, _ = tagged("join-b")
+        switch = uuid.UUID(h.switches[0])
+        first = pending.session(_gated_maker(first_engine, gate))
+        holder = pending.task(
+            record_l2_membership_active(first, h.reservation, alloc, switch, "0/0/1")
+        )
+        await asyncio.wait_for(gate.inside.wait(), COORDINATION_TIMEOUT)
+        second = pending.session(async_sessionmaker(second_engine, expire_on_commit=False))
+        row_b = await asyncio.wait_for(
+            record_l2_membership_active(second, h.reservation, alloc, switch, "0/0/2"),
+            COORDINATION_TIMEOUT,
+        )
+        holder_was_holding = not gate.returned
+        gate.proceed.set()
+        row_a = await asyncio.wait_for(holder, COORDINATION_TIMEOUT)
+
+        assert holder_was_holding, "the second join finished while the first held its lock"
+        assert (row_a.status, row_b.status) == ("ACTIVE", "ACTIVE")
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await pending.settle()
+        await _cleanup(session_factory, h)
+
+
 @pytest.mark.parametrize("caller", ["removal_pass", "no_removal"])
 async def test_a_release_holding_its_lock_makes_the_join_wait_and_lose(
     session_factory, pg_engine, tagged, pending, caller

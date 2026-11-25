@@ -615,6 +615,89 @@ async def test_reattempt_l2_rows_skips_id_deleted_before_refresh():
     )
 
 
+# --- a retry's join that loses to the release of its allocation (issue #1413) ---
+
+
+def _release_at_record_time(allocation_id, *, release_row=None):
+    """A stand-in for vlan_service.hold_active_allocation that first commits the release
+    of `allocation_id` (and, when given, a save-driven release of the membership row
+    `release_row`) from another session: the retry drove add_to_vlan on an allocation it
+    read ACTIVE, and the allocation was released before the join was recorded."""
+    from app.services import vlan_service
+    from app.services.l2_membership_service import release_l2_membership
+
+    real = vlan_service.hold_active_allocation
+
+    async def _hold(db, va_id):
+        async with TestSessionLocal() as s:
+            row = await s.get(VlanAssignment, allocation_id)
+            row.status = "RELEASED"
+            await s.commit()
+            if release_row is not None:
+                await release_l2_membership(s, uuid.UUID(RES_ID), uuid.UUID(SW_L2), release_row)
+        return await real(db, va_id)
+
+    return patch("app.services.vlan_service.hold_active_allocation", new=_hold)
+
+
+@pytest.mark.parametrize("row_released_meanwhile", [True, False])
+async def test_a_retry_join_that_loses_its_allocation_writes_only_the_row_it_loaded(
+    row_released_meanwhile,
+):
+    """Through the real retry entry: the join's failure write is the row-identity
+    compare-and-swap with the pass's claims (WIRE-LEDGER-8). When a save released the
+    row while add_to_vlan ran, nothing is written and no FAILED row is inserted for the
+    port (the #814 zombie), and the row joins the pass's lost set. When the row is still
+    the one this pass holds, the failure lands on that row id and its claim is cleared."""
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    va = await _seed_alloc()
+    rid = await _seed_l2_failed("0/0/1", "ACTIVE", va, attempts=2)
+    async with TestSessionLocal() as s:
+        rows = list(
+            (await s.execute(select(L2PortAssignment).where(L2PortAssignment.id == rid)))
+            .scalars()
+            .all()
+        )
+    claims = WiringRowClaims()
+    execute_fn, calls = _recorder()
+    with (
+        _patches(execute_fn),
+        _release_at_record_time(va, release_row="0/0/1" if row_released_meanwhile else None),
+    ):
+        await _reattempt_l2_rows(rows, _db_session_factory(), claims=claims)
+
+    assert ("add_to_vlan", "0/0/1") in calls
+    async with TestSessionLocal() as s:
+        own = (
+            (
+                await s.execute(
+                    select(L2PortAssignment).where(
+                        L2PortAssignment.reservation_id == uuid.UUID(RES_ID)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    (row,) = own
+    assert row.id == rid, "no other row is inserted for the port"
+    assert row.claimed_until is None
+    if row_released_meanwhile:
+        assert (row.status, row.attempts, row.last_error) == ("RELEASED", 2, None)
+        assert rid in claims.lost
+    else:
+        assert (row.status, row.intended, row.attempts, row.last_error) == (
+            "FAILED",
+            "ACTIVE",
+            3,
+            JOIN_LOST_ALLOCATION_RELEASED,
+        )
+        assert row.vlan_assignment_id == va
+
+
 # --- a failed join never drives a released allocation's number (issue #1413) ---
 
 
