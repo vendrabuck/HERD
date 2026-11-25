@@ -672,14 +672,21 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
   Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`)
-- **RES-PATCH-3.** A new `end_time` must be after `start_time` and in the future. \
+- **RES-PATCH-3.** A new `end_time` is taken as the instant it names: a value with an
+  offset is converted to UTC and a value without one is taken as UTC, and that UTC value
+  is what every check below compares and what is stored. It must be after `start_time`
+  and in the future. A value whose instant has no UTC equivalent (an offset near year 1
+  or year 9999) is 422, a validation list whose message is `end_time must fall between
+  0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
+  500. \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationUpdate`, `end_time_as_utc_instant`, `to_utc_instant`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_schema_converts_every_form_to_its_utc_instant`, `test_a_naive_end_time_is_utc_not_the_host_zone`, `test_an_end_time_with_no_utc_equivalent_is_a_validation_error`, `test_an_end_time_at_the_edge_of_the_utc_range_is_accepted`, `test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`, `test_route_answers_the_same_for_one_instant_in_every_form`, `test_route_answers_422_for_an_end_time_with_no_utc_equivalent`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
+- **RES-PATCH-4.** Extending the end time (a new end whose instant, RES-PATCH-3, is later
+  than the stored end) conflict-checks the added span `[old end, new end)` for the booked
+  exclusive devices, so an extension is refused the same way whatever offset its end is
+  written in; when inventory cannot say which devices are exclusive, all are checked. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`)
-- **RES-PATCH-4.** Extending the end time conflict-checks the added span
-  `[old end, new end)` for the booked exclusive devices; when inventory cannot say which
-  devices are exclusive, all are checked. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`, `test_update_reservation_inventory_unreachable_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_extend_non_exclusive_skips_conflict`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_extension`, `test_update_reservation_inventory_unreachable_on_extension`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_extend_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_extend_non_exclusive_skips_conflict`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_by_its_instant`, `test_extension_into_a_booking_that_starts_at_the_old_end_is_refused`, `test_extension_check_receives_aware_utc_bounds`, `test_route_refuses_the_overlapping_extension_in_every_form`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_overlapping_extension_is_refused_in_every_offset_form`, `test_extension_into_a_booking_that_starts_at_the_old_end_is_refused`); `tests/integration/test_reservation_patch.py` (`test_patch_extension_into_another_booking_is_refused_in_every_offset_form`)
 - **RES-PATCH-5.** A new `end_time` is judged against `RESERVATION_MAX_DURATION_SECONDS`
   over the effective window (the stored `start_time` to the new end) by the same check
   create uses (RES-CREATE-5), with the same wording; exactly the cap passes, one second
@@ -688,7 +695,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   row already longer than the cap stays editable in its purpose and devices; setting a
   new end that is still over the cap is refused. PATCH cannot change `start_time`. \
   Enforced in: `services/reservations/app/schemas/reservation.py` (`check_max_duration`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_patch_end_time_is_judged_against_the_cap`, `test_patch_cap_uses_the_stored_start_on_an_active_row`, `test_over_cap_legacy_row_stays_editable_outside_its_window`, `test_over_cap_legacy_row_cannot_set_a_window_still_over_the_cap`, `test_cap_zero_disables_the_patch_check`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_over_max_duration_returns_400`)
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_patch_end_time_is_judged_against_the_cap`, `test_patch_cap_uses_the_stored_start_on_an_active_row`, `test_over_cap_legacy_row_stays_editable_outside_its_window`, `test_over_cap_legacy_row_cannot_set_a_window_still_over_the_cap`, `test_cap_zero_disables_the_patch_check`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_over_max_duration_returns_400`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_against_the_cap_by_its_instant`)
 - **RES-PATCH-6.** A new `device_ids` must be non-empty (at most 200, deduped), every
   device must exist, and the booked devices must share one topology type. The instance
   devices the reservation already holds (a held device whose template is one of the
@@ -710,14 +717,15 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`, `test_patch_topology_membership_break_is_400_with_the_structured_body`)
 - **RES-PATCH-9.** An added exclusive device must not conflict over
-  `[max(now, start), end)`, checked by the same refusal create uses, with create's
-  wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
+  `[max(now, start), end)`, its bounds UTC instants whatever the process time zone (the
+  end is the new end when the same PATCH sets one), checked by the same refusal create
+  uses, with create's wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
   must also be `AVAILABLE` now, because the row is about to hold it. On a `PENDING`
   reservation the current status is not consulted, exactly like a create for a future
   window (RES-CREATE-12): the row holds nothing until activation, which sets the device
   `RESERVED` as usual. By decision (issue #999, 2026-10-05). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_assert_no_window_conflicts`) \
-  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`, `test_pending_add_refuses_a_device_booked_over_the_window_with_creates_wording`, `test_active_add_still_refuses_a_device_that_is_not_available_now`, `test_device_added_to_a_pending_row_is_reserved_at_activation`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`)
+  Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_pending_add_accepts_a_device_reserved_now_but_free_in_the_window`, `test_pending_add_refuses_a_device_booked_over_the_window_with_creates_wording`, `test_active_add_still_refuses_a_device_that_is_not_available_now`, `test_device_added_to_a_pending_row_is_reserved_at_activation`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_conflict_on_added_device`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_added_device_check_receives_aware_utc_bounds`, `test_added_device_check_uses_the_new_end_in_utc`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_added_device_is_checked_from_now_in_any_process_zone`, `test_added_device_free_from_now_is_accepted_in_any_process_zone`)
 - **RES-PATCH-10.** The edit commits under a status guard: a self-transition
   compare-and-swap on the status the PATCH read. If a cancel, release, auto-complete, or
   the sweep's activation claim moved the row during the PATCH, nothing of the edit is
@@ -745,9 +753,10 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `tests/integration/test_device_set_patch_wiring.py` (`test_patch_add_wires_nothing_until_fork_save_and_remove_releases`)
 - **RES-PATCH-13.** Every successful edit stages `reservation.updated` in its
-  transaction, with `end_time` set only when the end time actually changed. \
+  transaction, with `end_time_changed` true and `end_time` set (the new end in UTC, ISO
+  8601) only when the end's instant changed. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`)
+  Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
 
 **Out of scope.** The fork prune itself and the wiring release are cabling's and
 execution's (`provisioning-and-wiring.md`).
@@ -799,7 +808,7 @@ section 5).
   equivalent (an offset near year 1 or year 9999) is 422 `<parameter> must fall between
   0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
   500 (issue #1523). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`) \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`); `services/reservations/app/schemas/reservation.py` (`to_utc_instant`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`, `test_window_bound_with_no_utc_equivalent_is_422`, `test_window_bound_at_the_edge_of_the_utc_range_is_accepted`)
 - **RES-LIST-9.** `total` is the filtered total. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
@@ -1269,6 +1278,7 @@ sweep, and event delivery never return an error to a caller.
 | relayed 4xx | cabling's or execution's `detail`, unwrapped | the upstream refused a forwarded fork or wiring call | RES-FORK-10, RES-FORK-18 |
 | 422 | validation list | create schema violation: device cap, empty booking, window, past start, duration, purpose length, more than 50 dynamic requests | RES-CREATE-1 to RES-CREATE-6, RES-DYN-2 |
 | 422 | validation list | PATCH with an empty or over-cap `device_ids` | RES-PATCH-6 |
+| 422 | validation list whose message is `end_time must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC` | PATCH `end_time` whose instant has no UTC equivalent (an offset near year 1 or year 9999) | RES-PATCH-3 |
 | 422 | validation list | list: unknown sort field or direction, unknown status, naive or bad timestamp, search over 200 characters | RES-LIST-3, RES-LIST-6, RES-LIST-8 |
 | 422 | `<parameter> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC` | list: a time bound whose instant has no UTC equivalent (an offset near year 1 or year 9999) | RES-LIST-8 |
 | 422 | validation list | calendar without `range_start` or `range_end`; internal route without the token header | RES-CAL-1, RES-INTERNAL-1 |
@@ -1355,7 +1365,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_reservation_patch_race_live_pg.py`, `test_pending_fork_prune_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_reservation_patch_race_live_pg.py`, `test_reservation_patch_end_time_live_pg.py`, `test_pending_fork_prune_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
