@@ -122,11 +122,12 @@ def test_execute_passes_rlimit_policy_to_child_env(monkeypatch):
 
     def _capture_run(cmd, *a, **kw):
         seen["env"] = kw["env"]
-        # preexec_fn must no longer be used (thread-unsafe under to_thread).
-        assert "preexec_fn" not in kw or kw["preexec_fn"] is None
+        # That the spawn itself passes no preexec_fn (thread-unsafe under
+        # to_thread) is pinned at the Popen call, by
+        # test_driver_sandbox.py::test_child_spawn_starts_a_new_session_without_preexec_fn.
         return _Done()
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", _capture_run)
+    monkeypatch.setattr(driver_sandbox, "_run_child", _capture_run)
     # A context key that uppercases onto the rlimits env key must not win.
     result = execute_driver_method(
         driver_dir, "login", {"HERD_sandbox_rlimits": "attacker"}, timeout=10
@@ -147,7 +148,7 @@ def test_pip_install_exception_swallowed(monkeypatch):
     with open(os.path.join(driver_dir, "requirements.txt"), "w") as f:
         f.write("# empty\n")
 
-    real_run = driver_sandbox.subprocess.run
+    real_run = driver_sandbox._run_child
     raised = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -156,7 +157,7 @@ def test_pip_install_exception_swallowed(monkeypatch):
             raise RuntimeError("pip exploded")
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", fake_run)
+    monkeypatch.setattr(driver_sandbox, "_run_child", fake_run)
     result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "x"}, timeout=15)
     # The install was attempted (and raised), and the failure did not abort
     # the driver run.
@@ -176,7 +177,7 @@ def test_success_with_non_json_stdout_wraps_raw_output(monkeypatch):
         stdout = "this is not json"
         stderr = ""
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Done())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Done())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is True
     assert result["output"] == {"raw_output": "this is not json"}
@@ -196,7 +197,7 @@ def test_success_with_stderr_carries_it_separately_and_leaves_error_none(monkeyp
         stdout = json.dumps({"ok": True})
         stderr = "DeprecationWarning: something benign\n"
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Done())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Done())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is True
     assert result["error"] is None
@@ -213,7 +214,7 @@ def test_success_with_empty_stderr_leaves_both_error_and_stderr_none(monkeypatch
         stdout = json.dumps({"ok": True})
         stderr = ""
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Done())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Done())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is True
     assert result["error"] is None
@@ -233,7 +234,7 @@ def test_unstructured_failure_never_stores_raw_stderr_as_error(monkeypatch):
         stdout = ""
         stderr = "could not connect to 10.9.9.9:22 as admin"
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Failed())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Failed())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is False
     assert result["error"] == "driver process exited with status 1"
@@ -264,7 +265,7 @@ def test_raise_behind_stderr_noise_is_still_sanitized(monkeypatch):
             "paramiko.transport: Error reading SSH protocol banner\n\n" + structured + "\n"
         )
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Failed())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Failed())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is False
     assert result["error"] == "driver raised NetmikoTimeoutException"
@@ -319,7 +320,7 @@ def test_dry_run_injects_context_flag(monkeypatch):
             seen["ctx"] = json.load(f)
         return _Done()
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", _capture_run)
+    monkeypatch.setattr(driver_sandbox, "_run_child", _capture_run)
     result = execute_driver_method(
         driver_dir,
         "login",
@@ -344,7 +345,7 @@ def test_negative_returncode_reports_signal(monkeypatch):
         stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(driver_sandbox.subprocess, "run", lambda *a, **kw: _Killed())
+    monkeypatch.setattr(driver_sandbox, "_run_child", lambda *a, **kw: _Killed())
     result = execute_driver_method(driver_dir, "login", {}, timeout=10)
     assert result["success"] is False
     assert "signal 9" in result["error"]

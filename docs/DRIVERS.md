@@ -596,6 +596,11 @@ Driver code runs in a separate subprocess with these limits enforced:
 A driver that exceeds the wall-clock timeout is recorded with status `TIMEOUT` (not
 `FAILED`) and the error `Execution timed out after <N>s`; a `TIMEOUT` run can be retried
 like a `FAILED` one.
+The child runs in a process group of its own, and when the call ends, for any reason,
+the whole group is killed: a helper process the driver started (an `ssh` client, an
+`expect` script, a vendor CLI) does not outlive the call, even after a successful one.
+A helper that puts itself in a new session or process group (as a process that
+daemonizes itself does) is not killed; a driver must stop such a helper itself.
 A driver killed by a resource limit (for example out-of-memory or CPU exhaustion) is
 recorded as failed with the terminating signal.
 
