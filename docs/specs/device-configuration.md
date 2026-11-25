@@ -1315,7 +1315,7 @@ the child entry point `services/execution/app/services/_runner.py`;
   holds them; no argument text is on the child's command line. Both files are written
   with owner-only permissions and deleted when the call ends. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`); `services/execution/app/services/_runner.py` (`main`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`); `services/execution/tests/test_run_arguments_storage.py` (`test_driver_arguments_never_on_the_child_command_line`, `test_driver_call_without_arguments_passes_no_arguments_file`); `services/execution/tests/test_sandbox_isolation.py` (`test_child_command_is_isolated_and_env_carries_no_pythonpath`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_login`, `test_execute_context_passed`, `test_execute_connect_ports_via_method_kwargs`, `test_child_spawn_starts_a_new_session_without_preexec_fn`); `services/execution/tests/test_runner.py` (`test_runner_login_action`, `test_runner_connect_ports_with_args`, `test_runner_invalid_context_file`); `services/execution/tests/test_run_arguments_storage.py` (`test_driver_arguments_never_on_the_child_command_line`, `test_driver_call_without_arguments_passes_no_arguments_file`); `services/execution/tests/test_sandbox_isolation.py` (`test_child_command_is_isolated_and_env_carries_no_pythonpath`)
 - **CFG-SBX-2.** The keyword arguments are `method_kwargs` plus `port_a` and `port_b`
   when given and not already present. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`) \
@@ -1327,7 +1327,7 @@ the child entry point `services/execution/app/services/_runner.py`;
   `PYTHONDONTWRITEBYTECODE`: the child runs with `-I`, which ignores every `PYTHON*`
   variable (issue #1180). \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`, `context_to_env_vars`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_context_to_env_vars_string`, `test_context_to_env_vars_bool`, `test_context_to_env_vars_none`, `test_context_to_env_vars_dict`, `test_context_to_env_vars_keys_uppercased`, `test_context_to_env_vars_exclude_strips_secrets`, `test_env_vars_visible_in_subprocess`, `test_password_keys_stripped_from_env_but_kept_in_context`); `services/execution/tests/test_sandbox_isolation.py` (`test_no_secret_key_leaks_into_env`, `test_child_command_is_isolated_and_env_carries_no_pythonpath`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_context_to_env_vars_string`, `test_context_to_env_vars_bool`, `test_context_to_env_vars_none`, `test_context_to_env_vars_dict`, `test_context_to_env_vars_keys_uppercased`, `test_context_to_env_vars_exclude_strips_secrets`, `test_env_vars_visible_in_subprocess`, `test_password_keys_stripped_from_env_but_kept_in_context`, `test_child_spawn_starts_a_new_session_without_preexec_fn`); `services/execution/tests/test_sandbox_isolation.py` (`test_no_secret_key_leaks_into_env`, `test_child_command_is_isolated_and_env_carries_no_pythonpath`)
 - **CFG-SBX-4.** The child applies `RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NOFILE`, and
   `RLIMIT_NPROC` from the `DRIVER_RLIMIT_*` settings as both soft and hard limits before
   it imports the driver; 0 leaves a limit off, and a limit that cannot be set is
@@ -1357,14 +1357,20 @@ the child entry point `services/execution/app/services/_runner.py`;
   not yet reaped, and then reaps the child (issue #1407). So a process the driver started
   that stayed in the group does not outlive the call, and one that holds the child's
   stdout or stderr open no longer holds a finished call until the timeout. Killing only
-  before the reap keeps the group id from naming a reused pid. A cancelled caller does
-  not stop the call: it runs on a worker thread to one of those ends. Not covered: a
-  process that leaves the group (it calls setsid or setpgid, as a helper that daemonizes
-  itself does) is not killed, and if it holds the child's stdout or stderr open, the call
-  waits for it until the timeout; and a second exception raised while the service waits
-  for the killed child can leave that child unreaped. \
+  before the reap keeps the group id from naming a reused pid; this assumes nothing else
+  in the service reaps the child (no code in execution or `herd_common` waits for any
+  child but its own or installs a SIGCHLD handler). A cancelled caller does not stop the
+  call: it runs on a worker thread to one of those ends. The output is decoded as
+  `subprocess.run(text=True)` decoded it, so output that is not valid in the service's
+  locale encoding raises `UnicodeDecodeError` out of `execute_driver_method`, after the
+  group kill and the reap, as it did before. No descriptor and no thread is left after
+  the call. Not covered: a process that leaves the group (it calls setsid or setpgid, as
+  a helper that daemonizes itself does) is not killed, and if it holds the child's stdout
+  or stderr open, the call waits for it until the timeout; and a second exception raised
+  while the service joins the exit watcher or waits for the killed child leaves that
+  child unreaped and its two output pipes and the exit pipe's read end open. \
   Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`, `_run_child`, `_collect`, `_watch_exit`, `_kill_group`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_timeout`, `test_execute_default_timeout_status`, `test_execute_default_timeout_login`, `test_no_process_the_run_started_outlives_it`, `test_child_leads_its_own_session_and_group`, `test_the_child_is_killed_even_if_the_group_kill_does_nothing`, `test_the_exit_watcher_is_joined_before_the_call_returns`, `test_an_exception_in_the_parent_after_the_spawn_still_kills_the_group`, `test_a_cancelled_caller_does_not_leave_the_group_running`, `test_limit_a_grandchild_in_a_session_of_its_own_survives`, `test_an_honest_driver_gets_the_same_result_as_before`, `test_child_spawn_starts_a_new_session_without_preexec_fn`, `test_kill_group_refuses_this_process_group_and_ids_below_two`)
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_timeout`, `test_execute_default_timeout_status`, `test_execute_default_timeout_login`, `test_no_process_the_run_started_outlives_it`, `test_child_leads_its_own_session_and_group`, `test_the_child_is_killed_even_if_the_group_kill_does_nothing`, `test_the_exit_watcher_is_joined_before_the_call_returns`, `test_an_exception_in_the_parent_after_the_spawn_still_kills_the_group`, `test_a_cancelled_caller_does_not_leave_the_group_running`, `test_limit_a_grandchild_in_a_session_of_its_own_survives`, `test_an_honest_driver_gets_the_same_result_as_before`, `test_output_that_is_not_valid_text_raises_as_subprocess_run_did`, `test_the_deadline_is_the_timeout_from_the_spawn`, `test_no_descriptor_or_thread_is_left_after_any_ending`, `test_child_spawn_starts_a_new_session_without_preexec_fn`, `test_kill_group_refuses_this_process_group_and_ids_below_two`)
 - **CFG-SBX-6.** The child instantiates `Driver(context)`, calls the action with the
   keyword arguments, and prints the result as JSON; any exception prints one JSON line
   `{exception_class, message}` to stderr and exits 1. \

@@ -4,6 +4,8 @@ import functools
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,6 +14,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from app.services import driver_sandbox
 from app.services.driver_sandbox import context_to_env_vars, execute_driver_method
+
+# Every test here runs real children; a defect that leaves the parent waiting on a
+# child (a kill dropped, a wait with no deadline) fails within this bound instead
+# of hanging until a driver's own two-minute sleep ends. The slowest passing test
+# takes about 5 seconds.
+pytestmark = pytest.mark.timeout(60)
 
 
 def _make_driver_dir(driver_code: str) -> str:
@@ -778,15 +786,20 @@ def test_no_process_the_run_started_outlives_it(group_run, monkeypatch, mode):
     assert watchers == []
 
 
+@pytest.mark.timeout(30)
 def test_the_child_is_killed_even_if_the_group_kill_does_nothing(group_run, monkeypatch):
     """Belt and braces: at the timeout the child itself is sent SIGKILL besides
     its group, so a group kill that did nothing (here stubbed out) cannot leave
-    the call waiting forever on a child that ignores SIGTERM. The grandchild
-    survives that stub; the fixture kills it."""
+    the call waiting on a child that ignores SIGTERM. Without that kill the call
+    would end only when the driver's 120 second sleep does; the duration bound
+    (far below the sleep, far above the 3 second timeout) and the 30 second
+    marker make that fail fast. The grandchild survives the stub; the fixture
+    kills it."""
     driver_dir, context, record_path = group_run
     monkeypatch.setattr(driver_sandbox, "_kill_group", lambda pgid: None)
     result = execute_driver_method(driver_dir, "run", context("hang"), timeout=3)
     assert result["error"] == "Execution timed out after 3s"
+    assert result["duration_ms"] < 30_000
     record = _wait_for_record(record_path)
     _assert_child_reaped(record["child"])
 
@@ -834,7 +847,15 @@ def test_the_exit_watcher_is_joined_before_the_call_returns(monkeypatch):
     """The exit watcher is joined before the child is reaped, so it can never
     wait on a pid that a later process reuses. The watcher is held back for half
     a second (the injected fault that opens the window) and the parent raises
-    before it sees the exit; the call must still not return while it runs."""
+    before it sees the exit; the call must still not return while it runs.
+
+    The hold is a fixed sleep, not a gate, by necessity: with the join, the call
+    returns only after the watcher ends, so whatever releases the watcher must
+    fire inside the call, before the join; without the join, that same release
+    would let the watcher end before the check below, and the test could not
+    tell the two apart. A gate released by the test after the call returns would
+    deadlock the correct code. The sleep only widens the window; no assertion
+    reads a clock."""
     real_watch = driver_sandbox._watch_exit
 
     def late_watch(pid, exit_w):
@@ -895,15 +916,33 @@ class Driver:
         pass
 
     def login(self):
-        sys.stderr.write("a\\r\\nb\\rc\\n")
+        sys.stderr.buffer.write(_STDERR_BYTES)
+        sys.stderr.buffer.flush()
         return {"success": True, "text": "x\\r\\ny"}
 """
+
+# What the honest driver writes to stderr: both newline forms `text=True`
+# translates, and a non-ASCII letter in UTF-8 (u with diaeresis).
+_HONEST_STDERR = b"a\r\nb\rc Z\xc3\xbcrich\n"
+HONEST_DRIVER = HONEST_DRIVER.replace("_STDERR_BYTES", repr(_HONEST_STDERR))
+
+
+def _reference_run(stream: str, data: bytes) -> subprocess.CompletedProcess:
+    """What `subprocess.run(text=True)`, the sandbox's old spawn, makes of a child
+    that writes `data` to `stream`, decoded in this process's locale."""
+    script = f"import sys; sys.{stream}.buffer.write({data!r})"
+    return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
 
 
 def test_an_honest_driver_gets_the_same_result_as_before():
     """An honest driver's result has the shape subprocess.run(text=True) gave it:
-    stdout parsed as JSON, stderr decoded with universal newlines (CRLF and CR
-    become LF, as `text=True` does), no error, an empty transcript."""
+    stdout parsed as JSON, stderr decoded in the locale's encoding with universal
+    newlines (CRLF and CR become LF), non-ASCII text intact, no error, an empty
+    transcript. The expected stderr is also what subprocess.run(text=True) makes
+    of the same bytes here, so the comparison is with the old spawn, not with a
+    hand-written decoding (a UTF-8 locale is assumed, as on this host and CI)."""
+    expected_stderr = "a\nb\nc Z" + chr(0xFC) + "rich\n"
+    assert _reference_run("stderr", _HONEST_STDERR).stderr == expected_stderr
     driver_dir = _make_driver_dir(HONEST_DRIVER)
     result = execute_driver_method(driver_dir, "login", {}, timeout=20)
     duration = result.pop("duration_ms")
@@ -912,20 +951,54 @@ def test_an_honest_driver_gets_the_same_result_as_before():
         "success": True,
         "output": {"success": True, "text": "x\r\ny"},
         "error": None,
-        "stderr": "a\nb\nc\n",
+        "stderr": expected_stderr,
         "transcript": [],
     }
+
+
+INVALID_TEXT_DRIVER = """
+import sys
+
+class Driver:
+    def __init__(self, context):
+        self.context = context
+
+    def login(self):
+        sys.stdout.buffer.write(b"\\xff\\n")
+        sys.stdout.buffer.flush()
+        return {"success": True}
+"""
+
+
+def test_output_that_is_not_valid_text_raises_as_subprocess_run_did():
+    """A driver whose stdout is not valid in the locale's encoding makes
+    `execute_driver_method` raise UnicodeDecodeError, the error
+    subprocess.run(text=True) raised for the same byte. The sandbox maps nothing
+    here, as before; on the run path `run_driver_action` records it as
+    `execution failed: UnicodeDecodeError` (`_fail_run_unexpected`)."""
+    with pytest.raises(UnicodeDecodeError) as reference:
+        _reference_run("stdout", b"\xff\n")
+    driver_dir = _make_driver_dir(INVALID_TEXT_DRIVER)
+    with pytest.raises(UnicodeDecodeError) as raised:
+        execute_driver_method(driver_dir, "login", {}, timeout=20)
+    ours, theirs = raised.value, reference.value
+    assert (ours.encoding, ours.reason) == (theirs.encoding, theirs.reason)
+    assert ours.object[ours.start : ours.end] == theirs.object[theirs.start : theirs.end]
+    assert ours.object[ours.start : ours.end] == b"\xff"
 
 
 def test_child_spawn_starts_a_new_session_without_preexec_fn(monkeypatch):
     """The child is started by Popen with start_new_session (the session is made
     in the child before exec, so before any kill) and no preexec_fn, which is not
-    safe in the threads the sandbox runs on (#307)."""
+    safe in the threads the sandbox runs on (#307). What Popen itself receives is
+    also the command of CFG-SBX-1 and the environment of CFG-SBX-3, exactly: the
+    tests that stub `_run_child` see only what reaches that function, so a spawn
+    that widened the environment there (`{**os.environ, **env}`) passed them."""
     real_popen = driver_sandbox.subprocess.Popen
     seen = []
 
     def spy(cmd, *args, **kwargs):
-        seen.append(kwargs)
+        seen.append((list(cmd), kwargs))
         return real_popen(cmd, *args, **kwargs)
 
     monkeypatch.setattr(driver_sandbox.subprocess, "Popen", spy)
@@ -933,8 +1006,77 @@ def test_child_spawn_starts_a_new_session_without_preexec_fn(monkeypatch):
     result = execute_driver_method(driver_dir, "login", {}, timeout=20)
     assert result["success"] is True, result
     assert len(seen) == 1
-    assert seen[0]["start_new_session"] is True
-    assert seen[0].get("preexec_fn") is None
+    cmd, kwargs = seen[0]
+    assert cmd[:6] == ["python", "-I", "-B", driver_sandbox._RUNNER_PATH, driver_dir, "login"]
+    assert len(cmd) == 7  # plus the context file; no kwargs file
+    assert os.path.basename(cmd[6]).startswith("herd_ctx_")
+    assert set(kwargs["env"]) == {"PATH", "HERD_TRANSCRIPT_PATH", "HERD_SANDBOX_RLIMITS"}
+    assert kwargs["start_new_session"] is True
+    assert kwargs.get("preexec_fn") is None
+
+
+def test_the_deadline_is_the_timeout_from_the_spawn(monkeypatch):
+    """The read gives up `timeout` seconds after the spawn: the deadline handed
+    to `_collect` is within a second of now plus the timeout, and never past it.
+    No duration is measured, so the bound holds on any host speed."""
+    real_collect = driver_sandbox._collect
+    seen = []
+
+    def spy(proc, exit_r, pgid, deadline):
+        seen.append(deadline - time.monotonic())
+        return real_collect(proc, exit_r, pgid, deadline)
+
+    monkeypatch.setattr(driver_sandbox, "_collect", spy)
+    driver_dir = _make_driver_dir(VALID_L1_DRIVER)
+    result = execute_driver_method(driver_dir, "login", {}, timeout=20)
+    assert result["success"] is True, result
+    assert len(seen) == 1
+    assert 19 < seen[0] <= 20
+
+
+def _open_descriptors() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_no_descriptor_or_thread_is_left_after_any_ending(monkeypatch, tmp_path):
+    """Every ending (exit 0, exit 0 with a helper holding the pipes, a raised
+    driver exception, death by a signal, the timeout, and an exception in the
+    parent) closes every descriptor the call opened (both output pipes and both
+    ends of the exit pipe) and leaves no thread behind. One round of every ending
+    warms up whatever opens a descriptor once; two more rounds must leave the
+    counts where they were."""
+    monkeypatch.setattr(driver_sandbox.settings, "driver_rlimit_nproc", 0)
+    driver_dir = _make_driver_dir(GROUP_DRIVER)
+    records: list[str] = []
+    endings = [("return", 20), ("hold_pipes", 20), ("raise", 20), ("die", 20), ("hang", 1)]
+
+    def interrupted_collect(proc, exit_r, pgid, deadline):
+        raise _Interrupted
+
+    def one_round(tag: str) -> None:
+        for mode, timeout in endings:
+            record = str(tmp_path / f"{tag}-{mode}.json")
+            records.append(record)
+            context = {"HERD_mode": mode, "HERD_record": record}
+            execute_driver_method(driver_dir, "run", context, timeout=timeout)
+        record = str(tmp_path / f"{tag}-interrupted.json")
+        records.append(record)
+        with monkeypatch.context() as patch:
+            patch.setattr(driver_sandbox, "_collect", interrupted_collect)
+            with pytest.raises(_Interrupted):
+                execute_driver_method(
+                    driver_dir, "run", {"HERD_mode": "return", "HERD_record": record}, timeout=20
+                )
+
+    try:
+        one_round("warm-up")
+        descriptors, threads = _open_descriptors(), threading.active_count()
+        one_round("first")
+        one_round("second")
+        assert (_open_descriptors(), threading.active_count()) == (descriptors, threads)
+    finally:
+        for record in records:
+            _cleanup(record)
 
 
 def test_kill_group_refuses_this_process_group_and_ids_below_two(monkeypatch):
@@ -956,43 +1098,66 @@ def _sh_child(script: str, *, timeout: float, text: bool = False):
     )
 
 
-# A background `sleep` (in sh's process group) and its pid and start time.
-_SH_BACKGROUND_SLEEP = 'sleep 120 & echo $! $(cut -d" " -f22 /proc/$!/stat)'
+def _sh_with_helper(out, then: str) -> str:
+    """An sh script that starts a background `sleep` (in sh's process group, its
+    stdout the child's), first records sh's and the sleep's pid and start time
+    to `out`, so a test that fails at any point can still kill both, then runs
+    `then`."""
+    record = (
+        'echo $$ $(cut -d" " -f22 /proc/$$/stat) $! $(cut -d" " -f22 /proc/$!/stat)'
+        f" > {out}.tmp && mv {out}.tmp {out}"
+    )
+    return f"sleep 120 & {record}; {then}"
 
 
-def _kill_if_alive(helper: tuple[int, int] | None) -> None:
-    if helper is not None and _proc_state(*helper) == "alive":
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(helper[0], signal.SIGKILL)
+def _sh_record(out) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """((sh pid, start), (helper pid, start)) from the record, or None."""
+    if not out.exists():
+        return None
+    sh_pid, sh_start, helper_pid, helper_start = (int(v) for v in out.read_text().split())
+    return (sh_pid, sh_start), (helper_pid, helper_start)
 
 
-def test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes():
+def _kill_sh_leftovers(out) -> None:
+    """Kill the recorded sh and its helper if either is still alive, and reap
+    the sh if it is still this process's child."""
+    record = _sh_record(out)
+    if record is None:
+        return
+    for pid, start in record:
+        if _proc_state(pid, start) == "alive":
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(record[0][0], 0)
+    _wait_until_gone(*record[1])
+
+
+def test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes(tmp_path):
     """`_run_child` as the pip install uses it (bytes): a child that exits 0 with
     a background helper still holding stdout returns at once with its output,
     and the helper is killed with the group."""
-    helper = None
+    out = tmp_path / "record"
     try:
-        result = _sh_child(_SH_BACKGROUND_SLEEP, timeout=20)
+        result = _sh_child(_sh_with_helper(out, "echo done"), timeout=20)
         assert result.returncode == 0
-        assert isinstance(result.stdout, bytes) and result.stderr == b""
-        pid, start = (int(v) for v in result.stdout.split())
-        helper = (pid, start)
-        assert _wait_until_gone(pid, start) == "gone"
+        assert (result.stdout, result.stderr) == (b"done\n", b"")
+        _sh, helper = _sh_record(out)
+        assert _wait_until_gone(*helper) == "gone"
     finally:
-        _kill_if_alive(helper)
+        _kill_sh_leftovers(out)
 
 
 def test_run_child_timeout_kills_the_group_and_raises(tmp_path):
     """At the timeout `_run_child` kills the group, reaps the child, and raises
     subprocess.TimeoutExpired, as subprocess.run did, for the pip install too."""
-    out = tmp_path / "helper"
-    helper = None
+    out = tmp_path / "record"
     try:
         with pytest.raises(driver_sandbox.subprocess.TimeoutExpired) as raised:
-            _sh_child(f"{_SH_BACKGROUND_SLEEP} > {out}; sleep 120", timeout=2)
+            _sh_child(_sh_with_helper(out, "wait"), timeout=2)
         assert raised.value.timeout == 2
-        pid, start = (int(v) for v in out.read_text().split())
-        helper = (pid, start)
-        assert _wait_until_gone(pid, start) == "gone"
+        (sh_pid, _sh_start), helper = _sh_record(out)
+        assert _wait_until_gone(*helper) == "gone"
+        _assert_child_reaped(sh_pid)
     finally:
-        _kill_if_alive(helper)
+        _kill_sh_leftovers(out)

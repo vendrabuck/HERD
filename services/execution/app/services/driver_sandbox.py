@@ -32,9 +32,12 @@ def _kill_group(pgid: int) -> None:
     child starts in a session of its own (`_run_child`). Callers send it only
     while the child is not yet reaped, so the id still names the child's group.
     A group already gone is fine. The kill is refused for an id below 2 (0 would
-    be this process's own group, 1 is init) and for this process's own group, so
-    no spawn that failed to start a new session can make the service signal
-    itself.
+    be this process's own group, 1 is init) and for this process's own group.
+    That refusal is defense in depth: with the new session the id is the child's
+    pid and never this process's group, and without one `killpg` of the child's
+    pid finds no such group (ESRCH, suppressed here); it is what stands between a
+    future change that looks the group up some other way and the service
+    killing itself.
     """
     if pgid < 2 or pgid == os.getpgrp():
         logger.error("Refusing to signal process group %d: not a sandbox child's group", pgid)
@@ -138,14 +141,22 @@ def _run_child(
         holding the child's stdout or stderr end when the child does, rather
         than at the timeout.
 
+    Assumed: nothing else in this process reaps the child. No code in the
+    execution service or `herd_common` waits for any child but its own (no
+    `waitpid(-1)`, no `os.wait`) or installs a SIGCHLD handler; a change that
+    brought one in could reap the child behind this function, after which its
+    pid, and the group id the kills use, could be reused.
+
     Not covered: a descendant that leaves the group (it calls setsid or setpgid,
     as a helper that daemonizes itself does) is not killed, and if it holds the
     child's stdout or stderr open, the call waits for it until the timeout and
     raises TimeoutExpired. A second exception raised in this thread while the
-    `finally` waits for the killed child can leave the child unreaped (it has
-    been sent SIGKILL; Popen reaps it later). This runs on a worker thread
-    (`asyncio.to_thread`), and cancelling the coroutine that awaits the thread
-    does not stop it: the call still ends in one of the ways above.
+    `finally` is joining the watcher or waiting for the killed child leaves the
+    child unreaped (it has been sent SIGKILL; Popen reaps it later) and leaves
+    open the child's stdout and stderr pipes and the read end of the exit pipe.
+    This runs on a worker thread (`asyncio.to_thread`), and cancelling the
+    coroutine that awaits the thread does not stop it: the call still ends in
+    one of the ways above.
     """
     proc = subprocess.Popen(
         cmd,
@@ -162,15 +173,22 @@ def _run_child(
     try:
         deadline = time.monotonic() + timeout
         exit_r, exit_w = os.pipe()
+        # Hand exit_w to the watcher before it starts: from here only the
+        # watcher closes it, so no exception can make it closed twice.
+        watcher_w, exit_w = exit_w, None
         thread = threading.Thread(
             target=_watch_exit,
-            args=(proc.pid, exit_w),
+            args=(proc.pid, watcher_w),
             name=_WATCHER_THREAD_NAME,
             daemon=True,
         )
-        thread.start()
-        # From here the watcher owns exit_w and closes it.
-        watcher, exit_w = thread, None
+        try:
+            thread.start()
+        except RuntimeError:
+            # The thread could not be started, so it never closes its end.
+            os.close(watcher_w)
+            raise
+        watcher = thread
         collected = _collect(proc, exit_r, pgid, deadline)
         if collected is None:
             raise subprocess.TimeoutExpired(cmd, timeout)

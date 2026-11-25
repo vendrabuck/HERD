@@ -600,7 +600,10 @@ The child runs in a process group of its own, and when the call ends, for any re
 the whole group is killed: a helper process the driver started (an `ssh` client, an
 `expect` script, a vendor CLI) does not outlive the call, even after a successful one.
 A helper that puts itself in a new session or process group (as a process that
-daemonizes itself does) is not killed; a driver must stop such a helper itself.
+daemonizes itself does) is not killed; a driver must stop such a helper itself. If such a
+helper still holds the driver's stdout or stderr open when the driver exits, the call
+waits for it and ends with `Execution timed out after <N>s`, even after a successful
+driver method.
 A driver killed by a resource limit (for example out-of-memory or CPU exhaustion) is
 recorded as failed with the terminating signal.
 
