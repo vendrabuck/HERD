@@ -1,10 +1,14 @@
 """Driver sandbox: execute driver methods in an isolated subprocess."""
 
+import contextlib
 import json
 import logging
 import os
+import selectors
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +17,202 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 _RUNNER_PATH = str(Path(__file__).parent / "_runner.py")
+
+# The read size for a child's stdout and stderr, the one communicate() uses.
+_READ_CHUNK_BYTES = 32768
+
+# The name of the thread that waits for a sandbox child's exit (`_watch_exit`).
+_WATCHER_THREAD_NAME = "herd-sandbox-exit-watch"
+
+
+def _kill_group(pgid: int) -> None:
+    """SIGKILL every process in the sandbox child's process group (issue #1407).
+
+    `pgid` is the child's pid, which is also its process group id because the
+    child starts in a session of its own (`_run_child`). Callers send it only
+    while the child is not yet reaped, so the id still names the child's group.
+    A group already gone is fine. The kill is refused for an id below 2 (0 would
+    be this process's own group, 1 is init) and for this process's own group.
+    That refusal is defense in depth: with the new session the id is the child's
+    pid and never this process's group, and without one `killpg` of the child's
+    pid finds no such group (ESRCH, suppressed here); it is what stands between a
+    future change that looks the group up some other way and the service
+    killing itself.
+    """
+    if pgid < 2 or pgid == os.getpgrp():
+        logger.error("Refusing to signal process group %d: not a sandbox child's group", pgid)
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def _watch_exit(pid: int, exit_w: int) -> None:
+    """Close `exit_w` once the child `pid` has exited, without reaping it.
+
+    Runs on a thread of its own. `os.waitid` with WNOWAIT returns when the child
+    exits and leaves it a zombie, so its pid, and with it its group id, stays
+    reserved until `_run_child` reaps it. A pidfd would do the same without a
+    thread, but the python-build-standalone interpreters that uv installs (the
+    3.12.12 and 3.14.0 builds were checked) have no `os.pidfd_open`.
+    """
+    try:
+        with contextlib.suppress(ChildProcessError):
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+    finally:
+        os.close(exit_w)
+
+
+def _collect(
+    proc: subprocess.Popen, exit_r: int, pgid: int, deadline: float
+) -> tuple[bytes, bytes] | None:
+    """Read the child's stdout and stderr to their end and see it exit, by `deadline`.
+
+    Returns (stdout, stderr) as bytes once the child has exited and both pipes
+    are closed, or None when `deadline` (a `time.monotonic` value) passes first.
+    The exit is seen as end of file on `exit_r`, whose write end `_watch_exit`
+    closes when the child exits and before it is reaped. At that moment the
+    child's group is killed, so a process the child started that holds a pipe
+    open cannot keep the read waiting until the deadline; its pipe ends close
+    when it dies. Nothing here reaps the child.
+    """
+    assert proc.stdout is not None and proc.stderr is not None
+    out_fd = proc.stdout.fileno()
+    err_fd = proc.stderr.fileno()
+    chunks: dict[int, list[bytes]] = {out_fd: [], err_fd: []}
+    with selectors.PollSelector() as selector:
+        selector.register(out_fd, selectors.EVENT_READ)
+        selector.register(err_fd, selectors.EVENT_READ)
+        selector.register(exit_r, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            for key, _events in selector.select(remaining):
+                if key.fd == exit_r:
+                    selector.unregister(exit_r)
+                    _kill_group(pgid)
+                    continue
+                data = os.read(key.fd, _READ_CHUNK_BYTES)
+                if data:
+                    chunks[key.fd].append(data)
+                else:
+                    selector.unregister(key.fd)
+    return b"".join(chunks[out_fd]), b"".join(chunks[err_fd])
+
+
+def _decode(data: bytes, stream) -> str:
+    """Decode a pipe's bytes exactly as `subprocess.run(text=True)` does: the
+    pipe's own encoding and error handler, then universal newlines."""
+    return data.decode(stream.encoding, stream.errors).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _run_child(
+    cmd: list[str], *, env: dict[str, str], timeout: float, text: bool
+) -> subprocess.CompletedProcess:
+    """Run `cmd` with its stdout and stderr captured; nothing it started outlives it.
+
+    The replacement for `subprocess.run(cmd, capture_output=True, timeout=...)`
+    for the sandbox child and the `pip install` child (issue #1407): the same
+    result (a CompletedProcess whose stdout and stderr are decoded as `text=True`
+    decodes them, or bytes), the same `subprocess.TimeoutExpired` when the child
+    has not exited, or its stdout or stderr is still open, `timeout` seconds after
+    it started, and the same OSError when it cannot be started.
+
+    The invariant: however the call ends (the child exits with any status or is
+    killed by a signal, the timeout passes, or an exception is raised in this
+    thread between the start and the reap), every process in the child's process
+    group, the child included, is sent SIGKILL, and then the child is reaped.
+
+    How it holds:
+      - The child starts with `start_new_session=True`, so it leads a session and
+        a process group of its own, whose id is its pid. The new session is made
+        in the child before it executes the command, and Popen returns only after
+        that, so no kill is ever sent before the group exists. The kill goes to
+        that id only, never to 0 or to this process's group (`_kill_group`).
+      - The group is killed only while the child is not yet reaped: when its exit
+        is seen (`_collect`, told by `_watch_exit`, which waits for the exit
+        without reaping), and in the `finally` below, before `wait()` reaps it.
+        An unreaped child keeps its pid, and with it the group id, from being
+        reused, so a kill can never reach a process group that a recycled id
+        names, another sandbox call's included. The watcher thread is joined
+        before the reap for the same reason: it never waits on a pid that is no
+        longer the child's.
+      - The kill at the exit is what lets a call whose driver left a helper
+        holding the child's stdout or stderr end when the child does, rather
+        than at the timeout.
+
+    Assumed: nothing else in this process reaps the child. No code in the
+    execution service or `herd_common` waits for any child but its own (no
+    `waitpid(-1)`, no `os.wait`) or installs a SIGCHLD handler; a change that
+    brought one in could reap the child behind this function, after which its
+    pid, and the group id the kills use, could be reused.
+
+    Not covered: a descendant that leaves the group (it calls setsid or setpgid,
+    as a helper that daemonizes itself does) is not killed, and if it holds the
+    child's stdout or stderr open, the call waits for it until the timeout and
+    raises TimeoutExpired. A second exception raised in this thread while the
+    `finally` is joining the watcher or waiting for the killed child leaves the
+    child unreaped (it has been sent SIGKILL; Popen reaps it later) and leaves
+    open the child's stdout and stderr pipes and the read end of the exit pipe.
+    This runs on a worker thread (`asyncio.to_thread`), and cancelling the
+    coroutine that awaits the thread does not stop it: the call still ends in
+    one of the ways above.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        env=env,
+        start_new_session=True,
+    )
+    # The child leads its own session, so its process group id is its pid.
+    pgid = proc.pid
+    exit_r = exit_w = None
+    watcher = None
+    try:
+        deadline = time.monotonic() + timeout
+        exit_r, exit_w = os.pipe()
+        # Hand exit_w to the watcher before it starts: from here only the
+        # watcher closes it, so no exception can make it closed twice.
+        watcher_w, exit_w = exit_w, None
+        thread = threading.Thread(
+            target=_watch_exit,
+            args=(proc.pid, watcher_w),
+            name=_WATCHER_THREAD_NAME,
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            # The thread could not be started, so it never closes its end.
+            os.close(watcher_w)
+            raise
+        watcher = thread
+        collected = _collect(proc, exit_r, pgid, deadline)
+        if collected is None:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        stdout, stderr = collected
+        if text:
+            stdout = _decode(stdout, proc.stdout)
+            stderr = _decode(stderr, proc.stderr)
+    finally:
+        _kill_group(pgid)
+        # The child itself, whatever became of the group kill: it is not reaped
+        # yet, so its pid is still its own.
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(proc.pid, signal.SIGKILL)
+        if watcher is not None:
+            watcher.join()
+        if exit_w is not None:
+            os.close(exit_w)
+        proc.wait()
+        assert proc.stdout is not None and proc.stderr is not None
+        proc.stdout.close()
+        proc.stderr.close()
+        if exit_r is not None:
+            os.close(exit_r)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def context_to_env_vars(context: dict, exclude: set[str] | None = None) -> dict[str, str]:
@@ -240,13 +440,15 @@ def execute_driver_method(
         # for the same reasons the child runs with those flags (issue #1180):
         # pip must not import a `sitecustomize.py` or a stdlib-shadowing module
         # from the package directory or the current directory, and `-B` stands
-        # in for the PYTHONDONTWRITEBYTECODE that `-I` ignores.
+        # in for the PYTHONDONTWRITEBYTECODE that `-I` ignores. It runs through
+        # `_run_child`, like the driver child, so nothing pip starts outlives it
+        # (issue #1407).
         deps_dir = os.path.join(driver_path, "_deps")
         reqs_file = os.path.join(driver_path, "requirements.txt")
         if os.path.exists(reqs_file) and not os.path.exists(deps_dir):
             if settings.allow_driver_pip_install:
                 try:
-                    subprocess.run(
+                    _run_child(
                         [
                             "python",
                             "-I",
@@ -260,9 +462,9 @@ def execute_driver_method(
                             deps_dir,
                             "-q",
                         ],
-                        timeout=60,
-                        capture_output=True,
                         env=env,
+                        timeout=60,
+                        text=False,
                     )
                 except Exception as e:
                     logger.warning("Failed to install driver dependencies: %s", e)
@@ -277,13 +479,9 @@ def execute_driver_method(
 
         start = time.monotonic()
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
+            # The child and every process it starts that stays in its process
+            # group end with the call, however it ends (issue #1407, _run_child).
+            result = _run_child(cmd, env=env, timeout=timeout, text=True)
             elapsed_ms = int((time.monotonic() - start) * 1000)
 
             transcript = _read_transcript(transcript_file)
