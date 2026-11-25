@@ -28,6 +28,7 @@ from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
     EXTRA_BODY_BYTES_ATTRIBUTE,
     FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
     MIN_MAX_REQUEST_BODY_BYTES,
     LimitRequestBody,
     RefuseLoneSurrogates,
@@ -154,12 +155,44 @@ def test_the_one_item_names_the_limit_and_nothing_else():
     assert BODY_TOO_LARGE_TYPE == "body_too_large"
 
 
-def test_the_default_is_four_mebibytes():
-    """The one place the number lives (the config copy and the compose defaults are
-    pinned to it elsewhere)."""
-    assert DEFAULT_MAX_REQUEST_BODY_BYTES == 4 * 1024 * 1024
+def test_the_default_and_the_allowances_are_pinned():
+    """The one place each number lives (the config copy and the compose defaults are
+    pinned to it elsewhere). The default is 256 KiB since issue #1484; the large-JSON
+    allowance keeps the 4 MiB every route took before it."""
+    assert DEFAULT_MAX_REQUEST_BODY_BYTES == 256 * 1024 == 262144
+    assert LARGE_JSON_BODY_BYTES == 4 * 1024 * 1024 == 4194304
     assert MIN_MAX_REQUEST_BODY_BYTES == 64 * 1024
     assert FORWARD_ENVELOPE_BYTES == 256 * 1024
+    assert MIN_MAX_REQUEST_BODY_BYTES <= DEFAULT_MAX_REQUEST_BODY_BYTES < LARGE_JSON_BODY_BYTES
+
+
+@pytest.mark.parametrize(
+    "setting", [MIN_MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REQUEST_BODY_BYTES, 8 * 1024 * 1024]
+)
+def test_route_body_limit_of_a_large_json_route_adds_the_allowance_to_any_setting(setting):
+    """A mark adds to the setting, so an operator who raises MAX_REQUEST_BODY_BYTES
+    past the allowance raises the large-JSON routes too: the limit is never below
+    max(setting, LARGE_JSON_BODY_BYTES). A forward of a large body adds the envelope."""
+
+    async def canvas_save(body: dict = Body(...)):
+        return body
+
+    async def forwarded_canvas_save(body: dict = Body(...)):
+        return body
+
+    class LargeJson:
+        endpoint = extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)(canvas_save)
+
+    class LargeForward:
+        endpoint = extends_body_limit(lambda: LARGE_JSON_BODY_BYTES + FORWARD_ENVELOPE_BYTES)(
+            forwarded_canvas_save
+        )
+
+    large = route_body_limit(LargeJson(), setting)
+    assert large == setting + LARGE_JSON_BODY_BYTES
+    assert large > max(setting, LARGE_JSON_BODY_BYTES)
+    assert route_body_limit(LargeForward(), setting) == large + FORWARD_ENVELOPE_BYTES
+    assert route_body_limit(None, setting) == setting
 
 
 @pytest.mark.parametrize(
@@ -445,9 +478,10 @@ def _answer(sent: list[dict]) -> tuple[list[int], bytes]:
 
 
 async def test_known_limit_a_streaming_route_that_never_reads_its_body_fails_behind_the_logger():
-    """Documents a known limit (OPS-VALID-9, limits by decision; a follow-up issue
-    tracks it). No HERD route is affected today: the one streaming route reads its
-    JSON body before it streams.
+    """Documents a known limit (OPS-VALID-9; issue #1483 kept it, by decision, and
+    guards against it instead). No HERD route is affected: the one streaming route
+    takes its JSON body as a parameter, and `tests/unit/test_request_body_limit_wiring.py`
+    fails on a streaming route that does not, unless it is listed there.
 
     Behind the request logger (a BaseHTTPMiddleware, as in every HERD service), the
     disconnect listener of a streaming response makes the first read of a body whose
@@ -456,8 +490,7 @@ async def test_known_limit_a_streaming_route_that_never_reads_its_body_fails_beh
     ends with the response never started, the logger has nothing to return, and
     Starlette raises `RuntimeError: No response returned.`: the client gets a 500 (a
     server that cannot send one resets the connection). What is pinned: the failure
-    is a server error, never a served response, and nothing of the body is read. A
-    streaming route must read or drain its body before it streams (CONVENTIONS)."""
+    is a server error, never a served response, and nothing of the body is read."""
     script = _Script(_chunks(256))
     sent: list[dict] = []
 

@@ -384,6 +384,13 @@ async def _reattempt_rows(
     which claims each row immediately before its own driver call. A row the OTHER
     channel claimed first is not driven at all and reads back "in_progress", not
     "still_failed": nothing failed, another channel is mid-drive on it.
+
+    Direction (issue #1496): the claim also requires the row to still intend the
+    direction this pass planned for it. A build row another pass parked (intended
+    RELEASED) after this pass revalidated it, or a release row whose intent became
+    ACTIVE, is not driven, is left exactly as it is, and reads back by its status,
+    "still_failed" while FAILED: it is work for the next pass in its true direction,
+    not another channel's work in flight.
     """
     from app.services.nats_consumer import (
         WIRING_STALE_BUILD_REASON,
@@ -539,6 +546,8 @@ async def _reattempt_rows(
             # finished, its real outcome is the honest answer.
             outcome = "in_progress"
         else:
+            # Includes a row whose claim was refused for its direction (issue #1496,
+            # claims.wrong_direction): nobody else is driving it, so it reads by status.
             outcome = "still_failed"
         outcomes.append(_outcome(row, outcome))
     if upstream_skips is not None:
@@ -861,6 +870,7 @@ async def _reattempt_l2_rows(
                 # The other channel claimed this row before our driver call (issue #817).
                 outcome = "in_progress"
             else:
+                # Includes a row refused for its direction (issue #1496).
                 outcome = "still_failed"
             outcomes.append(_l2_outcome(row, outcome, vlan_by_va.get(row.vlan_assignment_id)))
         if upstream_skips is not None:
@@ -1152,6 +1162,7 @@ async def _reattempt_l3_rows(
             # The other channel claimed this pin before our driver call (issue #817).
             outcome = "in_progress"
         else:
+            # Includes a pin refused for its direction (issue #1496).
             outcome = "still_failed"
         outcomes.append(_l3_outcome(row, outcome))
     if upstream_skips is not None:

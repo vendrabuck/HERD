@@ -180,7 +180,9 @@ three points, each surfacing the same kind of problem list:
   a routing problem refuses the save outright rather than saving broken intent, with a
   "Routing intent refused: N problems" toast and the same badge/reason-line treatment. A
   canvas shape the panel could not have produced (rare, and worth reporting rather than
-  hiding) toasts "Routing intent malformed: ..." instead. If the switch's config could not be
+  hiding) toasts "Routing intent malformed: ..." instead, and so does a switch given more
+  than 1,000 distinct routes (issue #1493): "Routing intent malformed: switch <device id>
+  has <count> distinct routes; a switch carries at most 1000". If the switch's config could not be
   read at all (inventory unreachable), the toast reads "Could not verify routing intent:
   inventory unavailable" and nothing is saved.
 - **Creating a reservation** from a topology with routing intent runs the same check as part
@@ -204,7 +206,7 @@ The reasons you may see, in plain words:
 
 | Reason | Meaning |
 |---|---|
-| `l3_malformed` | The routing data on this node is not shaped the way the editor writes it; this should not happen through the Routing panel itself. |
+| `l3_malformed` | The routing data on this node is not shaped the way the editor writes it, which should not happen through the Routing panel itself; or the switch has more than 1,000 distinct routes, counted over every node naming it with a duplicate counted once (issue #1493), which the panel does not stop you from entering. |
 | `l3_not_a_router` | The device is not a Layer 3 Switch, so it cannot carry routes. |
 | `l3_switch_unconfigured` | The switch has no config version, or its config lists no interfaces; import a config first, or configure the switch, then add routes. |
 | `l3_switch_unattached` | Nothing on the canvas actually wires to this switch, so its routes would serve nothing. Which of its interfaces are wired is a separate, per-route check: see `l3_interface_unwired`. |

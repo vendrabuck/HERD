@@ -11,7 +11,11 @@ suite pins it through that service's real app.
 
 from __future__ import annotations
 
+import encodings.utf_16_le
 import json
+import re
+import threading
+from collections import Counter
 from typing import Any
 
 import pytest
@@ -19,6 +23,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, 
 from fastapi.exceptions import RequestValidationError
 from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
+    LARGE_JSON_BODY_BYTES,
     LONE_SURROGATE_BODY_ERROR,
     RENDERED_KEYS,
     STRING_UNICODE_MSG,
@@ -36,7 +41,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from tests._cost import cpu_ratio, growth_ratios
+from tests._cost import CallProfile, call_profile, cpu_ratio, growth_ratios
 
 MARKER = "canary-Secret-7q"
 
@@ -386,14 +391,144 @@ def test_holds_lone_surrogate(value, expected):
     assert holds_lone_surrogate(value) is expected
 
 
+# Where `json.dumps` stops is the interpreter's, not HERD's (issue #1487). Python 3.12
+# and 3.13 count C recursion against a fixed limit: 3.12 serializes a list nested 9,997
+# deep and refuses 9,998, 3.13 serializes 9,998 and refuses 9,999. Python 3.14 checks
+# the real stack instead, so the depth varies by build and by stack size; 3.14.3 on
+# 64-bit Linux, for example, refuses about 58,000 in 8 MiB, about 7,000 in 1 MiB, and
+# serializes 2,000,000 in an unlimited main-thread stack. So no fixed depth is too deep
+# everywhere; these tests find the depth on the interpreter that runs them, in a thread
+# whose stack size they set, so the depth found does not depend on `ulimit -s` either.
+_STACK_BYTES = 8 * 1024 * 1024
+# The deepest nesting the search tries: far above any depth an 8 MiB thread reaches on
+# the interpreters measured (under 75,000), so reaching it means `json.dumps` stopped
+# refusing deep values, and the search fails instead of going further.
+_DEEPEST_SEARCHED = 2_048_000
+
+
+def _nested(leaf: object, depth: int) -> object:
+    deep = leaf
+    for _ in range(depth):
+        deep = [deep]
+    return deep
+
+
+def _serializes(value: object) -> bool:
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except RecursionError:
+        return False
+    return True
+
+
+def _shallowest_depth_too_deep_to_serialize() -> int:
+    """The smallest nesting depth `json.dumps` refuses with RecursionError, here."""
+    fits, too_deep = 0, 1_000
+    while _serializes(_nested("ok", too_deep)):
+        fits, too_deep = too_deep, too_deep * 2
+        assert too_deep <= _DEEPEST_SEARCHED, "json.dumps serialized every depth searched"
+    while too_deep - fits > 1:
+        middle = (fits + too_deep) // 2
+        if _serializes(_nested("ok", middle)):
+            fits = middle
+        else:
+            too_deep = middle
+    return too_deep
+
+
+def _in_a_thread_with_a_fixed_stack(check: Any) -> None:
+    """Run `check()` in a thread with a `_STACK_BYTES` stack; re-raise what it raised."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            check()
+        except BaseException as exc:  # handed back to the test's own thread
+            raised.append(exc)
+
+    previous = threading.stack_size(_STACK_BYTES)
+    try:
+        thread = threading.Thread(target=run)
+        thread.start()
+    finally:
+        threading.stack_size(previous)
+    thread.join()
+    if raised:
+        raise raised[0]
+
+
 def test_holds_lone_surrogate_on_a_value_too_deep_to_serialize():
-    for leaf, expected in ((SUR, True), ("ok", False)):
-        deep: object = leaf
-        for _ in range(10_000):
-            deep = [deep]
-        with pytest.raises(RecursionError):
-            json.dumps(deep)
-        assert holds_lone_surrogate(deep) is expected
+    """At twice the depth `json.dumps` refuses, only the walk can answer: the value is
+    asserted unserializable first, so a pass here is the walk's answer."""
+
+    def check() -> None:
+        depth = 2 * _shallowest_depth_too_deep_to_serialize()
+        for leaf, expected in ((SUR, True), ("ok", False)):
+            deep = _nested(leaf, depth)
+            with pytest.raises(RecursionError):
+                json.dumps(deep, ensure_ascii=False)
+            assert holds_lone_surrogate(deep) is expected
+
+    _in_a_thread_with_a_fixed_stack(check)
+
+
+def test_holds_lone_surrogate_answers_at_every_depth_where_serializing_stops():
+    """For every depth on both sides of where `json.dumps` stops on this interpreter, and
+    on both sides of the fixed limits of 3.12 and 3.13, the answer is right, whichever of
+    the serialization and the walk gives it."""
+
+    def check() -> None:
+        edge = _shallowest_depth_too_deep_to_serialize()
+        assert not _serializes(_nested("ok", edge))
+        assert _serializes(_nested("ok", edge - 1))
+        for depth in (*range(edge - 3, edge + 4), *range(9_996, 10_001)):
+            for leaf, expected in ((SUR, True), ("ok", False)):
+                assert holds_lone_surrogate(_nested(leaf, depth)) is expected, (depth, leaf)
+
+    _in_a_thread_with_a_fixed_stack(check)
+
+
+def _spine(kind: str, depth: int) -> object:
+    """A value nested `depth` deep holding no string but dict keys `"k"`: lists, dicts
+    (`{"k": ...}`), or the two alternating."""
+    deep: object = 0
+    for level in range(depth):
+        as_dict = kind == "dict" or (kind == "mixed" and level % 2 == 1)
+        deep = {"k": deep} if as_dict else [deep]
+    return deep
+
+
+# Where the lone surrogate sits beside a spine too deep to serialize. Each shape is a
+# place the walk must reach: a dict key, a dict value, a list's second item, a list's
+# first item, and a string after a clean one (whichever end the walk starts from, a
+# clean string comes first, so an answer decided by the first string is wrong).
+_WALK_SHAPES = {
+    "dict_key_over_a_dict_spine": lambda text, depth: {text: _spine("dict", depth)},
+    "dict_value_beside_a_mixed_spine": lambda text, depth: {
+        "spine": _spine("mixed", depth),
+        "leaf": text,
+    },
+    "second_list_item_after_a_list_spine": lambda text, depth: [_spine("list", depth), text],
+    "first_list_item_before_a_mixed_spine": lambda text, depth: [text, _spine("mixed", depth)],
+    "between_clean_strings": lambda text, depth: ["ok", _spine("list", depth), text, "ok"],
+}
+
+
+@pytest.mark.parametrize("shape", _WALK_SHAPES.values(), ids=_WALK_SHAPES.keys())
+def test_the_walk_finds_a_lone_surrogate_wherever_it_sits(shape):
+    """Past the depth `json.dumps` refuses, the walk answers for every shape: True with
+    a lone surrogate, False for the same value with clean text in its place. The value
+    is asserted unserializable first, so the answer is the walk's."""
+
+    def check() -> None:
+        depth = 2 * _shallowest_depth_too_deep_to_serialize()
+        for text, expected in ((SUR, True), ("clean", False)):
+            value = shape(text, depth)
+            with pytest.raises(RecursionError):
+                json.dumps(value, ensure_ascii=False)
+            assert holds_lone_surrogate(value) is expected, text
+
+    _in_a_thread_with_a_fixed_stack(check)
 
 
 class _Strict(BaseModel):
@@ -404,10 +539,14 @@ class _Strict(BaseModel):
 
 def _open_app(*, refuse: bool = True) -> FastAPI:
     """Routes whose types accept a lone surrogate: a plain str, a free-form mapping,
-    Any, a raw `Request`, plus routes that take no body, a form, and a query."""
+    Any, a raw `Request`, plus routes that take no body, a form, and a query. Its limit
+    is a large-JSON route's (issue #1484): the cost tests send bodies of about 1 MB,
+    which the 256 KiB default would refuse before the scan they measure."""
     app = FastAPI()
     install_validation_errors(
-        app, max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES, refuse_lone_surrogates=refuse
+        app,
+        max_body_bytes=DEFAULT_MAX_REQUEST_BODY_BYTES + LARGE_JSON_BODY_BYTES,
+        refuse_lone_surrogates=refuse,
     )
 
     @app.post("/str")
@@ -797,16 +936,17 @@ async def test_install_after_the_app_started_is_refused():
 
 # -- The cost: one scan of the raw bytes (round 4 of the #1456 review) ----------------
 #
-# Every time is CPU time read through `tests/_cost.py` (#1477), and every bound is
+# Every time is CPU time read through `tests/_cost.py` (#1477), and every time bound is
 # relative, with margin over the worst measurement, and re-measured once before it
-# fails. Bounds: the escape-heavy scan against itself at 4 and 16 times the size
-# (linear work) and against one `bytes.lower` pass per shape (a constant factor); the
-# structural scan and the parsed-value check against the parse they stand beside; the
-# no-marker exit against one `bytes.lower` pass; a refused request against the same
-# request without the check.
+# fails. Bounds: the escape-heavy and UTF-16 scans against themselves at 4 and 16 times
+# the size (linear work); the structural scan and the parsed-value check against the
+# parse they stand beside; a refused request against the same request without the
+# check. The escape-heavy, UTF-16, and no-marker bodies are also held to a frozen
+# budget of C passes (a constant factor, `_scan_cost_budget`), by call counts that read
+# no clock (`call_profile` in `tests/_cost.py`, `_within_budget` below, #1512).
 #
 # Every measured figure below is a CPU-time ratio, one attempt with no re-measure, from
-# the #1477 measurements, which have three sources:
+# the #1477 measurements, sources (a) to (c), and the #1492 ones, sources (d) and (e):
 # (a) the development host, AMD Threadripper PRO 5955WX, the builder's runs: at least
 #     50 rounds of every bound in each of unpinned, `taskset -c 0`, pinned beside CPU
 #     hogs, and under coverage;
@@ -818,6 +958,17 @@ async def test_install_after_the_app_started_is_refused():
 #     Intel Xeon 6975P-C unpinned and under `taskset -c 0`, and 20 on AMD EPYC 9V74 under
 #     coverage. The same run's 150 test reruns (50 per mode) passed and also landed on
 #     AMD EPYC 7763 and Intel Xeon Platinum 8573C, for which no ratios were printed.
+# (d) #1492, the development host (AMD Threadripper PRO 5955WX), every run pinned with
+#     `taskset -c 0`, 20 runs per interpreter build: Python 3.12.3 (the Ubuntu distro
+#     build, GCC), 3.13.12 and 3.14.3 (deadsnakes, GCC), and the python-build-standalone
+#     builds uv installs, 3.12.12, 3.12.16, 3.13.18, and 3.14.0 (Clang, PGO, LTO, BOLT);
+#     and 20 runs beside two CPU hogs on core 0 on 3.12.3 and on 3.12.16.
+# (e) #1499 (review and fix round of #1492), the same host: the review's 30 runs in each
+#     of unpinned, pinned, pinned beside two hogs, and under coverage on 3.12.3 and
+#     3.12.16; the fix round's 30 runs in each of those modes on 3.12.3, 3.12.16, and
+#     3.13.18 and 10 pinned runs on each of the other four builds of (d), with the
+#     budget and bodies below. Figures from (e) are the value `cpu_ratio` returned (one
+#     re-measure when over a bound).
 
 _MB = 1 << 20
 # Each fourfold step in size may cost at most this many times the one before: linear
@@ -827,8 +978,15 @@ _GROWTH_BOUND = 8.0
 
 
 def _fill(unit: str, head: str, tail: str, size: int = _MB) -> bytes:
-    """`unit` repeated to about `size` bytes between `head` and `tail`."""
-    return (head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail).encode()
+    """`unit` repeated to about `size` bytes of UTF-8 between `head` and `tail`."""
+    room = size - len(head.encode()) - len(tail.encode())
+    return (head + unit * (room // len(unit.encode())) + tail).encode()
+
+
+def _fill16(unit: str, head: str, tail: str, size: int = _MB) -> bytes:
+    """`_fill` as UTF-16-LE with no BOM, which `json.loads` also reads; BMP text only."""
+    room = size - 2 * (len(head) + len(tail))
+    return (head + unit * (room // (2 * len(unit))) + tail).encode("utf-16-le")
 
 
 def _peak(fn) -> int:
@@ -852,8 +1010,11 @@ _STRUCTURAL = {
     "triples": lambda: _fill("[[[]]],", '{"name":"a","z":[', _LONE_TEXT + "]}"),
     "nested_dicts": lambda: _fill('{"a":{"b":1}},', "[", _LONE_TEXT + "]"),
 }
-# Escape-heavy string bodies, the scan's own worst: json.loads decodes them fast. Each
-# takes the body's size, so the cost test can grow it.
+# Escape-heavy string bodies, the scan's own worst: json.loads decodes them fast. The
+# last two take the scan's other full paths: Korean text, whose UTF-8 holds a 0xED
+# byte in most characters, so the scan searches for a raw surrogate and then runs the
+# escape passes; and lone high escapes, which the scan refuses at the first one, after
+# its copies. Each takes the body's size, so the cost test can grow it.
 _ESCAPE_HEAVY = {
     "pairs": lambda size=_MB: _fill(_BS + "ud83d" + _BS + "ude00", '{"name":"', '"}', size),
     "pairs_upper_then_low": lambda size=_MB: _fill(
@@ -862,30 +1023,280 @@ _ESCAPE_HEAVY = {
     "backslash_pairs_then_low": lambda size=_MB: _fill(_BS * 2, '{"name":"', _BS + 'udc00"}', size),
     "u0041_then_low": lambda size=_MB: _fill(_BS + "u0041", '{"name":"', _BS + 'udc00"}', size),
     "four_backslashes_and_text": lambda size=_MB: _fill(_BS * 4 + "ude00", '{"name":"', '"}', size),
+    "korean_text": lambda size=_MB: _fill("한국어 텍스트 ", '{"name":"', '"}', size),
+    "lone_highs": lambda size=_MB: _fill(_BS + "ud800 ", '{"name":"', '"}', size),
 }
-# Per shape, the worst CPU-time ratio of the scan of the 1 MB body to one `bytes.lower`
-# pass over it: the maximum over every measurement to date, sources (a), (b), and (c)
-# above, three CPU models. The highest came from the runner's Xeon (pairs shapes) and
-# from the reviewer's runs on the host under concurrent load (backslash_pairs_then_low
-# 24.17, u0041_then_low 11.24). The ratio moves about 1.2 times between CPU models on
-# the pairs shapes (Xeon 30.1, host 28.0, EPYC 24.9), so a new CPU model may need its
-# entry raised: that is the cost of a constant-factor bound. The ratio differs per
-# shape (by its escape density) far more than per run, which is why each shape has its
-# own bound: one bound for all of them would let the cheapest shape slow down
-# sevenfold. The bound is _PASS_MARGIN times the entry; the comment on each entry is
-# the slowdown that fails it, the bound over the largest median of the three CPU models.
-_ESCAPE_PASSES_WORST = {
-    "pairs": 30.1,  # median 29.8 on the Xeon: fails at 2.0 times slower
-    "pairs_upper_then_low": 30.1,  # median 29.6 on the Xeon: 2.0 times
-    "backslash_pairs_then_low": 24.17,  # median 20.4 on the host: 2.4 times
-    "u0041_then_low": 11.24,  # median 10.3 on the EPYC: 2.2 times
-    "four_backslashes_and_text": 20.9,  # median 17.3 on the Xeon: 2.4 times
+# A UTF-16 body: CJK text and escaped pairs, which the scan decodes, searches for a raw
+# lone surrogate, encodes as UTF-8, and gives the escape passes, with no early exit.
+_UTF16 = {
+    "cjk_and_pairs": lambda size=_MB: _fill16(
+        "日本" + _BS + "ud83d" + _BS + "ude00", '{"name":"', '"}', size
+    ),
 }
-# Twice the worst: room for another CPU-model shift of 1.2 times on top of the largest
-# worst-to-median spread seen within one machine (1.4 times, four_backslashes on the
-# host), 1.7 in all, while a scan three times slower fails every shape on all three
-# CPU models (the largest threshold, bound over the smallest median, is 2.8).
-_PASS_MARGIN = 2.0
+# The constant-factor budget (#1492): the C passes the scan of a body was made of when
+# #1492 measured it (OPS-VALID-8), the same calls in the same order with the same early
+# exits, frozen here. It does not follow the scan: a cheaper scan leaves it alone, and
+# it changes only when a change to the scan makes a call, runs a pattern, or takes a
+# step it does not, as a reviewed decision. Its patterns are copied, not imported, so
+# its answer, which the tests compare with the scan's, does not come from the scan's
+# own code, and `test_the_scans_patterns_are_the_budgets_copies` pins each copy equal
+# to the scan's pattern. It leaves out
+# `json.detect_encoding`, a constant cost (it reads at most four bytes); the caller
+# passes the encoding instead, and `_within_budget` allows the scan that one call.
+# Until #1512 the scan was held to it by a CPU-time ratio under 1.5, whose true value
+# is 1.00 (the two make the same C calls), so the bound read noise: a shared CI runner
+# measured 1.548 and 1.524 on 2026-11-21 with no change to the scan. Since #1512 the two
+# are compared by `call_profile` counts (`tests/_cost.py`), which read no clock.
+_BUDGET_RAW_SURROGATE_BYTES = re.compile(rb"\xed[\xa0-\xbf]")
+_BUDGET_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+_BUDGET_HIGH_NOT_PAIRED = re.compile(rb"\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})")
+_BUDGET_LOW_ESCAPES = (b"\\udc", b"\\udd", b"\\ude", b"\\udf")
+_BUDGET_HIGH_ESCAPES = (b"\\ud8", b"\\ud9", b"\\uda", b"\\udb")
+
+
+def _budget_escape_passes(text: bytes) -> bool:
+    if b"\\\\" in text:
+        text = text.replace(b"\\\\", b"_")
+    text = text.lower()
+    if _BUDGET_HIGH_NOT_PAIRED.search(text):
+        return True
+    lows = sum(text.count(low) for low in _BUDGET_LOW_ESCAPES)
+    return lows > 0 and lows > sum(text.count(high) for high in _BUDGET_HIGH_ESCAPES)
+
+
+def _scan_cost_budget(body: bytes, encoding: str = "utf-8") -> bool:
+    """The C passes budgeted for the scan of `body`, whose encoding the caller names.
+
+    It returns the scan's answer on the cost bodies, which the tests assert: that pins
+    that the budget takes the same branches, so does comparable work, on those bodies;
+    it says nothing about the scan's answers elsewhere, which the scan's own tests pin.
+    """
+    if encoding == "utf-8":
+        if b"\\u" not in body and b"\xed" not in body:
+            return False
+        if _BUDGET_RAW_SURROGATE_BYTES.search(body):
+            return True
+        return _budget_escape_passes(body)
+    text = body.decode(encoding, "surrogatepass")
+    if _BUDGET_LONE_SURROGATE.search(text):
+        return True
+    return _budget_escape_passes(text.encode("utf-8"))
+
+
+# The scan's Python functions under the names of the budget's that stand for them. A
+# helper of the scan renamed, split, or added is a name the budget never starts, so it
+# fails loudly until it is mapped here as a reviewed decision. Names are compared only
+# for functions in each side's home (`call_profile`), whose calls and steps are counted.
+_BUDGET_NAMES = {
+    "_raw_text_holds_a_lone_surrogate": "_scan_cost_budget",
+    "_escapes_hold_a_lone_surrogate": "_budget_escape_passes",
+}
+# Python functions outside a profile's home, whose C calls and steps are not counted,
+# are compared by code object, one entry per start: a function of another name, or of
+# the same name defined anywhere else, is a different code object. The budget may start
+# only `_BUDGET_OUTSIDE_STARTS`: the codec's Python wrapper that `bytes.decode` starts
+# for "utf-16-le" (CPython has no C fast path for that name), once on the UTF-16 body.
+# The scan may start only what the budget's profile of the same body started, plus
+# `_SCAN_ONLY_OUTSIDE_STARTS`, the one call the budget leaves out.
+_BUDGET_OUTSIDE_STARTS = (encodings.utf_16_le.decode.__code__,)
+_SCAN_ONLY_OUTSIDE_STARTS = (json.detect_encoding.__code__,)
+# How many more Python steps (`call_profile`: lines, jumps, generator resumes, counted
+# in the profiled function's package) the scan may take than the budget on the same
+# body, by encoding. Measured unmutated: exactly 1 more on every UTF-8 body (the scan's
+# `json.detect_encoding` line) and 2 more on the UTF-16 body (that line and its `try`),
+# the same counts on Python 3.12.3, 3.12.12, 3.13.12, 3.14.0, and 3.14.3. A count does
+# not vary from run to run, so the allowance is the measured difference with no margin:
+# one more line on the scan's path, or one more iteration of any Python loop in it,
+# fails.
+_STEP_ALLOWANCE = {"utf-8": 1, "utf-16-le": 2}
+
+# The scan of every escape-heavy, UTF-16, and no-marker body is held to the budget by
+# `_within_budget` and `test_the_scans_patterns_are_the_budgets_copies`: counts, no
+# clock, the same counts on Python 3.12.3, 3.12.12, 3.13.12, 3.14.0, and 3.14.3, plain
+# and under `coverage run` (#1512). Unmutated, the scan's C calls and regex calls (by
+# method, pattern, and flags) equal the budget's on all 11 bodies, its functions in
+# `herd_common` are the budget's under `_BUDGET_NAMES`, outside `herd_common` it starts
+# `json.detect_encoding` once plus what the budget starts outside `tests/` (the UTF-16
+# codec's Python decode wrapper, on the UTF-16 body only), and its steps are the
+# budget's plus `_STEP_ALLOWANCE` and the same at 256 KiB and 1 MB. What it catches,
+# from one run of each mutation of the product scan: the tests on 3.12.3, and the check
+# alone on 3.12.12 and 3.14.0, or for the pattern-count and outside-start mutations the
+# tests on 3.12.12 and 3.14.3 (the counts are exact, so one run decides; E is the 7
+# escape-heavy bodies, U the UTF-16 body, N the 3 no-marker bodies):
+# - by calls, on E and U: the escape passes run twice or three times, a `bytes.lower`
+#   run twice in place, a Python callback per `\u` escape, a loop of `bytes.find` per
+#   backslash, `findall` in place of `search`, a quadratic scan that counts each 4 KiB
+#   prefix (in the test the growth bound, checked first, fails it), and the helper
+#   moved to another module of `herd_common` with three more regex passes; a loop of
+#   `bytes.find` per 0xED byte fails E (its first `find` is a call the budget never
+#   makes); the early exit removed fails N;
+# - by steps: a Python loop per backslash with no call in it, on several lines or as a
+#   comprehension on one (E and U), a loop over the decoded UTF-16 text (U), 1,000
+#   `in` scans in a loop and a counting loop of 200,000 iterations (E and U), a loop
+#   over the body that stops after 65,536 bytes (all 11), and one more line on the
+#   scan's path, such as a third `in` search on a line of its own (every body that runs
+#   the line);
+# - by pattern: a regex rewritten as an alternation of itself (its search 1.92 times as
+#   costly on `pairs`, one pinned measurement on 3.12.3), and a new costlier pattern
+#   used in place of `_HIGH_NOT_PAIRED` (E and U); by its count, `_HIGH_NOT_PAIRED`
+#   searched in place of `_RAW_SURROGATE_BYTES` (6 of E: the same number of regex
+#   calls, 1.6 times the CPU time on `pairs`, pinned on 3.12.3, fastest of five calls,
+#   as for every figure in the list below; `lone_highs` returns at that search,
+#   cheaper, and U does not run it);
+# - by a start outside `herd_common`: the escape passes moved to a top-level module
+#   outside the package under their own name, with three more regex passes (E and U),
+#   a stand-in `detect_encoding` outside the package that runs 1,000 `in` scans (all
+#   11), a function outside it named `_raw_text_holds_a_lone_surrogate` called from the
+#   scan (E), and a bytes-like object outside it whose Python `__buffer__` runs when
+#   `bytes.count` reads it, a C call calling back into Python (6 of E and U).
+# The helper moved unchanged to another module of `herd_common`, and a scan made
+# cheaper (one low escape dropped from the counts), pass every body. A helper renamed
+# or split fails loudly, naming the function the budget never starts, until it is
+# mapped in `_BUDGET_NAMES`. What still passes the counts (the list found by attacking
+# this check):
+# - operators added to a line the scan already runs (`in`, `==`, slicing, `+`): a
+#   third `in` search on the early exit's own line passes every body; so does an
+#   operator there that drives work built before the call: `True in G`, `G` a
+#   module-level `map(operator.contains, ...)` over a cycle of 1,000 substrings, runs
+#   1,000 C searches of the body, one C function calling another (14 times the scan's
+#   CPU time on `pairs`), and `0 in GEN`, `GEN` a generator outside `herd_common`
+#   started before the call, whose resumes are not counted, ran 1,000 `in` scans (13.5
+#   times); a `for` loop resumes it the same way, while `next` or `send` is a C call
+#   the budget never makes;
+# - more work inside a call the budget makes as often, with the same pattern: a larger
+#   argument (searching `body + body` passes 10 bodies; the memory bound catches it on
+#   `lone_highs`), another substring, codec, or error handler;
+# - a slowdown on an input none of the 11 bodies exercises;
+# - work outside the one call: the scan called more than once by its caller, work
+#   handed to a thread already running, garbage left for the collector (off during the
+#   profile);
+# - the work inside `json.detect_encoding`, the one call the scan makes beyond the
+#   budget's, and inside the UTF-16 codec's Python decode wrapper, which both sides
+#   start: they run outside both homes, so only their starts are counted (today the
+#   first reads at most four bytes and the second is the one C decode both sides pay).
+# The growth bound and the memory bounds stay.
+
+
+def _where(code) -> str:
+    return f"{code.co_qualname} ({code.co_filename}:{code.co_firstlineno})"
+
+
+def _starts_beyond(starts: tuple, allowed: tuple) -> list[str]:
+    """Each of `starts` (code objects) that `allowed` does not cover, by identity: each
+    entry of `allowed` covers one start of that very code object."""
+    left = list(allowed)
+    beyond = []
+    for code in starts:
+        index = next((i for i, entry in enumerate(left) if entry is code), None)
+        if index is None:
+            beyond.append(_where(code))
+        else:
+            del left[index]
+    return beyond
+
+
+def _within_budget(make, encoding: str = "utf-8") -> tuple[CallProfile, CallProfile]:
+    """Hold the scan of `make()` (1 MB) to `_scan_cost_budget` of it, by call counts.
+
+    Fails, with both sides' counts in the message, when:
+    - either profile lacks exactly one start of its own entry function, or the scan's
+      profile holds no CALL event at all (every path of the scan calls
+      `json.detect_encoding`), or the budget makes C calls and the scan none, so a
+      profile that saw nothing cannot pass;
+    - the budget starts a Python function outside its home beyond
+      `_BUDGET_OUTSIDE_STARTS`, or the scan (at either size) one beyond what the
+      budget's profile started plus `_SCAN_ONLY_OUTSIDE_STARTS`, compared by code
+      object, one entry per start (outside the home, a name proves nothing);
+    - the scan runs a regex whose pattern and flags the budget does not run, or runs
+      any (method, pattern, flags) more times than the budget does, so a pattern run in
+      place of another fails even when the number of regex calls is unchanged;
+    - the scan calls any C callable more times than the budget does (one the budget
+      never calls counts as zero), or starts any Python function in its home more times
+      than the budget does (its own functions under `_BUDGET_NAMES`);
+    - the scan takes more Python steps than the budget's on the same body plus
+      `_STEP_ALLOWANCE` for its encoding, or more steps at 1 MB than at a quarter of
+      that.
+    Returns (scan, budget)."""
+    body = make()
+    scan = call_profile(_raw_text_holds_a_lone_surrogate, body)
+    budget = call_profile(_scan_cost_budget, body, encoding)
+    quarter = call_profile(_raw_text_holds_a_lone_surrogate, make(_MB // 4))
+    scan_python: Counter[str] = Counter()
+    for name, count in scan.python_calls.items():
+        scan_python[_BUDGET_NAMES.get(name, name)] += count
+    over_c = {k: (v, budget.c_calls[k]) for k, v in scan.c_calls.items() if v > budget.c_calls[k]}
+    over_python = {
+        k: (v, budget.python_calls[k]) for k, v in scan_python.items() if v > budget.python_calls[k]
+    }
+    over_patterns = {
+        k: (v, budget.patterns[k]) for k, v in scan.patterns.items() if v > budget.patterns[k]
+    }
+    allowance = _STEP_ALLOWANCE[encoding]
+    report = (
+        f"over the budget, (scan, budget): C {over_c}, Python {over_python}, "
+        f"regex {over_patterns}; "
+        f"scan C calls {dict(sorted(scan.c_calls.items()))}, "
+        f"budget's {dict(sorted(budget.c_calls.items()))}; "
+        f"scan Python calls {dict(sorted(scan_python.items()))}, "
+        f"budget's {dict(sorted(budget.python_calls.items()))}; "
+        f"steps: scan {scan.steps}, budget {budget.steps} (allowance {allowance}), "
+        f"scan at {_MB // 4} bytes {quarter.steps}; "
+        f"CALL events: scan {scan.call_events}, budget {budget.call_events}"
+    )
+    if not scan_python["_scan_cost_budget"] == budget.python_calls["_scan_cost_budget"] == 1:
+        pytest.fail(f"a profile did not see its entry function start once: {report}")
+    if scan.call_events == 0 or (budget.c_calls and not scan.c_calls):
+        pytest.fail(f"the scan's profile saw no calls: {report}")
+    scan_may_start = budget.outside_starts + _SCAN_ONLY_OUTSIDE_STARTS
+    for side, profile, allowed in (
+        ("budget", budget, _BUDGET_OUTSIDE_STARTS),
+        ("scan", scan, scan_may_start),
+        ("quarter-size scan", quarter, scan_may_start),
+    ):
+        beyond = _starts_beyond(profile.outside_starts, allowed)
+        if beyond:
+            pytest.fail(
+                f"the {side} started Python code outside its home beyond what it may "
+                f"start (its calls and steps are not counted): {beyond}; "
+                f"it may start: {[_where(code) for code in allowed]}"
+            )
+    new_patterns = sorted((k for k in over_patterns if not budget.patterns[k]), key=repr)
+    if new_patterns:
+        pytest.fail(
+            "pattern changed: measure the new pattern and update the budget copy; "
+            f"the scan ran {new_patterns}, "
+            f"the budget runs {sorted(budget.patterns, key=repr)}"
+        )
+    if over_c or over_python or over_patterns:
+        pytest.fail(report)
+    if scan.steps > budget.steps + allowance or scan.steps > quarter.steps:
+        pytest.fail(report)
+    return scan, budget
+
+
+def test_the_scans_patterns_are_the_budgets_copies():
+    """Each regex the scan runs is the budget's copy, pattern text and flags (#1512).
+
+    The call counts see one `Pattern.search` whatever the pattern costs, so a costlier
+    pattern under the same name would pass them; this pins the named patterns, and
+    `_within_budget` fails a pattern the budget never runs, or one run more times than
+    the budget runs it (one of the scan's patterns run in place of another). Changing a
+    pattern is a reviewed decision: measure the new one and update the budget's copy."""
+    import herd_common.validation_errors as scan_module
+
+    copies = {
+        "_RAW_SURROGATE_BYTES": _BUDGET_RAW_SURROGATE_BYTES,
+        "_LONE_SURROGATE": _BUDGET_LONE_SURROGATE,
+        "_HIGH_NOT_PAIRED": _BUDGET_HIGH_NOT_PAIRED,
+    }
+    for name, copy in copies.items():
+        pattern = getattr(scan_module, name)
+        if (pattern.pattern, pattern.flags) != (copy.pattern, copy.flags):
+            pytest.fail(
+                f"pattern changed: measure the new pattern and update the budget copy; "
+                f"{name} is {pattern.pattern!r} (flags {pattern.flags}), "
+                f"the budget's copy {copy.pattern!r} (flags {copy.flags})"
+            )
 
 
 @pytest.mark.parametrize("make", _STRUCTURAL.values(), ids=_STRUCTURAL.keys())
@@ -897,7 +1308,11 @@ def test_a_structural_body_costs_a_small_part_of_its_parse(make):
     has medians of 0.04 to 0.067 and a maximum of 0.072 in sources (a) to (c), so the
     bound catches a scan about 3 to 5 times slower there (more on `chain900`): in
     source (b) a scan made 2.3 and 2.8 times slower passed and one 6.3 times slower
-    failed."""
+    failed. The ratio moves with the interpreter build, since the scan's substring
+    searches cost more on python-build-standalone and the parse does not: in source (d)
+    the medians on those two shapes were 0.041 to 0.075 on the GCC builds and 0.0915 to
+    0.115 on the python-build-standalone ones, maximum 0.12 (3.13.18), so there the
+    bound catches a scan about 1.7 to 2.2 times slower."""
     body = make()
     assert _raw_text_holds_a_lone_surrogate(body) is True
     ratio = cpu_ratio(
@@ -910,52 +1325,64 @@ def test_a_structural_body_costs_a_small_part_of_its_parse(make):
 @pytest.mark.parametrize("shape", _ESCAPE_HEAVY)
 def test_an_escape_heavy_body_costs_linear_work_in_two_copies(shape):
     """A body of nothing but escapes is the scan's worst: a few C passes (two copies, a
-    search, eight counts). Three bounds, none of which the others replace:
+    search, eight counts); `korean_text` and `lone_highs` take its other full paths.
+    Three bounds, none of which the others replace:
 
     - growth: each fourfold step in size costs at most `_GROWTH_BOUND` times the one
       before, so the cost is linear (a quadratic scan fails);
-    - passes: the scan of the 1 MB body costs under `_PASS_MARGIN` times the worst ratio
-      to one `bytes.lower` pass measured for this shape, so a linear scan that does
-      two to three times its work (the table says where for each shape), or one whose
-      cost follows the number of escapes, fails;
+    - budget: on the 1 MB body the scan makes no C call and starts no Python function
+      more times than `_scan_cost_budget` of it, runs only the budget's regex
+      patterns, and takes no more Python steps than the budget plus
+      `_STEP_ALLOWANCE` nor than at a quarter of the size (`_within_budget`, call
+      counts, no clock); the comment above `_within_budget` says what that catches
+      and what it cannot see;
     - memory: at most two copies of the bytes.
 
     These replaced a bound of 12 times `json.loads` of the same body (#1477), which a
-    wall clock read at 18.5 on a shared CI runner: `json.loads` runs at its own speed
-    on each CPU, while `bytes.lower` is one plain C pass like the scan's own."""
+    wall clock read at 18.5 on a shared CI runner, then a bound against one
+    `bytes.lower` pass per shape, which every python-build-standalone 3.12 failed
+    (#1492), then a CPU-time ratio under 1.5 against the budget, whose true value is
+    1.00, which a shared CI runner read at 1.548 and 1.524 (#1512)."""
     make = _ESCAPE_HEAVY[shape]
     n, times, ratios = growth_ratios(
         make, _raw_text_holds_a_lone_surrogate, bound=_GROWTH_BOUND, start=64 * 1024
     )
     assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
     body = make()
-    bound = _PASS_MARGIN * _ESCAPE_PASSES_WORST[shape]
-    passes = cpu_ratio(
-        lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=bound
-    )
-    assert passes < bound, (shape, passes)
+    assert _scan_cost_budget(body) is _raw_text_holds_a_lone_surrogate(body)
+    _, budget = _within_budget(make)
+    assert budget.c_calls["Pattern.search"] > 0, budget
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 2.2 * len(body)
 
 
-# Bodies with no surrogate marker, each with its bound on the scan's CPU time over one
-# `bytes.lower` pass: about twice the worst ratio measured for that body in sources (a)
-# to (c), and under the ratio of the full escape scan, which is what the scan costs
-# without its early exit (measured on the development host, 10 rounds: 4.1 for
-# `ascii_objects`, 4.6 for `cjk_text`, 7.7 for `other_escapes_only`). This ratio moves
-# more between CPU models than the escape passes do (1.2 times there): the worst moved
-# 1.6 times for `ascii_objects` (1.01 on the EPYC, 0.61 on the Xeon) and the median 2.4
-# times for `other_escapes_only` (a backslash every other byte: 2.01 on the Xeon, 0.84
-# on the host), which is why that body has the larger bound. So a new CPU model can
-# reach these bounds sooner than the escape-pass ones, and the memory bound, which
-# holds on every CPU, stays the primary proof of the early exit; the time bound is a
-# backstop.
+@pytest.mark.parametrize("shape", _UTF16)
+def test_a_utf16_body_costs_its_decode_and_the_escape_passes(shape):
+    """A UTF-16 body is decoded, searched for a raw lone surrogate, encoded as UTF-8,
+    and given the escape passes. The same growth and budget bounds as the escape test;
+    memory: under three times the body (2.5 measured for this one on 3.12.3, 3.12.16,
+    3.13.18, and 3.14.3: the decoded text, its UTF-8 copy, and the escape passes' copy;
+    OPS-VALID-8 records 4.0 for UTF-16 text outside the BMP)."""
+    make = _UTF16[shape]
+    body = make()
+    assert json.detect_encoding(body) == "utf-16-le"
+    n, times, ratios = growth_ratios(
+        make, _raw_text_holds_a_lone_surrogate, bound=_GROWTH_BOUND, start=64 * 1024
+    )
+    assert max(ratios) <= _GROWTH_BOUND, (n, times, ratios)
+    assert _raw_text_holds_a_lone_surrogate(body) is False
+    assert _scan_cost_budget(body, "utf-16-le") is False
+    _, budget = _within_budget(make, "utf-16-le")
+    assert budget.c_calls["bytes.decode"] > 0, budget
+    assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 3 * len(body)
+
+
+# Bodies with no surrogate marker. On each, `_scan_cost_budget` is the two `in`
+# searches of the early exit, operators that make no call, so the budget's profile
+# holds no C call and the scan's may hold none.
 _NO_MARKER = {
-    # worst 1.01 (EPYC, under coverage), host 0.70
-    "ascii_objects": (_fill('{"name":"device-1","rack":"r1"},', "[", "0]"), 2.0),
-    # worst 0.78 (Xeon), host 0.73
-    "cjk_text": (_fill("日本", '["', '"]'), 2.0),
-    # worst 2.03 (Xeon), host 1.11
-    "other_escapes_only": (_fill('"' + "\\n" * 8 + '",', "[", "0]"), 4.0),
+    "ascii_objects": lambda size=_MB: _fill('{"name":"device-1","rack":"r1"},', "[", "0]", size),
+    "cjk_text": lambda size=_MB: _fill("日本", '["', '"]', size),
+    "other_escapes_only": lambda size=_MB: _fill('"' + "\\n" * 8 + '",', "[", "0]", size),
 }
 
 
@@ -963,26 +1390,30 @@ _NO_MARKER = {
 def test_a_body_with_no_surrogate_marker_is_passed_after_two_searches(shape):
     """No `\\u` and no 0xED byte: two `in` searches and no copy (the early exit).
 
-    The memory bound is what proves the exit on every CPU: without it the scan copies
-    the body. The time bound (a backstop, per body in `_NO_MARKER`, re-measured before
-    it fails) catches the full escape scan running instead, with about twice the margin
-    on each side on the development host (`_NO_MARKER` gives the figures); it is not a
-    1x bound, which failed once on a CI runner under coverage read with a wall clock
-    (0.82 ms against 0.74)."""
-    body, bound = _NO_MARKER[shape]
+    The budget's profile holds no C call, so the scan may make none: the full escape
+    scan running instead (its regex search, its copies, its counts) fails the call
+    counts, and the memory bound fails it too, since the scan then copies the body. The
+    memory bound also proves the exit against a copy made without a call (a slice). The
+    two `in` searches themselves are operators, not calls: a third one on a line of its
+    own fails by its step (`_STEP_ALLOWANCE`), but one added to the exit's own line, or
+    a costlier one, passes. Before #1512 this was a CPU-time ratio under 1.5 against
+    the two searches; before that a 1x bound, which failed once on a CI runner under
+    coverage read with a wall clock (0.82 ms against 0.74)."""
+    make = _NO_MARKER[shape]
+    body = make()
     assert _raw_text_holds_a_lone_surrogate(body) is False
+    assert _scan_cost_budget(body) is False
+    _, budget = _within_budget(make)
+    assert budget.c_calls == Counter(), budget
     assert _peak(lambda: _raw_text_holds_a_lone_surrogate(body)) < 64 * 1024
-    ratio = cpu_ratio(
-        lambda: _raw_text_holds_a_lone_surrogate(body), lambda: body.lower(), bound=bound
-    )
-    assert ratio < bound, (shape, ratio)
 
 
 def test_through_an_app_a_refused_structural_body_costs_less_than_without_the_check():
     """A route behind a failing dependency, with no credentials: without the check
     FastAPI parses the body and answers 401; with it the body is refused (422) after
     the scan alone, which costs less than that parse: at most 0.045 of it in sources (a)
-    to (c), so this bound only catches a check that parses or walks the body."""
+    to (c) and at most 0.054 in sources (d) and (e) (3.13.18 under coverage), so this
+    bound only catches a check that parses or walks the body."""
     import asyncio
 
     body = _STRUCTURAL["chain900"]()
@@ -1009,7 +1440,10 @@ def test_holds_lone_surrogate_costs_about_one_serialization():
     as now, the ratio has medians of 1.08 to 1.25 and a maximum of 1.33 in sources (a)
     to (c); timed one side after the other, as before, it reached 1.9 in the first round
     of source (b). So the bound catches a check about 2.5 times as costly, and the
-    Python walk the check falls back to."""
+    Python walk the check falls back to. In sources (d) and (e) the medians were 0.54
+    (3.14.0, python-build-standalone) to 1.20, so on 3.14.0 the bound catches a check
+    about 5.5 times as costly; the maximum was 1.24 pinned and 1.77 beside two CPU hogs
+    (3.12.3)."""
     deep_lone = b"[" * 600 + b"0," * 300_000 + b'"\\ud800"' + b"]" * 600
     deep_pair = b"[" * 600 + b'"\\ud83d\\ude00",' + b"0," * 300_000 + b"0" + b"]" * 600
     for body, expected in ((deep_lone, True), (deep_pair, False)):

@@ -1,7 +1,10 @@
 """Integration tests for terminal-event provisioning teardown (issue #244).
 
-The invariant under test: a terminal reservation event tears down exactly the
-provisioning that landed before the reservation ended, and nothing else. As of
+The invariant under test: a terminal reservation event tears down the provisioning
+that landed, or may have landed, before the reservation ended, and nothing of other
+reservations: an ACTIVE row, and since issue #1501 a FAILED build row with a
+retryable reason (a driver call that timed out may still have landed), which the
+teardown parks and removes. As of
 ADR 0009 phase 6 the teardown is ledger-driven (an ACTIVE ledger row IS an
 applied op), and as of phase 7 the provisioning that writes those ledgers is
 fork-driven: each scenario books a reservation against a WIRED parent
@@ -50,6 +53,7 @@ import pytest
 
 from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._topology_teardown import delete_topology_checked
+from ._wiring_retry import retire_failed_rows_from_the_tick
 
 pytestmark = pytest.mark.asyncio
 
@@ -174,6 +178,12 @@ async def _poll_runs(
 
 def _method_kwargs(run: dict) -> dict:
     return run["input_params"]["method_kwargs"]
+
+
+async def _wiring_status(client, reservation_id: str) -> dict:
+    resp = await client.get(f"/reservations/{reservation_id}/wiring-status")
+    resp.raise_for_status()
+    return resp.json()
 
 
 @pytest.fixture(scope="session")
@@ -405,18 +415,34 @@ async def test_l3_failed_event_removes_pinned_routes_and_redelivery_is_idempoten
         await delete_device_checked(admin_client, switch["id"])
 
 
-@pytest.mark.timeout(90)
-async def test_l1_failed_event_disconnects_only_applied_pairs(
+@pytest.mark.timeout(150)
+async def test_l1_failed_event_disconnects_applied_pairs_and_failed_builds(
     admin_client, teardown_templates, fresh_devices
 ):
-    """Half-provisioned L1: the switch whose connect_ports succeeded is torn
-    down; the switch whose connect_ports FAILED gets no driver call at all."""
+    """Half-provisioned L1: the switch whose connect_ports succeeded is disconnected
+    as before, and, since issue #1501, so is the switch whose connect_ports FAILED.
+
+    A connect that did not confirm may still have landed (a driver call that timed
+    out), so the terminal teardown parks the FAILED intended-ACTIVE row intended
+    RELEASED and drives disconnect_ports for its pair (WIRE-TEARDOWN-6). The broken
+    switch raises on connect_ports only (`mock_raise_actions`), and the stateless mock
+    acknowledges a disconnect of a pair it never connected, so that disconnect is a
+    SUCCESS run and both rows end RELEASED on the wiring-status surface. A redelivered
+    terminal event is then a no-op on both switches.
+
+    Before the cancel, the broken row is pushed past the retry tick's attempts cap
+    with manual retries (`retire_failed_rows_from_the_tick`): the teardown leaves a row
+    alone while a retry pass holds a live claim on it, so a cancel inside a tick's
+    drive of the row would see that documented outcome instead. A FAILED row with a
+    pinned (non-retryable) reason is left alone by the teardown; this seam cannot
+    produce one on a real switch pair (the stack's driver upload refuses a package
+    that cannot load), so that case is pinned by the execution unit suite
+    (`test_teardown_leaves_a_pinned_reason_build_row_alone`)."""
     suffix = uuid.uuid4().hex[:8]
     template_id = teardown_templates["mock_l1"]["id"]
     sw_ok = await _create_switch(admin_client, template_id, f"failed-l1-ok-{suffix}")
-    # mock_raise_actions (not mock_fail_actions): the sandbox keys run status
-    # on the driver subprocess exit code, so only a RAISING action records the
-    # FAILED run that makes this switch's provisioning genuinely un-applied.
+    # mock_raise_actions: connect_ports raises in the driver subprocess, which the
+    # sandbox records as a FAILED run, so this switch's build lands a FAILED row.
     sw_broken = await _create_switch(
         admin_client, template_id, f"failed-l1-broken-{suffix}", raise_actions="connect_ports"
     )
@@ -455,23 +481,39 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         assert failed_connects, "the broken switch was supposed to raise on connect_ports"
         assert {str(r["device_id"]) for r in failed_connects} == {sw_broken["id"]}
 
+        retired = await retire_failed_rows_from_the_tick(admin_client, res_id)
+        assert retired is not None, "the broken switch's FAILED row never passed the tick cap"
+        assert {str(r["switch_device_id"]) for r in retired} == {sw_broken["id"]}
+
         # End the reservation for real: a forged reservation.failed for this
         # still-ACTIVE row would now be acked, unverified, by the corroboration
         # gate rather than driving any teardown.
         await _cancel_for_real(admin_client, res_id)
-        disconnects = await _poll_runs(admin_client, res_id, "disconnect_ports")
-        assert disconnects, "cancelling did not disconnect the applied pair"
-        assert {str(r["device_id"]) for r in disconnects} == {sw_ok["id"]}, (
-            "teardown must only touch the switch whose connect_ports succeeded"
+        disconnects = await _poll_runs(admin_client, res_id, "disconnect_ports", count=2)
+        assert {str(r["device_id"]) for r in disconnects} == {sw_ok["id"], sw_broken["id"]}, (
+            "teardown must disconnect the applied pair and the failed build's pair"
         )
-        applied = {(k["port_a"], k["port_b"]) for k in (_method_kwargs(r) for r in ok_connects)}
-        torn_down = {(k["port_a"], k["port_b"]) for k in (_method_kwargs(r) for r in disconnects)}
-        assert torn_down == applied
 
-        # Ordering anchor (issue #1147): the first disconnect can land while the
-        # same teardown has yet to reach the broken switch, so book a later wired
-        # reservation on the healthy switch and wait for its connect. The consumer
-        # handles the stream in order, so the cancel's teardown is then complete.
+        def _pairs(runs, switch_id):
+            return {
+                (k["port_a"], k["port_b"])
+                for k in (_method_kwargs(r) for r in runs if str(r["device_id"]) == switch_id)
+            }
+
+        assert _pairs(disconnects, sw_ok["id"]) == _pairs(ok_connects, sw_ok["id"])
+        assert _pairs(disconnects, sw_broken["id"]) == _pairs(failed_connects, sw_broken["id"])
+
+        status = await _wiring_status(admin_client, res_id)
+        l1_rows = [c for c in status.get("connections", []) if c.get("layer") == "l1"]
+        assert {str(c["switch_device_id"]) for c in l1_rows} == {sw_ok["id"], sw_broken["id"]}
+        assert all(c["status"] == "RELEASED" for c in l1_rows), l1_rows
+
+        # Redelivery: a duplicate terminal event for the now-CANCELLED reservation.
+        # Both rows are RELEASED, so the teardown finds nothing to drive. Ordering
+        # anchor (issue #1147): book a later wired reservation on the healthy switch
+        # and wait for its connect; the consumer handles the stream in order, so the
+        # redelivered event was fully processed by then.
+        await _publish_event("reservation.failed", res_id, device_ids)
         dut_c, dut_d = await fresh_devices(2)
         connections.append(await _connect(admin_client, dut_c["id"], "eth0", sw_ok["id"], "ok-p3"))
         connections.append(await _connect(admin_client, dut_d["id"], "eth0", sw_ok["id"], "ok-p4"))
@@ -482,13 +524,10 @@ async def test_l1_failed_event_disconnects_only_applied_pairs(
         assert await _poll_runs(admin_client, anchor["id"], "connect_ports"), (
             "anchor reservation was never provisioned"
         )
-
-        # The broken switch got no disconnect attempt in ANY status: an ACTIVE
-        # ledger row is the teardown's only trigger, and its connect never landed
-        # one (the applied-state-only guarantee, now intrinsic to the ledger).
-        all_runs = await _runs(admin_client, res_id)
-        broken_actions = {r["action"] for r in all_runs if str(r["device_id"]) == sw_broken["id"]}
-        assert "disconnect_ports" not in broken_actions
+        after = await _runs(admin_client, res_id, "disconnect_ports")
+        assert sorted(str(r["device_id"]) for r in after) == sorted(
+            [sw_ok["id"], sw_broken["id"]]
+        ), "a redelivered terminal event drove another disconnect"
     finally:
         if anchor:
             await admin_client.delete(f"/reservations/{anchor['id']}")

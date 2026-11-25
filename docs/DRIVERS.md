@@ -38,7 +38,7 @@ still refused, with a structured 409 `driver_cannot_configure` detail naming the
 connection type and driver.
 
 This gate has two independent layers. Inventory's `_assert_driver_can_configure`
-(`services/manage_guard.py`) checks it first, before any call reaches execution or a job
+(`services/inventory/app/services/manage_guard.py`) checks it first, before any call reaches execution or a job
 row is created. Execution carries its own copy of the same check (`_assert_action_permitted`
 in `services/execution/app/services/execution_service.py`, issue #870): both
 `POST /execute` and `POST /execute/internal` refuse a `configure` action against a
@@ -480,8 +480,7 @@ class Driver:
 | Event | Sequence |
 |---|---|
 | Reservation created (DUTs connected through L1 switch) | login(), connect_ports(a, b) for each port pair, logout() |
-| Reservation cancelled or completed | login(), disconnect_ports(a, b) for each port pair, logout() |
-| Reservation failed | login(), disconnect_ports(a, b) for each pair whose connect_ports succeeded, logout(); a switch with no applied pairs is not contacted |
+| Reservation cancelled, completed, or failed | login(), disconnect_ports(a, b) for each pair whose connect_ports succeeded, and for each pair whose connect_ports failed with a retryable reason (a call that timed out may still have landed, issue #1501), logout(); a switch with neither is not contacted. A disconnect_ports of a pair that is not connected must succeed |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 When multiple port pairs go through the same L1 switch in a single reservation, the
@@ -858,7 +857,7 @@ VLAN definition lifecycle is coupled to the per-fabric allocation (issue #442, d
 |---|---|
 | VLAN definition (a fabric allocation's first built membership, or a scope growth) | login(), create_vlan(vlan_id), logout(), once per switch in the definition scope, before the first add_to_vlan on that switch |
 | Membership reconcile (activation, fork save, heal, retry) | login(), remove_from_vlan(port, vlan_id) for each departed port, add_to_vlan(port, vlan_id, tag) for each joined port, logout() |
-| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger; then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated in the switch's current cabling component; skipped, with the definition left in place and a `vlan_delete_unjudged` log line, when cabling cannot answer that question; and stopped for that allocation, with the definition left in place on the switches not reached and a `vlan_delete_upstream_failed` log line, when the switch or template read fails because inventory answered anything but the record or a 404 (a 5xx, a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a malformed body) or could not be reached) |
+| Reservation ended (cancelled, completed, failed) | membership removes as above, driven strictly from the stored ledger, for each ACTIVE membership and for each join that failed with a retryable reason (a call that timed out may still have landed, issue #1501; a remove_from_vlan of a port that is not a member must succeed); then login(), delete_vlan(vlan_id), logout() per switch the VLAN was defined on (skipped when the number was re-allocated in the switch's current cabling component; skipped, with the definition left in place and a `vlan_delete_unjudged` log line, when cabling cannot answer that question; and stopped for that allocation, with the definition left in place on the switches not reached and a `vlan_delete_upstream_failed` log line, when the switch or template read fails because inventory answered anything but the record or a 404 (a 5xx, a 401 or 403 during an `INTERNAL_API_TOKEN` rotation, a malformed body) or could not be reached) |
 | Device added to HERD or admin health check | login(), status(), logout() |
 
 The definition scope is transit-inclusive: it covers every L2 switch the reservation's

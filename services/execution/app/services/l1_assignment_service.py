@@ -19,8 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.l1_connection_assignment import L1ConnectionAssignment
 from app.models.reservation_wiring_state import ReservationWiringState
 from app.services._uuid_utils import as_uuid as _as_uuid
-from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
-from app.services.wiring_due import tick_would_drive
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    direction_guarded_values,
+    unclaimed,
+)
+from app.services.wiring_due import frozen_build_failure_values, tick_would_drive
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,13 @@ logger = logging.getLogger(__name__)
 # while frozen, ADR 0009 phase 3) drive the disconnect. Deliberately outside the
 # non-retryable prefixes in wiring_retry_service so the auto channel sweeps it.
 FROZEN_BUILD_PENDING_RELEASE = "connect landed after wiring freeze; pending release"
+
+# Reason the terminal teardown parks a FAILED intended-ACTIVE L1 row under (issue
+# #1501), the route_service.TEARDOWN_PENDING_REMOVAL mirror: a connect that did not
+# confirm may still have landed (a timed-out driver call), so at teardown the row flips
+# to intended RELEASED and is disconnected, and, should that fail, the release-direction
+# retry channels (which run while frozen) finish it. Outside the non-retryable prefixes.
+TEARDOWN_PENDING_DISCONNECT = "reservation ended; pending disconnect"
 
 
 def canonical_port_pair(port_a: str, port_b: str) -> tuple[str, str]:
@@ -683,6 +695,21 @@ async def _record_l1_failed_for_row(
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
     drive claim, so this failure is not written and the row joins `claims.lost`.
+
+    Issue #1496: on a row this pass does not hold (`claims` None, or the row not in
+    `claims.held`), every value is written only where
+    `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
+    row still intends the direction this failure records, or the failure is a release
+    and the reservation is frozen. Such a write runs before any per-row claim (a
+    switch read, template read, driver load, or login failure, an L2 create_vlan or
+    re-allocation failure, or an L3 drive-gate refusal), so the row may have been
+    parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    `RETURNING intended` tell an admitted write from a refused one; a refused write is
+    rolled back, which is what leaves every value as it was, returns None, and adds the
+    row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
+    compared the direction already. Known gap: with `claims` None a refused write is
+    recorded nowhere and logs nothing (no retry caller passes `row_id` without
+    `claims` today).
     """
     values: dict = {
         "status": "FAILED",
@@ -692,6 +719,8 @@ async def _record_l1_failed_for_row(
         # The drive this failure records is over, so release the claim (issue #817).
         "claimed_until": None,
     }
+    if claims is None or row_id not in claims.held:
+        values = direction_guarded_values(L1ConnectionAssignment, values, intended)
     result = await db.execute(
         update(L1ConnectionAssignment)
         .where(
@@ -700,8 +729,17 @@ async def _record_l1_failed_for_row(
             *claim_write_clauses(L1ConnectionAssignment, row_id, claims),
         )
         .values(**values)
+        .returning(L1ConnectionAssignment.intended)
     )
-    if result.rowcount == 0:
+    found = result.first()
+    if found is not None and found[0] != intended:
+        # The direction is not admitted (issue #1496): every value was written back
+        # as it was.
+        await db.rollback()
+        if claims is not None:
+            claims.refuse_wrong_direction(L1ConnectionAssignment, row_id, intended)
+        return None
+    if found is None:
         await db.rollback()
         if claims is not None:
             claims.lost.add(row_id)
@@ -790,6 +828,20 @@ async def record_l1_failed(
     was taken over can rewrite the row under the current holder's drive. A refused
     write changes nothing on the row, returns None, and adds the row to `claims.lost`.
     The key-based upsert ignores `claims`.
+
+    Issue #1501, the key-based path only: a BUILD failure (`intended` ACTIVE) with a
+    hardware-retryable reason that lands on a reservation whose wiring is frozen is
+    recorded intended RELEASED with attempts 0, the state the terminal teardown parks
+    a FAILED intended-ACTIVE row in (`TEARDOWN_PENDING_DISCONNECT`), so the
+    release-direction retry channels disconnect whatever the build may have landed (a
+    disconnect of a pair that was never connected is the idempotent no-op the #491
+    stale settlement already relies on). The frozen fact is read inside the UPDATE or
+    INSERT itself (`wiring_due.frozen_build_failure_values`). Without it, a failure
+    from a reconcile that passed its frozen gate before the freeze, landing after the
+    teardown's read, left the row FAILED intended ACTIVE, which no pass drives on a
+    frozen reservation. `last_error` keeps the failure's own reason. A pinned-reason
+    failure, a release failure, and every write on a reservation that is not frozen
+    are unchanged. The row-id path is unchanged.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -810,6 +862,15 @@ async def record_l1_failed(
             intended=intended,
             claims=claims,
         )
+
+    from app.services.wiring_retry_service import is_retryable_failure
+
+    # Issue #1501: a build failure written on a frozen reservation is recorded as the
+    # terminal teardown parks such a row (intended RELEASED, attempts 0), for exactly
+    # the rows the teardown parks: a hardware-retryable reason. A pinned-reason row (an
+    # unresolvable hop keyed on raw hop endpoints, or a switch whose driver package
+    # cannot load, #1199) cannot be driven, and stays as before.
+    frozen_parks = intended == "ACTIVE" and is_retryable_failure(last_error)
 
     result = await db.execute(
         select(L1ConnectionAssignment).where(
@@ -848,14 +909,25 @@ async def record_l1_failed(
             )
             return row
         row.status = "FAILED"
-        row.intended = intended
-        row.attempts = (row.attempts or 0) + attempts
+        if frozen_parks:
+            # Issue #1501: decided in this UPDATE's own statement.
+            frozen_values = frozen_build_failure_values(
+                L1ConnectionAssignment,
+                func.coalesce(L1ConnectionAssignment.attempts, 0) + attempts,
+            )
+            row.intended = frozen_values["intended"]
+            row.attempts = frozen_values["attempts"]
+        else:
+            row.intended = intended
+            row.attempts = (row.attempts or 0) + attempts
         row.last_error = last_error
         # The drive this failure records is over, so release the claim (issue #817).
         row.claimed_until = None
         if physical_connection_id and row.physical_connection_id is None:
             row.physical_connection_id = _as_uuid(physical_connection_id)
         await db.commit()
+        if frozen_parks:
+            await db.refresh(row)
         return row
 
     row = L1ConnectionAssignment(
@@ -869,6 +941,13 @@ async def record_l1_failed(
         attempts=attempts,
         last_error=last_error,
     )
+    if frozen_parks:
+        # Issue #1501: decided in this INSERT's own statement.
+        frozen_values = frozen_build_failure_values(
+            L1ConnectionAssignment, attempts, reservation_id=res_uuid
+        )
+        row.intended = frozen_values["intended"]
+        row.attempts = frozen_values["attempts"]
     db.add(row)
     await db.commit()
     await db.refresh(row)

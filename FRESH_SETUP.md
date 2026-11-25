@@ -6,7 +6,7 @@ Complete guide for building HERD from scratch on a new machine.
 
 - Docker and Docker Compose 2.27.1 or later. The Traefik service interpolates `${COMPOSE_PROJECT_NAME}`, which Compose sets for interpolation (from `-p`, the environment, `.env`, or the directory name) only since 2.27.1 (compose-go #628). On an older Compose every command fails with `required variable COMPOSE_PROJECT_NAME is missing a value: the compose project name is empty (needs Docker Compose 2.27.1 or later); Traefik would route nothing`; upgrade Compose (`docker compose version` shows yours).
 - Git
-- Node.js 22.22.2+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` declares `engines.node: ">=22"`, but `engine-strict` in `frontend/.npmrc` binds every dependency's own engines floor too, and jsdom 30 declares `^22.22.2 || ^24.15.0 || >=26`, so a Node 22.x host below 22.22.2 is refused by `npm ci`/`npm install`, issue #885)
+- Node.js 22.22.2+ and npm 11.11.0+ (for local frontend dev/testing; `frontend/package.json` declares `engines.node: ">=22"`, but `engine-strict` in `frontend/.npmrc` binds every dependency's own engines floor too, and jsdom 31 declares `^22.22.2 || ^24.15.0 || >=26`, so a Node 22.x host below 22.22.2 is refused by `npm ci`/`npm install`, issue #885)
 - Python 3.12+ and uv (for local backend dev/testing)
 - openssl (only if regenerating TLS certs)
 

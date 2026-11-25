@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 import httpx
+from herd_common.validation_errors import LARGE_JSON_BODY_BYTES
 
 from app.config import settings
 from app.schemas.generate import (
@@ -42,12 +43,19 @@ HTTP_TIMEOUT = 15.0
 # The canvas a commit builds is larger than the commit request that describes it (a
 # node carries generated ids and fixed keys for each proposed device, an edge for each
 # proposed link), so it is measured before anything is written (issue #1466): cabling
-# takes the canvas PUT at its MAX_REQUEST_BODY_BYTES, the same setting this service
-# reads, and a canvas over it is refused here, never there.
+# takes the canvas PUT, a large-JSON route, at its MAX_REQUEST_BODY_BYTES plus
+# LARGE_JSON_BODY_BYTES (issue #1484), the same setting this service reads, and a
+# canvas over that is refused here, never there.
 CANVAS_TOO_LARGE_DETAIL = (
     "The topology this commit builds is {size} bytes, over the {limit}-byte request "
     "body limit; commit fewer devices, elements, or links"
 )
+
+
+def canvas_put_limit() -> int:
+    """Cabling's limit for the canvas PUT: the setting plus the large-JSON allowance
+    its mark adds (`route_body_limit` of that route, read from the same setting)."""
+    return settings.max_request_body_bytes + LARGE_JSON_BODY_BYTES
 
 
 def canvas_put_bytes(canvas_data: dict[str, Any]) -> int:
@@ -611,11 +619,9 @@ async def commit_proposal(
         # port lookup against inventory (D2), which reuses this same client.
         canvas_data = await _build_canvas_data(client, headers, req)
         size = canvas_put_bytes(canvas_data)
-        if size > settings.max_request_body_bytes:
-            raise CommitError(
-                413,
-                CANVAS_TOO_LARGE_DETAIL.format(size=size, limit=settings.max_request_body_bytes),
-            )
+        canvas_limit = canvas_put_limit()
+        if size > canvas_limit:
+            raise CommitError(413, CANVAS_TOO_LARGE_DETAIL.format(size=size, limit=canvas_limit))
         topology_id = await _create_topology(client, headers, req.topology_name)
         try:
             await _update_topology_canvas(client, headers, topology_id, canvas_data)

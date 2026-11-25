@@ -868,6 +868,20 @@ editor's Routing panel (section 8.16).
   12 s deadline fails the whole pass closed with 503 `{"error": "l3_config_unavailable"}`. \
   Enforced in: `services/cabling/app/services/l3_validation.py` (`validate_canvas_l3`, `L3ConfigUnavailable`) \
   Pinned by: `services/cabling/tests/test_l3_validation.py` (`test_503_on_device_batch_transport_error`, `test_503_on_device_batch_5xx`, `test_503_on_config_fetch_5xx`, `test_503_on_missing_internal_token_short_circuits_to_l3_config_unavailable`, `test_l3_pass_deadline_trips_into_503`)
+- **TOPO-L3-12.** Routing intent gives one switch at most 1,000 distinct routes (#1493),
+  counted over every node naming it, merged and deduplicated by the TOPO-L3-3 identity
+  as TOPO-L3-5 stores them, so a duplicate counts once and two nodes cannot each stay
+  under the limit while their switch goes over it. A plain topology save does not
+  parse routing intent, so a topology can still be stored over the limit; validating
+  or reserving it, or saving its fork, refuses it. Every node of a switch over the
+  limit is malformed with the message `switch <device id> has <count> distinct
+  routes; a switch carries at most 1000`, in canvas node order with the shape refusals, so TOPO-L3-6
+  applies to it: save answers 422 (TOPO-FORK-14), validation reports `l3_malformed`
+  with no inventory call, and fork create drops the switch's intent. The limit is one
+  constant shared with execution's drive-time check (WIRE-L3-20), compared through one
+  function, so this check is exactly as strict as execution's. \
+  Enforced in: `services/cabling/app/services/l3_intent.py` (`walk_l3_nodes`, `_refuse_switches_over_the_route_limit`, `route_limit_message`); `services/common/herd_common/l3_route_limit.py` (`MAX_ROUTES_PER_SWITCH`, `route_limit_exceeded`) \
+  Pinned by: `services/cabling/tests/test_l3_intent.py` (`test_a_switch_at_the_route_limit_parses`, `test_a_switch_one_route_over_the_limit_is_malformed_with_the_exact_message`, `test_duplicates_do_not_count_against_the_route_limit`, `test_the_route_limit_counts_a_switch_merged_across_its_nodes`, `test_routes_two_nodes_of_one_switch_share_count_once_toward_the_limit`, `test_a_shape_malformed_node_after_an_over_limit_switch_keeps_canvas_order`, `test_the_tolerant_parser_drops_an_over_limit_switch_and_keeps_the_others`); `services/cabling/tests/test_l3_validation.py` (`test_a_switch_over_the_route_limit_reports_l3_malformed_naming_it`); `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_when_a_switch_is_over_the_route_limit`, `test_save_route_stores_a_switch_at_the_route_limit`)
 
 **Out of scope.** Driving routes onto switches and drive-time re-validation are
 execution's (`provisioning-and-wiring.md`). Switch configuration versions are
@@ -955,7 +969,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
 - **TOPO-FORK-14.** Save refuses malformed routing intent with 422
   `{"error": "l3_intent_malformed", "node_id", "message"}` before any inventory call. \
   Enforced in: `services/cabling/app/routes/forks.py` (`save_fork_internal`) \
-  Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_on_malformed_intent`)
+  Pinned by: `services/cabling/tests/test_fork_l3_routes.py` (`test_save_route_422_on_malformed_intent`, `test_save_route_422_when_a_switch_is_over_the_route_limit`)
 - **TOPO-FORK-15.** The resolver turns each committed edge between two device nodes into
   the first shortest path and records each cable on it as one hop with its backing
   connection id and the canvas edge id; a hop two edges share is recorded once, under the
@@ -1023,7 +1037,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   does not verify is 401. A service caller that forwards no bearer (execution,
   ai-orchestrator) gets every row as stored. \
   Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_redact_fork_connection`, `_decode_on_behalf_of`); `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_cabling_fork_call`) \
-  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`)
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_get_fork_on_behalf_of_non_admin_redacts_hidden_transit`, `test_get_fork_on_behalf_of_admin_and_service_callers_unredacted`, `test_get_fork_on_behalf_of_visibility_unavailable_is_503`, `test_get_fork_on_behalf_of_bad_bearer_is_401`); `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_owner_forwards_200`, `test_get_fork_lazy_create_rereads_on_behalf_of_caller`, `test_get_fork_relays_cabling_visibility_503`, `test_cabling_fork_call_sends_on_behalf_of_beside_internal_token`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named`)
 - **TOPO-CLAIM-1.** A wire to build whose `(device, port)` endpoint is already in a wire
   of another `ACTIVE` fork refuses the save or create with 409
   `{message, conflicts: [{reservation_id, device_id, port}]}`, conflicts sorted;
@@ -1086,7 +1100,7 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   Pinned by: `services/cabling/tests/test_fork_devices_batch.py` (`test_batch_returns_sorted_distinct_ids_active_and_archived`, `test_batch_id_with_no_fork_is_absent`, `test_batch_empty_list_is_422`, `test_batch_over_cap_is_422`, `test_batch_exactly_at_cap_is_accepted`)
 
 **Out of scope.** When reservations creates, saves, prunes, or archives a fork, and the
-user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-19). What execution
+user-facing forwarding, are `reservations.md` (RES-FORK-1 to RES-FORK-20). What execution
 builds from the wires and routes is `provisioning-and-wiring.md`.
 
 ### 8.13 Topology templates
@@ -1275,6 +1289,18 @@ is the user guide.
   escaped pair is imported. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`_decode_import`, `parse_json_topologies`, `parse_csv_topologies`, `IMPORT_NOT_UTF8_DETAIL`, `IMPORT_NOT_TEXT_DETAIL`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_non_utf8_import_file_is_422_naming_the_encoding`, `test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_json_import_with_a_surrogate_pair_escape_is_not_refused`)
+- **TOPO-BULK-20.** A topology import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB)
+  answers 413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"],
+  "msg": "Request body is larger than <limit> bytes"}`, and nothing is parsed or written.
+  The route's own `extends_body_limit` bound covers the whole multipart envelope; this is
+  the exact per-file bound, applied to the bytes read: the read asks for one byte past
+  the bound, so a file one byte over it is refused, and the cap does not grow when an
+  operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does. Starlette has
+  already received and spooled the upload by then, so this bounds what is copied out of
+  the spool into memory and not the upload itself; a file up to 10 MiB is still decoded
+  and parsed on the event loop. The same rule on inventory is INV-BULK-23. \
+  Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1492,7 +1518,7 @@ layer. Many lines between the same two devices draw as one thick line with a cou
   invalid, offers per-member delete except in read-only mode, and a remove on the bundle
   removes every member while a replace is not expanded. \
   Enforced in: `frontend/src/components/topology-editor/edges/groupEdgesForRender.ts` (`groupEdgesForRender`); `frontend/src/components/topology-editor/edges/BundledEdge.tsx` (`BundledEdge`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleEdgesChange`) \
-  Pinned by: `frontend/src/test/components/BundledEdge.test.tsx` (`projects selected true onto the bundle when ANY member is selected, so React Flow's controlled reconciliation can see it (review item 1)`, `renders red the moment any member is invalid (uncabled port), never averaging it away (review item 4b)`, `hides the per-member delete control in read-only mode, closing the store-bypass (review round 3 item 3)`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a remove change on a bundled edge id expands to every member id before reaching the store`, `a replace change targeting a bundle id is NOT expanded, so the synthetic bundle shape never gets written into a real edge slot (review round 3 item 11)`)
+  Pinned by: `frontend/src/test/components/BundledEdge.test.tsx` (`projects selected true onto the bundle when ANY member is selected, so React Flow's controlled reconciliation can see it (review item 1)`, `renders red the moment any member is invalid (uncabled port), never averaging it away (review item 4b)`, `hides the per-member delete control in read-only mode, closing the store-bypass (review round 3 item 3)`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a remove change on a bundled edge id expands to every member id before reaching the store`, `a replace change targeting a bundle id is NOT expanded, so the synthetic bundle shape never gets written into a real edge slot (review round 3 item 11)`, `one changeset mixing select, remove, and replace on bundles expands select and remove, passes the bundle replace through, and strips a replaced edge's server reason`)
 - **TOPO-WIRE-8.** The attach dialog lets a user pick several ports of the device, never a
   port already wired on the canvas, and adds one attachment edge per port with the device
   as source and the port in `source_port_name`; an element-first line is turned around
@@ -1615,7 +1641,7 @@ reservation's fork opens read-only.
   and it does not block Commit: the live-edit bar states the count instead, since the
   save wires the other lines (issue #1066). \
   Enforced in: `frontend/src/lib/edgeProblems.ts` (`serverEdgeProblemsFrom`, `applySkippedConstrainedEdges`, `withServerEdgeProblems`, `stripServerEdgeProblem`); `frontend/src/hooks/useForkAutosave.ts` (`onDraftValidated`); `frontend/src/pages/TopologyEditorPage.tsx` (`loadCanvasAndClearRouteProblems`, `handleDraftValidated`, `serverOnlyInvalidEdgeCount`); `frontend/src/components/topology-editor/edges/edgeStatus.ts` (`resolveEdgeStroke`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`serverInvalidEdgeCount`) \
-  Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+  Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a replace on a real edge strips the render-only server reason before the store sees it (issue #1066)`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is

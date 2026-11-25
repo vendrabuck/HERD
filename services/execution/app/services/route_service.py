@@ -21,8 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.route_assignment import RouteAssignment
 from app.services._uuid_utils import as_uuid as _as_uuid
 from app.services.l1_assignment_service import get_wiring_state
-from app.services.wiring_claim import WiringRowClaims, claim_write_clauses, unclaimed
-from app.services.wiring_due import tick_would_drive
+from app.services.wiring_claim import (
+    WiringRowClaims,
+    claim_write_clauses,
+    direction_guarded_values,
+    unclaimed,
+)
+from app.services.wiring_due import frozen_build_failure_values, tick_would_drive
 
 logger = logging.getLogger(__name__)
 
@@ -470,6 +475,14 @@ async def record_route_reconcile_failed(
     concurrent writer released or already failed it first) or when the
     compare-and-swap found a stale writer: whichever writer got there first (or
     is still working from current data) owns the row's fate.
+
+    Issue #1501, the record_route_failed rule: on a reservation whose wiring is
+    frozen (read inside this UPDATE, `wiring_due.frozen_build_failure_values`) the
+    failure is recorded intended RELEASED with attempts 0 and the reason
+    `TEARDOWN_PENDING_REMOVAL` (what the teardown's park records), keeping the routes
+    above, so the release-direction retry channels remove everything the failed delta may
+    have left (the record_route_reconciled frozen branch's direction for the failure
+    case). Otherwise, as before, intended ACTIVE with the attempts added.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
@@ -499,9 +512,17 @@ async def record_route_reconcile_failed(
         )
         return None
     row.status = "FAILED"
-    row.intended = "ACTIVE"
-    row.attempts = (row.attempts or 0) + attempts
-    row.last_error = last_error
+    # Issue #1501: on a frozen reservation, the teardown park's state (intended RELEASED,
+    # attempts 0, TEARDOWN_PENDING_REMOVAL), decided in this UPDATE's own statement.
+    frozen_values = frozen_build_failure_values(
+        RouteAssignment,
+        func.coalesce(RouteAssignment.attempts, 0) + attempts,
+        last_error=last_error,
+        frozen_last_error=TEARDOWN_PENDING_REMOVAL,
+    )
+    row.intended = frozen_values["intended"]
+    row.attempts = frozen_values["attempts"]
+    row.last_error = frozen_values["last_error"]
     if possibly_installed is not None:
         row.routes = possibly_installed
     # The drive this failure records is over, so release the claim (issue #817).
@@ -538,6 +559,21 @@ async def _record_route_failed_for_row(
     of wiring_claim.claim_write_clauses (issue #1479), no insert branch:
     rowcount zero means a concurrent writer moved the row or another pass holds its
     drive claim, so this failure is not written and the row joins `claims.lost`.
+
+    Issue #1496: on a row this pass does not hold (`claims` None, or the row not in
+    `claims.held`), every value is written only where
+    `wiring_claim.direction_admits(model, intended)` holds, in the same UPDATE: the
+    row still intends the direction this failure records, or the failure is a release
+    and the reservation is frozen. Such a write runs before any per-row claim (a
+    switch read, template read, driver load, or login failure, an L2 create_vlan or
+    re-allocation failure, or an L3 drive-gate or route-limit refusal), so the row may
+    have been parked since the pass planned it. The value CASE (`direction_guarded_values`) and
+    `RETURNING intended` tell an admitted write from a refused one; a refused write is
+    rolled back, which is what leaves every value as it was, returns None, and adds the
+    row to `claims.wrong_direction`. A row this pass holds takes no compare: its claim
+    compared the direction already. Known gap: with `claims` None a refused write is
+    recorded nowhere and logs nothing (no retry caller passes `row_id` without
+    `claims` today).
     """
     values: dict = {
         "status": "FAILED",
@@ -549,6 +585,8 @@ async def _record_route_failed_for_row(
     }
     if routes is not None:
         values["routes"] = routes
+    if claims is None or row_id not in claims.held:
+        values = direction_guarded_values(RouteAssignment, values, intended)
     result = await db.execute(
         update(RouteAssignment)
         .where(
@@ -559,8 +597,17 @@ async def _record_route_failed_for_row(
             ),
         )
         .values(**values)
+        .returning(RouteAssignment.intended)
     )
-    if result.rowcount == 0:
+    found = result.first()
+    if found is not None and found[0] != intended:
+        # The direction is not admitted (issue #1496): every value was written back
+        # as it was.
+        await db.rollback()
+        if claims is not None:
+            claims.refuse_wrong_direction(RouteAssignment, row_id, intended)
+        return None
+    if found is None:
         await db.rollback()
         if claims is not None:
             claims.lost.add(row_id)
@@ -631,6 +678,18 @@ async def record_route_failed(
     write changes nothing, returns None, and adds the row to `claims.lost`. The
     key-based upsert ignores `claims`. `holder_or_unclaimed` widens the condition for
     the L3 holder's partial-failure write (wiring_claim.claim_write_clauses).
+
+    Issue #1501, the key-based path only, the record_l1_failed rule: a BUILD failure
+    landing on a reservation whose wiring is frozen is recorded intended RELEASED with
+    attempts 0 and the reason `TEARDOWN_PENDING_REMOVAL`, whatever its own reason, the
+    state the terminal teardown parks every FAILED intended-ACTIVE pin in, so the
+    release-direction retry channels select it and remove the routes it records
+    (removing an absent route is idempotent by driver contract). A pinned reason is not
+    kept: the teardown's park does not keep it either, and a removal that then fails
+    for the same cause records it again, release-direction (#1199). The frozen fact is
+    read inside the UPDATE or INSERT itself (`wiring_due.frozen_build_failure_values`).
+    The stored routes are written as before. A release failure and every write on a reservation
+    that is not frozen are unchanged; the row-id path is unchanged.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)
@@ -673,9 +732,21 @@ async def record_route_failed(
             )
             return row
         row.status = "FAILED"
-        row.intended = intended
-        row.attempts = (row.attempts or 0) + attempts
-        row.last_error = last_error
+        if intended == "ACTIVE":
+            # Issue #1501: decided in this UPDATE's own statement.
+            frozen_values = frozen_build_failure_values(
+                RouteAssignment,
+                func.coalesce(RouteAssignment.attempts, 0) + attempts,
+                last_error=last_error,
+                frozen_last_error=TEARDOWN_PENDING_REMOVAL,
+            )
+            row.intended = frozen_values["intended"]
+            row.attempts = frozen_values["attempts"]
+            row.last_error = frozen_values["last_error"]
+        else:
+            row.intended = intended
+            row.attempts = (row.attempts or 0) + attempts
+            row.last_error = last_error
         # The drive this failure records is over, so release the claim (issue #817).
         row.claimed_until = None
         if routes is not None:
@@ -693,6 +764,18 @@ async def record_route_failed(
         attempts=attempts,
         last_error=last_error,
     )
+    if intended == "ACTIVE":
+        # Issue #1501: decided in this INSERT's own statement.
+        frozen_values = frozen_build_failure_values(
+            RouteAssignment,
+            attempts,
+            reservation_id=res_uuid,
+            last_error=last_error,
+            frozen_last_error=TEARDOWN_PENDING_REMOVAL,
+        )
+        row.intended = frozen_values["intended"]
+        row.attempts = frozen_values["attempts"]
+        row.last_error = frozen_values["last_error"]
     db.add(row)
     await db.commit()
     await db.refresh(row)
@@ -860,10 +943,11 @@ async def get_effective_pinned_routes(
 
     Also None when the row records no routes (issue #1004). A provision never pins an
     empty set (a switch whose route source yields nothing is not provisioned), so an
-    empty `routes` list is only ever a drive-gate refusal recorded before anything was
-    applied: it records that nothing is installed, not an applied empty set, and the
-    caller falls back to the configured routes exactly as for a fresh provision (ADR
-    0014 Decision 2). Addendum X4's "keeps its applied set" needs an applied set.
+    empty `routes` list is only ever a drive-gate or route-limit refusal (issue #1493)
+    recorded before anything was applied: it records that nothing is installed, not an
+    applied empty set, and the caller falls back to the configured routes exactly as
+    for a fresh provision (ADR 0014 Decision 2). Addendum X4's "keeps its applied set"
+    needs an applied set.
     """
     res_uuid = _as_uuid(reservation_id)
     dev_uuid = _as_uuid(device_id)

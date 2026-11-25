@@ -3,7 +3,7 @@ import io
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import httpx
 from herd_common.csv_safety import csv_safe_cell
@@ -55,30 +55,48 @@ class TransitGearUnavailable(RuntimeError):
 
 
 def _as_utc(dt: datetime) -> datetime:
-    # SQLite (test backend) drops tzinfo; Postgres preserves it. Treat naive as UTC.
+    """Return ``dt`` as an aware datetime in UTC.
+
+    A naive value is taken to be UTC: SQLite (the test backend) drops tzinfo on
+    read, and the report routes accept a query datetime without an offset. An
+    aware value in any other offset is converted, so its date fields are UTC
+    date fields (issue #1523).
+    """
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt.astimezone(timezone.utc)
 
 
 def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, float]]:
     """Break [start, end) across UTC midnight boundaries.
 
-    Returns a list of (YYYY-MM-DD, hours) tuples. The caller sums across these.
+    Returns a list of (YYYY-MM-DD, hours) tuples, each labeled with its UTC date.
+    The caller sums across these. Both bounds are converted to UTC first, so the
+    slices are positive, contiguous, split exactly at UTC midnights, and sum to
+    ``end - start`` whatever offset either bound carries (issue #1523: reading
+    the date fields of a non-UTC value put the first midnight before the start
+    and counted hours outside the window).
     """
+    start = _as_utc(start)
+    end = _as_utc(end)
     if end <= start:
         return []
     out: list[tuple[str, float]] = []
     cursor = start
     while cursor < end:
-        # Next midnight UTC strictly after cursor.
-        day_end = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc) + timedelta(
-            days=1
-        )
-        slice_end = min(day_end, end)
-        hours = (slice_end - cursor).total_seconds() / 3600.0
-        if hours > 0:
-            out.append((cursor.strftime("%Y-%m-%d"), hours))
+        day = cursor.date()
+        if day == date.max:
+            # 9999-12-31 has no next midnight (computing it overflows), and end is
+            # a UTC datetime, so it falls on this day too: the slice runs to end.
+            slice_end = end
+        else:
+            # Next UTC midnight strictly after cursor: cursor is UTC, so its date
+            # fields are the UTC date and this midnight is always after it.
+            next_midnight = datetime.combine(day + timedelta(days=1), time(), tzinfo=timezone.utc)
+            slice_end = min(next_midnight, end)
+        # isoformat, not strftime("%Y-%m-%d"): on Python 3.12 strftime does not pad
+        # a year before 1000 ("1-01-01"); isoformat always writes four digits.
+        out.append((day.isoformat(), (slice_end - cursor).total_seconds() / 3600.0))
         cursor = slice_end
     return out
 
@@ -183,7 +201,14 @@ async def build_utilization_report(
     caller passes include_transit=False to skip that call entirely and get
     back the phase-1, reserved-devices-only semantics with the transit fields
     all zero.
+
+    window_start and window_end are converted to UTC first (a naive value is
+    taken as UTC), so a mixed naive and aware pair compares, the query bounds
+    do not depend on the driver's or the host's local zone, and the report
+    echoes the window in UTC (issue #1523).
     """
+    window_start = _as_utc(window_start)
+    window_end = _as_utc(window_end)
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
 
@@ -266,9 +291,6 @@ async def build_utilization_report(
     legacy_reserved_device_ids: dict[uuid.UUID, set[uuid.UUID]] = {}
     legacy_reservation_hours: dict[uuid.UUID, float] = {}
     legacy_reservation_category: dict[uuid.UUID, str] = {}
-
-    window_start = _as_utc(window_start)
-    window_end = _as_utc(window_end)
 
     for r in reservations:
         effective_start = max(_as_utc(r.start_time), window_start)

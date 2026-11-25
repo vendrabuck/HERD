@@ -35,7 +35,7 @@ import pytest
 from ._device_teardown import delete_device_checked, delete_devices_checked
 from ._nats_helpers import probe_nats
 from ._topology_teardown import delete_topology_checked
-from ._wiring_retry import poll_wiring_retry
+from ._wiring_retry import poll_wiring_retry, retire_failed_rows_from_the_tick
 
 pytestmark = pytest.mark.asyncio
 
@@ -359,6 +359,127 @@ async def test_cancel_releases_all_three_ledgers(
         assert _all_released(status), (
             f"every ledger row must end RELEASED after a clean teardown: {status}"
         )
+    finally:
+        if rid:
+            await admin_client.delete(f"/reservations/{rid}")
+        if topology_id:
+            await delete_topology_checked(admin_client, topology_id)
+        for conn in connections:
+            await admin_client.delete(f"/cabling/connections/{conn['id']}")
+        await delete_devices_checked(admin_client, [sw["id"] for sw in switches])
+
+
+@pytest.mark.timeout(150)
+async def test_cancel_while_every_build_is_failed_releases_every_row(
+    base_url, admin_token, admin_client, fresh_devices, teardown_drivers
+):
+    """Issue #1501: a reservation ended while its wires are FAILED ends with every row
+    RELEASED. Each switch's build action is armed to fail (connect_ports, add_to_vlan,
+    configure_route), so the fork save lands an L1, an L2, and an L3 row FAILED intended
+    ACTIVE. Cancel with the knobs still armed (only the builds fail): the teardown parks
+    each failed build intended RELEASED and drives its removal (a driver call that timed
+    out may have landed), and every wiring-status row ends RELEASED. Before #1501 the L1
+    and L2 rows stayed FAILED forever; the L3 pin was already settled (#1001)."""
+    nats_err = await probe_nats()
+    if nats_err:
+        pytest.skip(nats_err)
+
+    a1, a2, b1, b2, c1, c2 = await fresh_devices(6)
+    l1_sw = await _create_switch(
+        admin_client,
+        teardown_drivers["l1"]["id"],
+        "l1sw",
+        {"model": "t", "mock_fail_actions": "connect_ports"},
+    )
+    l2_sw = await _create_switch(
+        admin_client,
+        teardown_drivers["l2"]["id"],
+        "l2sw",
+        {"model": "t", "mock_fail_actions": "add_to_vlan"},
+    )
+    l3_sw = await _create_switch(
+        admin_client,
+        teardown_drivers["l3"]["id"],
+        "l3sw",
+        {"model": "t", "mock_fail_actions": "configure_route"},
+    )
+    switches = [l1_sw, l2_sw, l3_sw]
+    connections = []
+    rid = None
+    topology_id = None
+    try:
+        await _set_l3_config(admin_client, l3_sw["id"])
+        connections.append(await _connect(admin_client, a1["id"], "eth0", l1_sw["id"], "p1"))
+        connections.append(await _connect(admin_client, a2["id"], "eth0", l1_sw["id"], "p2"))
+        connections.append(await _connect(admin_client, b1["id"], "eth0", l2_sw["id"], "1"))
+        connections.append(await _connect(admin_client, b2["id"], "eth0", l2_sw["id"], "2"))
+        connections.append(await _connect(admin_client, c1["id"], "eth0", l3_sw["id"], "1"))
+        connections.append(await _connect(admin_client, c2["id"], "eth0", l3_sw["id"], "2"))
+
+        topology_id = await _create_topology(admin_client, {"nodes": [], "edges": []})
+        device_ids = [d["id"] for d in (a1, a2, b1, b2, c1, c2)] + [s["id"] for s in switches]
+        res = await _reserve(admin_client, device_ids, topology_id)
+        rid = res["id"]
+        assert await _poll_active(admin_client, rid), "reservation never activated"
+
+        canvas = {
+            "nodes": [_node(d["id"]) for d in (a1, a2, b1, b2, c1, c2)],
+            "edges": [
+                _edge(1, a1["id"], a2["id"]),
+                _edge(2, b1["id"], b2["id"]),
+                _edge(3, c1["id"], c2["id"]),
+            ],
+        }
+        saved = await _save_fork(admin_client, rid, canvas)
+        assert saved.status_code == 200, saved.text
+
+        def _failed_builds(status: dict) -> bool:
+            rows = status.get("connections", [])
+            return {c["layer"] for c in rows} == {"l1", "l2", "l3"} and all(
+                c["status"] == "FAILED" for c in rows
+            )
+
+        deadline = asyncio.get_event_loop().time() + 30.0
+        status = await _wiring_status(admin_client, rid)
+        while not _failed_builds(status) and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.5)
+            status = await _wiring_status(admin_client, rid)
+        assert _failed_builds(status), f"every build must land FAILED first: {status}"
+        assert await _count_runs(admin_client, rid, "connect_ports") == 0
+        assert await _count_runs(admin_client, rid, "add_to_vlan") == 0
+
+        # The teardown leaves a row alone while a retry pass holds a live claim on it,
+        # so push every FAILED row past the background tick's attempts cap first: a
+        # cancel inside a tick's drive would otherwise see that documented outcome.
+        retired = await retire_failed_rows_from_the_tick(admin_client, rid)
+        assert retired is not None, "the FAILED builds never passed the tick's attempts cap"
+        assert {r["layer"] for r in retired} == {"l1", "l2", "l3"}
+
+        cancelled = await admin_client.delete(f"/reservations/{rid}")
+        assert cancelled.status_code == 204, cancelled.text
+
+        assert await _poll_runs(admin_client, rid, "disconnect_ports", 1), (
+            "the failed L1 build was never disconnected"
+        )
+        assert await _poll_runs(admin_client, rid, "remove_from_vlan", 1), (
+            "the failed L2 join was never removed"
+        )
+        assert await _poll_runs(admin_client, rid, "remove_route", 1), (
+            "the failed L3 provision was never removed"
+        )
+
+        def _all_released(status: dict) -> bool:
+            rows = status.get("connections", [])
+            return {c["layer"] for c in rows} == {"l1", "l2", "l3"} and all(
+                c["status"] == "RELEASED" for c in rows
+            )
+
+        deadline = asyncio.get_event_loop().time() + 25.0
+        status = await _wiring_status(admin_client, rid)
+        while not _all_released(status) and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.5)
+            status = await _wiring_status(admin_client, rid)
+        assert _all_released(status), f"every ledger row must end RELEASED: {status}"
     finally:
         if rid:
             await admin_client.delete(f"/reservations/{rid}")

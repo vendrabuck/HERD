@@ -8,7 +8,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
-from herd_common.validation_errors import FORWARD_ENVELOPE_BYTES, extends_body_limit
+from herd_common.validation_errors import (
+    FORWARD_ENVELOPE_BYTES,
+    LARGE_JSON_BODY_BYTES,
+    extends_body_limit,
+)
 from pydantic import AwareDatetime, BaseModel
 from sqlalchemy import and_, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,14 +90,35 @@ ReservationSortField = Literal[
 ReservationSortDir = Literal["asc", "desc"]
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
-    """Normalize a timezone-aware filter bound to UTC (issue #959).
+_UTC_RANGE_TEXT = "0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z"
+
+
+def _as_utc(value: datetime | None, name: str) -> datetime | None:
+    """Normalize a list filter bound or a report bound to UTC (issues #959, #1523).
 
     Postgres compares timestamptz by instant, but SQLite compares the stored text, so
     an offset like +05:00 must be converted before it reaches the query for both
-    dialects to agree.
+    dialects to agree. The report routes read UTC dates off their bounds (the day
+    section, the CSV file name), so they convert too. A naive value is taken as UTC,
+    never as the host's local zone (which is what astimezone would assume); only the
+    report routes admit one, the list filters are AwareDatetime.
+
+    A value near datetime's limits can have no UTC equivalent
+    (0001-01-01T00:00:00+05:00 is before year 1 in UTC, 9999-12-31T23:00:00-05:00
+    after year 9999), and converting it raises OverflowError. That is the caller's
+    input, so it is a 422 naming the query parameter `name`, never a 500.
     """
-    return value.astimezone(timezone.utc) if value is not None else None
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    try:
+        return value.astimezone(timezone.utc)
+    except OverflowError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must fall between {_UTC_RANGE_TEXT} once converted to UTC",
+        ) from None
 
 
 @router.post("/", response_model=ReservationResponse, status_code=status.HTTP_201_CREATED)
@@ -218,10 +243,10 @@ async def get_my_reservations(
         search=search,
         statuses=tuple(status_filter or ()),
         purpose_category=purpose_category,
-        starts_after=_as_utc(starts_after),
-        starts_before=_as_utc(starts_before),
-        ends_after=_as_utc(ends_after),
-        ends_before=_as_utc(ends_before),
+        starts_after=_as_utc(starts_after, "starts_after"),
+        starts_before=_as_utc(starts_before, "starts_before"),
+        ends_after=_as_utc(ends_after, "ends_after"),
+        ends_before=_as_utc(ends_before, "ends_before"),
     )
     # Visibility is resolved before ordering: the `all` gate below decides which
     # ROW SET the caller can see at all, and each branch's own query (the owner
@@ -319,6 +344,11 @@ async def get_utilization_report(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
+    # Issue #1523: every later read of the bounds (the day split, the run-count
+    # query) sees UTC, whatever offset the caller sent; a bound with no UTC
+    # equivalent is 422.
+    start = _as_utc(start, "start")
+    end = _as_utc(end, "end")
     status_filter = status if status else [ReservationStatus.COMPLETED]
     # The fleet section defaults to ACTIVE+COMPLETED so a reservation running
     # right now counts toward utilization; an explicit ?status= applies to
@@ -361,6 +391,10 @@ async def get_utilization_report_csv(
     db: AsyncSession = Depends(get_db),
     _admin: dict = Depends(require_admin),
 ):
+    # Issue #1523: the file name below is dated with the bounds' UTC dates, the
+    # same calendar the day section uses; a bound with no UTC equivalent is 422.
+    start = _as_utc(start, "start")
+    end = _as_utc(end, "end")
     status_filter = status if status else [ReservationStatus.COMPLETED]
     fleet_devices = None
     fleet_filter = None
@@ -1009,6 +1043,8 @@ async def get_reservation_fork(
 
 
 @router.put("/{reservation_id}/fork/canvas")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def update_reservation_fork_canvas(
     reservation_id: uuid.UUID,
     body: ForkCanvasBody,
@@ -1041,6 +1077,8 @@ async def update_reservation_fork_canvas(
 
 
 @router.post("/{reservation_id}/fork/save")
+# A canvas: a large JSON body (issue #1484).
+@extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
 async def save_reservation_fork(
     reservation_id: uuid.UUID,
     body: ForkSaveBody,

@@ -12,7 +12,9 @@ service builds its own (CORS, the request logger, `install_validation_errors`), 
 talk to it with `httpx.AsyncClient`. Every attempt must get the exact 413 (no retry
 hides a reset), and the same connection must then serve a normal request: uvicorn
 reads and discards what is left of a refused body. A 64 MiB chunked body refused at
-the limit must not grow memory with the body: the discard holds nothing.
+the limit must not grow memory with the body: the discard holds nothing. A route marked
+with the large-JSON allowance (issue #1484) is refused one byte over its own limit the
+same way, and takes a body at that limit.
 """
 
 from __future__ import annotations
@@ -33,17 +35,26 @@ from herd_common.cors import add_cors_middleware
 from herd_common.logging import RequestLoggingMiddleware
 from herd_common.validation_errors import (
     DEFAULT_MAX_REQUEST_BODY_BYTES,
+    LARGE_JSON_BODY_BYTES,
+    extends_body_limit,
     install_validation_errors,
 )
 
 LIMIT = DEFAULT_MAX_REQUEST_BODY_BYTES
+LARGE_LIMIT = LIMIT + LARGE_JSON_BODY_BYTES
 ATTEMPTS = 10
 _MIB = 1024 * 1024
 _JSON = {"content-type": "application/json"}
-EXPECTED = (
-    b'{"detail":[{"type":"body_too_large","loc":["body"],'
-    b'"msg":"Request body is larger than ' + str(LIMIT).encode() + b' bytes"}]}'
-)
+
+
+def _expected(limit: int) -> bytes:
+    return (
+        b'{"detail":[{"type":"body_too_large","loc":["body"],'
+        b'"msg":"Request body is larger than ' + str(limit).encode() + b' bytes"}]}'
+    )
+
+
+EXPECTED = _expected(LIMIT)
 
 HTTP_IMPLS = [impl for impl in ("h11", "httptools") if importlib.util.find_spec(impl)]
 
@@ -71,6 +82,11 @@ def _app(ports: list[int]) -> FastAPI:
 
     @app.post("/json")
     async def json_route(body: dict[str, Any] = Body(...)):
+        return {"keys": len(body)}
+
+    @app.post("/large")
+    @extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
+    async def large_route(body: dict[str, Any] = Body(...)):
         return {"keys": len(body)}
 
     @app.get("/ok")
@@ -165,22 +181,59 @@ async def test_a_body_at_the_limit_still_reaches_the_route(http):
 
 
 @pytest.mark.parametrize("http", HTTP_IMPLS)
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(lambda: b"x" * (LARGE_LIMIT + 1), id="declared"),
+        pytest.param(lambda: _chunks(LARGE_LIMIT + 1), id="chunked"),
+    ],
+)
+async def test_a_large_json_route_refuses_one_byte_over_its_own_limit_and_keeps_the_connection(
+    http, body
+):
+    """The marked route's 413 names its own limit, carries no `Connection: close`, and
+    the same connection serves the next request."""
+    ports: list[int] = []
+    async with _serving(_app(ports), http) as base_url, _client(base_url) as client:
+        for attempt in range(3):
+            ports.clear()
+            refused = await client.post("/large", content=body(), headers=_JSON)
+            assert refused.status_code == 413, (attempt, refused.status_code)
+            assert refused.content == _expected(LARGE_LIMIT), attempt
+            assert "close" not in refused.headers.get("connection", "").lower()
+            ok = await client.get("/ok")
+            assert ok.json() == {"ok": True}, attempt
+            assert len(ports) == 2 and ports[0] == ports[1], (attempt, ports)
+
+
+@pytest.mark.parametrize("http", HTTP_IMPLS)
+async def test_a_body_at_a_large_json_routes_limit_reaches_it(http):
+    body = b'{"k":"' + b"v" * (LARGE_LIMIT - 8) + b'"}'
+    assert len(body) == LARGE_LIMIT
+    async with _serving(_app([]), http) as base_url, _client(base_url) as client:
+        resp = await client.post("/large", content=body, headers=_JSON)
+    assert resp.json() == {"keys": 1}
+
+
+@pytest.mark.parametrize("http", HTTP_IMPLS)
 async def test_refusing_a_64_mib_chunked_body_holds_no_more_than_the_limit(http):
     """The server reads the body up to the limit (the route's own body reader and the
     surrogate check each join what they read), refuses, and then discards the other
-    60 MiB as they arrive. The peak of everything this process allocates while that
-    happens, client and server, stays under three times the limit, so under a fifth
-    of the body: nothing holds the discarded part."""
+    60 MiB as they arrive. Sent to a large-JSON route, whose limit (4.25 MiB) is what
+    most large JSON refusals read (a forward route reads up to 4.5 MiB, the package
+    validator about 13.6 MiB of base64): the peak of everything this process
+    allocates while that happens, client and server, stays under three times that
+    limit, so under a fifth of the body: nothing holds the discarded part."""
     total = 64 * _MIB
     async with _serving(_app([]), http) as base_url, _client(base_url) as client:
         await client.get("/ok")  # the connection and the app are warm before measuring
         tracemalloc.start()
         try:
-            refused = await client.post("/json", content=_chunks(total), headers=_JSON)
+            refused = await client.post("/large", content=_chunks(total), headers=_JSON)
             peak = tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
-        assert refused.content == EXPECTED
+        assert refused.content == _expected(LARGE_LIMIT)
         assert (await client.get("/ok")).json() == {"ok": True}
-    assert peak < 3 * LIMIT
+    assert peak < 3 * LARGE_LIMIT
     assert peak < total / 5

@@ -55,8 +55,16 @@ export function AppLayout() {
   }, [user]);
 
   const handleLogout = async () => {
-    await logout.mutateAsync();
-    usePreferencesStore.getState().clear();
+    // A refused logout still signs the user out: logoutUnderRefreshLock clears
+    // the tokens in its `finally`, and useLogout's onSettled clears auth and the
+    // cache, so resetOnSignOut sees the edge and AuthGuard redirects. Awaiting
+    // mutateAsync here would make the rejected call an unhandled rejection in
+    // this handler (issue #1419).
+    try {
+      await logout.mutateAsync();
+    } catch {
+      // The server call failed; the local sign-out above already happened.
+    }
     navigate("/login");
   };
 

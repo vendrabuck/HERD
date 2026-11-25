@@ -50,7 +50,7 @@ numbered rules in section 8; section 5 names the caller condition for each route
 | Fork wiring ledger | The last fork version for which this service staged a `reservation.wiring_changed` event | reservations | `fork_wiring_ledger` (`ForkWiringLedger`) |
 | Outbox event | A lifecycle event written in the same transaction as the state change, published to NATS later | reservations | `outbox` (`OutboxEvent`) |
 | Purpose suggestion | The AI orchestrator's classification of a finished reservation, stored verbatim and reviewed by an admin | reservations (produced by ai-orchestrator) | `reservations.purpose_suggestion` |
-| Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged | reservations | `reservations.pending_fork_prune_device_ids` |
+| Pending prune marker | Device ids removed from an ACTIVE reservation whose fork wiring release has not yet converged; SQL NULL when nothing is pending, otherwise a non-empty list (RES-FORK-20) | reservations | `reservations.pending_fork_prune_device_ids` |
 | Provision clock | When the row last entered `PENDING_PROVISION`, written in the same statement as each entry (the create path's insert, the sweep's claim) and never cleared; the two provisioning backstops measure their timeout from it. Null on rows that predate migration 0017, which fall back to `updated_at` | reservations | `reservations.provision_started_at` |
 
 ## 4. State model
@@ -142,7 +142,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   already booked), moves to `ACTIVE` with `reservation.created` in that transaction, then
   creates the fork best-effort. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`)
 - **RES-DYN-8.** A failed callback moves to `FAILED` with `reservation.failed` and the
   purpose marker in that transaction, then releases exclusive devices (holder-aware) and
   archives the fork. \
@@ -186,13 +186,14 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_fails_stuck_dynamic_reservation`, `test_timeout_backstop_leaves_fresh_dynamic_reservation`); `services/reservations/tests/test_fork_archive_reconcile.py` (`test_timeout_backstop_failed_archives_fork`); `services/reservations/tests/test_provision_clock.py` (`test_purpose_category_patch_does_not_move_the_backstop_deadline`, `test_backstop_reads_provision_started_at_not_updated_at`, `test_backstop_falls_back_to_updated_at_when_unstamped`, `test_create_stamps_provision_started_at_when_it_enters_pending_provision`, `test_create_leaves_provision_started_at_null_for_pending_and_active`, `test_sweep_claim_stamps_provision_started_at`, `test_every_entry_into_pending_provision_stamps_provision_started_at`, `test_cas_into_pending_provision_is_only_the_self_transition_guard`)
 - **RES-SWEEP-7.** A physical-only `PENDING_PROVISION` row stranded past the same
   deadline (measured the same way) is moved back to `PENDING` by compare-and-swap, so a later tick re-activates
-  it; nothing is torn down. Only the writer whose compare-and-swap won then releases
+  it; nothing is torn down. Physical-only is judged by the row's own dynamic requests:
+  another reservation's request does not hide it. Only the writer whose compare-and-swap won then releases
   the row's exclusive devices through the holder-aware filter (RES-HOLD-1: a `PENDING`
   row holds nothing, and a later cancel or elapsed-window failure writes no inventory
   status), after the commit and before the tick's claimed rows activate; a device
   another live row holds is skipped. A later claim re-flips the devices. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`); `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `release_devices_not_held_by_others`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`)
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_restart_backstop_reverts_stranded_physical_reservation`, `test_restart_backstop_reclaims_and_reactivates_across_cycles`, `test_restart_backstop_skips_row_activated_concurrently`); `services/reservations/tests/test_restart_backstop_release.py` (`test_restart_backstop_revert_releases_the_rows_devices`, `test_restart_backstop_revert_then_elapsed_window_releases_exactly_once`, `test_restart_backstop_revert_then_cancel_leaves_nothing_reserved`, `test_restart_backstop_release_skips_a_device_another_live_row_holds`, `test_restart_backstop_lost_cas_releases_nothing`, `test_restart_backstop_judges_each_row_by_its_own_dynamic_requests`, `test_restart_backstop_leaves_a_dynamic_row_that_appears_after_the_dynamic_select`)
 - **RES-SWEEP-8.** `PROVISION_TIMEOUT_SECONDS=0` disables both provisioning backstops. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_timeout_backstop_disabled_when_zero`, `test_restart_backstop_disabled_when_timeout_zero`)
@@ -201,11 +202,11 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_cancel_failed_is_terminal_no_release_no_event`); `services/reservations/tests/test_reservations.py` (`test_cancel_already_cancelled`)
 - **RES-CANCEL-4.** Cancel compare-and-swaps from the exact status it read; when the row
-  moved, it re-reads and retries, at most three times, then logs
+  moved, it re-reads and tries again, three attempts in all, then logs
   `reservation_cancel_cas_exhausted` and stages nothing. A row that went terminal
   meanwhile is a clean no-op. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`cancel_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward`, `test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing`, `test_cancel_loses_to_a_concurrent_completion_is_a_noop`)
+  Pinned by: `services/reservations/tests/test_reservation_status_cas.py` (`test_cancel_retries_with_the_fresh_status_when_the_row_moved_forward`, `test_cancel_cas_exhaustion_warns_with_fixed_action_and_stages_nothing`, `test_cancel_loses_to_any_terminal_winner_is_a_noop`, `test_cancel_loses_to_a_non_terminal_winner_retries_and_cancels`)
 - **RES-CANCEL-5.** A winning cancel stages `reservation.cancelled` whose `user_id` is
   the owner (also on an admin cancel), stamps the purpose marker, then releases devices
   only if it left `PENDING_PROVISION` or `ACTIVE`, then requests a fork archive (a
@@ -263,7 +264,7 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
 | POST | `/{id}/fork/versions/{vid}/restore` | owner, or any admin; ACTIVE only | 200 | RES-FORK-4, RES-FORK-6, RES-FORK-9, RES-FORK-10 |
 | GET | `/{id}/wiring-status` | owner, or any admin | 200 | RES-FORK-4, RES-FORK-18 |
 | POST | `/{id}/wiring/retry` | owner, or any admin; not `PENDING` or `PENDING_PROVISION` | 200 | RES-FORK-4, RES-FORK-18 |
-| GET | `/admin/purpose-review` | admin | 200 | RES-PURPOSE-9, RES-PURPOSE-14 |
+| GET | `/admin/purpose-review` | admin | 200 | RES-PURPOSE-9, RES-PURPOSE-14, RES-PURPOSE-15 |
 | POST | `/admin/purpose-review/{id}/accept` | admin | 200 | RES-PURPOSE-10, RES-PURPOSE-14 |
 | POST | `/admin/purpose-review/{id}/dismiss` | admin | 200 | RES-PURPOSE-11, RES-PURPOSE-14 |
 | POST | `/admin/purpose-review/{id}/classify` | admin | 200 | RES-PURPOSE-13, RES-PURPOSE-14 |
@@ -637,10 +638,12 @@ pending-prune reconcile.
   transaction; 0 disables reminders. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_reminder_cycle`) \
   Pinned by: `services/reservations/tests/test_expiry_reminder.py` (`test_reminder_not_repeated_across_ticks`, `test_reminder_stamp_and_event_commit_together`, `test_lead_window_zero_disables_reminder`)
-- **RES-SWEEP-10.** A failure in one step of a tick does not stop the loop or the
-  following steps. \
+- **RES-SWEEP-10.** Every tick runs four steps, each once: `_run_expiration_cycle`,
+  `_run_reminder_cycle`, `_run_fork_archive_reconcile`, `_run_pending_prune_reconcile`.
+  A failure in one step is logged at ERROR and does not stop the loop or skip any
+  other step. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`expiration_loop`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_runs_both_cycles_and_handles_errors`)
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_expiration_loop_awaits_exactly_the_four_named_steps_and_the_sleep`, `test_expiration_loop_runs_every_step_and_a_failing_step_skips_none`)
 - **RES-SWEEP-11.** Purpose classification runs on its own task and interval, never
   inside the expiration loop. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/reservations/app/tasks/expiration.py` (`purpose_classify_loop`) \
@@ -700,12 +703,12 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   refuses an invisible device as not found (400). The calendar, which returns rows,
   fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
   (`l3=0`). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`)
+  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`, `test_patch_topology_membership_break_is_400_with_the_structured_body`)
 - **RES-PATCH-9.** An added exclusive device must not conflict over
   `[max(now, start), end)`, checked by the same refusal create uses, with create's
   wording (`... already reserved in the requested window`). On an `ACTIVE` reservation it
@@ -792,9 +795,12 @@ section 5).
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_my_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_purpose_category_value_and_none`, `test_purpose_category_unknown_is_422_with_pinned_message`)
 - **RES-LIST-8.** Time bounds must carry a timezone; `*_after` is inclusive and
-  `*_before` exclusive, compared by instant. \
+  `*_before` exclusive, compared by instant. A bound whose instant has no UTC
+  equivalent (an offset near year 1 or year 9999) is 422 `<parameter> must fall between
+  0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
+  500 (issue #1523). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`) \
-  Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`)
+  Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`, `test_window_bound_with_no_utc_equivalent_is_422`, `test_window_bound_at_the_edge_of_the_utc_range_is_accepted`)
 - **RES-LIST-9.** `total` is the filtered total. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_total_is_filtered_total_across_pages_and_sort`)
@@ -837,7 +843,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_returns_cross_user_reservations`, `test_calendar_boundary_exclusion`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_returns_cross_user_reservations`, `test_calendar_boundary_exclusion`, `test_calendar_visibility_is_the_callers_and_judged_per_row`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_returns_exactly_the_rows_overlapping_the_half_open_window`)
 - **RES-CAL-2.** A window wider than `CALENDAR_MAX_SPAN_DAYS` (default 366) is 422; 0
   disables the cap. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \
@@ -851,7 +857,7 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   calendar page shows a could-not-load state on the refusal, not the empty-range
   message. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_calendar_reservations`, `_fetch_visible_device_ids_strict`); `frontend/src/pages/ReservationCalendarPage.tsx` (`ReservationCalendarPage`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_calendar_non_admin_visibility_filtering`, `test_calendar_non_admin_fails_closed_when_visibility_is_unanswerable`, `test_calendar_admin_is_unfiltered_and_never_asks_for_visibility`, `test_calendar_non_admin_with_a_real_answer_is_filtered`, `test_calendar_visibility_is_the_callers_and_judged_per_row`); `services/reservations/tests/test_reservation_service_unit.py` (`test_calendar_visibility_subset_and_empty_set`, `test_calendar_visibility_keeps_a_row_only_when_all_its_devices_are_visible`); `frontend/src/test/pages/ReservationCalendarPage.test.tsx` (`ReservationCalendarPage`)
 
 **Out of scope.** Utilization reports (`GET /reports/utilization` and its CSV) live in
 this service but belong to `operations-and-observability.md`.
@@ -881,11 +887,11 @@ routes in section 5; background work `purpose_classify_loop` every
   holding a lone surrogate is now refused before the route runs, with the shared 422,
   one `string_unicode` item at `["body"]` (OPS-VALID-6), and nothing is written. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`validate_purpose_category`); `services/common/herd_common/error_details.py` (`unknown_value_detail`) \
-  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
+  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_create_reservation_with_unknown_purpose_category_is_422`, `test_patch_purpose_category_unknown_category_is_422`, `test_create_with_a_lone_surrogate_category_is_422_not_500`, `test_patch_with_a_lone_surrogate_category_is_422_and_changes_nothing`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_list_a_category_must_be_in_is_the_one_the_string_gives`); `tests/integration/test_purpose_category_flow.py` (`test_purpose_category_unknown_value_rejected_through_facade`, `test_a_lone_surrogate_in_a_facade_create_is_a_422_not_a_500`)
 - **RES-PURPOSE-2.** The owner or an admin may set or clear the category in any status,
   including terminal; anyone else gets 403 (not 404). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
-  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_by_admin`, `test_patch_purpose_category_allowed_on_completed_reservation`, `test_patch_purpose_category_by_third_user_is_403`)
+  Pinned by: `services/reservations/tests/test_purpose_category.py` (`test_patch_purpose_category_by_admin`, `test_patch_purpose_category_allowed_on_completed_reservation`, `test_patch_purpose_category_by_third_user_is_403`, `test_patch_purpose_category_writes_only_the_named_row`, `test_patch_purpose_category_by_a_third_user_is_403_and_writes_nothing`)
 - **RES-PURPOSE-3.** A null category clears the category, its setter, and its time
   together. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`set_purpose_category`) \
@@ -902,20 +908,20 @@ routes in section 5; background work `purpose_classify_loop` every
   rows with no suggestion and fewer than `PURPOSE_CLASSIFY_MAX_ATTEMPTS` attempts,
   oldest stamp first. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_purpose_classify_reconcile`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`, `test_reconcile_batch_is_filled_only_by_eligible_rows`)
 - **RES-PURPOSE-6.** A feature-off answer (403 with the disabled marker, or 404), a
   transient answer (429, 502, 503, 504, or a transport error other than a timeout), or
   a 403 without the marker ends the tick and counts no attempt. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`, `test_reconcile_transport_error_ends_tick_without_bump`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
 - **RES-PURPOSE-7.** A timeout, any other non-200, or an unparseable body counts one
   attempt on that row and the tick continues. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_bump_purpose_classify_attempts`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
 - **RES-PURPOSE-8.** A 200 stores the orchestrator's body verbatim as the suggestion; it
-  never writes `purpose_category`. \
+  never writes `purpose_category`. Known gap, see #1543. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`, `test_classify_one_maps_each_answer_to_its_outcome`)
 - **RES-PURPOSE-9.** The review list holds rows with an undismissed suggestion whose
   category is unset or differs from the suggestion's `top_category`. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
@@ -924,11 +930,11 @@ routes in section 5; background work `purpose_classify_loop` every
   with a value, that value (validated as RES-PURPOSE-1); the accepting admin becomes the
   setter. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`accept_purpose_suggestion`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`, `test_accept_unknown_category_value_is_422`, `test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_accept_with_null_uses_top_category`, `test_accept_with_chosen_value_overrides_top_category`, `test_accept_unknown_category_value_is_422`, `test_accept_with_a_lone_surrogate_category_is_422_and_changes_nothing`, `test_accept_changes_only_the_named_row`, `test_accept_and_dismiss_read_the_named_rows_suggestion`)
 - **RES-PURPOSE-11.** Dismiss sets only `purpose_suggestion_dismissed_at` and keeps the
   suggestion. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`dismiss_purpose_suggestion`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_dismiss_sets_dismissed_at_and_keeps_suggestion`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_dismiss_sets_dismissed_at_and_keeps_suggestion`, `test_dismiss_changes_only_the_named_row`, `test_accept_and_dismiss_read_the_named_rows_suggestion`)
 - **RES-PURPOSE-12.** Backfill stamps every terminal row with no stamp and no
   suggestion, and resets the attempt count of every capped row with no suggestion; it
   returns the sum. \
@@ -936,12 +942,17 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_backfill_marks_terminal_rows_without_suggestion`, `test_backfill_resets_capped_rows_without_suggestion`, `test_backfill_counts_newly_marked_and_reset_rows_together`)
 - **RES-PURPOSE-13.** Classify now runs the same single-row classifier immediately,
   ignores the attempt cap, and answers 200 with the outcome word for every outcome except
-  feature-off. \
+  feature-off. Known gap, see #1543. \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`, `test_trigger_answers_the_outcome_word_for_every_answer`)
 - **RES-PURPOSE-14.** Every purpose review route is admin-only. \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`require_admin`) \
-  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`, `test_every_purpose_review_route_refuses_a_non_admin`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
+- **RES-PURPOSE-15.** The review list is ordered by `purpose_suggested_at`, newest first,
+  then by reservation id. The id is unique, so the order is total, and paging through a
+  queue that does not change in between neither repeats nor skips a row. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
+  Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_newest_suggestion_first_then_by_id`)
 
 **Out of scope.** The classifier, its prompt, and its feature gate are
 ai-orchestrator's (`ai-features.md`, [AI_PURPOSE_CLASSIFICATION.md](../AI_PURPOSE_CLASSIFICATION.md)).
@@ -982,13 +993,13 @@ reconcile on the expiration loop.
 - **RES-FORK-4.** Every fork and wiring route is owner-or-admin; any other caller gets
   404 and no upstream call is made. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_load_owned_or_admin`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_other_user_404_and_no_cabling_call`, `test_get_fork_admin_allowed_for_other_owner`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`); `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_other_user_404_and_no_cabling_call`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_a_caller_who_is_neither_owner_nor_admin_gets_404_and_no_upstream_call`, `test_the_owner_or_any_admin_reaches_the_upstream_for_the_reservation_named`)
 - **RES-FORK-5.** Reading the fork works in any status; on a cabling 404 an `ACTIVE`
   reservation lazily creates the fork (also with no parent topology) and re-reads, while
   any other status answers 404 `Fork not found`. A failed or refused lazy create,
   including a cabling 409, answers 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_fork`); `services/reservations/app/services/reservation_service.py` (`_lazy_create_reservation_fork`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_get_fork_lazy_creates_on_active_miss`, `test_get_fork_lazy_creates_with_no_parent_topology`, `test_get_fork_ended_reservation_no_fork_404_and_no_lazy_create`, `test_lazy_create_posts_the_reservations_own_parent_topology_and_rereads`, `test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`, `test_a_fork_miss_outside_active_is_404_fork_not_found_with_no_create`)
 - **RES-FORK-6.** Canvas PUT, save, and restore require `ACTIVE`; otherwise 409 and no
   upstream call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`FORK_EDIT_REQUIRES_ACTIVE`, `FORK_SAVE_REQUIRES_ACTIVE`, `FORK_RESTORE_REQUIRES_ACTIVE`) \
@@ -1010,7 +1021,7 @@ reconcile on the expiration loop.
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
   unavailable`; a transport failure is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
   the create-path flip failure and the elapsed-window failure asks cabling to archive the
   fork, three attempts, after the commit; failure is logged and never undoes the
@@ -1043,14 +1054,36 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_wrapper_no_fork_keeps_marker_while_fork_may_appear`, `test_wrapper_archived_409_clears_marker`, `test_wrapper_failure_keeps_marker`); `services/reservations/tests/test_wiring_changed_staging.py` (`test_patch_remove_calls_prune_devices_and_stages_released_delta`)
 - **RES-FORK-17.** Each tick retries up to 20 reservations with a pending prune marker,
   oldest `updated_at` first, one attempt each; a marker on a non-ACTIVE reservation is
-  cleared without a prune. \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_PENDING_PRUNE_BATCH`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`)
+  cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20).
+  On an `ACTIVE` row, marker entries that do not parse as a UUID are cleared in the
+  same tick without a prune, and the row's other entries are retried as usual
+  (RES-FORK-16). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`)
+- **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,
+  held by three parts. Every writer stores SQL NULL or a non-empty list, whichever path
+  empties the marker (a full clear, a partial clear followed by a full one, a terminal or
+  corrupt-entry clear by the sweep) or never sets it. Migration 0018 repaired the stored
+  rows once: JSON `null` and an empty list, from before issue #1522, became SQL NULL (its
+  downgrade is a no-op). And the reconciler of RES-FORK-17 heals any marker it selects
+  that holds nothing actionable (anything but a non-empty list: JSON `null`, an empty
+  list, a corrupt non-list value, as a process on the previous code could still write) to
+  SQL NULL in the same tick, in any status, without iterating it, so a corrupt value
+  never stops the rows after it; the heal reads the marker again under the row lock,
+  which it holds until its UPDATE commits (so a concurrent write waits for the heal and
+  is never nulled by it), and leaves the marker if a concurrent write made it a
+  non-empty list. The heal's write also moves `updated_at` (the model's `onupdate`), as
+  the ORM clear always has. A non-list value is logged at
+  ERROR by type name only. So the reconciler never keeps a row with nothing pending in
+  its batch for more than one tick, and a backlog of emptied rows cannot keep a new
+  marker out of it. \
+  Enforced in: `services/reservations/app/models/reservation.py` (`Reservation`); `services/reservations/app/services/reservation_service.py` (`_clear_pending_fork_prune`, `_prune_marker_actionable`, `_heal_non_actionable_prune_marker`); `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`); `services/reservations/migrations/versions/0018_pending_fork_prune_sql_null.py` (`upgrade`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
   absence is 503. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`) \
-  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`)
+  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
   View as-built (an ended one) only to the owner, and only when the reservation has a
   `topology_id`; an admin who does not own the reservation sees neither, although the
@@ -1160,7 +1193,7 @@ user in the flow. The routes, callers, and answers are in section 7.
 
 - **RES-INTERNAL-1.** A wrong internal token answers 403; a missing header answers 422. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`internal_token_matches`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_status_bad_token_rejected`, `test_internal_status_missing_token_rejected`, `test_internal_active_bad_token_rejected`, `test_active_users_requires_valid_internal_token`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_every_internal_route_answers_422_without_the_token_header`, `test_every_internal_route_answers_403_to_a_wrong_token`, `test_internal_status_bad_token_rejected`, `test_internal_status_missing_token_rejected`, `test_internal_active_bad_token_rejected`, `test_internal_active_missing_token_rejected`, `test_active_users_requires_valid_internal_token`, `test_internal_by_topology_bad_token_rejected`, `test_internal_by_device_bad_token_rejected`); `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_refuses_a_wrong_internal_token`); `services/reservations/tests/test_dynamic_requests.py` (`test_callback_wrong_token_403_wording`, `test_callback_missing_token_rejected`)
 - **RES-INTERNAL-2.** `is_active` is true only when the status is `ACTIVE` and now is
   within `[start_time, end_time]`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
@@ -1168,16 +1201,16 @@ user in the flow. The routes, callers, and answers are in section 7.
 - **RES-INTERNAL-3.** `owns_active` is true only when the user owns an `ACTIVE`
   reservation that contains the device and whose window contains now. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`owns_active_reservation_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_owner_with_device_returns_true`, `test_internal_active_non_owner_returns_false`, `test_internal_active_outside_window_returns_false`, `test_internal_active_cancelled_returns_false`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_active_owner_with_device_returns_true`, `test_internal_active_non_owner_returns_false`, `test_internal_active_outside_window_returns_false`, `test_internal_active_cancelled_returns_false`, `test_internal_active_answers_only_from_the_users_reservation_holding_the_device`, `test_internal_active_is_true_only_for_an_active_reservation`, `test_internal_active_is_true_only_while_the_window_contains_now`)
 - **RES-INTERNAL-4.** `active-users` lists, once each, the owners of `ACTIVE`
   reservations containing the device whose window contains now. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_active_reservation_users_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_active_users_dedupes_same_user_multiple_reservations`, `test_active_users_filters_by_time_window`, `test_active_users_filters_by_status`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_active_users_dedupes_same_user_multiple_reservations`, `test_active_users_filters_by_time_window`, `test_active_users_filters_by_status`, `test_active_users_lists_only_the_owner_of_the_reservation_holding_the_device`, `test_active_users_lists_only_owners_of_active_reservations`, `test_active_users_lists_only_owners_whose_window_contains_now`)
 - **RES-INTERNAL-5.** `by-topology` and `by-device` return every reservation that
   references the topology or contains the device, in every status and for every owner,
   without pagination. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_reservations_for_topology`, `list_reservations_for_device`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_internal_by_topology_returns_matching_reservation`, `test_internal_by_device_returns_matching_reservation`, `test_internal_by_device_returns_only_the_reservation_holding_the_device`)
 - **RES-INTERNAL-6.** The literal `active`, `active-users`, `held-devices`,
   `by-topology`, and `by-device` segments are never parsed as a reservation id. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_internal_status`) \
@@ -1197,7 +1230,7 @@ user in the flow. The routes, callers, and answers are in section 7.
   user's `PENDING_PROVISION` and `ACTIVE` reservations (the statuses that hold devices),
   and nothing of a `PENDING` or terminal row or of another user's (issue #1030). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`list_devices_held_by_user`) \
-  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_lists_only_the_users_live_reservations`, `test_held_devices_for_a_user_with_nothing_live_is_empty`, `test_held_devices_refuses_a_wrong_internal_token`)
+  Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_held_devices_lists_only_the_users_live_reservations`, `test_held_devices_lists_a_row_by_its_own_status_alone`, `test_held_devices_for_a_user_with_nothing_live_is_empty`, `test_held_devices_refuses_a_wrong_internal_token`)
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
 
@@ -1237,6 +1270,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | validation list | create schema violation: device cap, empty booking, window, past start, duration, purpose length, more than 50 dynamic requests | RES-CREATE-1 to RES-CREATE-6, RES-DYN-2 |
 | 422 | validation list | PATCH with an empty or over-cap `device_ids` | RES-PATCH-6 |
 | 422 | validation list | list: unknown sort field or direction, unknown status, naive or bad timestamp, search over 200 characters | RES-LIST-3, RES-LIST-6, RES-LIST-8 |
+| 422 | `<parameter> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC` | list: a time bound whose instant has no UTC equivalent (an offset near year 1 or year 9999) | RES-LIST-8 |
 | 422 | validation list | calendar without `range_start` or `range_end`; internal route without the token header | RES-CAL-1, RES-INTERNAL-1 |
 | 422 | `Unknown purpose_category; allowed: <list>` | an unknown category on create, purpose-category PATCH, accept, or the list filter | RES-PURPOSE-1, RES-PURPOSE-10, RES-LIST-7 |
 | 422 | `Device <id> not found in inventory` | create names a device that does not exist or that the caller cannot see | RES-CREATE-8, RES-CREATE-9 |
@@ -1321,7 +1355,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_reservation_patch_race_live_pg.py`, `test_pending_fork_prune_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
@@ -1335,7 +1369,13 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-None at present.
+- #1543 (RES-PURPOSE-8, RES-PURPOSE-13): a classify answer of 200 whose JSON body is
+  not an object is taken as the suggestion. A list, a string, or a number is stored
+  verbatim, and every route that then reads the row answers 500: Classify now, the
+  review list, accept, dismiss (after its write commits), and the owner's `GET /{id}`.
+  A JSON `null` stores nothing, counts no attempt, and is sent again on every sweep
+  tick with no cap. A real orchestrator cannot answer such a body; it takes a
+  deployment fault at the orchestrator's address.
 
 ### Limits by decision
 

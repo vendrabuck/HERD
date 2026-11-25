@@ -13,8 +13,10 @@ from app.services.l3_intent import (
     parse_l3_intent,
     parse_l3_intent_tolerant,
     parse_node_l3,
+    route_limit_message,
     walk_l3_nodes,
 )
+from herd_common.l3_route_limit import MAX_ROUTES_PER_SWITCH
 
 DEVICE_A = uuid.uuid4()
 DEVICE_B = uuid.uuid4()
@@ -662,3 +664,115 @@ def test_merge_candidates_by_device_matches_parse_l3_intent():
     candidates, _malformed = walk_l3_nodes(canvas)
     merged = merge_candidates_by_device(candidates)
     assert merged == parse_l3_intent(canvas)
+
+
+# --- issue #1493: the per-switch route limit --------------------------------
+
+
+def _routes(start: int, count: int) -> list[dict]:
+    """`count` distinct routes, numbered from `start` (distinct across calls whose
+    ranges do not overlap)."""
+    return [
+        {"destination": f"10.{i // 256}.{i % 256}.0/24", "interface": "eth0"}
+        for i in range(start, start + count)
+    ]
+
+
+def test_a_switch_at_the_route_limit_parses():
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": _routes(0, MAX_ROUTES_PER_SWITCH)})])
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert malformed == []
+    assert len(candidates[0][2]) == MAX_ROUTES_PER_SWITCH
+    assert len(parse_l3_intent(canvas)[DEVICE_A]) == MAX_ROUTES_PER_SWITCH
+
+
+def test_a_switch_one_route_over_the_limit_is_malformed_with_the_exact_message():
+    over = MAX_ROUTES_PER_SWITCH + 1
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": _routes(0, over)})])
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert candidates == []
+    [(node_id, device_id, exc)] = malformed
+    assert (node_id, device_id, exc.node_id) == ("n1", DEVICE_A, "n1")
+    assert exc.message == (
+        f"switch {DEVICE_A} has 1001 distinct routes; a switch carries at most 1000"
+    )
+    assert exc.message == route_limit_message(DEVICE_A, over)
+    with pytest.raises(L3IntentMalformed) as raised:
+        parse_l3_intent(canvas)
+    assert raised.value.message == exc.message
+
+
+def test_duplicates_do_not_count_against_the_route_limit():
+    """1,000 distinct routes plus a copy of every one of them, and one more route
+    spelled differently but of the same identity, is still exactly the limit."""
+    routes = _routes(0, MAX_ROUTES_PER_SWITCH)
+    same_identity = {"destination": "10.0.0.9/24", "interface": "eth0", "next_hop": ""}
+    canvas = _canvas([_switch_node("n1", DEVICE_A, {"routes": routes + routes + [same_identity]})])
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert malformed == []
+    _node_id, _device_id, parsed, duplicate_indices = candidates[0]
+    assert len(parsed) == MAX_ROUTES_PER_SWITCH
+    assert len(duplicate_indices) == MAX_ROUTES_PER_SWITCH + 1
+
+
+def test_the_route_limit_counts_a_switch_merged_across_its_nodes():
+    """Two nodes of one switch, each under the limit, whose merged distinct set is one
+    over: both nodes are malformed with the switch-wide count, in canvas order, and a
+    switch in between is unaffected."""
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, {"routes": _routes(0, 600)}),
+            _switch_node("n2", DEVICE_B, {"routes": _routes(0, 3)}),
+            _switch_node("n3", DEVICE_A, {"routes": _routes(600, 401)}),
+        ]
+    )
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert [(c[0], c[1]) for c in candidates] == [("n2", DEVICE_B)]
+    assert [(node_id, device_id) for node_id, device_id, _ in malformed] == [
+        ("n1", DEVICE_A),
+        ("n3", DEVICE_A),
+    ]
+    assert {exc.message for _n, _d, exc in malformed} == {route_limit_message(DEVICE_A, 1001)}
+    with pytest.raises(L3IntentMalformed) as raised:
+        parse_l3_intent(canvas)
+    assert raised.value.node_id == "n1"
+
+
+def test_routes_two_nodes_of_one_switch_share_count_once_toward_the_limit():
+    """600 plus 600 routes sharing 200 identities merge to exactly 1,000: allowed."""
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, {"routes": _routes(0, 600)}),
+            _switch_node("n2", DEVICE_A, {"routes": _routes(400, 600)}),
+        ]
+    )
+    candidates, malformed = walk_l3_nodes(canvas)
+    assert malformed == []
+    assert len(parse_l3_intent(canvas)[DEVICE_A]) == MAX_ROUTES_PER_SWITCH
+
+
+def test_a_shape_malformed_node_after_an_over_limit_switch_keeps_canvas_order():
+    """The limit's malformed entries interleave with shape refusals in canvas node
+    order, so the strict parser still raises on the FIRST refused node."""
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_B, {"bad": "shape"}),
+            _switch_node("n2", DEVICE_A, {"routes": _routes(0, MAX_ROUTES_PER_SWITCH + 1)}),
+            _switch_node("n3", DEVICE_B, {"routes": "not-a-list"}),
+        ]
+    )
+    _candidates, malformed = walk_l3_nodes(canvas)
+    assert [node_id for node_id, _d, _e in malformed] == ["n1", "n2", "n3"]
+
+
+def test_the_tolerant_parser_drops_an_over_limit_switch_and_keeps_the_others(caplog):
+    canvas = _canvas(
+        [
+            _switch_node("n1", DEVICE_A, {"routes": _routes(0, MAX_ROUTES_PER_SWITCH + 1)}),
+            _switch_node("n2", DEVICE_B, {"routes": _routes(0, 2)}),
+        ]
+    )
+    with caplog.at_level("WARNING", logger="app.services.l3_intent"):
+        result = parse_l3_intent_tolerant(canvas)
+    assert set(result) == {DEVICE_B}
+    assert any("n1" in r.getMessage() and "1001" in r.getMessage() for r in caplog.records)

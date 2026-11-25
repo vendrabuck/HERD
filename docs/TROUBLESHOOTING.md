@@ -143,9 +143,11 @@ Either:
 
 ### A request answers `413` with `body_too_large`
 
-The body was larger than the service accepts (issue #1466): `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`. Every service, config included, refuses a body over `MAX_REQUEST_BODY_BYTES` (4 MiB by default) before it parses it or checks the caller's token, so a client gets this 413 even without credentials. Each refusal logs one INFO line in the service that refused it, with `action` `request_body_too_large`, the limit, and `declared` (the `Content-Length` said so) or `received` (the bytes passed the limit); the log never holds any of the body. The service keeps the connection open and discards the rest of the body, so the client sees the 413 even while it is still sending, and its next request can use the same connection.
+The body was larger than the route accepts (issues #1466, #1484): `{"detail": [{"type": "body_too_large", "loc": ["body"], "msg": "Request body is larger than <limit> bytes"}]}`. Every service, config included, refuses a body over `MAX_REQUEST_BODY_BYTES` (256 KiB by default; 4 MiB before #1484) before it parses it or checks the caller's token, so a client gets this 413 even without credentials. Each refusal logs one INFO line in the service that refused it, with `action` `request_body_too_large`, the limit, and `declared` (the `Content-Length` said so) or `received` (the bytes passed the limit); the log never holds any of the body. The service keeps the connection open and discards the rest of the body, so the client sees the 413 even while it is still sending, and its next request can use the same connection.
 
-- A topology save, a reservation's fork save, or a facade call carrying a very large canvas: the default holds a canvas of about 1,000 devices and 4,000 links. Raise `MAX_REQUEST_BODY_BYTES` in `.env` and recreate every service (`make up`, or `docker compose up -d` for each), since the canvas passes through reservations, cabling, and the `/api/v1` facade, and the smallest limit on the path wins.
+- A route that takes a large JSON body (a topology or template canvas save, a reservation's fork canvas or fork save, an AI commit, a device configuration version, a bulk connection create, and the execution and cabling routes those are forwarded to) accepts the default plus 4 MiB, so the number in the message is larger; that holds a canvas of about 1,880 devices with four links each, as the editor saves it. Raise `MAX_REQUEST_BODY_BYTES` in `.env` and recreate every service (`make up`, or `docker compose up -d` for each): every marked route rises by as much, and since a canvas passes through reservations and cabling, the smallest limit on the path wins.
+- Any other route (a device or template create, a secret, preferences, and every route a caller reaches without a token): its limit is the default. A client that sent more than 256 KiB to such a route before #1484 now gets this 413; raise `MAX_REQUEST_BODY_BYTES` on every service together if the body is legitimate, and report the route, since a route that legitimately takes more belongs in the large-JSON table. An operator who set `MAX_REQUEST_BODY_BYTES=4194304` explicitly keeps 4 MiB on every route, gaining nothing, and the large-JSON routes then take 8 MiB and the routes they forward to 8.25 MiB; remove an explicit 4194304 to take the new default.
+- A body near a route's bound, sent pretty-printed: the bounds are measured as compact JSON. A `POST /pathfind/batch` of its 2,000 pairs is 236011 bytes compact but 288019 indented by two spaces, over the default; send compact JSON (what `JSON.stringify` and httpx write).
 - An upload (a driver package, a bulk import file, AI generate files, the package validator): its limit is the default plus the files the route accepts, so the number in the message is larger. Raise the route's own setting (`DRIVER_MAX_SIZE_BYTES`, `UPLOAD_MAX_FILES` and `UPLOAD_MAX_FILE_BYTES`, `VALIDATE_PACKAGE_MAX_BYTES`); the bulk imports' 10 MiB file bound is fixed in code. The table is in [docs/specs/operations-and-observability.md](specs/operations-and-observability.md) (OPS-VALID-10).
 
 ### One local account always gets `Invalid credentials` after an upgrade (bcrypt cost above 14)
@@ -589,9 +591,9 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
   may mean the hardware was left connected: the disconnect never ran, and no retry channel
   will run it later (an open defect, issue #1199). Re-publishing the reservation's terminal
-  event does not recover these rows either: the teardown pass reads only `ACTIVE` L1 and L2
-  rows and, for L3, `ACTIVE` pins and `FAILED` pins intended `ACTIVE`, never a `FAILED` row
-  intended `RELEASED` (`_teardown_from_ledgers`). Read the row with
+  event does not recover these rows either: the teardown pass reads `ACTIVE` rows and
+  `FAILED` rows intended `ACTIVE` (on L1 and L2 only those with a retryable reason, since
+  issue #1501), never a `FAILED` row intended `RELEASED` (`_teardown_from_ledgers`). Read the row with
   `GET /api/reservations/{id}/wiring-status` (any status, owner or admin), which lists each
   row's switch, and its ports for L1 and L2. For a reason such as a missing template or `driver load failed:
   DriverPackageError` the switch is still in inventory: check on the switch whether the
@@ -606,9 +608,10 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   `INTERNAL_API_TOKEN` rotation (every service must hold the new value, or
   service-to-service calls answer 403 until they do), or any other answer that is not a
   200 carrying a JSON object or a 404, is transient: the event is NAKed with backoff and
-  the ACTIVE rows keep their status, attempts, and reason (a `FAILED` L3 pin intended
+  the ACTIVE rows keep their status, attempts, and reason (a `FAILED` row intended
   `ACTIVE` is the exception: teardown parks it intended `RELEASED` before it reads the
-  switch, issue #1001, and the retry tick finishes it). In a retry, the tick leaves the
+  switch, issue #1001 for L3 pins and #1501 for L1 and L2 rows with a retryable reason,
+  and the retry tick finishes it). In a retry, the tick leaves the
   rows of a reservation whose apply hit the error unchanged and counts them in
   `skipped_upstream`; a build row whose endpoint read fails while the tick re-checks its
   intent reads back `still_failed` only, and a manual retry answers 503. An L3 row that
@@ -638,8 +641,12 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   on a stack whose configuration was saved in the config UI, `INTERNAL_API_TOKEN` is
   read from that `config.json`, not from `.env`, so change it in the config UI.
 - `excluded_frozen`: build-direction rows of reservations that have ended. A connection
-  is never built for an ended reservation, so these rows stay as a record of a build that
-  did not finish. No action is needed.
+  is never built for an ended reservation, so these rows stay as they are. A build that
+  did not confirm may still have landed (a driver call that timed out); since issue #1501
+  the teardown removes what such a row may have left, except on a row another retry pass
+  held while the teardown ran and whose holder then failed or died (WIRE-TEARDOWN-6 in
+  `docs/specs/provisioning-and-wiring.md`). For such a row, check the switch as described
+  for `excluded_not_retryable` above.
 
 `null` in place of a number means the count could not be read on that tick; the execution
 log carries a warning with the cause, and the tick still retried what it selected.
