@@ -63,8 +63,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 USER_ID = uuid.uuid4()
-NOW = datetime.now(timezone.utc)
 INTERNAL_TOKEN = "test-internal-token"
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)

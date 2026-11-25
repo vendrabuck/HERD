@@ -26,7 +26,12 @@ OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
 ADMIN_ID = str(uuid.uuid4())
 
-NOW = datetime.now(timezone.utc)
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW
+    NOW = datetime.now(timezone.utc)
 
 
 def _client_as(sub: str, role: str = "user") -> AsyncClient:
