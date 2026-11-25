@@ -22,6 +22,7 @@ from app.database import get_db
 from app.dependencies.auth import get_current_user_payload, require_admin
 from app.models.reservation import Reservation, ReservationDevice, ReservationStatus
 from app.schemas.reservation import (
+    UTC_RANGE_TEXT,
     HeldDevicesResponse,
     OwnsActiveResponse,
     PaginatedReservationResponse,
@@ -34,6 +35,7 @@ from app.schemas.reservation import (
     ReservationResponse,
     ReservationUpdate,
     UtilizationReport,
+    to_utc_instant,
 )
 from app.services.purpose_service import validate_purpose_category
 from app.services.reporting_service import (
@@ -90,9 +92,6 @@ ReservationSortField = Literal[
 ReservationSortDir = Literal["asc", "desc"]
 
 
-_UTC_RANGE_TEXT = "0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z"
-
-
 def _as_utc(value: datetime | None, name: str) -> datetime | None:
     """Normalize a list filter bound or a report bound to UTC (issues #959, #1523).
 
@@ -110,14 +109,12 @@ def _as_utc(value: datetime | None, name: str) -> datetime | None:
     """
     if value is None:
         return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
     try:
-        return value.astimezone(timezone.utc)
+        return to_utc_instant(value)
     except OverflowError:
         raise HTTPException(
             status_code=422,
-            detail=f"{name} must fall between {_UTC_RANGE_TEXT} once converted to UTC",
+            detail=f"{name} must fall between {UTC_RANGE_TEXT} once converted to UTC",
         ) from None
 
 

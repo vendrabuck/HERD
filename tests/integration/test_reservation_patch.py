@@ -217,3 +217,54 @@ async def test_patch_end_time_past_the_maximum_duration_is_refused(admin_client,
         assert resp.json()["detail"].startswith("reservation duration exceeds the maximum of ")
     finally:
         await _cancel(admin_client, res["id"])
+
+
+_END_TIME_FORMS = {
+    "-12:00": timezone(timedelta(hours=-12)),
+    "+00:00": timezone.utc,
+    "Z": timezone.utc,
+    "+14:00": timezone(timedelta(hours=14)),
+    "naive": None,
+}
+
+
+def _render_end(instant: datetime, form: str) -> str:
+    tz = _END_TIME_FORMS[form]
+    if tz is None:
+        return instant.astimezone(timezone.utc).replace(tzinfo=None).isoformat()
+    text = instant.astimezone(tz).isoformat()
+    return text.replace("+00:00", "Z") if form == "Z" else text
+
+
+@pytest.mark.parametrize("form", list(_END_TIME_FORMS))
+async def test_patch_extension_into_another_booking_is_refused_in_every_offset_form(
+    admin_client, fresh_devices, form
+):
+    """The extension conflict check judges the new end by its instant, whatever its offset.
+
+    The other booking starts an hour after the row ends; every offset form of an end
+    inside it is refused.
+    """
+    duts = await fresh_devices(1)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start = now + timedelta(hours=30)
+    end = start + timedelta(hours=10)
+    other_start = end + timedelta(hours=1)
+    other_end = other_start + timedelta(hours=2)
+    mine = await _create_window(admin_client, [duts[0]["id"]], start, end)
+    theirs = await _create_window(admin_client, [duts[0]["id"]], other_start, other_end)
+    try:
+        resp = await admin_client.patch(
+            f"/reservations/{mine['id']}",
+            json={"end_time": _render_end(other_end, form)},
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == (
+            f"Time conflict: devices ['{duts[0]['id']}'] already reserved in the extended window"
+        )
+        read = await admin_client.get(f"/reservations/{mine['id']}")
+        read.raise_for_status()
+        assert datetime.fromisoformat(read.json()["end_time"]) == end
+    finally:
+        await _cancel(admin_client, mine["id"])
+        await _cancel(admin_client, theirs["id"])
