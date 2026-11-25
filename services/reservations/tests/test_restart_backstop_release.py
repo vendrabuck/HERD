@@ -25,11 +25,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-NOW = datetime.now(timezone.utc)
 EXP = "app.tasks.expiration"
 SVC = "app.services.reservation_service"
 OWNER = uuid.uuid4()
-STALE = NOW - timedelta(hours=2)
+
+
+@pytest.fixture(autouse=True)
+def _clock():
+    """Read the clock when each test starts, never at import (#1561)."""
+    global NOW, STALE
+    NOW = datetime.now(timezone.utc)
+    STALE = NOW - timedelta(hours=2)
 
 
 @pytest.fixture(autouse=True)
@@ -213,19 +219,19 @@ async def test_restart_backstop_lost_cas_releases_nothing(spy):
 # `own_request_stranded` row is stranded too but carries its own request, so it takes
 # the dynamic backstop (RES-SWEEP-6, FAILED) and is never reverted to PENDING. A NOT
 # EXISTS deleted outright hides nothing; the race test after this one pins that case.
-# Each value: (seeded status, updated_at or None for now, final status, its device's
-# inventory writes).
+# Each value: (seeded status, whether its updated_at is STALE rather than now, final
+# status, its device's inventory writes).
 _OTHER_ROWS = {
-    "active": (ReservationStatus.ACTIVE, None, ReservationStatus.ACTIVE, []),
+    "active": (ReservationStatus.ACTIVE, False, ReservationStatus.ACTIVE, []),
     "pending_provision_inside_deadline": (
         ReservationStatus.PENDING_PROVISION,
-        None,
+        False,
         ReservationStatus.PENDING_PROVISION,
         [],
     ),
     "own_request_stranded": (
         ReservationStatus.PENDING_PROVISION,
-        STALE,
+        True,
         ReservationStatus.FAILED,
         ["AVAILABLE"],
     ),
@@ -234,10 +240,10 @@ _OTHER_ROWS = {
 
 @pytest.mark.parametrize("other", sorted(_OTHER_ROWS))
 async def test_restart_backstop_judges_each_row_by_its_own_dynamic_requests(spy, other):
-    seeded, updated_at, final, other_writes = _OTHER_ROWS[other]
+    seeded, stale, final, other_writes = _OTHER_ROWS[other]
     stranded_dev, other_dev = uuid.uuid4(), uuid.uuid4()
     stranded = await _insert(ReservationStatus.PENDING_PROVISION, [stranded_dev], updated_at=STALE)
-    other_rid = await _insert(seeded, [other_dev], updated_at=updated_at, dynamic=1)
+    other_rid = await _insert(seeded, [other_dev], updated_at=STALE if stale else None, dynamic=1)
 
     await _run_expiration_cycle()
 
