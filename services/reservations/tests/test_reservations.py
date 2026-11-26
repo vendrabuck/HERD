@@ -4334,11 +4334,15 @@ async def _stored(rid: str) -> Reservation:
 
 
 def _patch_mocks(*, visible: set[str], validate=None):
-    """The router's visibility helper plus the service's inventory and cabling helpers."""
+    """The router's visibility helper plus the service's inventory and cabling helpers.
+
+    The visibility helper is autospecced, so a call is compared after binding to the
+    real signature: the same values passed by position or by keyword match."""
     return (
         patch(
             "app.routers.reservations._fetch_visible_device_ids_strict",
-            new=AsyncMock(return_value=visible),
+            autospec=True,
+            return_value=visible,
         ),
         patch(
             "app.services.reservation_service._fetch_devices",
@@ -4355,20 +4359,22 @@ def _patch_mocks(*, visible: set[str], validate=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
 @pytest.mark.parametrize("role", _ROLES)
-@pytest.mark.parametrize("field", ["end_time", "purpose"])
+@pytest.mark.parametrize("field", ["end_time", "purpose", "purpose_with_null_device_ids"])
 async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field, role, status):
     """RES-PATCH-7 applies to a non-admin's new device_ids only: a PATCH of only
-    end_time or only purpose, by any role, answers 200 with the field written and
-    never asks inventory for visibility, even though the lookup would answer with
-    a set that leaves out the row's own device."""
+    end_time or only purpose, or of purpose with `device_ids` sent as null (#1551),
+    by any role, answers 200 with the field written and the device set unchanged,
+    and never asks inventory for visibility, even though the lookup would answer
+    with a set that leaves out the row's own device."""
     rid = await _insert_editable_row(status, [DEVICE_A])
     before = await _stored(rid)
     end = before.end_time.replace(tzinfo=timezone.utc)
-    body = (
-        {"end_time": (end - timedelta(hours=1)).isoformat()}
-        if field == "end_time"
-        else {"purpose": "purpose set by #1533"}
-    )
+    if field == "end_time":
+        body = {"end_time": (end - timedelta(hours=1)).isoformat()}
+    elif field == "purpose":
+        body = {"purpose": "purpose set by #1533"}
+    else:
+        body = {"purpose": "purpose set by #1533", "device_ids": None}
     visible_mock, fetch, validate, statuses = _patch_mocks(visible={DEVICE_B})
     try:
         async with _client_as(CALLER_ID, role) as ac:
@@ -4380,6 +4386,7 @@ async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field
     assert resp.status_code == 200, resp.text
     lookup.assert_not_awaited()
     after = await _stored(rid)
+    assert {str(d) for d in after.device_ids} == {DEVICE_A}
     if field == "end_time":
         assert after.end_time.replace(tzinfo=timezone.utc) == end - timedelta(hours=1)
         assert after.purpose == before.purpose
