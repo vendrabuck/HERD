@@ -67,7 +67,9 @@ def _two_port_distinct_edges_canvas(device_a_id: str, device_b_id: str) -> dict:
     }
 
 
-async def _create_connection(client, device_a_id: str, port_a: str, device_b_id: str, port_b: str) -> str:
+async def _create_connection(
+    client, device_a_id: str, port_a: str, device_b_id: str, port_b: str
+) -> str:
     resp = await client.post(
         "/cabling/connections",
         json={
@@ -111,9 +113,7 @@ async def _create_reservation(client, device_ids: list[str], topology_id: str) -
 
 
 def _endpoint_pair(conn: dict) -> frozenset:
-    return frozenset(
-        {(conn["device_a_id"], conn["port_a"]), (conn["device_b_id"], conn["port_b"])}
-    )
+    return frozenset({(conn["device_a_id"], conn["port_a"]), (conn["device_b_id"], conn["port_b"])})
 
 
 async def test_activation_fork_resolves_two_port_distinct_edges_to_two_connections(

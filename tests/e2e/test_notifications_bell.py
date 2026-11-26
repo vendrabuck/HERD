@@ -25,9 +25,7 @@ def _open_bell(driver):
     """Click the bell button; return the panel element once visible."""
     wait = WebDriverWait(driver, WAIT)
     bell = wait.until(
-        EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "button[aria-label='Notifications']")
-        )
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "button[aria-label='Notifications']"))
     )
     bell.click()
     panel = wait.until(
@@ -49,9 +47,7 @@ def test_notifications_bell_renders_for_admin(logged_in_browser, base_url):
     logged_in_browser.get(f"{base_url}/topology")
     wait = WebDriverWait(logged_in_browser, WAIT)
     bell = wait.until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "button[aria-label='Notifications']")
-        )
+        EC.presence_of_element_located((By.CSS_SELECTOR, "button[aria-label='Notifications']"))
     )
     assert bell.is_displayed()
 

@@ -26,9 +26,7 @@ WAIT = 20
 def first_device(admin_browser, base_url):
     """Return the first inventory device (any status). Skip if none exist."""
     admin_browser.get(f"{base_url}/inventory")
-    WebDriverWait(admin_browser, WAIT).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+    WebDriverWait(admin_browser, WAIT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     resp = api_request(
         admin_browser,
         "GET",
@@ -53,14 +51,9 @@ def test_device_detail_page_loads(admin_browser, base_url, first_device):
     # heading (always rendered post-load, unlike the edit-only dev-name input)
     # before reading the body, otherwise we race the fetch and see only the
     # loading placeholder.
-    wait.until(
-        EC.text_to_be_present_in_element((By.TAG_NAME, "body"), "Device Details")
-    )
+    wait.until(EC.text_to_be_present_in_element((By.TAG_NAME, "body"), "Device Details"))
     body_text = admin_browser.find_element(By.TAG_NAME, "body").text
-    assert (
-        first_device.get("name", "") in body_text
-        or first_device["id"][:8] in body_text
-    )
+    assert first_device.get("name", "") in body_text or first_device["id"][:8] in body_text
 
 
 def test_device_config_section_visible(admin_browser, base_url, first_device):
@@ -71,27 +64,17 @@ def test_device_config_section_visible(admin_browser, base_url, first_device):
     # The "Configuration history" section is rendered for every device once the
     # page loads. The config-json textarea itself lives inside the "New version"
     # modal, so it is not in the DOM until that dialog is opened.
-    wait.until(
-        EC.text_to_be_present_in_element(
-            (By.TAG_NAME, "body"), "Configuration history"
-        )
-    )
+    wait.until(EC.text_to_be_present_in_element((By.TAG_NAME, "body"), "Configuration history"))
     # Open the New-version dialog to reveal the config-json textarea.
     new_version_btn = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH, "//button[normalize-space()='New version']")
-        )
+        EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='New version']"))
     )
     new_version_btn.click()
-    textarea = wait.until(
-        EC.visibility_of_element_located((By.ID, "config-json"))
-    )
+    textarea = wait.until(EC.visibility_of_element_located((By.ID, "config-json")))
     assert textarea.is_displayed()
 
 
-def test_device_config_section_has_apply_jobs_panel(
-    admin_browser, base_url, first_device
-):
+def test_device_config_section_has_apply_jobs_panel(admin_browser, base_url, first_device):
     """The config section renders its history controls.
 
     The "Scheduled applies" panel (ApplyJobsPanel) only renders when the device
@@ -102,11 +85,7 @@ def test_device_config_section_has_apply_jobs_panel(
     """
     admin_browser.get(f"{base_url}/inventory/{first_device['id']}")
     wait = WebDriverWait(admin_browser, WAIT)
-    wait.until(
-        EC.text_to_be_present_in_element(
-            (By.TAG_NAME, "body"), "Configuration history"
-        )
-    )
+    wait.until(EC.text_to_be_present_in_element((By.TAG_NAME, "body"), "Configuration history"))
     body = admin_browser.find_element(By.TAG_NAME, "body").text.lower()
     # The history section always renders its New-version and Compare controls.
     assert "new version" in body and "compare" in body

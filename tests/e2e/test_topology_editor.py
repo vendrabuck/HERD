@@ -65,9 +65,7 @@ def test_topology_editor_equipment_panel_visible(logged_in_browser, base_url, tr
     assert logged_in_browser.find_element(By.ID, "eq-topo-filter").is_displayed()
 
 
-def test_topology_editor_equipment_panel_collapses(
-    logged_in_browser, base_url, transient_topology
-):
+def test_topology_editor_equipment_panel_collapses(logged_in_browser, base_url, transient_topology):
     """Clicking the panel's toggle button collapses and re-expands it."""
     _open_editor(logged_in_browser, base_url, transient_topology["id"])
     wait = WebDriverWait(logged_in_browser, WAIT)
@@ -85,9 +83,7 @@ def test_topology_editor_equipment_panel_collapses(
     wait.until(EC.presence_of_element_located((By.ID, "eq-search")))
 
 
-def test_topology_editor_search_filters_palette(
-    logged_in_browser, base_url, transient_topology
-):
+def test_topology_editor_search_filters_palette(logged_in_browser, base_url, transient_topology):
     """Typing in the palette search filters the device list.
 
     Issue #1148: the old check ("no devices found" or the typed term absent from
@@ -136,9 +132,7 @@ def test_topology_editor_search_filters_palette(
     time.sleep(0.5)
 
 
-def test_topology_editor_show_reserved_checkbox(
-    logged_in_browser, base_url, transient_topology
-):
+def test_topology_editor_show_reserved_checkbox(logged_in_browser, base_url, transient_topology):
     """The 'Show reserved resources' toggle exists and is checked by default."""
     _open_editor(logged_in_browser, base_url, transient_topology["id"])
     wait = WebDriverWait(logged_in_browser, WAIT)
