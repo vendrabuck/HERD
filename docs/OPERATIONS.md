@@ -507,18 +507,39 @@ old account's groups and ownership over is a manual step.
 
 ### A user's first single sign-on login is refused as `email_invalid`
 
-The same log query shows `email_invalid` when the email the provider sends (the claim
-`OIDC_EMAIL_CLAIM` names, default `email`) is not a plain address: white space at
-either end, an invisible or control character, not exactly one `@` with text on both
-sides, or, since issue #1400, any character outside ASCII, in the part before the `@`
-or after it. The last
-rule keeps a look-alike (a Cyrillic or Greek letter, a fullwidth letter, an accented
-letter) from becoming a second account that reads like someone else's, and it also
-refuses a genuinely internationalized mailbox. HERD does not convert the address: give
-the person an ASCII email at the provider, or point `OIDC_EMAIL_CLAIM` at a claim that
-holds one. A domain written in its ASCII `xn--` form is accepted and shown that way.
+The `login_failure` query under "A user's first single sign-on login is refused as a
+collision" above shows the reason. It is `email_invalid` when the email the provider
+sends (the claim `OIDC_EMAIL_CLAIM` names, default `email`) is not a plain address:
+a space at either end, an invisible format character (a zero width space, a bidi
+control), not exactly one `@` with text on both sides, or, since issue #1400, any
+character outside ASCII, in the part before the `@` or after it. A control character
+is different: a tab, a newline, any other C0 or C1 control (C1, U+0080 to U+009F, is
+outside ASCII too), or a lone surrogate makes HERD treat the claim as absent, so the
+log shows `email_missing` instead. The person sees the same failure page either way.
+
+The ASCII rule keeps a look-alike (a Cyrillic or Greek letter, a fullwidth letter, an
+accented letter) from becoming a second account that reads like someone else's, and
+it also refuses a genuinely internationalized mailbox. HERD does not convert the
+address: give the person an ASCII email at the provider, or point `OIDC_EMAIL_CLAIM`
+at a claim that holds one. A domain written in its ASCII `xn--` form is accepted and
+shown that way. The rule does not catch an all-ASCII look-alike (`rn` for `m`), nor an
+ASCII email that imitates an account already holding a non-ASCII one, which is still
+provisioned as a separate account.
+
 The rule applies only to a first sign-in: an account created with a non-ASCII email
-before it keeps signing in.
+before it keeps signing in. To find such accounts, in a UTF-8 database (check with
+`SHOW server_encoding;`), run in `docker compose exec postgres psql -U "$POSTGRES_USER"
+-d "$POSTGRES_DB"`:
+
+```sql
+SELECT id, auth_source FROM auth.users WHERE octet_length(email) <> char_length(email);
+```
+
+For an `oidc` account in that list, a sign-in from a second identity carrying the same
+email (for example after the provider reissued the person's `sub`) is now refused as
+`email_invalid`, not `email_taken`, so no relink candidate is kept for it. Recover such
+a person with the typed issuer-and-subject relink in "A user's first single sign-on
+login is refused as a collision", with a `sub` read at the provider.
 
 ### Sessions after a relink or rewrite
 

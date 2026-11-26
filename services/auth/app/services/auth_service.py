@@ -584,7 +584,10 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     between the ID token and the `users` row normalizes it (no NFC or NFKC, no
     case fold, no trim), so a fullwidth or Cyrillic look-alike is refused
     here, not folded to ASCII first, and an internationalized domain passes
-    only in its ASCII `xn--` form. The
+    only in its ASCII `xn--` form. Through the callback a Cc or Cs character
+    (the C1 controls U+0080 to U+009F among them) never gets here:
+    `oidc_service._optional_string` holds such a claim as None, so it is
+    `email_missing` there, and `email_invalid` only for a direct caller. The
     username likewise: `username_invalid` when it is None and
     `username_unusable` is True (option C found a candidate but none fit),
     else `username_missing`, `username_invalid`,

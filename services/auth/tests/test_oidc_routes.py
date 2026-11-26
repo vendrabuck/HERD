@@ -1104,6 +1104,48 @@ async def test_a_non_ascii_email_at_first_login_answers_failed_and_creates_nothi
     assert (users, identities) == (int(holder), 0)
 
 
+# A control character (Cc, the C1 range U+0080 to U+009F included, which is outside
+# ASCII) or a lone surrogate (Cs) in the email claim never reaches the ASCII rule:
+# `oidc_service._optional_string` holds such a claim as None, so through the callback
+# the refusal is `email_missing`, not `email_invalid` (IAM-OIDC-9).
+CONTROL_CALLBACK_EMAILS = {
+    "c1-next-line": "own\x85er@example.test",
+    "c1-first": "owner\x80@example.test",
+    "c1-last": "owner@ex\x9fample.test",
+    "c0-start-of-heading": "own\x01er@example.test",
+    "c0-tab": "owner\t@example.test",
+    "c0-trailing-newline": "owner@example.test\n",
+    "cs-lone-surrogate": "owner@example.test\ud800",
+}
+
+
+@pytest.mark.parametrize("holder", [True, False], ids=["holder-exists", "no-holder"])
+@pytest.mark.parametrize("kind", sorted(CONTROL_CALLBACK_EMAILS))
+async def test_a_control_character_in_the_email_claim_is_refused_as_email_missing(
+    client, idp, caplog, kind, holder
+):
+    """The same generic failure as every provisioning refusal, nothing created,
+    with or without the look-alike account, and the logged reason `email_missing`."""
+    if holder:
+        await _local_account()
+    email = CONTROL_CALLBACK_EMAILS[kind]
+    _hidden(idp, email)
+    idp.claim_changes["email"] = email
+    begun = await begin(client, idp)
+    response = await complete_callback(client, idp, begun)
+    assert response.headers["location"] == FAILED
+    assert oidc_router.HANDOFF_COOKIE not in set_cookies(response)
+    refusals = [
+        r.reason
+        for r in caplog.get_records("call")
+        if r.name == "app.services.auth_service" and getattr(r, "action", None) == "login_failure"
+    ]
+    assert refusals == ["email_missing"]
+    assert (await flow_row(begun.state)).status == "failed"
+    users, identities, _ = await counts()
+    assert (users, identities) == (int(holder), 0)
+
+
 async def test_an_ascii_email_with_a_plus_tag_and_a_non_ascii_name_signs_in(client, idp):
     """The rule is the email's alone: mixed case and a plus tag are ASCII, and a
     non-ASCII display name is kept as sent."""
