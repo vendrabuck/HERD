@@ -3916,10 +3916,21 @@ async def _apply_one_vlan_action(
                 claims=claims,
                 undo_lost_join=_undo,
             )
-        elif not await settle_undone_join(db, res_uuid, switch_uuid, port):
-            # Issue #1413: a row that owed a lost join's undo becomes a pending join
-            # again (settle_undone_join); every other removal is released as before.
-            await release_l2_membership(db, res_uuid, switch_uuid, port)
+        elif not await settle_undone_join(
+            db, res_uuid, switch_uuid, port, vlan_assignment_id=vlan_assignment_id
+        ):
+            # Issue #1413: a row that owed a lost join's undo on the allocation this
+            # removal drove becomes a pending join again (settle_undone_join); every
+            # other removal is released as before, except a row that now owes the
+            # undo on ANOTHER allocation (moved there after this removal was planned),
+            # which is left owing it.
+            await release_l2_membership(
+                db,
+                res_uuid,
+                switch_uuid,
+                port,
+                driven_vlan_assignment_id=vlan_assignment_id,
+            )
     else:
         await update_execution_run(
             db,

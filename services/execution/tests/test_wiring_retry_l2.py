@@ -920,6 +920,7 @@ async def test_a_lost_first_join_whose_undo_raises_owes_the_removal_and_raises()
         ("same_port_other_number", True),
         ("other_port_same_number", True),
         ("same_port_same_number_released_allocation", True),
+        ("same_port_same_number_failed_membership", True),
     ],
 )
 async def test_the_undo_is_skipped_only_when_a_live_membership_holds_the_number_on_the_port(
@@ -927,7 +928,8 @@ async def test_the_undo_is_skipped_only_when_a_live_membership_holds_the_number_
 ):
     """The membership supersession rule: the port is left in the number only when an
     ACTIVE membership on that exact (switch, port) sits on an ACTIVE allocation holding
-    that number (here another reservation's, given 100 again after the release)."""
+    that number (here another reservation's, given 100 again after the release); a
+    FAILED membership on such an allocation does not hold it."""
     va = await _seed_alloc()
     number = 100 if "same_number" in holder else 200
     port = "0/0/1" if "same_port" in holder else "0/0/2"
@@ -943,7 +945,10 @@ async def test_the_undo_is_skipped_only_when_a_live_membership_holds_the_number_
         s.add(rival)
         await s.commit()
         other = rival.id
-    await _seed_l2_active(port, other, reservation_id=OTHER_RES)
+    if holder.endswith("failed_membership"):
+        await _seed_l2_failed(port, "ACTIVE", other, reservation_id=OTHER_RES, attempts=1)
+    else:
+        await _seed_l2_active(port, other, reservation_id=OTHER_RES)
     execute_fn, calls = _vlan_recorder()
     await _first_join(va, execute_fn)
 
@@ -1145,10 +1150,10 @@ async def test_the_teardown_removes_a_port_that_owes_a_removal():
     assert (await _l2_row(rid)).status == "RELEASED"
 
 
-# --- an owed removal is superseded only on its own number (issue #1413) ---
+# --- a landed add's pending removal is superseded only on its own number (issue #1413) ---
 
 
-@pytest.mark.parametrize("owes_undo", [True, False])
+@pytest.mark.parametrize("reason", ["owed_undo", "frozen_join", "plain"])
 @pytest.mark.parametrize(
     "holder",
     [
@@ -1156,31 +1161,35 @@ async def test_the_teardown_removes_a_port_that_owes_a_removal():
         "same_port_other_number",
         "same_port_same_number",
         "same_port_same_number_released_allocation",
+        "same_port_same_number_failed_membership",
         "other_port_same_number",
     ],
 )
-async def test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_number(
-    owes_undo, holder
+async def test_a_landed_add_pending_removal_is_superseded_only_by_a_live_holder_of_its_number(
+    reason, holder
 ):
-    """Through the retry entry. A row that owes a lost join's removal from number N is
+    """Through the retry entry. A row parked for an add known to have landed on its own
+    number N (a lost join's owed undo, or a join recorded on a frozen reservation) is
     settled with no driver call only when an ACTIVE membership on that (switch, port)
-    sits on an ACTIVE allocation holding N; a membership in another number leaves the
-    port in N (an add is per VLAN), so the removal is still driven. Any other
-    release-direction row keeps WIRE-LEDGER-16 as it was: another reservation's ACTIVE
-    row on the port supersedes it, whatever its number."""
+    sits on an ACTIVE allocation holding N; a holder in another number, on a released
+    allocation, or not ACTIVE itself leaves the removal driven. Any other release row
+    keeps WIRE-LEDGER-16 as it was: another reservation's ACTIVE row on the port
+    supersedes it, whatever its number."""
     from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
         JOIN_LOST_ALLOCATION_RELEASED,
         JOIN_UNDO_PENDING_REMOVAL,
     )
 
     released, released_vlan = await _seed_released_alloc()
-    rid = await _seed_l2_failed(
-        "0/0/1",
-        "RELEASED",
-        released,
-        attempts=1,
-        err=JOIN_UNDO_PENDING_REMOVAL if owes_undo else "remove_from_vlan failed: boom",
-    )
+    err = {
+        "owed_undo": JOIN_UNDO_PENDING_REMOVAL,
+        "frozen_join": FROZEN_JOIN_PENDING_REMOVAL,
+        "plain": "remove_from_vlan failed: boom",
+    }[reason]
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=1, err=err)
+    if reason == "frozen_join":
+        await _seed_state(frozen=True)
     if holder != "none":
         async with TestSessionLocal() as s:
             rival = VlanAssignment(
@@ -1194,20 +1203,23 @@ async def test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_nu
             s.add(rival)
             await s.commit()
             rival_id = rival.id
-        foreign = await _seed_l2_active(
-            "0/0/1" if holder.startswith("same_port") else "0/0/2",
-            rival_id,
-            reservation_id=OTHER_RES,
-        )
+        port = "0/0/1" if holder.startswith("same_port") else "0/0/2"
+        if holder.endswith("failed_membership"):
+            foreign = await _seed_l2_failed(
+                port, "ACTIVE", rival_id, reservation_id=OTHER_RES, attempts=1
+            )
+        else:
+            foreign = await _seed_l2_active(port, rival_id, reservation_id=OTHER_RES)
+        foreign_before = await _l2_row(foreign)
 
     execute_fn, calls = _vlan_recorder()
     with _patches(execute_fn):
         result = await reattempt_reservation(RES_ID, _db_session_factory())
 
-    if owes_undo:
-        superseded = holder == "same_port_same_number"
+    if reason == "plain":
+        superseded = holder.startswith("same_port") and not holder.endswith("failed_membership")
     else:
-        superseded = holder.startswith("same_port")
+        superseded = holder == "same_port_same_number"
     row = await _l2_row(rid)
     if superseded:
         assert _membership_ops(calls) == []
@@ -1215,7 +1227,7 @@ async def test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_nu
         assert result["results"][0]["outcome"] == "superseded"
     else:
         assert _membership_ops(calls) == [("remove_from_vlan", "0/0/1", released_vlan)]
-        if owes_undo:
+        if reason == "owed_undo":
             assert (row.status, row.intended, row.last_error) == (
                 "FAILED",
                 "ACTIVE",
@@ -1225,7 +1237,31 @@ async def test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_nu
             assert row.status == "RELEASED"
     if holder != "none":
         kept = await _l2_row(foreign)
-        assert (kept.status, kept.intended) == ("ACTIVE", "ACTIVE")
+        assert (kept.status, kept.intended, kept.vlan_assignment_id) == (
+            foreign_before.status,
+            foreign_before.intended,
+            foreign_before.vlan_assignment_id,
+        )
+
+
+async def test_a_landed_add_pending_removal_with_no_resolvable_number_is_never_superseded():
+    """With the row's allocation gone there is no number to judge a holder by, so the
+    row is not settled with no driver call, even with another reservation ACTIVE on the
+    port (which would supersede an ordinary release row)."""
+    from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
+        supersede_l2_release_if_reclaimed,
+    )
+
+    rid = await _seed_l2_failed(
+        "0/0/1", "RELEASED", uuid.uuid4(), attempts=1, err=JOIN_UNDO_PENDING_REMOVAL
+    )
+    other = await _seed_alloc(reservation_id=OTHER_RES, vlan_id=777)
+    await _seed_l2_active("0/0/1", other, reservation_id=OTHER_RES)
+    loaded = await _l2_row(rid)
+    async with TestSessionLocal() as s:
+        assert await supersede_l2_release_if_reclaimed(s, loaded) is False
+    assert (await _l2_row(rid)).status == "FAILED"
 
 
 @pytest.mark.parametrize("ledger_owes_undo", [True, False])
@@ -1422,9 +1458,11 @@ async def test_a_failed_undo_written_by_key_takes_a_concurrent_active_row_and_co
     """Known limit, pinned: pass B recorded this reservation's port ACTIVE on N' while
     pass A's join on N was in flight; A loses and its undo fails, and its key-based
     owed write takes B's row onto N (the port is in both numbers, one row names one).
-    N' is then untracked until the row converges: the retry removes the port from N,
-    the row becomes a pending join, and the next retry re-allocates it onto N' and adds
-    it there again."""
+    No row names N' then. Here, with N' still ACTIVE, the reservation not frozen, and
+    the removal succeeding, the row converges: the retry removes the port from N, the
+    row becomes a pending join, and the next retry re-allocates it onto N' and adds it
+    there again. It does not converge when N' is released meanwhile, when the
+    reservation freezes first, or when the removal fails up to the attempts cap."""
     from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL
 
     va = await _seed_alloc()
@@ -1456,26 +1494,285 @@ async def test_a_failed_undo_written_by_key_takes_a_concurrent_active_row_and_co
     assert (row.id, row.status, row.vlan_assignment_id) == (b_row, "ACTIVE", fresh)
 
 
-async def test_a_frozen_join_recorded_on_a_port_that_owes_a_removal_moves_the_row_to_its_number():
-    """Known limit, pinned: a join on N' that passed the apply's check before the row
-    owed a removal from N, and is recorded after the reservation froze, is parked on
-    N' over the owed row (the port is in both numbers, one row names one); N is then
-    untracked, and the release channel removes the port from N' only."""
+@pytest.mark.parametrize("owes_undo", [True, False])
+async def test_a_frozen_join_never_moves_a_row_that_owes_a_removal_off_its_number(
+    owes_undo, caplog
+):
+    """A join on N' that passed the apply's check before the row owed a removal from N,
+    and is recorded after the reservation froze: the frozen park leaves a row that owes
+    the removal on N (a RELEASED number nothing else would clean the port out of) and
+    logs that N' is not recorded; a row that owes nothing is parked on N' as before."""
+    import logging
+
     from app.services.l2_membership_service import (
         FROZEN_JOIN_PENDING_REMOVAL,
+        JOIN_UNDO_PENDING_REMOVAL,
         record_l2_membership_active,
     )
 
     released, _ = await _seed_released_alloc()
-    rid = await _owed_row(released)
+    err = JOIN_UNDO_PENDING_REMOVAL if owes_undo else "remove_from_vlan failed: boom"
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=2, err=err)
     fresh = await _seed_alloc(vlan_id=300)
     await _seed_state(frozen=True)
+    caplog.set_level(logging.WARNING, logger="app.services.l2_membership_service")
+    async with TestSessionLocal() as s:
+        returned = await record_l2_membership_active(s, RES_ID, fresh, SW_L2, "0/0/1")
+    row = await _l2_row(rid)
+    lines = [
+        r for r in caplog.records if getattr(r, "action", None) == "l2_frozen_join_left_owed_row"
+    ]
+    assert returned.id == rid
+    if owes_undo:
+        assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+            "FAILED",
+            "RELEASED",
+            released,
+            JOIN_UNDO_PENDING_REMOVAL,
+        )
+        assert row.attempts == 2
+        assert len(lines) == 1 and lines[0].vlan_assignment_id == str(fresh)
+    else:
+        assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+            "FAILED",
+            "RELEASED",
+            fresh,
+            FROZEN_JOIN_PENDING_REMOVAL,
+        )
+        assert lines == []
+
+
+async def test_a_frozen_join_left_off_an_owed_row_still_parks_a_frozen_holder():
+    """The frozen park's other write in the same session, a frozen other reservation's
+    ACTIVE row on the port, is still committed when the own row is left owing."""
+    from app.services.l2_membership_service import (
+        STALE_JOIN_SUPERSEDED_PENDING_REMOVAL,
+        record_l2_membership_active,
+    )
+
+    released, _ = await _seed_released_alloc()
+    await _owed_row(released)
+    fresh = await _seed_alloc(vlan_id=300)
+    other_va = await _seed_alloc(reservation_id=OTHER_RES, vlan_id=555)
+    foreign = await _seed_l2_active("0/0/1", other_va, reservation_id=OTHER_RES)
+    await _seed_state(frozen=True)
+    async with TestSessionLocal() as s:
+        s.add(ReservationWiringState(reservation_id=uuid.UUID(OTHER_RES), frozen=True))
+        await s.commit()
     async with TestSessionLocal() as s:
         await record_l2_membership_active(s, RES_ID, fresh, SW_L2, "0/0/1")
+    parked = await _l2_row(foreign)
+    assert (parked.status, parked.intended, parked.last_error) == (
+        "FAILED",
+        "RELEASED",
+        STALE_JOIN_SUPERSEDED_PENDING_REMOVAL,
+    )
+
+
+# --- a removal planned on one number never settles a row that owes another (#1413) ---
+
+
+async def _released_alloc_with(vlan_id):
+    async with TestSessionLocal() as s:
+        va = VlanAssignment(
+            reservation_id=uuid.UUID(RES_ID),
+            fabric_id=FABRIC,
+            vlan_id=vlan_id,
+            switch_device_ids=[SW_L2],
+            defined_switch_ids=[],
+            status="RELEASED",
+        )
+        s.add(va)
+        await s.commit()
+        return va.id
+
+
+@pytest.mark.parametrize("planned_from", ["plain_release", "owed_undo", "reconcile"])
+async def test_a_removal_planned_on_one_number_never_settles_a_row_that_owes_another(
+    planned_from,
+):
+    """A pass plans the removal of the port from N1 (the retry, from the copy it
+    loaded; or the reconcile, from its delta). Before it drives, another writer moves
+    the row to owe a lost join's removal from N2: the key-based owed write over a plain
+    failed leave, or, inside #1413's own flow, the other channel settling the owed row
+    on N1 into a pending join whose re-allocated join then lost on N2. The removal of
+    N1 succeeds; the row is neither settled into a pending join nor released, and still
+    owes N2. The next pass removes the port from N2 and then settles it."""
+    from app.services.l2_membership_service import (
+        JOIN_LOST_ALLOCATION_RELEASED,
+        JOIN_UNDO_PENDING_REMOVAL,
+        record_l2_failed,
+        settle_undone_join,
+    )
+    from app.services.nats_consumer import _apply_one_vlan_action
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    n1 = await _released_alloc_with(1402)
+    n2 = await _released_alloc_with(2222)
+    first = JOIN_UNDO_PENDING_REMOVAL if planned_from == "owed_undo" else "boom"
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", n1, attempts=1, err=first)
+    loaded = await _l2_row(rid)
+
+    if planned_from == "owed_undo":
+        async with TestSessionLocal() as s:
+            assert await settle_undone_join(s, RES_ID, SW_L2, "0/0/1", vlan_assignment_id=n1)
+    async with TestSessionLocal() as s:
+        await record_l2_failed(
+            s, RES_ID, n2, SW_L2, "0/0/1", 1, JOIN_UNDO_PENDING_REMOVAL, intended="RELEASED"
+        )
+
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn):
+        if planned_from == "reconcile":
+            async with TestSessionLocal() as s:
+                await _apply_one_vlan_action(
+                    s,
+                    "remove_from_vlan",
+                    "/tmp/driver",
+                    {},
+                    set(),
+                    uuid.UUID(SW_L2),
+                    uuid.UUID(DRIVER_ID),
+                    "sha",
+                    uuid.UUID(RES_ID),
+                    "0/0/1",
+                    1402,
+                    n1,
+                )
+        else:
+            await _reattempt_l2_rows([loaded], _db_session_factory(), claims=WiringRowClaims())
+    assert _membership_ops(calls) == [("remove_from_vlan", "0/0/1", 1402)]
     row = await _l2_row(rid)
     assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
         "FAILED",
         "RELEASED",
-        fresh,
-        FROZEN_JOIN_PENDING_REMOVAL,
+        n2,
+        JOIN_UNDO_PENDING_REMOVAL,
     )
+
+    # The claim the lost settle left is let lapse; the next pass drives N2.
+    async with TestSessionLocal() as s:
+        (await s.get(L2PortAssignment, rid)).claimed_until = None
+        await s.commit()
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    assert _membership_ops(calls) == [("remove_from_vlan", "0/0/1", 2222)]
+    row = await _l2_row(rid)
+    assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+        "FAILED",
+        "ACTIVE",
+        n2,
+        JOIN_LOST_ALLOCATION_RELEASED,
+    )
+
+
+@pytest.mark.parametrize("row_allocation", ["driven", "other"])
+async def test_the_release_after_a_removal_skips_only_a_row_that_owes_another_number(
+    row_allocation,
+):
+    """release_l2_membership with the driven allocation: a row that owes a lost join's
+    removal on another allocation is not released; one that owes it on the driven
+    allocation, and a plain release row on any allocation, are released as before."""
+    from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
+        release_l2_membership,
+    )
+
+    n1 = await _released_alloc_with(1402)
+    n2 = await _released_alloc_with(2222)
+    on = n1 if row_allocation == "driven" else n2
+    owed = await _seed_l2_failed("0/0/1", "RELEASED", on, attempts=1, err=JOIN_UNDO_PENDING_REMOVAL)
+    plain = await _seed_l2_failed("0/0/2", "RELEASED", n2, attempts=1, err="boom")
+    async with TestSessionLocal() as s:
+        first = await release_l2_membership(s, RES_ID, SW_L2, "0/0/1", driven_vlan_assignment_id=n1)
+    async with TestSessionLocal() as s:
+        second = await release_l2_membership(
+            s, RES_ID, SW_L2, "0/0/2", driven_vlan_assignment_id=n1
+        )
+    assert second is not None and (await _l2_row(plain)).status == "RELEASED"
+    if row_allocation == "driven":
+        assert first is not None and (await _l2_row(owed)).status == "RELEASED"
+    else:
+        assert first is None and (await _l2_row(owed)).status == "FAILED"
+
+
+# --- an undo interrupted inside a flush or commit still records the removal (#1413) ---
+
+
+@pytest.mark.parametrize("raised", ["IntegrityError", "CancelledError"])
+async def test_an_undo_interrupted_inside_a_flush_still_records_the_owed_removal(raised):
+    """The undo's execution-run write (only the undo's: the add's own run is written
+    as usual) fails inside its flush, leaving the session in
+    need of a rollback, and the undo ends with that error or with a cancellation raised
+    while handling it. The handler rolls back before the owed write, so the row lands
+    owing the removal and the undo's exception goes on."""
+    import asyncio
+
+    from app.services import execution_service
+    from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL
+    from sqlalchemy.exc import IntegrityError
+
+    real_run = execution_service.create_execution_run
+
+    async def _broken_run(db, *args, **kwargs):
+        if args[3] != "remove_from_vlan":
+            return await real_run(db, *args, **kwargs)
+        db.add(
+            L2PortAssignment(
+                reservation_id=uuid.UUID(OTHER_RES),
+                vlan_assignment_id=uuid.uuid4(),
+                switch_device_id=uuid.UUID(SW_L2),
+                port=None,
+                status="FAILED",
+                intended="RELEASED",
+            )
+        )
+        try:
+            await db.flush()
+        except IntegrityError:
+            if raised == "CancelledError":
+                raise asyncio.CancelledError() from None
+            raise
+
+    va = await _seed_alloc()
+    execute_fn, _calls = _vlan_recorder()
+    expected = IntegrityError if raised == "IntegrityError" else asyncio.CancelledError
+    with pytest.raises(expected):
+        await _first_join(
+            va,
+            execute_fn,
+            patch("app.services.execution_service.create_execution_run", new=_broken_run),
+        )
+    (row,) = await _own_rows()
+    assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+        "FAILED",
+        "RELEASED",
+        va,
+        JOIN_UNDO_PENDING_REMOVAL,
+    )
+
+
+@pytest.mark.parametrize("exc_type", [GeneratorExit, KeyboardInterrupt, SystemExit])
+async def test_an_undo_ended_by_a_closing_or_exiting_exception_writes_nothing(exc_type):
+    """GeneratorExit (the coroutine is being closed, nothing may be awaited),
+    KeyboardInterrupt, and SystemExit are not caught by the undo's handler: no rollback
+    is awaited, no owed row is written, and the exception goes on unchanged, the same
+    state as a process that dies inside the undo."""
+    from app.services.l2_membership_service import record_l2_membership_active
+
+    va = await _seed_alloc()
+
+    async def _undo():
+        raise exc_type()
+
+    with patch(
+        "app.services.vlan_service.hold_active_allocation", new=AsyncMock(return_value=False)
+    ):
+        async with TestSessionLocal() as s:
+            with pytest.raises(exc_type):
+                await record_l2_membership_active(
+                    s, RES_ID, va, SW_L2, "0/0/1", undo_lost_join=_undo
+                )
+    assert await _own_rows() == []
