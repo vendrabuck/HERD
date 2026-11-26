@@ -1113,7 +1113,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   the document is nested too deeply or holds a number too long to read`, which names no
   part of the file or the exception: one nested deeper than the parser's C recursion
   budget (the interpreter's bound, not a HERD setting; just under 10,000 levels on
-  Python 3.12), or one holding an integer literal longer than Python's integer string
+  the service image's Python 3.12), or one holding an integer literal longer than Python's integer string
   conversion limit (4,300 digits, sign not counted). Both were 500s before issue
   #1511. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
@@ -1221,7 +1221,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   `Import file holds a lone surrogate escape, which is not valid text; fix it and retry`
   for the whole file, and nothing is written. A CSV row whose JSON cell (`field_data`,
   `sections`) holds one is rejected with the reason `a JSON cell holds a lone surrogate
-  escape, which is not valid text`; the other rows are imported. The file is a
+  escape, which is not valid text`, and the other rows are judged on their own. The file is a
   multipart upload, which the shared body check (OPS-VALID-6) passes through, so the
   importer checks the JSON it parses itself. Before issue #1456's sweep a device or
   template name holding one made the report unencodable (a 500), and one in
@@ -1229,16 +1229,16 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   character outside the BMP written as an escaped pair is imported. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only`)
-- **INV-BULK-24.** A CSV row whose JSON cell (`field_data`, `sections`) the parser
-  refuses for its shape, nested deeper than its C recursion budget or holding an integer
-  literal longer than 4,300 digits (the bounds of INV-BULK-4), is rejected with the
-  fixed reason `a JSON cell is nested too deeply or holds a number too long to read`;
-  the other rows are imported. A cell with a syntax error is still rejected with the
+- **INV-BULK-24.** A row whose `field_data` (device) or `sections` (template) is JSON
+  text, a CSV cell or a JSON string in a JSON import, that the parser refuses for its
+  shape, nested deeper than its C recursion budget or holding an integer literal longer
+  than 4,300 digits (the bounds of INV-BULK-4), is rejected with the fixed reason `a
+  JSON cell is nested too deeply or holds a number too long to read`, and the other rows
+  are judged on their own. Such text with a syntax error is still rejected with the
   decoder's message, which names a position and no content. Before issue #1511 the row
-  was rejected with Python's own exception text. A cell is bounded by the csv module's
-  field limit (131,072 characters) before it reaches the parser. \
+  was rejected with Python's own exception text. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_coerce_json_cell`, `JSON_CELL_UNREADABLE_REASON`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_cell_the_parser_refuses_raises_the_fixed_reason`, `test_a_json_cell_just_under_the_bounds_still_parses`, `test_a_json_cell_syntax_error_keeps_the_decoder_error`, `test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only`)
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_cell_the_parser_refuses_raises_the_fixed_reason`, `test_a_json_cell_just_under_the_bounds_still_parses`, `test_a_json_cell_syntax_error_keeps_the_decoder_error`, `test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only`, `test_a_json_string_cell_the_parser_refuses_rejects_that_row_only`)
 - **INV-BULK-23.** An import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB) answers
   413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"], "msg":
   "Request body is larger than <limit> bytes"}`, and nothing is parsed or written. The

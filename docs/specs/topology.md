@@ -1226,7 +1226,7 @@ is the user guide.
   `Invalid JSON: the document is nested too deeply or holds a number too long to read`,
   which names no part of the file or the exception: one nested deeper than the parser's
   C recursion budget (the interpreter's bound, not a HERD setting; just under 10,000
-  levels on Python 3.12), or one holding an integer literal longer than Python's integer
+  levels on the service image's Python 3.12), or one holding an integer literal longer than Python's integer
   string conversion limit (4,300 digits, sign not counted). Both were 500s before issue
   #1511, reachable by any signed-in user; inventory's importers give the same answer
   (INV-BULK-4 in `inventory.md`). \

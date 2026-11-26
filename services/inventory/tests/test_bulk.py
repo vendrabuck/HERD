@@ -1411,13 +1411,15 @@ async def test_the_read_asks_for_exactly_one_byte_past_the_bound(monkeypatch):
 # budget and a plain ValueError (not a JSONDecodeError) for an integer literal longer
 # than `sys.get_int_max_str_digits()`, 4,300 digits by default; both were 500s. The
 # depth bound is the interpreter's, not HERD's: on 3.12 and 3.13 it is the C recursion
-# limit (bare `json.loads` refuses at 9,998 and 9,999 levels), on 3.14 a C stack
-# budget (52,160 levels on 3.14.3), and `sys.setrecursionlimit` moves neither. So no
-# test pins a depth: `_parser_depth_bound` measures where `json.loads` first refuses on
-# the running interpreter, and the boundary cases sit `_DEPTH_MARGIN` levels either
+# limit, on 3.14 a C stack budget, and `sys.setrecursionlimit` moves neither. Measured
+# from a script's top level, bare `json.loads` refused at about 10,000 levels on 3.12
+# and 3.13 and at about 43,000 to 52,000 on the 3.14 builds tried; each figure moves a
+# few levels, or a few dozen on 3.14, with the depth of the call stack it runs on. So
+# no test pins a depth: `_parser_depth_bound` measures where `json.loads` first refuses
+# on the running interpreter, and the boundary cases sit `_DEPTH_MARGIN` levels either
 # side of it, which covers the difference between the measuring call stack and the
-# route's (a few levels on 3.12, about 50 on 3.14). `_DEEP` is past every bound
-# measured and, as arrays, 200,000 bytes.
+# route's. `_DEEP` is past every bound measured (3.12 to 3.14) and, as arrays, 200,000
+# bytes.
 
 _UNREADABLE = "Invalid JSON: the document is nested too deeply or holds a number too long to read"
 _CELL_UNREADABLE = "a JSON cell is nested too deeply or holds a number too long to read"
@@ -1654,3 +1656,49 @@ async def test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only(client, 
     ]
     assert report["rows"][0]["reason"] == _CELL_UNREADABLE
     assert (await _bulk_state(client))[0] == ["d2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    "text",
+    [
+        lambda bound: _nest(_DEEP),
+        lambda bound: _nest(bound + _DEPTH_MARGIN),
+        lambda bound: '{"model": ' + _DIGITS_OVER_LIMIT + "}",
+        lambda bound: '[{"b": [0, -' + _DIGITS_OVER_LIMIT + "]}]",
+    ],
+    ids=["deep", "deep_just_over_the_bound", "long_int", "negative_long_int"],
+)
+async def test_a_json_string_cell_the_parser_refuses_rejects_that_row_only(
+    client, path, dry_run, text
+):
+    """A JSON import may carry `field_data` or `sections` as a JSON string; it goes
+    through the same cell parse as a CSV cell and gets the same fixed reason. The
+    file itself parses, so only that row is rejected and the next is judged alone."""
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    good = await _bulk_import_row(client, path)
+    key = "field_data" if path == "/devices/import" else "sections"
+    bad = {**good, "name": "bad-row", key: text(_parser_depth_bound())}
+    resp = await client.post(
+        path,
+        params={"format": "json", "dry_run": dry_run},
+        files={
+            "file": ("d.json", io.BytesIO(json.dumps([bad, good]).encode()), "application/json")
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert [(r["identity"], r["action"]) for r in report["rows"]] == [
+        ("bad-row", "reject"),
+        (good["name"], "create"),
+    ]
+    assert report["rows"][0]["reason"] == _CELL_UNREADABLE
+    devices, templates = await _bulk_state(client)
+    if dry_run:
+        assert (devices, templates) == before
+    else:
+        assert "bad-row" not in devices + templates
+        assert good["name"] in devices + templates
