@@ -36,10 +36,10 @@ and the sandbox are patched; everything from the ledger down is the real thing.
 
 Env contract identical to services/cabling/tests/test_fork_restore_save_race_live_pg.py:
     HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
-                            empty, the suite is skipped and connects to nothing.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip into
-                            a hard failure. A named database that does not answer
-                            fails every test either way (herd_common.pg_live_suite).
+                            empty, the suite is skipped and connects to nothing; a
+                            named database that does not answer skips it too.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either skip
+                            into an error at setup (herd_common.pg_live_suite).
 
 Every test uses a fresh random reservation_id (no cross-schema FKs, so nothing else
 references it) and deletes its own rows in a finally.

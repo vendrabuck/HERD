@@ -35,16 +35,29 @@ coming back anywhere else. It fails when:
 3. any Python file under `services/`, `tests/`, `scripts/`, or `infra/` (outside
    `.venv`, `node_modules`, and `__pycache__`), other than the files in
    `READER_EXEMPT` (the helper, its tests, and the gate-recipe guard, which reads a
-   parsed recipe's assignments), reads or writes HERD_TEST_PG_DSN or HERD_TEST_PG_REQUIRED in the
-   process environment: a `getenv`, `putenv`, or `unsetenv` call, or a `.get`,
-   `.pop`, `.setdefault`, `.setenv`, or `.delenv` call, whose first argument names
-   the variable; a subscript by the name (load, store, or delete); an `.update(...)`
-   call that carries the name as a keyword or a dict key; and an `|=` of a dict that
-   carries it as a key. The variable is named by the string literal, by a name the
-   same file binds to that literal, or by `DSN_VARIABLE` / `REQUIRED_VARIABLE` from
-   the helper (imported, or read as an attribute). Naming it as a dict key or a
-   keyword anywhere else (a child process's `env=`) is allowed: that names a
-   database explicitly for a process the file starts;
+   parsed recipe's assignments), reads or writes HERD_TEST_PG_DSN or
+   HERD_TEST_PG_REQUIRED in the process environment. Refused: a call named
+   `getenv`, `putenv`, `unsetenv`, `get`, `pop`, `setdefault`, `setenv`, `delenv`,
+   `setitem`, `delitem`, `setattr`, `__getitem__`, `__setitem__`, or `__delitem__`
+   (as a bare name or an attribute) any of whose arguments, positional or keyword,
+   `*` and `**` included, carries a variable anywhere inside it; a call to an
+   attribute named `update`, `__ior__`, or `dict` (`os.environ.update`,
+   `mock.patch.dict`) whose arguments carry one; a subscript whose index carries
+   one (load, store, or delete); an `|=` whose right side carries one; and an
+   assignment to a name or attribute called `environ` whose value carries one. An
+   expression carries a variable when anything inside it names one, when a keyword
+   inside it is named after one (`dict(HERD_TEST_PG_DSN=...)`), or when it uses a
+   name the file binds to such an expression (`CHILD = {...}`). A variable is named
+   by an expression that is only string literals and evaluates to the name (a
+   literal, a `+` of literals, an f-string of literal parts, `"_".join([...])` of
+   literals), by `DSN_VARIABLE` or `REQUIRED_VARIABLE` from the helper (imported
+   under any name, or read as an attribute of anything), or by a name the file
+   binds to one of those, at any depth, through `=` (tuple and list unpacking
+   included), an annotated assignment, `:=`, or a `for` loop over a literal list,
+   tuple, or set, followed through any number of such bindings. Naming it anywhere
+   else, a child process's `env={..., "HERD_TEST_PG_DSN": dsn}` or
+   `dict(os.environ, HERD_TEST_PG_DSN=dsn)` passed to `subprocess.run`, is allowed:
+   that names a database explicitly for a process the file starts;
 4. the Makefile names HERD_TEST_PG_DSN on a line that is not a comment outside the
    `_gate-pg-live-tests` rule and its recipe (a global or target-specific
    `export HERD_TEST_PG_DSN = ...`, or `HERD_TEST_PG_DSN=... pytest` in `make test`,
@@ -55,19 +68,25 @@ Limits. Not seen: a DSN assembled at run time from pieces none of these rules
 refuses (a non-loopback host name and a port that is not 5433, `chr()` arithmetic,
 text read from a file); a default supplied from outside the scanned files (a pytest
 plugin installed in the environment, `PYTEST_ADDOPTS`, `sitecustomize`, a wrapper
-script, a CI workflow's `env:`, which is an explicit choice and allowed); the
-environment reached by another spelling (`getattr(os, "environ")`,
-`os.environ.__setitem__`, a name built by concatenation or bound in another file
-than the helper); a test file not named `*_live_pg.py` that opens its own Postgres
-connection; a binding inside a `match` pattern; and the helper's run-time behavior,
-which its own tests pin. Read conservatively (refused though it may be sound): a
-`.get`, `.pop`, or `.setdefault` with the variable's name on ANY object in a file
-outside `READER_EXEMPT`; a live suite that adds another mark to `pytestmark` or
-writes the fixture differently; a Postgres URL, loopback address, or 5433 in a live
-suite even as a harmless example outside a docstring (examples go in the
-docstring); a TOML or `.env.example` line that holds the name before a trailing
-comment. In the Makefile a line is a comment only when it starts with `#` after any
-leading whitespace and `@`, `-`, or `+` prefix characters.
+script, a CI workflow's `env:`, which is an explicit choice and allowed); a
+variable's name built by anything but literals, `+`, an f-string, and `"".join`
+(`.replace`, `.format`, `%`, `str.upper`, slicing, `chr`), or bound in another module
+than the helper and imported; a binding the scan does not follow (a function's
+return value, a `with ... as`, a `match` pattern, an attribute or subscript target,
+a loop over anything but a literal); the environment reached through a call by
+another name (`put = os.putenv; put(...)`, `getattr(os.environ, "update")(...)`,
+`vars(os)`, `exec`, `eval`); a test file not named `*_live_pg.py` that opens its own
+Postgres connection; and the helper's run-time behavior, which its own tests pin.
+Read conservatively (refused though it may be sound): a call from the first list
+on ANY object, or an `update` on a copy of the environment that is then handed to a
+child process, when its arguments carry a variable, in a file outside
+`READER_EXEMPT` (build the child's environment with a dict literal or `dict(...)`
+instead); a live suite that adds another mark to `pytestmark` or writes the
+fixture differently; a Postgres URL, loopback address, or 5433 in a live suite even
+as a harmless example outside a docstring (examples go in the docstring); a TOML or
+`.env.example` line that holds the name before a trailing comment. In the Makefile
+a line is a comment only when it starts with `#` after any leading whitespace and
+`@`, `-`, or `+` prefix characters.
 
 The detector tests below feed these spellings to the same scans the real-tree tests
 use, in both directions.
@@ -113,9 +132,30 @@ _LOOPBACK = re.compile(r"(?i)(?<![\w.:])(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0
 _OLD_PORT = re.compile(r"(?<!\d)5433(?!\d)")
 _ENV_NAME = re.compile(r"(?:HERD_TEST_PG_[A-Z0-9_]*|POSTGRES_[A-Z0-9_]*|PG[A-Z]+|DATABASE_URL)")
 _PLACEHOLDER_HOST = "HOST"
-_ENVIRONMENT_FIRST_ARGUMENT_CALLS = frozenset(
-    {"getenv", "putenv", "unsetenv", "get", "pop", "setdefault", "setenv", "delenv"}
+# Calls that read or write one entry by name: refused when any part of any argument,
+# positional or keyword (`**` included), names a variable.
+_NAMED_ENTRY_CALLS = frozenset(
+    {
+        "getenv",
+        "putenv",
+        "unsetenv",
+        "get",
+        "pop",
+        "setdefault",
+        "setenv",
+        "delenv",
+        "setitem",
+        "delitem",
+        "setattr",
+        "__getitem__",
+        "__setitem__",
+        "__delitem__",
+    }
 )
+# Calls, by attribute name, that write many entries at once (`os.environ.update`,
+# `os.environ.__ior__`, `mock.patch.dict`): refused when any part of any argument
+# names a variable, as a value or as a keyword name.
+_BULK_WRITE_CALLS = frozenset({"update", "__ior__", "dict"})
 
 
 def _dump(source: str, mode: str = "exec") -> str:
@@ -314,41 +354,130 @@ def helper_shape_problems(source: str) -> list[str]:
     return problems
 
 
+def _constant_text(node: ast.AST | None) -> str | None:
+    """The text an expression always evaluates to when it is built only from string
+    literals: a literal, a `+` of such expressions, an f-string whose every part is
+    a literal or a formatted literal with no conversion or format spec, and
+    `"<sep>".join([...])` of such expressions in a list or tuple. None otherwise."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _constant_text(node.left), _constant_text(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue):
+                if part.conversion != -1 or part.format_spec is not None:
+                    return None
+                part = part.value
+            text = _constant_text(part)
+            if text is None:
+                return None
+            parts.append(text)
+        return "".join(parts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        separator = _constant_text(node.func.value)
+        pieces = [_constant_text(element) for element in node.args[0].elts]
+        if separator is None or any(piece is None for piece in pieces):
+            return None
+        return separator.join(pieces)
+    return None
+
+
+def _pairs(target: ast.AST, value: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
+    """(name target, value) pairs of an assignment, through tuple and list unpacking
+    of a tuple or list value of the same length."""
+    if isinstance(target, ast.Name):
+        return [(target, value)]
+    if (
+        isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(e, ast.Starred) for e in target.elts)
+    ):
+        return [pair for t, v in zip(target.elts, value.elts, strict=True) for pair in _pairs(t, v)]
+    return []
+
+
+def _bound_names(tree: ast.AST, seed: set[str], judge) -> set[str]:
+    """`seed` plus every name this file binds, at any depth, to a value `judge(value,
+    names)` accepts: by `=` (tuple and list unpacking included), an annotated
+    assignment, `:=`, and a `for` loop over a literal list, tuple, or set. Repeated
+    until nothing new is bound, so a name bound to such a name counts too."""
+    names = set(seed)
+    while True:
+        before = len(names)
+        for node in ast.walk(tree):
+            pairs: list[tuple[ast.AST, ast.AST]] = []
+            if isinstance(node, ast.Assign):
+                pairs = [p for target in node.targets for p in _pairs(target, node.value)]
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                pairs = _pairs(node.target, node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(
+                node.iter, (ast.List, ast.Tuple, ast.Set)
+            ):
+                pairs = [p for element in node.iter.elts for p in _pairs(node.target, element)]
+            for target, value in pairs:
+                if judge(value, names):
+                    names.add(target.id)
+        if len(names) == before:
+            return names
+
+
 def _variable_aliases(tree: ast.AST) -> set[str]:
-    """Names this file binds to one of the variable names: `X = "HERD_TEST_PG_DSN"`
-    at any depth, and the helper's DSN_VARIABLE / REQUIRED_VARIABLE imported."""
-    aliases: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = node.value
-            if isinstance(value, ast.Constant) and value.value in VARIABLE_NAMES:
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                aliases.update(t.id for t in targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.ImportFrom) and node.module == HELPER_MODULE:
-            aliases.update(
-                alias.asname or alias.name
-                for alias in node.names
-                if alias.name in HELPER_NAME_CONSTANTS
-            )
-    return aliases
+    """Names that stand for a variable's name: bound (see `_bound_names`) to an
+    expression whose `_constant_text` is the name, or to another alias; plus the
+    helper's DSN_VARIABLE and REQUIRED_VARIABLE imported under any name."""
+    seed = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == HELPER_MODULE
+        for alias in node.names
+        if alias.name in HELPER_NAME_CONSTANTS
+    }
+    return _bound_names(tree, seed, _names_a_variable)
+
+
+def _carrier_names(tree: ast.AST, aliases: set[str]) -> set[str]:
+    """Aliases plus names bound to a value that carries a variable anywhere inside it
+    (`CHILD = {"HERD_TEST_PG_DSN": ...}`, `PAIR = ("HERD_TEST_PG_DSN", "x")`), so
+    `os.environ.update(CHILD)` is read as carrying it."""
+    return _bound_names(tree, aliases, _carries_a_variable)
+
+
+def _names_a_variable(node: ast.AST | None, aliases: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in aliases
+    if isinstance(node, ast.Attribute) and node.attr in HELPER_NAME_CONSTANTS:
+        return True
+    return _constant_text(node) in VARIABLE_NAMES
+
+
+def _carries_a_variable(node: ast.AST, aliases: set[str]) -> bool:
+    """Whether any expression inside `node` names a variable, or any keyword inside
+    it (`dict(HERD_TEST_PG_DSN=...)`) is named after one."""
+    return any(
+        _names_a_variable(inner, aliases)
+        or (isinstance(inner, ast.keyword) and inner.arg in VARIABLE_NAMES)
+        for inner in ast.walk(node)
+    )
 
 
 def environment_touches(source: str) -> list[str]:
     """Rule 3: every read or write of the two variables in the process environment."""
     tree = ast.parse(source)
-    aliases = _variable_aliases(tree)
+    aliases = _carrier_names(tree, _variable_aliases(tree))
 
-    def names_it(node: ast.AST | None) -> bool:
-        if isinstance(node, ast.Constant):
-            return node.value in VARIABLE_NAMES
-        if isinstance(node, ast.Name):
-            return node.id in aliases
-        if isinstance(node, ast.Attribute):
-            return node.attr in HELPER_NAME_CONSTANTS
-        return False
-
-    def dict_carries_it(node: ast.AST) -> bool:
-        return isinstance(node, ast.Dict) and any(names_it(key) for key in node.keys)
+    def carries(nodes) -> bool:
+        return any(_carries_a_variable(node, aliases) for node in nodes)
 
     touches = []
     for node in ast.walk(tree):
@@ -361,21 +490,33 @@ def environment_touches(source: str) -> list[str]:
                 if isinstance(func, ast.Attribute)
                 else None
             )
-            if called in _ENVIRONMENT_FIRST_ARGUMENT_CALLS and node.args and names_it(node.args[0]):
+            arguments = [*node.args, *node.keywords]
+            if called in _NAMED_ENTRY_CALLS and carries(arguments):
                 touches.append(f"line {node.lineno}: {called}() of the variable")
-            if called == "update" and (
-                any(k.arg in VARIABLE_NAMES for k in node.keywords)
-                or any(dict_carries_it(a) for a in node.args)
+            elif (
+                isinstance(func, ast.Attribute)
+                and called in _BULK_WRITE_CALLS
+                and carries(arguments)
             ):
-                touches.append(f"line {node.lineno}: update() carrying the variable")
-        elif isinstance(node, ast.Subscript) and names_it(node.slice):
+                touches.append(f"line {node.lineno}: {called}() carrying the variable")
+        elif isinstance(node, ast.Subscript) and carries([node.slice]):
             touches.append(f"line {node.lineno}: a subscript by the variable")
         elif (
             isinstance(node, ast.AugAssign)
             and isinstance(node.op, ast.BitOr)
-            and dict_carries_it(node.value)
+            and carries([node.value])
         ):
-            touches.append(f"line {node.lineno}: |= of a dict carrying the variable")
+            touches.append(f"line {node.lineno}: |= carrying the variable")
+        elif (
+            isinstance(node, ast.Assign)
+            and any(
+                (isinstance(t, ast.Attribute) and t.attr == "environ")
+                or (isinstance(t, ast.Name) and t.id == "environ")
+                for t in node.targets
+            )
+            and carries([node.value])
+        ):
+            touches.append(f"line {node.lineno}: an environ replaced by one carrying the variable")
     return touches
 
 
@@ -699,6 +840,75 @@ ENVIRONMENT_BREAKS = {
     "the name held in an annotated variable": (
         'import os\nK: str = "HERD_TEST_PG_DSN"\nX = os.environ.pop(K)\n'
     ),
+    # The #1401 review's spellings, the first of which brought the default back end
+    # to end from a service conftest.
+    "update(**{...}) in a conftest": (
+        "import os as _os\n"
+        '_os.environ.update(**{"HERD_TEST_PG_DSN": "postgresql+asyncpg://herd:herd@127.0.0.1:9/herd"})\n'
+    ),
+    "getenv by keyword": (
+        'import os\nX = os.getenv(key="HERD_TEST_PG_DSN", default="postgresql://h/d")\n'
+    ),
+    "environ.get by keyword": (
+        'import os\nX = os.environ.get(key="HERD_TEST_PG_DSN", default="postgresql://h/d")\n'
+    ),
+    "monkeypatch.setenv by keyword": (
+        "def f(monkeypatch):\n"
+        "    monkeypatch.setenv(name='HERD_TEST_PG_DSN', value='postgresql://h/d')\n"
+    ),
+    "update(dict(...))": (
+        'import os\nos.environ.update(dict(HERD_TEST_PG_DSN="postgresql://h/d"))\n'
+    ),
+    "update with a list of pairs": (
+        'import os\nos.environ.update([("HERD_TEST_PG_DSN", "postgresql://h/d")])\n'
+    ),
+    "|= of dict(...)": 'import os\nos.environ |= dict(HERD_TEST_PG_DSN="postgresql://h/d")\n',
+    "|= of a list of pairs": 'import os\nos.environ |= [("HERD_TEST_PG_DSN", "x")]\n',
+    "an alias by tuple unpacking": (
+        'import os\nK, J = "HERD_TEST_PG_DSN", 1\nos.environ[K] = "postgresql://h/d"\n'
+    ),
+    "an alias by walrus": (
+        'import os\nif (K := "HERD_TEST_PG_DSN"):\n    os.environ[K] = "postgresql://h/d"\n'
+    ),
+    "an alias of an alias": (
+        'import os\nK = "HERD_TEST_PG_DSN"\nJ = K\nos.environ.setdefault(J, "x")\n'
+    ),
+    "an alias from a for loop": (
+        'import os\nfor K in ["HERD_TEST_PG_DSN"]:\n    os.environ[K] = "x"\n'
+    ),
+    "the name built with +": 'import os\nos.environ["HERD_TEST_PG" + "_DSN"] = "x"\n',
+    "the name built by join": (
+        'import os\nos.environ["_".join(["HERD", "TEST", "PG", "DSN"])] = "x"\n'
+    ),
+    "the name built by an f-string": 'import os\nos.environ[f"HERD_TEST_PG_{\'DSN\'}"] = "x"\n',
+    "__setitem__": 'import os\nos.environ.__setitem__("HERD_TEST_PG_DSN", "x")\n',
+    "__ior__": 'import os\nos.environ.__ior__({"HERD_TEST_PG_DSN": "x"})\n',
+    "monkeypatch.setitem on environ": (
+        "import os\ndef f(monkeypatch):\n"
+        "    monkeypatch.setitem(os.environ, 'HERD_TEST_PG_DSN', 'x')\n"
+    ),
+    "mock.patch.dict on environ": (
+        "import os\nfrom unittest import mock\n"
+        "P = mock.patch.dict(os.environ, {'HERD_TEST_PG_DSN': 'x'})\n"
+    ),
+    "mock.patch.dict by keyword": (
+        "import os\nfrom unittest import mock\n"
+        "P = mock.patch.dict(os.environ, HERD_TEST_PG_DSN='x')\n"
+    ),
+    "update with a dict bound earlier": (
+        'import os\nCHILD = {"HERD_TEST_PG_DSN": "x"}\nos.environ.update(CHILD)\n'
+    ),
+    "|= with a dict bound earlier": (
+        'import os\nCHILD = dict(HERD_TEST_PG_DSN="x")\nos.environ |= CHILD\n'
+    ),
+    "setdefault of a pair bound earlier": (
+        'import os\nPAIR = ("HERD_TEST_PG_DSN", "x")\nos.environ.setdefault(*PAIR)\n'
+    ),
+    "environ replaced through monkeypatch.setattr": (
+        "import os\ndef f(monkeypatch):\n"
+        "    monkeypatch.setattr(os, 'environ', {'HERD_TEST_PG_DSN': 'x'})\n"
+    ),
+    "environ replaced": 'import os\nos.environ = {**os.environ, "HERD_TEST_PG_DSN": "x"}\n',
 }
 
 
@@ -725,6 +935,13 @@ ENVIRONMENT_HONEST = {
         "    env = os.environ.copy()\n"
         "    env.pop('VIRTUAL_ENV', None)\n"
         "    return subprocess.run(['pytest'], env={**env, 'HERD_TEST_PG_DSN': dsn})\n"
+    ),
+    "an unrelated name built by +": 'import os\nX = os.environ.get("HERD_" + "BUILD")\n',
+    "an alias name reused for something else": (
+        'import os\nK = "HERD_TEST_PG_DSN"\nCOUNTS = {}\nCOUNTS.get("other")\n'
+    ),
+    "a dict literal with the name not written anywhere": (
+        'CHILD_ENV = {"HERD_TEST_PG_DSN": "postgresql+asyncpg://x:x@127.0.0.1:9/x"}\n'
     ),
 }
 

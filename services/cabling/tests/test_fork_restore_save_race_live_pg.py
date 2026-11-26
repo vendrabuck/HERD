@@ -22,10 +22,10 @@ functions (``_load_fork``, ``save_fork``) against a live database.
 
 Env contract identical to services/common/tests/test_advisory_lock_live_pg.py:
     HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
-                            empty, the suite is skipped and connects to nothing.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip into
-                            a hard failure. A named database that does not answer
-                            fails every test either way (herd_common.pg_live_suite).
+                            empty, the suite is skipped and connects to nothing; a
+                            named database that does not answer skips it too.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either skip
+                            into an error at setup (herd_common.pg_live_suite).
 
 This file creates exactly one throwaway reservation_fork row per test (a
 random UUID reservation_id, no cross-schema FK, so nothing else in the
@@ -97,8 +97,9 @@ def _use_cabling_schema():
     schema=None by the time this module's tests run. The live database's
     migrations created these tables under the real "cabling" schema, so this
     fixture restores it around each test only, never at import time: a skipped
-    run here (HERD_TEST_PG_DSN unset) never mutates anything, since skip
-    happens before fixture setup, and a combined `pytest tests/` run leaves
+    run here (no database named, or one that does not answer) never mutates
+    anything, since skip happens before fixture setup, and a combined
+    `pytest tests/` run leaves
     every other file's SQLite queries untouched between tests because the
     schema is reset in the finally before the next test runs.
     """

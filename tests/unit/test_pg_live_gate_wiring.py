@@ -3,8 +3,9 @@
 No database, no stack, no Docker: this only parses the Makefile, in the style of
 tests/unit/test_nos_lab_ci_wiring.py.
 
-A `*_live_pg.py` suite skips itself when no Postgres is reachable, which is what
-makes it safe to leave in the tree, and also what makes it invisible when nobody
+A `*_live_pg.py` suite skips itself unless HERD_TEST_PG_DSN names a Postgres that
+answers (issue #1401: there is no default), which is what makes it safe to leave in
+the tree, and also what makes it invisible when nobody
 wires it up: it would be written, reviewed, merged, and then silently never run.
 The `_gate-pg-live-tests` phase of `make master` and `make everything` is the only
 place these suites execute with HERD_TEST_PG_REQUIRED=1, so membership in that

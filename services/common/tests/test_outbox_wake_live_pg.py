@@ -9,9 +9,9 @@ real engine with a real Postgres LISTEN connection, commits an outbox row
 from a SEPARATE session (exactly like a service's request handler would),
 and measures the time from that commit to the relay's publish call.
 
-Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database;
-HERD_TEST_PG_REQUIRED=1 turns that skip into a failure, and a named database
-that does not answer fails every test either way. This file follows the env
+Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database, and
+skipped too when the named database does not answer; HERD_TEST_PG_REQUIRED=1
+turns either skip into an error at setup. This file follows the env
 contract of every live suite (herd_common.pg_live_suite, issue #1401); see
 test_advisory_lock_live_pg.py in this directory for the writeup.
 

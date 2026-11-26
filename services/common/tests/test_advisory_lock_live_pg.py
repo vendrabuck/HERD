@@ -11,19 +11,21 @@ assumption that doesn't hold) would pass every existing test and still fail
 in production.
 
 Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database
-(issue #1401: there is no default; the dev stack's Postgres is never assumed).
-Setting HERD_TEST_PG_REQUIRED=1 turns that skip into a failure, mirroring
+(issue #1401: there is no default; the dev stack's Postgres is never assumed),
+and skipped with a reason that names the database when the one it names does
+not answer. Setting HERD_TEST_PG_REQUIRED=1 turns either skip into an error at
+setup with an explicit message, mirroring
 services/auth/tests/test_ldap_service_live.py's HERD_TEST_LDAP_REQUIRED
-contract, and a named database that does not answer fails every test with an
-explicit message either way. The rule lives in ONE helper,
-herd_common.pg_live_suite.pg_live_target, which every *_live_pg.py suite uses.
+contract. The rule lives in ONE helper, herd_common.pg_live_suite.pg_live_target,
+which every *_live_pg.py suite uses.
 
 Env contract:
     HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use, e.g.
                             postgresql+asyncpg://user:pass@host:port/db
-                            Unset or empty, the suite is skipped.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip
-                            into a hard failure.
+                            Unset or empty, or naming a database that
+                            does not answer, the suite is skipped.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either
+                            skip into an error.
 
 Any reachable Postgres works: these tests create no tables and touch no
 application schema, since advisory locks are server-instance-scoped, not

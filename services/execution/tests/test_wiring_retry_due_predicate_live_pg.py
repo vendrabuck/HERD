@@ -23,10 +23,10 @@ applied, and shows from a second session what the select locks.
 
 Env contract identical to test_wiring_retry_claim_race_live_pg.py:
     HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
-                            empty, the suite is skipped and connects to nothing.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip into
-                            a hard failure. A named database that does not answer
-                            fails every test either way (herd_common.pg_live_suite).
+                            empty, the suite is skipped and connects to nothing; a
+                            named database that does not answer skips it too.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either skip
+                            into an error at setup (herd_common.pg_live_suite).
 
 Used-ledger rules (issue #819). This suite runs in `_gate-pg-live-tests` against the
 gate's already-migrated, already-used execution schema, whose ledgers hold other

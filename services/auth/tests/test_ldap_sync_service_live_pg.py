@@ -20,10 +20,10 @@ entry (`from app import database` then `database.engine.dialect.name` /
 `database.engine.connect()` at call time, not import time), so no production
 code changes are needed: this is a pure test-side seam.
 
-Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database;
-HERD_TEST_PG_REQUIRED=1 turns that skip into a failure, mirroring
-test_ldap_service_live.py's HERD_TEST_LDAP_REQUIRED contract, and a named
-database that does not answer fails every test either way. See
+Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database, and
+skipped too when the named database does not answer; HERD_TEST_PG_REQUIRED=1
+turns either skip into an error at setup, mirroring test_ldap_service_live.py's
+HERD_TEST_LDAP_REQUIRED contract. See
 test_advisory_lock_live_pg.py in services/common/tests for the full env
 contract writeup (HERD_TEST_PG_DSN, HERD_TEST_PG_REQUIRED, issue #1401); this
 file follows it identically through herd_common.pg_live_suite.
