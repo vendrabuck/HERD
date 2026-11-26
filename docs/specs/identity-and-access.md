@@ -1748,7 +1748,7 @@ sends signed-out visitors to the login page, and keeps admin pages away from non
 `frontend/src/api/auth.ts`, `frontend/src/components/guards.tsx`,
 `frontend/src/routes.tsx`, `frontend/src/lib/roles.ts`, `frontend/src/lib/login.ts`,
 `frontend/src/pages/LoginPage.tsx`, `frontend/src/queryClient.ts`,
-`frontend/src/components/layout/AppLayout.tsx`. The single sign-on parts of the login
+`frontend/src/components/layout/AppLayout.tsx`, `frontend/src/lib/adminNav.ts`. The single sign-on parts of the login
 page and the `/login/sso` page are in section 8.19.
 
 **Rules.**
@@ -1901,6 +1901,18 @@ page and the `/login/sso` page are in section 8.19.
   through exactly one sign-out. A same-account adoption passes through none. \
   Enforced in: `frontend/src/stores/authStore.ts` (`useAuthStore`, `tokenSubject`) \
   Pinned by: `frontend/src/test/stores/authStore.test.ts` (`a late-processed logout then login as another account passes through exactly one sign-out edge and ends as that account`, `a same-account token adoption emits no sign-out edge`, `a token whose account cannot be read counts as another account`)
+- **IAM-UI-17.** The header links to an `AdminGuard` page only for a role `isAdminRole`
+  accepts, the same predicate the guard applies: an admin and the superadmin see
+  Reporting as the last main navigation link and the Administration menu; a plain
+  user, an account whose role is any other value or missing, and an account not yet
+  loaded or that failed to load see neither, and no element for them is in the page.
+  Each main navigation and Administration menu entry is declared once with the role it
+  requires, and an entry requires admin exactly when its route sits behind `AdminGuard`
+  (issue #1402). Opening `/reporting` directly as a non-admin still lands on
+  `/topology` with no message (IAM-UI-6); the report routes refuse a non-admin on their
+  own (OPS-REPORT-1 in `operations-and-observability.md`). \
+  Enforced in: `frontend/src/lib/adminNav.ts` (`MAIN_NAV`, `ADMIN_NAV`, `visibleMainNav`, `visibleAdminNav`); `frontend/src/components/layout/AppLayout.tsx` (`AppLayout`) \
+  Pinned by: `frontend/src/test/routes.test.tsx` (`header links require exactly what their route's guard requires (issue #1402)`, `visibleMainNav and visibleAdminNav over the role space (issue #1402)`, `MAIN_NAV lists the five main pages in display order, Reporting last and admin only`); `frontend/src/test/components/AppLayout.test.tsx` (`AppLayout main navigation by role (issue #1402)`, `omits Reporting while the account is still loading, and shows it once an admin loads`, `Tab walks a plain user's main navigation without a Reporting stop`, `Tab walks an admin's main navigation through Reporting to the Administration button`); `frontend/src/test/components/AdminGuard.test.tsx` (`guards the /reporting route and redirects a non-admin to /topology`); `tests/e2e/test_register_and_roles.py` (`test_non_admin_has_no_administration_menu`, `test_non_admin_redirected_from_reporting`); `tests/e2e/test_reporting_page.py` (`test_admin_main_navigation_links_to_reporting`)
 
 **Out of scope.** Theming and preferences (`operations-and-observability.md`). How the
 login page adapts to the authentication mode, including hiding the Register link in
