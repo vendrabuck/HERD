@@ -71,9 +71,9 @@ Four small state machines live here. Only this section states their transitions.
 | (none) | `ACTIVE` | `record_l1_connect`, `record_l2_membership_active`, `record_route_active` after a successful build | wiring not frozen; no FAILED row of this reservation for the key; L2: the row's VLAN allocation is `ACTIVE`, under its share lock | nothing | WIRE-LEDGER-1, WIRE-LEDGER-2, WIRE-LEDGER-3, WIRE-VLAN-4 |
 | `FAILED` | `ACTIVE` | the same three functions | compare-and-swap on status `FAILED`; wiring not frozen; L2: the allocation is `ACTIVE`, under its share lock, and the row does not owe a lost join's undo | nothing | WIRE-LEDGER-2, WIRE-VLAN-4 |
 | (none) or `FAILED` | `FAILED`, intended `ACTIVE` | `record_l2_membership_active` after a successful build | wiring not frozen; the allocation is not `ACTIVE` (the join lost to its release), and its add was undone or a live membership holds the number on the port | nothing | WIRE-VLAN-4 |
-| (none), `FAILED`, or `ACTIVE` | `FAILED`, intended `RELEASED` (`JOIN_UNDO_PENDING_REMOVAL`), on the allocation the add used | `record_l2_membership_active` after a successful build | wiring not frozen; the allocation is not `ACTIVE`, and the undo of the add answered that it failed or ended by any exception, a cancellation included; from `ACTIVE` only by key (the reconcile): this reservation's row for the port, which another pass recorded `ACTIVE` on another allocation meanwhile | nothing | WIRE-VLAN-4 |
-| `FAILED`, intended `RELEASED` (`JOIN_UNDO_PENDING_REMOVAL`) | `FAILED`, intended `ACTIVE`, attempts 0 | `settle_undone_join` after a successful `remove_from_vlan` | the row still owes the undo; wiring not frozen, read in the same statement | nothing | WIRE-VLAN-4 |
-| (none) or `FAILED` | `FAILED`, intended `RELEASED` | the same three functions | wiring frozen at record time | nothing | WIRE-LEDGER-4 |
+| (none), `FAILED`, or `ACTIVE` | `FAILED`, intended `RELEASED` (`JOIN_UNDO_PENDING_REMOVAL`), on the allocation the add used | `record_l2_membership_active` after a successful build | wiring not frozen; the allocation is not `ACTIVE`, and the undo of the add answered that it failed or ended by an `Exception` or `asyncio.CancelledError`; by key (the reconcile) this reservation's row for the port as it finds it, so also a row another pass recorded `ACTIVE`, or a plain failed leave, on another allocation meanwhile | nothing | WIRE-VLAN-4 |
+| `FAILED`, intended `RELEASED` (`JOIN_UNDO_PENDING_REMOVAL`) | `FAILED`, intended `ACTIVE`, attempts 0 | `settle_undone_join` after a successful `remove_from_vlan` | the row still owes the undo, on the allocation the removal drove; wiring not frozen, read in the same statement | nothing | WIRE-VLAN-4 |
+| (none) or `FAILED` | `FAILED`, intended `RELEASED` | the same three functions | wiring frozen at record time; L2: not a row that owes a lost join's removal, which is left as it is (one UPDATE that does not match it) | nothing | WIRE-LEDGER-4, WIRE-VLAN-4 |
 | (none) | `FAILED` | `record_l1_failed`, `record_l2_failed`, `record_route_failed` (reconcile path) | no non-RELEASED row for the key | nothing | WIRE-LEDGER-5, WIRE-LEDGER-6 |
 | `FAILED` | `FAILED` | the failure writers; `park_stale_l1_build`, `park_stale_l2_build`, `park_stale_route_build` | key match (reconcile) or row id plus status `FAILED` (retry) | nothing | WIRE-LEDGER-6, WIRE-LEDGER-8, WIRE-LEDGER-13 |
 | `ACTIVE` | `FAILED`, intended `RELEASED` | the failure writers on a failed removal | release direction only | nothing | WIRE-LEDGER-7 |
@@ -83,9 +83,9 @@ Four small state machines live here. Only this section states their transitions.
 | (none), `ACTIVE`, or `FAILED` | `FAILED`, intended `RELEASED`, attempts 0 | a build failure written by `record_l1_failed`, `record_l2_failed`, `record_route_failed` (reconcile path) or `record_route_reconcile_failed` | wiring frozen, read in the write's own statement; L1 and L2: a retryable reason; L2: a real allocation; from `ACTIVE` only `record_route_reconcile_failed` | nothing | WIRE-LEDGER-17 |
 | `FAILED`, intended `ACTIVE` | `FAILED`, intended `RELEASED` | `park_stale_l1_build`, `park_stale_l2_build`, `park_stale_route_build` at terminal teardown | the row is still `FAILED` | nothing | WIRE-TEARDOWN-6 |
 | `ACTIVE` | `ACTIVE` (new route list) | `record_route_reconciled` | routes unchanged since the delta was computed; wiring not frozen | nothing | WIRE-LEDGER-14 |
-| `ACTIVE` or `FAILED` | `RELEASED` | `release_l1_connection`, `release_l2_membership`, `release_route_membership` after a successful removal or a settlement | row is this reservation's, not RELEASED; L2 after a removal: not a row `settle_undone_join` took | nothing | WIRE-LEDGER-9 |
+| `ACTIVE` or `FAILED` | `RELEASED` | `release_l1_connection`, `release_l2_membership`, `release_route_membership` after a successful removal or a settlement | row is this reservation's, not RELEASED; L2 after a removal: not a row `settle_undone_join` took, and not a row that owes a lost join's removal on an allocation other than the one the removal drove (read `FOR UPDATE`) | nothing | WIRE-LEDGER-9, WIRE-VLAN-4 |
 | `ACTIVE` | `RELEASED` | `record_l1_connect` of another reservation | same switch and canonical pair | nothing | WIRE-LEDGER-11 |
-| `FAILED`, intended `RELEASED` | `RELEASED` | `supersede_release_if_reclaimed`, `supersede_l2_release_if_reclaimed` | another reservation holds an ACTIVE row on the port; L2, for a row that owes a lost join's removal (`JOIN_UNDO_PENDING_REMOVAL`, read from the locked row): instead an ACTIVE row of any reservation on the port sits on an ACTIVE allocation holding the row's own number | nothing | WIRE-LEDGER-16 |
+| `FAILED`, intended `RELEASED` | `RELEASED` | `supersede_release_if_reclaimed`, `supersede_l2_release_if_reclaimed` | another reservation holds an ACTIVE row on the port; L2, for a row parked for an add that landed on its own number (`FROZEN_JOIN_PENDING_REMOVAL` or `JOIN_UNDO_PENDING_REMOVAL`, read from the locked row): instead an ACTIVE row of any reservation on the port sits on an ACTIVE allocation holding the row's own number | nothing | WIRE-LEDGER-16 |
 
 No transition leaves `RELEASED` (WIRE-LEDGER-10).
 
@@ -159,9 +159,11 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   attempts, so the release-direction retry channels remove what was built. An L3 flip
   keeps the stored routes and adds the routes just configured (`union_routes`), so the
   removal covers both. An L1 pair this reservation already holds ACTIVE is returned
-  unchanged before the freeze check. \
+  unchanged before the freeze check. An L2 row that owes the removal of a lost join's
+  add is not flipped: it is left on its number and the join's allocation goes
+  unrecorded (WIRE-VLAN-4, #1413). \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_connect`, `_park_frozen_build`); `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`); `services/execution/app/services/route_service.py` (`record_route_active`, `union_routes`) \
-  Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_record_connect_frozen_parks_failed_intended_released`, `test_record_connect_frozen_reuses_failed_row_and_keeps_attempts`, `test_record_connect_frozen_short_circuits_own_active_row_unchanged`); `services/execution/tests/test_l2_membership_service.py` (`test_record_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_route_service.py` (`test_record_route_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_wiring_retry_service.py` (`test_tick_build_racing_terminal_freeze_does_not_strand_active_row`)
+  Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_record_connect_frozen_parks_failed_intended_released`, `test_record_connect_frozen_reuses_failed_row_and_keeps_attempts`, `test_record_connect_frozen_short_circuits_own_active_row_unchanged`); `services/execution/tests/test_l2_membership_service.py` (`test_record_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_route_service.py` (`test_record_route_active_frozen_parks_failed_intended_released`); `services/execution/tests/test_wiring_retry_service.py` (`test_tick_build_racing_terminal_freeze_does_not_strand_active_row`); `services/execution/tests/test_wiring_retry_l2.py` (`test_a_frozen_join_never_moves_a_row_that_owes_a_removal_off_its_number`)
 - **WIRE-LEDGER-5.** Every failure write states the direction it attempted: intended
   `ACTIVE` for a failed build, `RELEASED` for a failed removal. \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`record_l1_failed`); `services/execution/app/services/l2_membership_service.py` (`record_l2_failed`); `services/execution/app/services/route_service.py` (`record_route_failed`) \
@@ -185,9 +187,11 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   Pinned by: `services/execution/tests/test_wiring_retry_stale_write.py` (`test_l1_tick_failure_write_never_resurrects_a_row_released_mid_flight`, `test_l2_tick_failure_write_never_resurrects_rows_released_mid_flight`, `test_l3_tick_failure_write_never_resurrects_a_pin_released_mid_flight`, `test_l2_tick_failure_write_no_ops_when_the_row_went_active`, `test_l1_tick_failure_write_applies_while_the_row_is_still_failed`)
 - **WIRE-LEDGER-9.** A successful removal, or a settlement with no driver call, flips this
   reservation's non-RELEASED row for the key (ACTIVE, or FAILED) to `RELEASED`, intended
-  `RELEASED`, clears `last_error`, and stamps `released_at`; no matching row is a no-op. \
+  `RELEASED`, clears `last_error`, and stamps `released_at`; no matching row is a no-op.
+  After an L2 removal the row is not taken when it owes the removal of a lost join's
+  add on an allocation other than the one the removal drove (WIRE-VLAN-4, #1413). \
   Enforced in: `services/execution/app/services/l1_assignment_service.py` (`release_l1_connection`); `services/execution/app/services/l2_membership_service.py` (`release_l2_membership`); `services/execution/app/services/route_service.py` (`release_route_membership`) \
-  Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_release_flips_active_to_released`, `test_release_flips_retried_failed_row_to_released`, `test_release_no_matching_active_row_is_noop`); `services/execution/tests/test_l2_membership_service.py` (`test_release_flips_release_direction_failed_row`, `test_release_missing_returns_none`)
+  Pinned by: `services/execution/tests/test_l1_assignment_service.py` (`test_release_flips_active_to_released`, `test_release_flips_retried_failed_row_to_released`, `test_release_no_matching_active_row_is_noop`); `services/execution/tests/test_l2_membership_service.py` (`test_release_flips_release_direction_failed_row`, `test_release_missing_returns_none`); `services/execution/tests/test_wiring_retry_l2.py` (`test_the_release_after_a_removal_skips_only_a_row_that_owes_another_number`)
 - **WIRE-LEDGER-10.** A RELEASED row is never rewritten: every keyed read for a write
   excludes RELEASED rows, the row-id failure write and the claim both require status
   `FAILED`, and a later build of the same key inserts a new row. \
@@ -232,16 +236,27 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
 - **WIRE-LEDGER-16.** A release-direction FAILED row is settled `RELEASED` with no driver
   call when another reservation holds an ACTIVE row on the same switch claiming either
   port of the pair (L1) or the same (switch, port) (L2). L3 has no such settlement:
-  route pins are per reservation and never displace each other. An L2 row that owes
-  the removal of a lost join's add (`JOIN_UNDO_PENDING_REMOVAL`, WIRE-VLAN-4) is
-  settled that way only when an ACTIVE membership on that (switch, port), of any
-  reservation, sits on an ACTIVE allocation holding the row's own number
-  (`port_holds_number_live`): an add is a membership of one VLAN number, so a
-  membership in another number leaves the port in the released one, and the removal
-  is driven (#1413). Whether the row owes it, and its number, are read from the row as
-  it stands under the retry's row lock, not from the copy the retry loaded. \
-  Enforced in: `services/execution/app/services/l1_assignment_service.py` (`supersede_release_if_reclaimed`); `services/execution/app/services/l2_membership_service.py` (`supersede_l2_release_if_reclaimed`); `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`) \
-  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_retry_supersession_flips_release_row_without_driver_call`, `test_retry_no_supersession_when_active_row_same_reservation_fires_driver`); `services/execution/tests/test_l2_membership_service.py` (`test_supersede_when_other_reservation_active_on_same_port`, `test_supersede_false_when_no_other_reservation`); `services/execution/tests/test_wiring_retry_l2.py` (`test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_number`, `test_whether_a_row_owes_its_removal_is_read_from_the_ledger_not_the_loaded_row`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_release_is_not_superseded_by_another_reservation_on_same_switch`)
+  route pins are per reservation and never displace each other. On L2 two driver
+  models of a membership meet, and HERD does not know which one a switch follows: on
+  the SR Linux driver (`drivers/srl_l2`) an add is a bridged subinterface per VLAN
+  number, so a port can be in several numbers at once and a membership in one leaves
+  it in the others; on the seeded IOS-style drivers (`seedtools/drivers.py`) an add
+  sets the port's one access VLAN, so a newer add replaces the old number. So an
+  ordinary L2 release row (a failed leave, a parked stale or teardown build) keeps the
+  rule above, whatever number the holder is in: on a one-number device the holder's
+  add already took the port out of the row's number, and a removal could strip the
+  holder. A row parked for an add known to have landed on the row's own number after
+  it could no longer be recorded `ACTIVE` (`FROZEN_JOIN_PENDING_REMOVAL`, WIRE-LEDGER-4,
+  and `JOIN_UNDO_PENDING_REMOVAL`, WIRE-VLAN-4) is settled that way only when an ACTIVE
+  membership on that (switch, port), of any reservation, sits on an ACTIVE allocation
+  holding the row's own number (`port_holds_number_live`); a holder in another number
+  does not settle it, and the removal of the row's number is driven (#1413). Which rule
+  applies, and the row's number, are read from the row as it stands under the retry's
+  row lock, not from the copy the retry loaded, and a row of the second kind whose
+  allocation no longer resolves to a number is never settled this way. Each rule
+  leaves a window on the other model (Open defects). \
+  Enforced in: `services/execution/app/services/l1_assignment_service.py` (`supersede_release_if_reclaimed`); `services/execution/app/services/l2_membership_service.py` (`supersede_l2_release_if_reclaimed`, `_landed_add_pending_removal`); `services/execution/app/services/wiring_retry_service.py` (`_reattempt_l3_rows`) \
+  Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_retry_supersession_flips_release_row_without_driver_call`, `test_retry_no_supersession_when_active_row_same_reservation_fires_driver`); `services/execution/tests/test_l2_membership_service.py` (`test_supersede_when_other_reservation_active_on_same_port`, `test_supersede_false_when_no_other_reservation`); `services/execution/tests/test_wiring_retry_l2.py` (`test_a_landed_add_pending_removal_is_superseded_only_by_a_live_holder_of_its_number`, `test_a_landed_add_pending_removal_with_no_resolvable_number_is_never_superseded`, `test_whether_a_row_owes_its_removal_is_read_from_the_ledger_not_the_loaded_row`); `services/execution/tests/test_wiring_retry_l3.py` (`test_l3_release_is_not_superseded_by_another_reservation_on_same_switch`)
 - **WIRE-LEDGER-17.** A build failure written by key (the reconcile path: `record_l1_failed`,
   `record_l2_failed`, `record_route_failed` with no row id, and
   `record_route_reconcile_failed`) on a reservation whose wiring is frozen is recorded
@@ -343,41 +358,50 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   was superseded, intended `ACTIVE` with the reason `VLAN allocation released before
   the join was recorded; pending re-allocation` (on the key path a reservation frozen
   by then records a pending release, WIRE-LEDGER-17), and the build retry re-allocates
-  it on a later pass (WIRE-RETRY-8); when the undo failed, or ended by any exception
-  (a `BaseException`, `asyncio.CancelledError` included), intended `RELEASED` with the
-  reason `VLAN allocation released after the join was driven; pending removal from its
-  number` (`JOIN_UNDO_PENDING_REMOVAL`), and the undo's exception is raised again after
-  that write. When that write itself raises an `Exception`, one line is logged at ERROR
-  with the action `l2_join_undo_owed_write_failed` and the class name only, and the
-  undo's exception, not the write's, is raised. The write runs after the undo, so a
-  process that dies inside the undo writes nothing (Open defects). A row that owes that
-  removal keeps naming the released allocation until a removal succeeds: the
-  release-direction retry channels drive it with the released allocation's number, a
-  release-direction failure write keeps that reason (by key and by row id), and its
-  success (`settle_undone_join`, one UPDATE that also requires the reservation not to
-  be frozen) turns the row into a pending join, `FAILED` intended `ACTIVE`, attempts 0,
-  the lost-join reason, still on the released allocation, which the build retry
+  it on a later pass (WIRE-RETRY-8); when the undo failed, or ended by an `Exception`
+  or `asyncio.CancelledError`, intended `RELEASED` with the reason `VLAN allocation
+  released after the join was driven; pending removal from its number`
+  (`JOIN_UNDO_PENDING_REMOVAL`), and the undo's exception is raised again after that
+  write. Before that write the session is rolled back, since the undo may have ended
+  inside a flush or a commit. When the write itself raises an `Exception`, one line is
+  logged at ERROR with the action `l2_join_undo_owed_write_failed` and the class name
+  only, and the undo's exception, not the write's, is raised. `GeneratorExit`,
+  `KeyboardInterrupt`, and `SystemExit` are not caught: nothing is awaited or written
+  and the exception goes on, as when the process dies inside the undo (Open defects).
+  A row that owes that removal keeps naming the released allocation until a removal
+  succeeds: the release-direction retry channels drive it with the released
+  allocation's number, a release-direction failure write keeps that reason (by key and
+  by row id), and its success (`settle_undone_join`, one UPDATE that also requires the
+  row to be on the allocation the removal drove and the reservation not to be frozen)
+  turns the row into a pending join, `FAILED` intended `ACTIVE`, attempts 0, the
+  lost-join reason, still on the released allocation, which the build retry
   re-allocates on a later pass; on a frozen reservation the success releases the row
-  as any removal does (WIRE-LEDGER-9). When an ACTIVE membership on that (switch,
-  port), of any reservation, sits on an ACTIVE allocation holding the row's own number,
-  the retry settles the row `RELEASED` with no driver call instead (WIRE-LEDGER-16),
-  and the retry does not redo the join; a membership in another number does not settle
-  it. Until a removal succeeds, these writers leave the row on its number: the apply
-  drives no add, define, or build write for that port (`membership_owes_undo`), the
-  FAILED flip of WIRE-LEDGER-2 refuses the row (it is returned as it is), a key-based
-  build failure leaves it as it is, and the build retry does not drive it (it is a
-  release-direction row). One writer still moves it: a join recorded on a frozen
-  reservation (WIRE-LEDGER-4) parks the row on that join's allocation, over the owed
-  number. And the owed write by key takes this reservation's row for the port as it
-  finds it, so a row another pass recorded `ACTIVE` on another allocation meanwhile is
-  moved onto the released one. Each of these is a port in two numbers, which one row
-  per (reservation, switch, port) cannot track; both are listed under Open defects. The
-  terminal teardown removes such a row's port too (WIRE-TEARDOWN-6). No join is
-  re-resolved inside the pass it lost in. The join on a frozen reservation (WIRE-LEDGER-4) and the existing-ACTIVE
+  as any removal does (WIRE-LEDGER-9). A removal planned on another allocation (the
+  retry's loaded copy, or the reconcile's delta, read before another writer moved the
+  row) neither settles nor releases a row that owes the removal on a different one
+  (`release_l2_membership` given the driven allocation, which reads the row `FOR
+  UPDATE`): the row keeps owing its own number, and on the retry the claim that pass
+  took lapses before the next pass drives it. When an ACTIVE membership on that (switch, port), of any
+  reservation, sits on an ACTIVE allocation holding the row's own number, the retry
+  settles the row `RELEASED` with no driver call instead (WIRE-LEDGER-16), and the
+  retry does not redo the join; a membership in another number does not settle it.
+  Until a removal succeeds, these writers leave the row on its number: the apply drives
+  no add, define, or build write for that port (`membership_owes_undo`), the FAILED
+  flip of WIRE-LEDGER-2 refuses the row (it is returned as it is), a join recorded on a
+  frozen reservation (WIRE-LEDGER-4) leaves it as it is (one UPDATE that does not match
+  it; a WARNING line with the action `l2_frozen_join_left_owed_row` names that join's
+  allocation, which no row then names), a key-based build failure leaves it as it is,
+  and the build retry does not drive it (it is a release-direction row). The owed write
+  by key itself takes this reservation's row for the port as it finds it: a row another
+  pass recorded `ACTIVE` on another allocation meanwhile, or a plain failed leave on
+  another allocation, is moved onto the released one. Those, and the frozen join left
+  unrecorded, are a port in two numbers, which one row per (reservation, switch, port)
+  cannot track; each is listed under Open defects. The terminal teardown removes such a
+  row's port too (WIRE-TEARDOWN-6). No join is re-resolved inside the pass it lost in. The join on a frozen reservation (WIRE-LEDGER-4) and the existing-ACTIVE
   short-circuit write no ACTIVE row and take no lock. On SQLite the lock clauses render
   nothing. \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_undo_lost_join`, `_apply_one_vlan_action`, `_apply_l2_memberships`); `services/execution/app/services/vlan_service.py` (`release_allocation_if_orphaned`, `hold_active_allocation`); `services/execution/app/services/l2_membership_service.py` (`count_active_memberships_for_vlan`, `record_l2_membership_active`, `record_l2_failed`, `settle_undone_join`, `membership_owes_undo`, `port_holds_number_live`, `JOIN_LOST_ALLOCATION_RELEASED`, `JOIN_UNDO_PENDING_REMOVAL`) \
-  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`, `test_a_join_on_an_active_allocation_is_recorded_active`, `test_a_join_on_an_allocation_that_is_not_active_fails_the_row`, `test_the_lost_join_reason_is_retryable_and_names_no_pinned_prefix`, `test_a_lost_join_is_selected_by_the_build_retry`, `test_a_lost_join_logs_one_line_with_its_action`, `test_a_lost_join_parks_no_other_reservations_row`, `test_a_frozen_join_on_a_released_allocation_is_still_parked_for_removal`, `test_a_lost_retry_join_writes_by_row_id_and_never_inserts`, `test_a_lost_retry_join_writes_the_row_it_holds`); `services/execution/tests/test_vlan_service.py` (`test_release_cas_releases_an_active_orphan_and_nothing_else`, `test_release_cas_loses_on_a_row_that_is_not_active`, `test_release_cas_loses_when_a_membership_joined_since_the_check`, `test_release_cas_ignores_memberships_that_are_not_active`, `test_release_cas_second_release_of_one_row_loses`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_lost_to_a_concurrent_release_drives_no_delete`, `test_release_lost_to_a_concurrent_join_keeps_the_allocation_active`, `test_release_loser_never_touches_a_reallocation_of_the_same_number`, `test_release_deletes_from_the_row_as_released_not_the_copy_read_before`, `test_two_interleaved_release_passes_release_and_undefine_once`, `test_a_held_allocation_logs_no_lost_race_line`, `test_an_allocation_already_released_is_skipped_with_no_line`, `test_joins_of_a_switch_whose_define_lost_are_parked_not_driven`); `services/execution/tests/test_vlan_release_cas_live_pg.py` (`test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner`, `test_a_join_committed_after_the_orphan_check_keeps_the_allocation_active`, `test_the_loser_never_touches_a_new_allocation_of_the_same_number`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_join_holding_its_lock_makes_the_release_wait_and_lose`, `test_a_release_holding_its_lock_makes_the_join_wait_and_lose`, `test_two_joins_of_one_allocation_do_not_wait_for_each_other`); `services/execution/tests/test_wiring_retry_l2.py` (`test_a_retry_join_that_loses_its_allocation_writes_only_the_row_it_loaded`, `test_a_lost_first_join_is_undone_and_left_for_re_allocation`, `test_a_lost_first_join_whose_undo_fails_owes_the_removal_on_the_old_number`, `test_a_lost_first_join_whose_undo_raises_owes_the_removal_and_raises`, `test_the_undo_is_skipped_only_when_a_live_membership_holds_the_number_on_the_port`, `test_a_lost_join_on_a_reservation_frozen_meanwhile_is_left_for_removal`, `test_a_lost_retry_join_is_undone_and_its_failed_undo_stays_owed`, `test_an_owed_removal_converges_remove_then_re_allocate_then_add`, `test_a_reconcile_add_for_a_port_that_owes_a_removal_is_not_driven`, `test_the_flip_and_the_failure_writes_keep_a_row_on_the_number_it_owes_a_removal_from`, `test_the_teardown_removes_a_port_that_owes_a_removal`, `test_an_owed_removal_is_superseded_only_by_a_live_holder_of_its_own_number`, `test_a_cancelled_undo_records_the_removal_as_owed_and_stays_cancelled`, `test_a_failed_owed_write_after_a_cancelled_undo_is_logged_and_the_cancel_wins`, `test_a_lost_join_rolls_back_its_park_of_a_frozen_holder_before_the_undo`, `test_a_failed_undo_written_by_key_takes_a_concurrent_active_row_and_converges`, `test_a_frozen_join_recorded_on_a_port_that_owes_a_removal_moves_the_row_to_its_number`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_lost_retry_join_owes_its_removal_until_it_succeeds_then_re_allocates`)
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_release_orphaned_allocations`, `_undo_lost_join`, `_apply_one_vlan_action`, `_apply_l2_memberships`); `services/execution/app/services/vlan_service.py` (`release_allocation_if_orphaned`, `hold_active_allocation`); `services/execution/app/services/l2_membership_service.py` (`count_active_memberships_for_vlan`, `record_l2_membership_active`, `record_l2_failed`, `settle_undone_join`, `release_l2_membership`, `membership_owes_undo`, `port_holds_number_live`, `JOIN_LOST_ALLOCATION_RELEASED`, `JOIN_UNDO_PENDING_REMOVAL`) \
+  Pinned by: `services/execution/tests/test_nats_consumer_l2_reconcile.py` (`test_reconcile_last_release_frees_allocation`, `test_reconcile_move_within_fabric_keeps_allocation`); `services/execution/tests/test_l2_membership_service.py` (`test_count_active_memberships_tracks_allocation_lifecycle`, `test_a_join_on_an_active_allocation_is_recorded_active`, `test_a_join_on_an_allocation_that_is_not_active_fails_the_row`, `test_the_lost_join_reason_is_retryable_and_names_no_pinned_prefix`, `test_a_lost_join_is_selected_by_the_build_retry`, `test_a_lost_join_logs_one_line_with_its_action`, `test_a_lost_join_parks_no_other_reservations_row`, `test_a_frozen_join_on_a_released_allocation_is_still_parked_for_removal`, `test_a_lost_retry_join_writes_by_row_id_and_never_inserts`, `test_a_lost_retry_join_writes_the_row_it_holds`); `services/execution/tests/test_vlan_service.py` (`test_release_cas_releases_an_active_orphan_and_nothing_else`, `test_release_cas_loses_on_a_row_that_is_not_active`, `test_release_cas_loses_when_a_membership_joined_since_the_check`, `test_release_cas_ignores_memberships_that_are_not_active`, `test_release_cas_second_release_of_one_row_loses`); `services/execution/tests/test_nats_consumer_vlan_definitions.py` (`test_release_lost_to_a_concurrent_release_drives_no_delete`, `test_release_lost_to_a_concurrent_join_keeps_the_allocation_active`, `test_release_loser_never_touches_a_reallocation_of_the_same_number`, `test_release_deletes_from_the_row_as_released_not_the_copy_read_before`, `test_two_interleaved_release_passes_release_and_undefine_once`, `test_a_held_allocation_logs_no_lost_race_line`, `test_an_allocation_already_released_is_skipped_with_no_line`, `test_joins_of_a_switch_whose_define_lost_are_parked_not_driven`); `services/execution/tests/test_vlan_release_cas_live_pg.py` (`test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner`, `test_a_join_committed_after_the_orphan_check_keeps_the_allocation_active`, `test_the_loser_never_touches_a_new_allocation_of_the_same_number`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_join_holding_its_lock_makes_the_release_wait_and_lose`, `test_a_release_holding_its_lock_makes_the_join_wait_and_lose`, `test_two_joins_of_one_allocation_do_not_wait_for_each_other`); `services/execution/tests/test_wiring_retry_l2.py` (`test_a_retry_join_that_loses_its_allocation_writes_only_the_row_it_loaded`, `test_a_lost_first_join_is_undone_and_left_for_re_allocation`, `test_a_lost_first_join_whose_undo_fails_owes_the_removal_on_the_old_number`, `test_a_lost_first_join_whose_undo_raises_owes_the_removal_and_raises`, `test_the_undo_is_skipped_only_when_a_live_membership_holds_the_number_on_the_port`, `test_a_lost_join_on_a_reservation_frozen_meanwhile_is_left_for_removal`, `test_a_lost_retry_join_is_undone_and_its_failed_undo_stays_owed`, `test_an_owed_removal_converges_remove_then_re_allocate_then_add`, `test_a_reconcile_add_for_a_port_that_owes_a_removal_is_not_driven`, `test_the_flip_and_the_failure_writes_keep_a_row_on_the_number_it_owes_a_removal_from`, `test_the_teardown_removes_a_port_that_owes_a_removal`, `test_a_landed_add_pending_removal_is_superseded_only_by_a_live_holder_of_its_number`, `test_a_cancelled_undo_records_the_removal_as_owed_and_stays_cancelled`, `test_a_failed_owed_write_after_a_cancelled_undo_is_logged_and_the_cancel_wins`, `test_a_lost_join_rolls_back_its_park_of_a_frozen_holder_before_the_undo`, `test_a_failed_undo_written_by_key_takes_a_concurrent_active_row_and_converges`, `test_a_frozen_join_never_moves_a_row_that_owes_a_removal_off_its_number`, `test_a_frozen_join_left_off_an_owed_row_still_parks_a_frozen_holder`, `test_a_removal_planned_on_one_number_never_settles_a_row_that_owes_another`, `test_the_release_after_a_removal_skips_only_a_row_that_owes_another_number`, `test_an_undo_interrupted_inside_a_flush_still_records_the_owed_removal`, `test_an_undo_ended_by_a_closing_or_exiting_exception_writes_nothing`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_lost_retry_join_owes_its_removal_until_it_succeeds_then_re_allocates`, `test_a_removal_planned_on_one_number_leaves_a_row_owing_another_on_a_used_ledger`)
 - **WIRE-ORDER-1.** `stamp_last_applied` inserts the wiring state row or raises its
   version; it never lowers the version and never clears `frozen`, including when it loses
   an insert race. \
@@ -1906,43 +1930,79 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
     to releases never reaches the cap.
   - The check for a live membership holding the number on the port and the
     `remove_from_vlan` after it are two steps, as in WIRE-VLAN-11, in the undo and in
-    the retry's supersession check of an owed row (WIRE-LEDGER-16): a membership of that
-    number joined on that port between them loses its port. The terminal teardown's
-    removal of an owed row makes no such check at all, so a live membership of that
-    number on the port, of another reservation that was given the number, loses its
-    port to it.
+    the retry's supersession check of a row parked for a landed add (WIRE-LEDGER-16): a
+    membership of that number joined on that port between them loses its port. The
+    terminal teardown's removal of an owed row makes no such check at all, so a live
+    membership of that number on the port, of another reservation that was given the
+    number, loses its port to it.
   - Two passes on one port of one reservation, the add of one landing while the other
-    records the removal as owed: an add that passed the apply's check while the row
-    did not yet owe a removal, and lands after another pass recorded that removal as
-    owed, is driven on its new number while the FAILED flip refuses the row, so that
-    new membership is on the switch with no row naming it; when the reservation froze
-    by then, the frozen park moves the row onto the new number instead
-    (WIRE-LEDGER-4), so the owed number is the one no row names, and the release
-    channel removes the port from the new number only.
+    records the removal as owed: an add on N' that passed the apply's check while the
+    row did not yet owe a removal, and lands after another pass recorded the removal of
+    N as owed, is driven while the FAILED flip refuses the row, and, when the
+    reservation froze by then, the frozen park leaves the row on N too (WIRE-LEDGER-4,
+    logged with the action `l2_frozen_join_left_owed_row`). Either way the port's
+    membership in N' is on the switch with no row naming it. N' is still this
+    reservation's allocation, so it is not handed out before it is released, but only a
+    removal pass that touches N' releases it (WIRE-VLAN-4): when no other row of the
+    reservation names N' when its removals run, nothing releases N', the number stays
+    allocated in that component, and its definition and the port's membership stay on
+    the switch. On the SR Linux driver, `delete_vlan` deletes the `network-instance`
+    named for the number, which holds the port's binding to it, and leaves the port's
+    `subinterface` of that number configured; so once N' is released and its
+    `delete_vlan` runs on that switch (not skipped, WIRE-VLAN-11, and not failed), the
+    port is bound to no network-instance of N'.
   - The reverse order: another pass recorded this reservation's port `ACTIVE` on
     another allocation N' while a join on N was in flight, and that join then loses
     and its undo fails. On the reconcile the owed write by key takes the `ACTIVE` row
-    onto N, so N' is not named by any row until the row converges: the retry removes
-    the port from N, the row becomes a pending join, and the build retry re-allocates
-    it, onto N' when that allocation is still the reservation's `ACTIVE` one in reach,
-    and adds it again. Meanwhile a removal pass that touches N' and finds no other
-    `ACTIVE` membership on it releases N' (WIRE-VLAN-4) with the port still in it.
+    onto N, and no row names N'. The row converges back onto N' only when the removal
+    from N succeeds, the reservation is not frozen, and N' is still the reservation's
+    `ACTIVE` allocation in reach when the build retry re-allocates the row. It does not
+    when N' is released meanwhile (a removal pass that touches N' and finds no other
+    `ACTIVE` membership on it releases N' with the port still in it, and the row is
+    re-allocated onto another number), when the reservation freezes first (the removal
+    from N is driven, the row ends `RELEASED`, and the port stays in N' with no row
+    naming it), or when the removal from N keeps failing up to the attempts cap.
+  - The owed write by key also takes a plain failed leave of this reservation's port, a
+    `FAILED` intended `RELEASED` row on another allocation N1, onto N: the pending
+    removal from N1 is lost and no row names N1. The FAILED flip of a successful join
+    (WIRE-LEDGER-2) does the same to such a row, moving it onto the join's allocation;
+    that predates #1413.
+  - A removal planned on one number (the retry's loaded copy, or the reconcile's delta)
+    that finds the row moved meanwhile to owe another number drives the planned
+    number, then leaves the row owing the other one; on the retry the row keeps the
+    drive claim stamp that pass took until it lapses, so the owed removal waits up to
+    one claim budget for the next pass.
   - On the retry path the owed removal is written by row id (WIRE-LEDGER-8): when the
     undo failed and the row was meanwhile released by a save, claimed by another pass,
     or flipped `ACTIVE` by another pass's join (on another allocation), that write is
     refused, no row is inserted, and no row names the number.
   - The owed write runs after the undo, not before its driver call: a process that
     dies inside the undo (after the add landed) writes nothing, and no row names the
-    number. Writing the row as owed before the undo was not done, because that write
-    clears the retry's drive claim (WIRE-CLAIM-2), which would let the other channel
-    drive the same removal and release the row after the undo's success turned it into
-    a pending join. A second cancellation during the owed write, or a failure of that
-    write (logged as `l2_join_undo_owed_write_failed`), leaves the same state.
+    number; so does a `GeneratorExit`, `KeyboardInterrupt`, or `SystemExit` there, a
+    second cancellation during the owed write, or a failure of that write (logged as
+    `l2_join_undo_owed_write_failed`). The owed row is not written before the undo
+    because that write makes the row claimable while the undo runs: on the retry it
+    clears the pass's own drive claim (WIRE-CLAIM-2), and on the reconcile there is no
+    claim at all, so either retry channel could claim the row, drive the same removal,
+    and, after the undo's success had turned the row into a pending join, release it.
+    A pre-write that keeps the retry's claim stamp, or mints one on the reconcile,
+    would close this window; that is a possible follow-up.
   - An exception from the undo ends the rest of that pass after the owed write: the
     switch's remaining operations and its logout, the later switches, and the pass's
     allocation releases are not driven; the event is redelivered as for any other
     exception in it, and the retry tick logs the L2 batch as failed with its rows left
     as they are.
+  - The two driver models of WIRE-LEDGER-16. An ordinary release row (a failed leave, a
+    parked stale or teardown build) whose port another reservation holds `ACTIVE` in a
+    different number is settled with no removal; on a per-number device such as the SR
+    Linux driver the port then stays in the row's number with no row naming it. That
+    predates #1413; applying the own-number rule to those rows too is an owner
+    decision, since on a one-number device the removal it would drive could strip the
+    holder. Conversely, a row parked for a landed add is removed from its number even
+    when the holder is in another one; on a one-number device that removal is not
+    needed, and what it does to the holder depends on the driver's `remove_from_vlan`
+    (the seeded IOS-style driver sends `no switchport access vlan <n>`; what IOS does
+    when `<n>` is not the port's current access VLAN is not verified here).
   - A replica on code from before this change records a lost join with no undo, so
     during a rolling deploy its lost joins leave the port in the released number as
     before.

@@ -1145,3 +1145,62 @@ async def test_a_lost_retry_join_owes_its_removal_until_it_succeeds_then_re_allo
     finally:
         await pending.settle()
         await _cleanup(session_factory, h)
+
+
+async def test_a_removal_planned_on_one_number_leaves_a_row_owing_another_on_a_used_ledger(
+    session_factory, pending
+):
+    """The settle and release after a removal, on a real Postgres (issue #1413): a retry
+    pass loads a failed leave on N1, then a lost join's key-based owed write moves the
+    row to owe the removal from N2. The pass drives the removal it planned, from N1,
+    and that success neither settles the row into a pending join nor releases it (the
+    compare-and-swap on the driven allocation, and the release's FOR UPDATE read): the
+    row still owes N2, and no foreign row changes."""
+    from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL, record_l2_failed
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    n1_vlan, n2_vlan = await _free_vlan_numbers(session_factory, 2)
+    try:
+        n1 = await _seed(session_factory, h, n1_vlan, scope=[switch], defined=[], status="RELEASED")
+        n2 = await _seed(session_factory, h, n2_vlan, scope=[switch], defined=[], status="RELEASED")
+        rid = await _seed_failed_join(session_factory, h, n1, "0/0/1", "boom")
+        async with session_factory() as s:
+            await s.execute(
+                update(L2PortAssignment)
+                .where(L2PortAssignment.id == rid)
+                .values(intended="RELEASED")
+            )
+            await s.commit()
+        before = await _foreign_snapshot(session_factory, h)
+        async with session_factory() as s:
+            loaded = await s.get(L2PortAssignment, rid)
+        async with session_factory() as s:
+            await record_l2_failed(
+                s,
+                h.reservation,
+                n2,
+                switch,
+                "0/0/1",
+                1,
+                JOIN_UNDO_PENDING_REMOVAL,
+                intended="RELEASED",
+            )
+        with h.patches(wires=[]):
+            await _reattempt_l2_rows(
+                [loaded], _session_ctx(session_factory), claims=WiringRowClaims()
+            )
+        assert h.of("remove_from_vlan") == [(switch, n1_vlan)]
+        row = await _own_row(session_factory, rid)
+        assert (row.status, row.intended, row.last_error, row.vlan_assignment_id) == (
+            "FAILED",
+            "RELEASED",
+            JOIN_UNDO_PENDING_REMOVAL,
+            n2,
+        )
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await pending.settle()
+        await _cleanup(session_factory, h)
