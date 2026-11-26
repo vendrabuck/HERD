@@ -140,9 +140,17 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_repeat_success_is_noop`, `test_callback_after_cancel_does_not_retransition`, `test_callback_after_failed_does_not_resurrect`)
 - **RES-DYN-7.** A successful callback attaches the reported `device_ids` (skipping ones
   already booked), moves to `ACTIVE` with `reservation.created` in that transaction, then
-  creates the fork best-effort. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`)
+  creates the fork best-effort. The ids are parsed by pydantic's UUID type and compared
+  as UUIDs, never by spelling: two spellings of one id that it accepts (case, braces,
+  `urn:uuid:`, 32 hex digits without dashes), or a spelling of an id already booked,
+  attach it once (issue #1552). A callback, success or failure, whose `device_ids` is not
+  a list of UUIDs that parser accepts is refused with 422 before anything runs; that
+  includes spellings only the stdlib `uuid.UUID` accepts (a `uuid:` or bare `urn:`
+  prefix, braces around 32 hex digits or inside `urn:uuid:`, dashes in other places).
+  The row keeps its status and devices, nothing is staged, and the provisioning timeout
+  backstop owns it (RES-SWEEP-6). \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ProvisionResultRequest`); `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`, `test_callback_success_attaches_each_spelling_of_one_id_once`, `test_callback_success_attaches_every_spelling_together_once`, `test_callback_with_a_malformed_device_id_is_422_and_changes_nothing`)
 - **RES-DYN-8.** A failed callback moves to `FAILED` with `reservation.failed` and the
   purpose marker in that transaction, then releases exclusive devices (holder-aware) and
   archives the fork. \
@@ -754,9 +762,19 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_add_reserves_only_after_the_edit_committed`, `test_active_add_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_active_remove_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_commit_failure_writes_nothing_to_inventory`, `test_patch_losing_its_status_guard_keeps_nothing`, `test_cancel_committing_after_the_edit_reverts_the_added_hold`, `test_patch_route_answers_409_when_the_status_guard_loses`); `services/reservations/tests/test_reservation_patch_race_live_pg.py` (`test_cancel_during_the_patch_checks_keeps_nothing_of_the_patch`, `test_cancel_during_the_post_commit_flip_leaves_the_added_device_released`, `test_patch_versus_cancel_jittered_around_the_patch_commit`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
 - **RES-PATCH-11.** Removing devices from an `ACTIVE` reservation records them in
   `pending_fork_prune_device_ids` in the edit's transaction, unioned with any ids still
-  pending, then asks cabling to prune them from the fork (RES-FORK-16). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_prune_removed_devices_from_fork_best_effort`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_patch_remove_writes_marker_with_the_edit`, `test_patch_remove_unions_into_existing_marker`)
+  pending, then asks cabling to prune them from the fork (RES-FORK-16). The union
+  compares ids, not spellings: a stored marker counts only when it is a non-empty list,
+  and then only its entries whose text parses as a UUID, written back in canonical form,
+  each id once; any other stored value (a number, a boolean, a string, an object) is
+  treated as empty. When the union discards a corrupt stored value or entry (JSON `null`
+  and an empty list are empty, not corrupt), it logs at ERROR after the edit commits,
+  with `action` `pending_prune_corrupt_marker_discarded`, the stored value's type name,
+  and, for a list, the number of entries it dropped (`discarded_entries`; null when the
+  whole value was dropped), never the stored text. An edit that loses its status guard
+  (RES-PATCH-10) keeps nothing, leaves the stored marker as it was, and logs no
+  discard (issue #1554). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_union_prune_marker`, `_parse_prune_marker_entry`, `_prune_removed_devices_from_fork_best_effort`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_patch_remove_writes_marker_with_the_edit`, `test_patch_remove_unions_into_existing_marker`, `test_a_patch_over_a_corrupt_marker_answers_200_and_stores_only_the_removed_ids`, `test_a_patch_over_an_empty_marker_stores_the_removed_ids_and_logs_nothing`, `test_a_patch_union_keeps_stored_ids_in_canonical_form_once`, `test_a_patch_union_of_valid_canonical_entries_logs_nothing`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_a_corrupt_marker_discard_is_logged_only_when_the_edit_commits`)
 - **RES-PATCH-12.** Adding a device wires nothing; its connections are built only by a
   later fork save. By decision (ADR 0009 Decision 6). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
@@ -1075,9 +1093,15 @@ reconcile on the expiration loop.
   cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20).
   On an `ACTIVE` row, marker entries that do not parse as a UUID are cleared in the
   same tick without a prune, and the row's other entries are retried as usual
-  (RES-FORK-16). \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`)
+  (RES-FORK-16). Entries are matched as UUIDs, never by spelling: an entry in any
+  spelling the stdlib `uuid.UUID` parser accepts (case, braces, the `urn:uuid:`, `urn:`,
+  and `uuid:` prefixes, 32 hex digits, dashes in any place) is pruned as its canonical
+  id, and the clear after a converged prune removes every stored entry whose text parses
+  to a pruned id, so the row leaves the batch; an entry that does not parse is cleared
+  by its text. The clear rewrites only a non-empty list: any other stored value is left
+  exactly as stored, for the heal (RES-FORK-20) (issue #1554). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`); `services/reservations/app/services/reservation_service.py` (`_clear_pending_fork_prune`, `_parse_prune_marker_entry`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`, `test_a_spelled_entry_is_pruned_once_then_cleared_and_leaves_the_batch`, `test_the_clear_matches_entries_by_uuid_and_keeps_the_rest`, `test_a_terminal_row_with_spelled_entries_clears_to_sql_null`, `test_the_clear_leaves_a_marker_that_is_not_a_list_for_the_heal`)
 - **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,
   held by three parts. Every writer stores SQL NULL or a non-empty list, whichever path
   empties the marker (a full clear, a partial clear followed by a full one, a terminal or
@@ -1291,6 +1315,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | validation list | list: unknown sort field or direction, unknown status, naive or bad timestamp, search over 200 characters | RES-LIST-3, RES-LIST-6, RES-LIST-8 |
 | 422 | `<parameter> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC` | list: a time bound whose instant has no UTC equivalent (an offset near year 1 or year 9999) | RES-LIST-8 |
 | 422 | validation list | calendar without `range_start` or `range_end`; internal route without the token header | RES-CAL-1, RES-INTERNAL-1 |
+| 422 | validation list | provision-result callback whose `device_ids` is not a list of UUIDs; the row is unchanged | RES-DYN-7 |
 | 422 | `Unknown purpose_category; allowed: <list>` | an unknown category on create, purpose-category PATCH, accept, or the list filter | RES-PURPOSE-1, RES-PURPOSE-10, RES-LIST-7 |
 | 422 | `Device <id> not found in inventory` | create names a device that does not exist or that the caller cannot see | RES-CREATE-8, RES-CREATE-9 |
 | 422 | `All devices must share the same topology type. Found: ...` | create mixes physical and cloud devices | RES-CREATE-10 |

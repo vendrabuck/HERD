@@ -845,8 +845,29 @@ async def _clear_pending_fork_prune(
     those must survive for the sweep to retry. Clearing is best-effort: a failure
     here leaves the marker set, and the sweep's next prune replay is an idempotent
     no-op that reaches this clear again.
+
+    Entries are matched by identity, never spelling (issue #1554): a stored entry is
+    removed when its text parses to one of the pruned UUIDs, whatever its case,
+    braces, `urn:uuid:` prefix, or dashes. An entry that does not parse (the
+    reconciler's bad-entry clear, or a terminal row's whole marker) is matched by its
+    text, as before. A stored marker that is not a non-empty list is left for the
+    reconciler's heal.
     """
-    pruned = {str(d) for d in pruned_device_ids}
+    pruned_ids: set[uuid.UUID] = set()
+    pruned_unparsed: set[str] = set()
+    for entry in pruned_device_ids:
+        parsed = _parse_prune_marker_entry(entry)
+        if parsed is None:
+            pruned_unparsed.add(str(entry))
+        else:
+            pruned_ids.add(parsed)
+
+    def _is_cleared(stored: object) -> bool:
+        parsed = _parse_prune_marker_entry(stored)
+        if parsed is None:
+            return str(stored) in pruned_unparsed
+        return parsed in pruned_ids
+
     try:
         async with AsyncSessionLocal() as db:
             res = (
@@ -860,9 +881,9 @@ async def _clear_pending_fork_prune(
                 .scalars()
                 .first()
             )
-            if res is None or not res.pending_fork_prune_device_ids:
+            if res is None or not _prune_marker_actionable(res.pending_fork_prune_device_ids):
                 return
-            remaining = [d for d in res.pending_fork_prune_device_ids if str(d) not in pruned]
+            remaining = [d for d in res.pending_fork_prune_device_ids if not _is_cleared(d)]
             res.pending_fork_prune_device_ids = remaining or None
             await db.commit()
     except Exception:
@@ -886,6 +907,54 @@ def _prune_marker_actionable(marker: object) -> bool:
     `_heal_non_actionable_prune_marker`.
     """
     return isinstance(marker, list) and len(marker) > 0
+
+
+def _parse_prune_marker_entry(entry: object) -> uuid.UUID | None:
+    """The ONE parse of a pending fork-prune marker entry: its text as a UUID, or None.
+
+    Shared by the reconciler (which prunes the parsed ids and clears the entries that
+    do not parse), the clear (which matches by parsed id, issue #1554), and the
+    device-set PATCH union (which keeps only parsed ids, in canonical form). Two
+    spellings of one id parse to one value.
+    """
+    try:
+        return uuid.UUID(str(entry))
+    except (ValueError, TypeError):
+        return None
+
+
+def _union_prune_marker(
+    stored: object, removed_ids: list[uuid.UUID]
+) -> tuple[list[str], str | None, int | None]:
+    """The marker a device-set PATCH stores: the stored ids plus the removed ones.
+
+    Returns (marker, discarded_type, discarded_entries). The stored value counts only
+    when `_prune_marker_actionable` says it is a non-empty list, and then only its
+    entries that parse as UUIDs, written back in canonical form, so two spellings of
+    one id become one entry (issue #1554). Any other stored value is treated as empty.
+    `discarded_type` names the stored value's type when something corrupt was
+    discarded (a non-list value, or list entries that do not parse); it is None for a
+    marker that was absent (SQL NULL or a JSON null) or an empty list.
+    `discarded_entries` counts the list entries that did not parse; it is None when
+    the whole stored value was discarded (not a list) or nothing was.
+    """
+    kept: set[uuid.UUID] = set(removed_ids)
+    discarded_type: str | None = None
+    discarded_entries: int | None = None
+    if _prune_marker_actionable(stored):
+        unparsed = 0
+        for entry in stored:
+            parsed = _parse_prune_marker_entry(entry)
+            if parsed is None:
+                unparsed += 1
+            else:
+                kept.add(parsed)
+        if unparsed:
+            discarded_type = type(stored).__name__
+            discarded_entries = unparsed
+    elif stored is not None and stored != []:
+        discarded_type = type(stored).__name__
+    return sorted(str(d) for d in kept), discarded_type, discarded_entries
 
 
 async def _heal_non_actionable_prune_marker(reservation_id: uuid.UUID) -> bool:
@@ -2123,7 +2192,7 @@ async def apply_provision_result(
     reservation_id: uuid.UUID,
     *,
     succeeded: bool,
-    device_ids: list[str],
+    device_ids: list[uuid.UUID],
     error: str | None = None,
 ) -> tuple[Reservation | None, bool]:
     """Apply the execution service's provision-result callback (ADR 0004).
@@ -2162,10 +2231,13 @@ async def apply_provision_result(
         return reservation, False
 
     if succeeded:
-        existing = {str(d) for d in reservation.device_ids}
+        # Identity is the UUID, never its spelling (issue #1552): the request
+        # schema parses each id, so two spellings of one id, or a spelling of an
+        # id the row already holds, attach it at most once.
+        existing = set(reservation.device_ids)
         for did in device_ids:
             if did not in existing:
-                reservation.device_ids.append(uuid.UUID(did))
+                reservation.device_ids.append(did)
                 existing.add(did)
         # The CAS already wrote ACTIVE; stage reservation.created in the same
         # transaction so the event commits atomically with the transition.
@@ -2791,11 +2863,17 @@ async def update_reservation(
     # below stays visible and the expiration sweep's pending-prune reconciler retries
     # it until it converges. Union with any ids a prior failed prune left pending.
     # ACTIVE-only, matching the prune call below: PENDING has no fork to prune.
+    # A stored marker that is not a list of UUIDs is treated as empty, and stored
+    # ids are kept in canonical form (issue #1554); a discard is logged after the
+    # commit below, so a lost status guard (which keeps nothing) logs nothing.
+    discarded_marker_type: str | None = None
+    discarded_marker_entries: int | None = None
     if removed_ids and observed_status == ReservationStatus.ACTIVE:
-        already_pending = set(reservation.pending_fork_prune_device_ids or [])
-        reservation.pending_fork_prune_device_ids = sorted(
-            already_pending | {str(d) for d in removed_ids}
-        )
+        (
+            reservation.pending_fork_prune_device_ids,
+            discarded_marker_type,
+            discarded_marker_entries,
+        ) = _union_prune_marker(reservation.pending_fork_prune_device_ids, removed_ids)
 
     reservation.modified_by = user_id
 
@@ -2844,6 +2922,21 @@ async def update_reservation(
     )
     await db.commit()
     await db.refresh(reservation)
+
+    if discarded_marker_type is not None:
+        logger.error(
+            "Reservation %s held a corrupt pending fork-prune marker of type %s; the "
+            "device-set edit kept only its UUID entries and added the removed devices",
+            reservation.id,
+            discarded_marker_type,
+            extra={
+                "action": "pending_prune_corrupt_marker_discarded",
+                "reservation_id": str(reservation.id),
+                "marker_type": discarded_marker_type,
+                # A count for a partly bad list; None when the whole value went.
+                "discarded_entries": discarded_marker_entries,
+            },
+        )
 
     # Inventory follows the committed edit, and only on a row that holds devices
     # (RES-HOLD-1). PENDING_PROVISION is refused above, so that means ACTIVE.

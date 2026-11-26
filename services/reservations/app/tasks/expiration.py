@@ -30,6 +30,7 @@ from app.services.reservation_service import (
     _fetch_active_forks,
     _fetch_devices_best_effort,
     _heal_non_actionable_prune_marker,
+    _parse_prune_marker_entry,
     _provision_requested_event,
     _prune_marker_actionable,
     _prune_removed_devices_from_fork_best_effort,
@@ -988,12 +989,15 @@ async def _run_pending_prune_reconcile() -> None:
         device_ids: list[uuid.UUID] = []
         bad_entries: list = []
         for raw in pending:
-            try:
-                device_ids.append(uuid.UUID(str(raw)))
-            except (ValueError, TypeError):
+            parsed = _parse_prune_marker_entry(raw)
+            if parsed is None:
                 # Defensive: the marker is written from validated UUIDs, so a bad
                 # entry is corruption; clear it rather than wedging the reconciler.
                 bad_entries.append(raw)
+            else:
+                # A non-canonical spelling prunes its canonical id, and the clear
+                # matches it by that id (issue #1554), so it leaves the batch.
+                device_ids.append(parsed)
         if bad_entries:
             await _clear_pending_fork_prune(row.id, bad_entries)
         if not device_ids:
