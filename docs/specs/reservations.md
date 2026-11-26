@@ -370,7 +370,7 @@ The status a new booking starts in is RES-CREATE-12 to RES-CREATE-16 (section 4)
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_create_reservation_visibility_fetch_failure_allows`, `test_create_visibility_precheck_still_skips_on_a_misshapen_answer`); `services/reservations/tests/test_coverage_gaps.py` (`test_visible_devices_non_200_logs_and_fails_open`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/inventory/tests/test_devices.py` (`test_batch_non_admin_gets_only_visible_with_passwords_redacted`)
 - **RES-CREATE-9.** Every requested device must exist in inventory, read in one batch
   call with the caller's JWT; a missing device refuses the booking with 422, and an
-  unreachable inventory fails closed with 503. \
+  unreachable inventory fails closed with 503. Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_fetch_devices`, `create_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_fetch_devices_missing_from_batch_raises_value_error`); `services/reservations/tests/test_reservations.py` (`test_inventory_unreachable_returns_503`)
 - **RES-CREATE-10.** All booked devices must share one topology type (physical and
@@ -491,7 +491,7 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
   `template_type` `dynamic`; inventory unreachable fails closed with 503. The template is
   read with the caller's JWT, so a dynamic template hidden from a non-admin
   (`dynamic-resources.md`, DYN-REQ-9) is refused with the same `Template <id> not found in
-  inventory` as an unknown id (issue #1053). \
+  inventory` as an unknown id (issue #1053). Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_dynamic_templates`) \
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_dynamic_booking_unknown_template_422_wording`, `test_dynamic_booking_non_dynamic_template_422_wording`, `test_dynamic_booking_inventory_unreachable_503_wording`); `services/reservations/tests/test_dynamic_gating.py` (`test_hidden_dynamic_template_refused_exactly_like_an_unknown_id`)
 - **RES-DYN-2.** A booking carries at most 50 dynamic requests; the create form's
@@ -508,7 +508,7 @@ The transitions are RES-DYN-4 to RES-DYN-9 and RES-SWEEP-6 (section 4).
   exists with 422, and a check that cannot be answered (no internal token, transport
   error, non-200 other than 404, a body without a boolean `enabled`) fails closed with 503
   (issue #1033). A hidden template is refused before this check, so its hypervisor's
-  name is never revealed. \
+  name is never revealed. Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_fetch_hypervisor_internal`) \
   Pinned by: `services/reservations/tests/test_dynamic_gating.py` (`test_disabled_hypervisor_refused_with_422_naming_it`, `test_enabled_hypervisor_books`, `test_each_distinct_hypervisor_is_read_once`, `test_missing_hypervisor_refused_with_422`, `test_unanswerable_hypervisor_check_fails_closed_with_503`, `test_hypervisor_check_without_an_internal_token_fails_closed`, `test_hidden_template_never_reaches_the_hypervisor_check`)
 
@@ -551,7 +551,7 @@ runs after the commit.
   restart backstop's revert share one release helper: a device whose exclusivity cannot
   be read is treated as exclusive, and a device inventory answers 404 for is dropped
   from the release set. Auto-complete reads exclusivity itself and follows RES-HOLD-9
-  instead. \
+  instead. Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_release_exclusive_devices_best_effort`, `_DeviceGoneFromInventory`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_cancel_fetch_failure_falls_back_to_exclusive`); `services/reservations/tests/test_reservation_service_unit.py` (`test_release_exclusive_devices_drops_404_fetch_result`)
 - **RES-HOLD-6.** A 404 from inventory when setting a device `AVAILABLE` counts as
@@ -570,7 +570,7 @@ runs after the commit.
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_device_statuses_no_token`)
 - **RES-HOLD-9.** Auto-complete treats every device whose record it cannot read, a 404
   included, as exclusive and posts `AVAILABLE` for it (holder-aware, RES-HOLD-3); a 404
-  on that post counts as success (RES-HOLD-6). \
+  on that post counts as success (RES-HOLD-6). Known gap, see #1577. \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_expiration_cycle`) \
   Pinned by: `services/reservations/tests/test_expiration.py` (`test_expiration_releases_all_device_ids_without_exclusivity_check`)
 
@@ -954,26 +954,36 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`, `test_reconcile_transport_error_ends_tick_without_bump`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
 - **RES-PURPOSE-7.** A timeout, any other non-200, or a 200 whose body is not a usable
   suggestion counts one attempt on that row, stores nothing, and the tick continues to
-  the next row. A 200 is a usable suggestion only when its body parses to a JSON object
-  whose `top_category` is a string (issue #1543), nested no deeper than 32 levels and
-  holding no number that is not finite (`NaN`, `Infinity`, or a literal such as `1e400`
-  that overflows a float), which the JSON encoder or Postgres would refuse on store.
-  Every other 200 is the same failure: a body that does not parse (not JSON, not UTF-8,
-  or nested deeper than the decoder's recursion limit, issue #1577), a list, a string, a
-  number, a boolean, a JSON `null`, or an object without a string `top_category`. It is
-  logged as one WARNING with the fixed action `purpose_classify_bad_body`, a fixed
-  `reason` (`not_json`, `too_deep`, or `wrong_shape`), and the parsed top-level type's
-  name as `body_type`, never body or exception text. \
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_read_classify_body`, `_suggestion_refusal`, `_bump_purpose_classify_attempts`) \
+  the next row. Nothing is stored that the store, Postgres's `json` operators, or the
+  response models refuse later: a 200 is a usable suggestion only when its body parses
+  to a JSON object whose `top_category` is a string (issue #1543), nested no deeper than
+  32 levels (the JSON encoder that stores the column, and the response models past
+  about 255 levels, refuse deeper nesting), holding no number that is not finite
+  (`NaN`, `Infinity`, or a literal such as `1e400` that overflows a float; Postgres
+  refuses the stored text), and holding no string, dict keys included, with a NUL or an
+  unpaired surrogate (Postgres's `->` and `->>` refuse both, and the response models
+  refuse the surrogate; a surrogate pair, a noncharacter, and any other control
+  character are stored). Every other 200 is the same failure: a body that does not
+  parse (not JSON, not UTF-8, or nested deeper than the decoder's recursion limit,
+  issue #1577), a list, a string, a number, a boolean, a JSON `null`, or an object that
+  breaks any part of the rule above. It is logged as one WARNING with the fixed action
+  `purpose_classify_bad_body`, a fixed `reason` (`not_json`, `too_deep`, `wrong_shape`,
+  or `bad_text`), and the parsed top-level type's name as `body_type`, never body or
+  exception text. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_read_classify_body`, `_suggestion_refusal`, `_unstorable_text`, `_bump_purpose_classify_attempts`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`, `test_reconcile_unusable_200_reaches_the_attempt_cap_without_stalling`, `test_classify_one_logs_an_unusable_200_with_fixed_fields_only`, `test_the_unusable_200_table_covers_every_json_type_and_reason`)
 - **RES-PURPOSE-8.** A 200 whose body is a usable suggestion (RES-PURPOSE-7) stores it
-  verbatim as the suggestion; it never writes `purpose_category`. A suggestion stored
-  before RES-PURPOSE-7 checked the body (one that is not a JSON object with a string
-  `top_category`), and a suggestion time or dismissal left with no suggestion, are reset
-  by migration 0019: the suggestion, its time, and its dismissal become SQL NULL, the
-  stamp and the attempt count are kept, and the sweep classifies the row again
-  (issue #1543). Until `make migrate` runs it, such a row still answers 500 on the
-  routes that read it. \
+  verbatim as the suggestion; it never writes `purpose_category`. Migration 0019 resets
+  every stored suggestion that RES-PURPOSE-7's rule would refuse today, as a copy of
+  that rule frozen in the migration: stored text Python cannot parse (an integer over
+  4,300 digits, or nesting past the decoder's recursion limit), anything but a JSON
+  object with a string `top_category`, nesting deeper than 32 levels, a number that is
+  not finite, or a NUL or an unpaired surrogate in any string or key. It also resets a
+  suggestion time or dismissal left with no suggestion. A reset makes the suggestion,
+  its time, and its dismissal SQL NULL and keeps the stamp and the attempt count, so the
+  sweep classifies the row again (issue #1543); every other row is left as it was.
+  Until `make migrate` runs it, such a row still answers 500 on the routes that read
+  it. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`); `services/reservations/migrations/versions/0019_purpose_suggestion_unusable_reset.py` (`upgrade`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`, `test_classify_one_maps_each_answer_to_its_outcome`); `services/reservations/tests/test_purpose_suggestion_unusable_reset_migration.py` (`test_upgrade_resets_exactly_the_unusable_rows_and_runs_twice`, `test_upgrade_resets_every_unusable_row_across_batches`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_a_row_stored_before_the_fix_answers_after_migration_0019`); `services/reservations/tests/test_purpose_suggestion_reset_live_pg.py` (`test_migration_0019_resets_exactly_the_unusable_suggestions_on_postgres`)
 - **RES-PURPOSE-9.** The review list holds rows with an undismissed suggestion whose
@@ -996,10 +1006,10 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_backfill_marks_terminal_rows_without_suggestion`, `test_backfill_resets_capped_rows_without_suggestion`, `test_backfill_counts_newly_marked_and_reset_rows_together`)
 - **RES-PURPOSE-13.** Classify now runs the same single-row classifier immediately,
   ignores the attempt cap, and answers 200 with the outcome word for every outcome except
-  feature-off: a 200 whose body is not a usable suggestion (RES-PURPOSE-7) is `failed`,
-  and afterwards the review list, accept, dismiss, and the owner's reads of the row
-  answer as for a row with no suggestion, and Classify now can be run on it again
-  (issues #1543 and #1577). \
+  feature-off: a 200 whose body is not a usable suggestion (RES-PURPOSE-7) is `failed`
+  and stores nothing, so afterwards the review list (filtered or not), accept, dismiss,
+  and the owner's `GET /{id}` and `GET /` answer as for a row with no suggestion, and
+  Classify now can be run on it again (issues #1543 and #1577). \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`, `test_trigger_answers_the_outcome_word_for_every_answer`, `test_every_reader_answers_after_classify_now_gets_an_unusable_200`)
 - **RES-PURPOSE-14.** Every purpose review route is admin-only. \
@@ -1076,7 +1086,7 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_fork_version_endpoints.py` (`test_restore_does_not_stage_wiring_changed`)
 - **RES-FORK-10.** A cabling 4xx is relayed with its status and unwrapped detail; a 5xx
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
-  unavailable`; a transport failure is 503. \
+  unavailable`; a transport failure is 503. Known gap, see #1577. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_cabling_detail`) \
   Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
@@ -1144,7 +1154,7 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
-  absence is 503. \
+  absence is 503. Known gap, see #1577. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`) \
   Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
@@ -1434,7 +1444,20 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-None at present.
+- #1577 (RES-CREATE-9, RES-DYN-1, RES-DYN-10, RES-HOLD-5, RES-HOLD-9, RES-FORK-10,
+  RES-FORK-18): an upstream service's JSON body is read without one guarded helper, so
+  a 200 (or, for the fork relays, an error answer) whose body does not parse, is nested
+  deeper than the decoder's recursion limit, or has the wrong top-level type gets a
+  different, often undocumented, answer at each site. On create and PATCH it answers
+  422 or 400 with the decoder's message, 409 `'topology_type'`, a 503 carrying an
+  exception message, or a 500, where the rules say 503. Cancel, release, and the
+  provision-result failure branch answer 500 after their terminal status committed,
+  leaving the devices `RESERVED`; an expiration tick that meets such a body stops after
+  its completions, and those rows' devices stay `RESERVED`; the fork and wiring relays
+  answer 500. A real upstream cannot send these bodies while its response model holds;
+  it takes a deployment fault at the upstream's address. The purpose classifier's part
+  (RES-PURPOSE-6, RES-PURPOSE-7, RES-PURPOSE-13) is fixed; the utilization report's
+  part is in `operations-and-observability.md`.
 
 ### Limits by decision
 

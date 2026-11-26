@@ -187,29 +187,58 @@ def _read_classify_body(resp) -> tuple[object, str | None]:
         return None, "too_deep"
 
 
+def _unstorable_text(text: str) -> bool:
+    """True for a string that would break a reader once stored (issue #1543 review):
+    one holding a NUL, which Postgres's `json` operators (`->`, `->>`) refuse to
+    de-escape, or an unpaired surrogate, which those operators and the response
+    models' JSON encoder both refuse. A surrogate pair in the body decodes to one
+    code point, so it is not unpaired and passes."""
+    if "\x00" in text:
+        return True
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 def _suggestion_refusal(body: object) -> str | None:
     """None when a parsed 200 body is a usable suggestion; otherwise the fixed reason
     it is not (issue #1543).
 
-    Usable means a JSON object whose `top_category` is a string (the owner's decision
-    on #1543), nested no deeper than `_PURPOSE_SUGGESTION_MAX_DEPTH`, and holding no
+    The invariant: nothing is stored that the store, Postgres's `json` operators, or
+    the response models refuse later. Usable means a JSON object whose `top_category`
+    is a string (the owner's decision on #1543), nested no deeper than
+    `_PURPOSE_SUGGESTION_MAX_DEPTH` (the encoder that serializes the column, and the
+    response models past about 255 levels, refuse deeper nesting), holding no
     non-finite number (`NaN`, `Infinity`, or a literal such as `1e400` that Python
-    reads as infinity: none is JSON, and Postgres refuses the stored text). Reasons:
-    "wrong_shape", "too_deep", "not_json". Walked iteratively, so the check itself
-    cannot hit a recursion limit.
+    reads as infinity: none is JSON, and Postgres refuses the stored text), and
+    holding no string, dict keys included, that `_unstorable_text` refuses.
+    Reasons: "wrong_shape", "too_deep", "not_json", "bad_text". Walked
+    iteratively, pushing only containers, so the check itself cannot hit a
+    recursion limit and a flat answer is one pass.
     """
     if not isinstance(body, dict) or not isinstance(body.get("top_category"), str):
         return "wrong_shape"
-    pending: list[tuple[object, int]] = [(body, 1)]
+    pending: list[tuple[dict | list, int]] = [(body, 1)]
     while pending:
-        value, depth = pending.pop()
-        if isinstance(value, float) and not math.isfinite(value):
-            return "not_json"
-        if isinstance(value, (dict, list)):
-            if depth > _PURPOSE_SUGGESTION_MAX_DEPTH:
-                return "too_deep"
-            children = value.values() if isinstance(value, dict) else value
-            pending.extend((child, depth + 1) for child in children)
+        container, depth = pending.pop()
+        if depth > _PURPOSE_SUGGESTION_MAX_DEPTH:
+            return "too_deep"
+        if isinstance(container, dict):
+            if any(_unstorable_text(key) for key in container):
+                return "bad_text"
+            children = container.values()
+        else:
+            children = container
+        for child in children:
+            if isinstance(child, (dict, list)):
+                pending.append((child, depth + 1))
+            elif isinstance(child, str):
+                if _unstorable_text(child):
+                    return "bad_text"
+            elif isinstance(child, float) and not math.isfinite(child):
+                return "not_json"
     return None
 
 
@@ -289,7 +318,8 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
       suggestion (issue #1543, and #1577 for the depth): one that does not parse
       (not JSON, not UTF-8, or nested past the decoder's recursion limit), or that
       parses to anything but a JSON object with a string `top_category`, nested no
-      deeper than _PURPOSE_SUGGESTION_MAX_DEPTH and holding no non-finite number
+      deeper than _PURPOSE_SUGGESTION_MAX_DEPTH, holding no non-finite number, and
+      holding no string or key with a NUL or an unpaired surrogate
       (_suggestion_refusal). purpose_classify_attempts is incremented and
       nothing is stored, so a JSON `null` counts an attempt like any other.
 

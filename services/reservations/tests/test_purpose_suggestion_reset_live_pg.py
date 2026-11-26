@@ -5,10 +5,12 @@ The SQLite suite (`test_purpose_suggestion_unusable_reset_migration.py`) pins th
 rule; this one proves the part SQLite cannot: on Postgres, every operator that looks
 inside a `json` value (`->`, `->>`, `json_each`) de-escapes it and fails on text such as
 `"\\u0000"`, which the `json` type stores, so the migration reads each stored value back
-as text and judges it in Python. Here rows holding `\\u0000` and a lone surrogate sit
-beside the rows the upgrade must reset, and the upgrade, schema-qualified as the stack
-runs it, resets exactly the unusable ones, leaves every other row byte for byte, and is
-a no-op the second time.
+as text and judges it in Python. Here rows holding `\\u0000` and unpaired surrogates (in
+values, keys, and `top_category`; all of them reset since the #1543 review, because
+those same operators made the review list fail on them), rows nested 32, 33, and 300
+levels, and rows a reader accepts sit together, and the upgrade, schema-qualified as
+the stack runs it, does not abort, resets exactly the unusable ones, leaves every other
+row byte for byte, and is a no-op the second time.
 
 Env contract identical to test_reservation_status_cas_live_pg.py:
     HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN.
@@ -33,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -107,14 +110,50 @@ async def pg_engine():
     await engine.dispose()
 
 
+def _strings_and_keys(value: object, depth: int = 1) -> tuple[list[str], int, bool]:
+    """Every string and key in `value`, its nesting depth, and whether it holds a number
+    that is not finite (recursive: the values here are a few levels deep or a few
+    hundred at most)."""
+    if isinstance(value, dict):
+        found, deepest, bad = list(value), depth, False
+        children = value.values()
+    elif isinstance(value, list):
+        found, deepest, bad = [], depth, False
+        children = value
+    else:
+        if isinstance(value, str):
+            return [value], depth - 1, False
+        return [], depth - 1, isinstance(value, float) and not math.isfinite(value)
+    for child in children:
+        more, child_depth, child_bad = _strings_and_keys(child, depth + 1)
+        found += more
+        deepest = max(deepest, child_depth)
+        bad = bad or child_bad
+    return found, deepest, bad
+
+
 def _usable(stored: str) -> bool:
-    """The rule (RES-PURPOSE-8 and the owner's decision on #1543), restated here so the
-    test does not take its expectation from the migration under test."""
+    """RES-PURPOSE-7's rule, restated here so the test does not take its expectation
+    from the migration under test: a JSON object with a string `top_category`, nested
+    no deeper than 32 levels, with no number that is not finite, and no string or key
+    holding a NUL or an unpaired surrogate (one that cannot be encoded as UTF-8)."""
     try:
         value = json.loads(stored)
     except (ValueError, RecursionError):
         return False
-    return isinstance(value, dict) and isinstance(value.get("top_category"), str)
+    if not isinstance(value, dict) or not isinstance(value.get("top_category"), str):
+        return False
+    texts, depth, non_finite = _strings_and_keys(value)
+    if depth > 32 or non_finite:
+        return False
+    for string in texts:
+        if "\x00" in string:
+            return False
+        try:
+            string.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+    return True
 
 
 def _after(state: tuple) -> tuple:
@@ -155,9 +194,19 @@ _OWN_ROWS = [
     '{"r": "\\u0000"}',
     '["\\u0000"]',
     '{"top_category": "training"}',
+    # A NUL or an unpaired surrogate in a value, a key, or top_category: reset (they
+    # were kept before the #1543 review; Postgres's `->` and `->>` refuse both).
     '{"top_category": "training", "r": "\\u0000"}',
+    '{"top_category": "training", "\\u0000": 1}',
     '{"top_category": "\\u0000"}',
     '{"top_category": "\\ud800"}',
+    '{"top_category": "training", "d": [{"\\udc00": 1}]}',
+    # Kept: a surrogate pair, a noncharacter, and another control character.
+    '{"top_category": "training", "\\ud83d\\ude00": "\\uffff\\u0001"}',
+    # Depth: 32 levels kept, 33 reset, 300 reset (the response models refuse it).
+    '{"top_category": "t", "x": ' + "[" * 31 + "]" * 31 + "}",
+    '{"top_category": "t", "x": ' + "[" * 32 + "]" * 32 + "}",
+    '{"top_category": "t", "x": ' + "[" * 299 + "]" * 299 + "}",
     '{ "top_category" : "qa_regression" }',
     None,
 ]

@@ -6,13 +6,21 @@ read the row then answered 500 (the review list, accept, dismiss, and the owner'
 `GET /{id}`). An object without a string `top_category` was stored too, and accept
 with a null body then cleared the row's category. A JSON `null` stored nothing but
 still set `purpose_suggested_at`. The classifier now stores a body only when it is a
-JSON object with a string `top_category`; this one-time data pass repairs the rows
+usable suggestion (RES-PURPOSE-7 in `docs/specs/reservations.md`); this one-time data
+pass repairs the rows
 written before that, the way the issue's proposed fix (point 4) describes, so the
 sweep classifies them again.
 
-A row is reset when its stored `purpose_suggestion` is not SQL NULL and is not a JSON
-object whose `top_category` is a JSON string, or when it is SQL NULL while
-`purpose_suggested_at` or `purpose_suggestion_dismissed_at` is set. A reset stores
+A row is reset when its stored `purpose_suggestion` is not SQL NULL and is not one the
+classifier would store today (RES-PURPOSE-7's rule, frozen in `_usable`), or when it is
+SQL NULL while `purpose_suggested_at` or `purpose_suggestion_dismissed_at` is set. The
+stored text is not usable when Python cannot parse it (`ValueError`, such as an integer
+over 4,300 digits, or `RecursionError`, nesting past the decoder's limit), when it is
+anything but a JSON object whose `top_category` is a string, when it nests deeper than
+32 levels (the response models refuse past about 255, and the old code stored any depth
+that parsed), when it holds a number that is not finite, or when any string or key in
+it holds a NUL or an unpaired surrogate (Postgres's `->` and `->>` refuse both, so one
+such row made the review list fail for every admin). A reset stores
 SQL NULL in all three columns; `purpose_classify_requested_at` and
 `purpose_classify_attempts` are kept, so a stamped row under the attempt cap is
 eligible for the sweep again (RES-PURPOSE-5) and keeps its place in the queue. The
@@ -37,6 +45,7 @@ Create Date: 2026-11-26 00:00:00.000000
 """
 
 import json
+import math
 import os
 
 import sqlalchemy as sa
@@ -56,14 +65,49 @@ def _qualified(table: str) -> str:
     return f"{_schema}.{table}" if _schema else table
 
 
+_MAX_DEPTH = 32
+
+
+def _bad_text(text: str) -> bool:
+    if "\x00" in text:
+        return True
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 def _usable(stored_text: str) -> bool:
-    """The shape rule the classifier applies before it stores (issue #1543), frozen
-    here so a later change to the service cannot change what this revision did."""
+    """The rule the classifier applies before it stores (issue #1543), frozen here so
+    a later change to the service cannot change what this revision did. Self-contained
+    on purpose: it imports nothing from the service."""
     try:
         value = json.loads(stored_text)
     except (ValueError, RecursionError):
         return False
-    return isinstance(value, dict) and isinstance(value.get("top_category"), str)
+    if not isinstance(value, dict) or not isinstance(value.get("top_category"), str):
+        return False
+    pending = [(value, 1)]
+    while pending:
+        container, depth = pending.pop()
+        if depth > _MAX_DEPTH:
+            return False
+        if isinstance(container, dict):
+            if any(_bad_text(key) for key in container):
+                return False
+            children = container.values()
+        else:
+            children = container
+        for child in children:
+            if isinstance(child, (dict, list)):
+                pending.append((child, depth + 1))
+            elif isinstance(child, str):
+                if _bad_text(child):
+                    return False
+            elif isinstance(child, float) and not math.isfinite(child):
+                return False
+    return True
 
 
 def upgrade() -> None:

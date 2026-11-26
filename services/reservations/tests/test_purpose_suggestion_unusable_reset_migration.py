@@ -2,10 +2,13 @@
 suggestion are reset.
 
 Before the fix the classifier stored whatever a 200 parsed to, so a row can hold a list,
-a string, a number, a boolean, the JSON literal "null", or an object without a string
-`top_category`, and a JSON `null` answer left `purpose_suggested_at` set with no
-suggestion. 0019 stores SQL NULL in the suggestion, its time, and its dismissal for each
-such row, keeps the stamp and the attempt count, and leaves every other row alone. The
+a string, a number, a boolean, the JSON literal "null", an object without a string
+`top_category`, an object nested at any depth that parsed, or a NUL or an unpaired
+surrogate in any string or key, and a JSON `null` answer left `purpose_suggested_at`
+set with no suggestion. 0019 stores SQL NULL in the suggestion, its time, and its
+dismissal for each row the classifier would not store today (RES-PURPOSE-7), and for
+stored text Python cannot parse, keeps the stamp and the attempt count, and leaves
+every other row alone. The
 upgrade runs for real through Alembic's Operations against an in-memory SQLite
 database (the shape of `test_pending_fork_prune_sql_null_migration.py`); the Postgres
 run is `test_purpose_suggestion_reset_live_pg.py`. The table here has only the columns
@@ -34,6 +37,16 @@ _migration = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_migration)
 
 SQL_NULL = None
+# Far past the JSON decoder's recursion limit on every interpreter (about 10,000 on 3.12).
+_DEEP = 200_000
+
+
+def _nested(lists: int) -> str:
+    """An object with a string top_category whose field `x` is `lists` lists deep, so
+    the object nests `lists + 1` levels."""
+    return '{"top_category": "t", "x": ' + "[" * lists + "]" * lists + "}"
+
+
 AT = "2026-11-20 10:00:00"
 REQUESTED = "2026-11-19 10:00:00"
 RESET = (SQL_NULL, SQL_NULL, SQL_NULL)
@@ -58,8 +71,24 @@ _ROWS = [
     ("top-category-integer", '{"top_category": 7}', AT, None, RESET),
     ("top-category-list", '{"top_category": ["training"]}', AT, None, RESET),
     ("top-category-object", '{"top_category": {"n": "training"}}', AT, None, RESET),
-    # Text the stored column cannot have been given by the classifier, judged unusable.
+    # Text Python cannot parse: not JSON, an integer over the 4,300-digit limit
+    # (ValueError), and nesting past the decoder's recursion limit (RecursionError, not
+    # a ValueError: a judge that caught ValueError only would abort the upgrade here).
     ("not-json", "not json", AT, None, RESET),
+    ("integer-over-digit-limit", '{"top_category": "t", "n": ' + "9" * 5000 + "}", AT, None, RESET),
+    ("past-decoder-limit", _nested(_DEEP), AT, None, RESET),
+    # The rest of RES-PURPOSE-7's rule, which the old code did not apply: nesting past 32
+    # levels (the response models refuse past about 255), a number that is not finite,
+    # and a NUL or an unpaired surrogate in any string or key (Postgres's `->` and `->>`
+    # refuse both). Written as JSON escapes, so this file stays ASCII.
+    ("past-store-bound", _nested(32), AT, None, RESET),
+    ("nan", '{"top_category": "t", "p": NaN}', AT, None, RESET),
+    ("nul-in-value", '{"top_category": "training", "r": "\\u0000"}', AT, AT, RESET),
+    ("nul-in-key", '{"top_category": "training", "\\u0000": 1}', AT, None, RESET),
+    ("nul-in-top-category", '{"top_category": "t\\u0000"}', AT, None, RESET),
+    ("surrogate-in-value", '{"top_category": "t", "d": [{"c": "\\ud800"}]}', AT, None, RESET),
+    ("surrogate-in-key", '{"top_category": "t", "d": [{"\\udc00": 1}]}', AT, AT, RESET),
+    ("surrogate-in-top-category", '{"top_category": "\\ud800"}', AT, None, RESET),
     # The JSON null answer's residue: no suggestion, but a time (and, defensively, a
     # dismissal with no suggestion).
     ("null-residue", None, AT, None, RESET),
@@ -80,12 +109,13 @@ _ROWS = [
         AT,
         ('{ "top_category" : "qa_regression", "x": [1] }', AT, AT),
     ),
+    ("usable-at-store-bound", _nested(31), AT, None, (_nested(31), AT, None)),
     (
-        "usable-nul-escape",
-        '{"top_category": "training", "r": "\\u0000"}',
+        "usable-surrogate-pair-and-noncharacter",
+        '{"top_category": "t", "\\ud83d\\ude00": "\\uffff\\u0001"}',
         AT,
         None,
-        ('{"top_category": "training", "r": "\\u0000"}', AT, None),
+        ('{"top_category": "t", "\\ud83d\\ude00": "\\uffff\\u0001"}', AT, None),
     ),
     (
         "usable-duplicate-key-last-wins",

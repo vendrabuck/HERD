@@ -434,6 +434,12 @@ _STORED_BEFORE_THE_FIX = [
     "{}",
     '{"top_category": 7}',
     '{"top_category": null}',
+    # Usable-shaped, but a reader refuses them (the #1543 review): an unpaired
+    # surrogate (the response models), a NUL (Postgres's `->>`), and 300 levels (the
+    # response models). Written as JSON escapes, so this file stays ASCII.
+    '{"top_category": "training", "r": "\\ud800"}',
+    '{"top_category": "training", "\\u0000": 1}',
+    '{"top_category": "t", "x": ' + "[" * 299 + "]" * 299 + "}",
     None,
 ]
 

@@ -6,8 +6,12 @@ Covered: a 200 whose body is a usable suggestion (a JSON object with a string
 `top_category`); a 200 whose body is not one (issue #1543): one that does not parse
 (not JSON, empty, HTML, not UTF-8, or nested past the decoder's recursion limit, issue
 #1577), every JSON type other than an object, an object without `top_category` or with
-one of every other JSON type, an object nested deeper than the classifier stores, and
-an object holding a number that is not finite; a 403 with the disabled marker, and
+one of every other JSON type, an object nested deeper than the classifier stores, an
+object holding a number that is not finite, and an object holding a NUL or an unpaired
+surrogate in a value, a nested value, a key, a nested key, or `top_category` itself
+(written as JSON escapes, so this file stays ASCII); beside those, the code points
+that are stored (a surrogate pair, a noncharacter, a control character other than
+NUL); a 403 with the disabled marker, and
 403s without it (one nested past the decoder's recursion limit among them); a 404;
 429, 502, 503, and 504; every other `http.HTTPStatus` member; a timeout; a transport
 error other than a timeout.
@@ -34,10 +38,11 @@ where the marker sits in a 403 body or which strings count as the marker:
 classifier's docstring and `test_reconcile_403_legacy_string_detail_is_still_feature_off`
 state), `403-marker-under-another-key` (the marker read only under `detail`), and
 `403-json-list` (a body that is not an object has no marker). The depth bound
-(`200-object-nested-past-the-store-bound`) and the non-finite numbers are decided by
-the code too: the owner's rule on #1543 names the object and its string `top_category`,
-and the classifier refuses these as well because they cannot be stored safely (see
-`_suggestion_refusal`).
+(`200-object-nested-past-the-store-bound`), the non-finite numbers, and the NUL and
+unpaired-surrogate strings are decided by the code too: the owner's rule on #1543 names
+the object and its string `top_category`, and the classifier refuses these as well
+because the store, Postgres's `json` operators, or the response models would refuse
+them later (see `_suggestion_refusal`).
 
 The outcome words are the six `classify_purpose_one`'s docstring names: `ok`,
 `feature_off`, `forbidden`, `timeout`, `transient`, `failed`.
@@ -262,6 +267,39 @@ def _answers() -> list[Answer]:
             _response(200, content=b'{"top_category": "training", "p": 1e400}'),
             "failed",
         ),
+    ]
+    # A NUL or an unpaired surrogate anywhere in the object (#1543 review): in a value,
+    # a nested value, a key, a nested key, and top_category itself. Each is written as
+    # a JSON escape inside the body template, so this file stays ASCII.
+    templates = {
+        "value": '{"top_category": "training", "r": "a%sb"}',
+        "nested-value": '{"top_category": "training", "d": [{"category": "a%sb"}]}',
+        "key": '{"top_category": "training", "a%sb": 1}',
+        "nested-key": '{"top_category": "training", "d": [{"a%sb": 1}]}',
+        "top-category": '{"top_category": "training%s"}',
+    }
+    escapes = {"nul": "\\u0000", "high-surrogate": "\\ud800", "low-surrogate": "\\udc00"}
+    for text, escape in escapes.items():
+        for where, template in templates.items():
+            body = (template % escape).encode()
+            cases.append(Answer(f"200-{text}-in-{where}", _response(200, content=body), "failed"))
+    # The code points beside them that are stored: a surrogate pair (one code point), a
+    # noncharacter, and a control character other than NUL.
+    for name, escape, decoded in (
+        ("surrogate-pair", "\\ud83d\\ude00", "\U0001f600"),
+        ("noncharacter", "\\uffff", "\uffff"),
+        ("control-character", "\\u0001", "\x01"),
+    ):
+        body = '{"top_category": "training", "r": "%s", "%s": 1}' % (escape, escape)
+        cases.append(
+            Answer(
+                f"200-{name}-is-stored",
+                _response(200, content=body.encode()),
+                "ok",
+                {"top_category": "training", "r": decoded, decoded: 1},
+            )
+        )
+    cases += [
         # 403 with the marker, and the legacy plain-string marker (RES-PURPOSE-6).
         Answer("403-marker", _response(403, json={"detail": FEATURE_OFF_DETAIL}), "feature_off"),
         Answer(

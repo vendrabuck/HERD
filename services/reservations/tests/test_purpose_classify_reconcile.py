@@ -771,7 +771,12 @@ UNUSABLE_200_IDS = [a.id for a in UNUSABLE_200]
 def _expected_reason(answer: Answer) -> str:
     """The fixed reason code each unusable 200 is logged with: nested too deep (for the
     decoder, or past the store bound), not JSON (it does not parse, or holds a number
-    that is not finite), or the wrong shape (anything else)."""
+    that is not finite), bad text (a NUL or an unpaired surrogate in a string or key), or
+    the wrong shape (anything else)."""
+    if any(
+        answer.id.startswith(f"200-{t}-in-") for t in ("nul", "high-surrogate", "low-surrogate")
+    ):
+        return "bad_text"
     if "deep" in answer.id or "store-bound" in answer.id:
         return "too_deep"
     not_json = ("not-json", "empty-body", "html", "invalid-utf8", "nan", "infinity", "overflow")
@@ -790,7 +795,15 @@ def test_the_unusable_200_table_covers_every_json_type_and_reason():
     for kind in ("null", "integer", "float", "true", "list", "object"):
         assert f"200-top-category-{kind}" in ids
     assert {"200-deep-array", "200-deep-object", "200-no-top-category"} <= ids
-    assert {_expected_reason(a) for a in UNUSABLE_200} == {"not_json", "too_deep", "wrong_shape"}
+    for text in ("nul", "high-surrogate", "low-surrogate"):
+        for where in ("value", "nested-value", "key", "nested-key", "top-category"):
+            assert f"200-{text}-in-{where}" in ids
+    assert {_expected_reason(a) for a in UNUSABLE_200} == {
+        "not_json",
+        "too_deep",
+        "wrong_shape",
+        "bad_text",
+    }
 
 
 @pytest.mark.asyncio
