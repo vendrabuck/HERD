@@ -732,6 +732,136 @@ async def test_relay_never_starts_listener_without_a_postgres_engine(session_fac
     assert calls == []
 
 
+# --- A broken listener never changes how the relay ends (issue #1549) ---
+
+
+async def _spin(iterations: int = 50) -> None:
+    for _ in range(iterations):
+        await asyncio.sleep(0)
+
+
+class _ListenerDied(Exception):
+    pass
+
+
+async def test_relay_logs_a_listener_that_dies_and_still_ends_cancelled(session_factory, caplog):
+    """A wake-up listener that ends with an exception is logged when it ends (by
+    `log_task_crash`, class name only), the relay keeps draining on its tick, and
+    a cancel ends the relay with `CancelledError`, not the listener's exception."""
+    listener_text = "listener detail that must stay out of the log"
+
+    async def dying_listener(engine, channel, wake, *, retry_seconds):
+        raise _ListenerDied(listener_text)
+
+    nc = _always_connected_nc()
+    with (
+        patch("herd_common.outbox._listen_for_wakeups", new=dying_listener),
+        caplog.at_level("ERROR", logger="herd_common.outbox"),
+    ):
+        relay = asyncio.create_task(
+            run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                name="test-outbox",
+                tick_seconds=60.0,
+                prune_every_seconds=10_000.0,
+                engine=_fake_engine("postgresql"),
+            )
+        )
+        try:
+            await _spin()
+            crashed = [
+                r for r in caplog.records if getattr(r, "action", None) == "background_task_crashed"
+            ]
+            assert [(r.task_name, r.error_class) for r in crashed] == [
+                ("test-outbox listener", "_ListenerDied")
+            ], "the dead listener was not logged when it ended"
+            assert not relay.done(), "a dead listener ended the relay"
+        finally:
+            relay.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await relay
+    assert listener_text not in caplog.text
+
+
+async def test_listen_for_wakeups_setup_failure_is_logged_once_and_returns(monkeypatch, caplog):
+    """The connect arguments come from the engine's dialect; when building them
+    raises, the listener logs ONE ERROR line (fixed `action`, class name only),
+    never connects, and returns instead of ending with the exception, so the relay
+    that awaits it at shutdown ends cancelled."""
+    setup_text = "dialect detail that must stay out of the log"
+
+    def broken_connect_args(url):
+        raise _ListenerDied(setup_text)
+
+    engine = SimpleNamespace(
+        url=SimpleNamespace(), dialect=SimpleNamespace(create_connect_args=broken_connect_args)
+    )
+    connects: list[dict] = []
+
+    async def fake_connect(**kwargs):
+        connects.append(kwargs)
+        raise AssertionError("the listener connected after its setup failed")
+
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=fake_connect))
+    wake = asyncio.Event()
+
+    with caplog.at_level("DEBUG", logger="herd_common.outbox"):
+        task = asyncio.create_task(
+            _listen_for_wakeups(engine, "herd_outbox_test", wake, retry_seconds=0.0)
+        )
+        await _spin()
+        assert task.done(), "the listener kept running after a setup failure"
+        assert task.result() is None  # returned, not raised
+
+    records = [r for r in caplog.records if r.name == "herd_common.outbox"]
+    assert [(r.levelname, r.action, r.error_class) for r in records] == [
+        ("ERROR", "outbox_listener_setup_failed", "_ListenerDied")
+    ]
+    assert setup_text not in caplog.text
+    assert connects == []
+    assert not wake.is_set()
+
+
+async def test_relay_with_a_listener_whose_setup_fails_ends_cancelled(
+    session_factory, monkeypatch, caplog
+):
+    """End to end through the real listener: the setup failure is logged once, no
+    crash of the listener task is logged (it returned), and the relay ends
+    `CancelledError` when cancelled."""
+
+    def broken_connect_args(url):
+        raise _ListenerDied("x")
+
+    engine = SimpleNamespace(
+        url=SimpleNamespace(),
+        dialect=SimpleNamespace(name="postgresql", create_connect_args=broken_connect_args),
+    )
+    monkeypatch.setitem(sys.modules, "asyncpg", SimpleNamespace(connect=AsyncMock()))
+    nc = _always_connected_nc()
+    with caplog.at_level("ERROR", logger="herd_common.outbox"):
+        relay = asyncio.create_task(
+            run_outbox_relay(
+                session_factory,
+                lambda: nc,
+                OutboxEvent,
+                tick_seconds=60.0,
+                prune_every_seconds=10_000.0,
+                engine=engine,
+            )
+        )
+        try:
+            await _spin()
+            assert not relay.done()
+        finally:
+            relay.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await relay
+    actions = [getattr(r, "action", None) for r in caplog.records]
+    assert actions == ["outbox_listener_setup_failed"]
+
+
 # --- _listen_for_wakeups: connect retry, reconnect backoff/close, DSN
 # (issue #695 review sweep: reconnect backoff, close-before-reconnect, DSN
 # from connect kwargs) ---

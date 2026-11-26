@@ -370,11 +370,14 @@ class ProvisionResultRequest(BaseModel):
     """Body of the execution service's provision-result callback (ADR 0004).
 
     device_ids are the inventory devices the dynamic instances materialized as;
-    on success they are attached to the reservation before it activates.
+    on success they are attached to the reservation before it activates. They are
+    parsed as UUIDs (issue #1552): a malformed id is a 422 before anything runs, and
+    every spelling of one id arrives as the same value, so the attach compares ids,
+    never their spelling.
     """
 
     succeeded: bool
-    device_ids: list[str] = Field(default_factory=list)
+    device_ids: list[uuid.UUID] = Field(default_factory=list)
     error: str | None = None
 
 

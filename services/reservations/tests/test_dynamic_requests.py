@@ -744,6 +744,143 @@ async def test_callback_success_with_repeated_device_ids_attaches_each_once(inte
     assert [str(d) for d in other.device_ids] == [other_device]
 
 
+# Issue #1552: identity is the UUID, never its spelling. Every spelling Python's
+# `uuid.UUID` and pydantic accept for one id.
+def _spellings(value: str) -> dict[str, str]:
+    parsed = uuid.UUID(value)
+    canonical = str(parsed)
+    return {
+        "lowercase": canonical,
+        "uppercase": canonical.upper(),
+        "braces": "{" + canonical + "}",
+        "braces_uppercase": "{" + canonical.upper() + "}",
+        "urn": "urn:uuid:" + canonical,
+        "hex32": parsed.hex,
+        "hex32_uppercase": parsed.hex.upper(),
+    }
+
+
+_SPELLING_KINDS = tuple(_spellings(str(uuid.uuid4())))
+
+
+async def _post_success(internal_client, rid, device_ids, fork_mock):
+    with patch(
+        "app.services.reservation_service._create_reservation_fork_best_effort",
+        new=fork_mock,
+    ):
+        return await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": True, "device_ids": device_ids, "error": None},
+        )
+
+
+@pytest.mark.parametrize("kind", _SPELLING_KINDS)
+async def test_callback_success_attaches_each_spelling_of_one_id_once(internal_client, kind):
+    """RES-DYN-7 (issue #1552): the new instance id N sent canonically and again in
+    `kind`, and the held DEVICE_A sent in `kind`, answers 200 applied, lands ACTIVE,
+    and holds DEVICE_A and N once each, in the row, the reservation.created payload,
+    and the fork's members. Before the fix a second spelling of one id answered 500
+    and left the row in PENDING_PROVISION."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+    new_id = str(uuid.uuid4())
+    reported = [new_id, _spellings(new_id)[kind], _spellings(DEVICE_A)[kind]]
+    fork_mock = AsyncMock()
+
+    resp = await _post_success(internal_client, rid, reported, fork_mock)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"reservation_id": str(rid), "status": "ACTIVE", "applied": True}
+    expected = sorted([DEVICE_A, new_id])
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert sorted(str(d) for d in res.device_ids) == expected
+    created = await _outbox_rows("herd.reservations.created")
+    assert [sorted(row.payload["device_ids"]) for row in created] == [expected]
+    fork_mock.assert_awaited_once()
+    assert sorted(str(d) for d in fork_mock.await_args.kwargs["member_device_ids"]) == expected
+
+
+async def test_callback_success_attaches_every_spelling_together_once(internal_client):
+    """All spellings of a new id and of the held DEVICE_A in one body attach each id
+    once (RES-DYN-7, issue #1552)."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+    new_id = str(uuid.uuid4())
+    reported = [*_spellings(DEVICE_A).values(), *_spellings(new_id).values()]
+
+    resp = await _post_success(internal_client, rid, reported, AsyncMock())
+
+    assert resp.status_code == 200, resp.text
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.ACTIVE
+    assert sorted(str(d) for d in res.device_ids) == sorted([DEVICE_A, new_id])
+
+
+_MALFORMED_DEVICE_IDS = {
+    "not_a_uuid": ["not-a-uuid"],
+    "empty_string": [""],
+    "short_hex": ["1234"],
+    "uuid_with_trailing_text": [str(uuid.uuid4()) + "x"],
+    "int": [7],
+    "bool": [True],
+    "null": [None],
+    "object": [{"id": str(uuid.uuid4())}],
+    "nested_list": [[str(uuid.uuid4())]],
+    "valid_then_malformed": [str(uuid.uuid4()), "not-a-uuid"],
+    "not_a_list": "not-a-list",
+}
+
+
+@pytest.mark.parametrize("succeeded", [True, False], ids=["success", "failure"])
+@pytest.mark.parametrize(
+    "device_ids", list(_MALFORMED_DEVICE_IDS.values()), ids=list(_MALFORMED_DEVICE_IDS)
+)
+async def test_callback_with_a_malformed_device_id_is_422_and_changes_nothing(
+    internal_client, device_ids, succeeded
+):
+    """RES-DYN-7 (issue #1552, owner decision): a device id that is not a UUID is
+    refused with 422 before anything runs, on a success or a failure callback. The
+    row keeps PENDING_PROVISION and its devices, no event is staged, no fork is
+    created, and no device is released; the provisioning timeout backstop
+    (RES-SWEEP-6) owns it. The answer does not quote the submitted value. Before the
+    fix a success callback answered 500."""
+    rid = await _insert_reservation(
+        ReservationStatus.PENDING_PROVISION, dynamic_template_ids=[TEMPLATE_ID]
+    )
+    fork_mock = AsyncMock()
+    release_mock = AsyncMock()
+    with (
+        patch(
+            "app.services.reservation_service._create_reservation_fork_best_effort",
+            new=fork_mock,
+        ),
+        patch(
+            "app.services.reservation_service._release_exclusive_devices_best_effort",
+            new=release_mock,
+        ),
+    ):
+        resp = await internal_client.post(
+            f"/internal/{rid}/provision-result",
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            json={"succeeded": succeeded, "device_ids": device_ids, "error": None},
+        )
+
+    assert resp.status_code == 422, resp.text
+    items = resp.json()["detail"]
+    assert items and all(item["loc"][:2] == ["body", "device_ids"] for item in items)
+    assert "not-a-uuid" not in resp.text and "not-a-list" not in resp.text
+    res = await _get_reservation(rid)
+    assert res.status == ReservationStatus.PENDING_PROVISION
+    assert [str(d) for d in res.device_ids] == [DEVICE_A]
+    assert await _outbox_rows() == []
+    fork_mock.assert_not_awaited()
+    release_mock.assert_not_awaited()
+
+
 # --- Provision-result callback: failure ---------------------------------------
 
 

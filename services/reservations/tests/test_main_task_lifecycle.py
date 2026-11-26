@@ -331,6 +331,119 @@ async def test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts():
         await _shut_down_holding(held)
 
 
+class _TaskDied(Exception):
+    """A fake loop raises this at once, before the lifespan yields (issue #1549)."""
+
+
+# Text an exception may carry from a driver, a model, or a stored value: the log lines
+# name the exception class only.
+_DEATH_TEXT = "upstream said: % Invalid input detected at marker"
+
+# The task names the lifespan logs, keyed by the name each fake replaces.
+_TASK_NAMES = {
+    "expiration_loop": "expiration_loop",
+    "purpose_classify_loop": "purpose_classify_loop",
+    "run_outbox_relay": "outbox_relay",
+}
+
+
+async def _crash_one_then_shut_down(dead: str, caplog) -> None:
+    """Run the real lifespan with NATS connected, make the `dead` loop end with an
+    exception at once, and check that it is logged before shutdown and that shutdown
+    then cancels the other two, closes NATS, and returns without raising."""
+    from app.main import lifespan
+
+    loops = _LifespanLoops()
+    survivors = [name for name in _LifespanLoops.NAMES if name != dead]
+
+    async def dies(*args, **kwargs):
+        loops.tasks[dead] = asyncio.current_task()
+        raise _TaskDied(_DEATH_TEXT)
+
+    patches = dict(zip(_LifespanLoops.NAMES, loops.patches(), strict=True))
+    patches[dead] = patch(
+        {
+            "expiration_loop": "app.tasks.expiration.expiration_loop",
+            "purpose_classify_loop": "app.tasks.expiration.purpose_classify_loop",
+            "run_outbox_relay": "app.main.run_outbox_relay",
+        }[dead],
+        new=dies,
+    )
+    nc = MagicMock()
+    nc.close = AsyncMock()
+    caplog.clear()
+    started: set[asyncio.Task] = set()
+    exit_task: asyncio.Task | None = None
+    with (
+        caplog.at_level("ERROR", logger="app.main"),
+        patch("app.main.create_all_and_stamp", new=AsyncMock()),
+        patch("app.main.connect_nats", new=AsyncMock(return_value=nc)),
+        patch("app.main.ensure_stream", new=AsyncMock()),
+        patches["expiration_loop"],
+        patches["purpose_classify_loop"],
+        patches["run_outbox_relay"],
+    ):
+        before = asyncio.all_tasks()
+        context = lifespan(MagicMock())
+        await context.__aenter__()
+        try:
+            await _spin()
+            started = asyncio.all_tasks() - before
+            assert loops.tasks[dead].done() and not loops.tasks[dead].cancelled()
+
+            # Logged when it ended, while the service still runs: not at shutdown.
+            crashed = [
+                r for r in caplog.records if getattr(r, "action", None) == "background_task_crashed"
+            ]
+            assert [(r.levelname, r.task_name, r.error_class) for r in crashed] == [
+                ("ERROR", _TASK_NAMES[dead], "_TaskDied")
+            ], f"{dead} died and was not logged when it ended"
+            for name in survivors:
+                assert not loops.tasks[name].done(), name
+
+            exit_task = asyncio.create_task(context.__aexit__(None, None, None))
+            await _spin()
+            assert exit_task.done(), f"shutdown did not return after {dead} died"
+            assert await exit_task is False  # re-raises anything shutdown raised
+            for name in survivors:
+                assert name in loops.cancel_seen, f"shutdown never cancelled {name}"
+                assert loops.tasks[name].cancelled(), name
+            nc.close.assert_awaited_once()
+
+            at_shutdown = [
+                r
+                for r in caplog.records
+                if getattr(r, "action", None) == "background_task_failed_at_shutdown"
+            ]
+            assert [(r.levelname, r.task_name, r.error_class) for r in at_shutdown] == [
+                ("ERROR", _TASK_NAMES[dead], "_TaskDied")
+            ]
+            assert _DEATH_TEXT not in caplog.text
+        finally:
+            for event in loops.release.values():
+                event.set()
+            for task in started:
+                task.cancel()
+            if exit_task is None:
+                exit_task = asyncio.create_task(context.__aexit__(None, None, None))
+            await _spin()
+            if not exit_task.done():
+                exit_task.cancel()
+                await _spin()
+            _retrieve(*started, exit_task)
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("dead", _LifespanLoops.NAMES)
+async def test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step(dead, caplog):
+    """Issue #1549: each of the three lifespan tasks in turn ends with an exception
+    before the lifespan yields. It is logged at ERROR the moment it ends (fixed
+    `action`, the task's name, the class name, no exception text), the others keep
+    running, and shutdown cancels the other two, logs the dead one again, closes
+    NATS, and returns without raising."""
+    await _crash_one_then_shut_down(dead, caplog)
+
+
 @pytest.mark.timeout(60)
 async def test_startup_creates_the_schema_from_the_services_metadata():
     """The lifespan builds or checks the schema at startup with this service's

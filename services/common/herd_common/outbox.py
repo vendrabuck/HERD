@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
 from herd_common.advisory_lock import is_postgres_dialect
+from herd_common.background_tasks import log_task_crash
 
 logger = logging.getLogger(__name__)
 
@@ -252,17 +253,38 @@ async def _listen_for_wakeups(
     `async_creator_fn`, `prepared_statement_cache_size`,
     `prepared_statement_name_func`) are not accepted by `asyncpg.connect`
     itself and are popped before the call.
-    """
-    import asyncpg
 
-    _, opts = engine.dialect.create_connect_args(engine.url)
-    for key in (
-        "async_fallback",
-        "async_creator_fn",
-        "prepared_statement_cache_size",
-        "prepared_statement_name_func",
-    ):
-        opts.pop(key, None)
+    Issue #1549: that setup (the driver import and the connect arguments) runs
+    inside its own `try`. It depends only on the engine, so a retry would fail the
+    same way: a failure is logged ONCE at ERROR (`action`
+    `outbox_listener_setup_failed`, the exception class name only) and the
+    listener returns, leaving the relay on its tick. It never ends the listener
+    with an exception, so it never changes how the relay ends.
+    """
+    try:
+        import asyncpg
+
+        _, opts = engine.dialect.create_connect_args(engine.url)
+        for key in (
+            "async_fallback",
+            "async_creator_fn",
+            "prepared_statement_cache_size",
+            "prepared_statement_name_func",
+        ):
+            opts.pop(key, None)
+    except Exception as exc:
+        logger.error(
+            "outbox listener: could not prepare the listen connection for channel %s "
+            "(%s); the relay drains on its tick only",
+            channel,
+            type(exc).__name__,
+            extra={
+                "action": "outbox_listener_setup_failed",
+                "channel": channel,
+                "error_class": type(exc).__name__,
+            },
+        )
+        return
 
     while True:
         conn = None
@@ -356,8 +378,12 @@ async def run_outbox_relay(
     channel = outbox_channel(model)
     listener_task: asyncio.Task | None = None
     if wake_on_write and engine is not None and is_postgres_dialect(engine.dialect.name):
-        listener_task = asyncio.create_task(
-            _listen_for_wakeups(engine, channel, wake, retry_seconds=tick_seconds)
+        listener_task = log_task_crash(
+            asyncio.create_task(
+                _listen_for_wakeups(engine, channel, wake, retry_seconds=tick_seconds)
+            ),
+            name=f"{name} listener",
+            log=logger,
         )
 
     max_backoff = max(tick_seconds * 10, 300)
@@ -447,11 +473,14 @@ async def run_outbox_relay(
             except asyncio.CancelledError:
                 raise
     finally:
+        # Issue #1549: a listener that already ended with an exception (logged when
+        # it ended, by `log_task_crash`) re-raises it here; it must not replace how
+        # the relay itself ends, so only the relay's own exit propagates.
         if listener_task is not None:
             listener_task.cancel()
             try:
                 await listener_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
 

@@ -425,9 +425,9 @@ async def test_valid_fork_devices_count_around_entries_that_are_not_uuids(
     second row's switch with its hours, the third row's reserved device alone, and
     nothing from the key that names no reservation.
 
-    Only string values are sent. A wrongly typed value (a number or a boolean as a
-    device id, a number as the list, `devices` as a list, a list as the body) is not
-    tried: no rule says what it becomes.
+    Only string values are sent here. Wrongly typed values (issue #1553) are pinned by
+    `test_wrongly_typed_entries_are_skipped_and_the_report_is_still_produced` and
+    `test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes`.
     """
     reserved_a, reserved_b, reserved_c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     switch_a1, switch_a2, switch_b, orphan_switch = (uuid.uuid4() for _ in range(4))
@@ -511,6 +511,83 @@ async def test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes(
     assert resp.status_code == 503
     assert resp.json() == {"detail": {"error": "transit_gear_unavailable"}}
     assert batch.call_count == 1
+
+
+# Issue #1553: a 200 whose body is not an object holding a `devices` object, or not
+# JSON at all. Each answered 500 (or 422 for a body that does not parse) before.
+WRONG_200_BODIES = [
+    pytest.param({"json": [1, 2]}, id="list"),
+    pytest.param({"json": "x"}, id="string"),
+    pytest.param({"json": True}, id="true"),
+    # httpx sends no body for `json=None`, so `null` is written out.
+    pytest.param({"content": b"null"}, id="null"),
+    pytest.param({"json": {}}, id="empty_object"),
+    pytest.param({"json": {"devices": ["rid"]}}, id="devices_list"),
+    pytest.param({"json": {"devices": "abc"}}, id="devices_string"),
+    pytest.param({"json": {"devices": None}}, id="devices_null"),
+    pytest.param({"content": b"<html>proxy error</html>"}, id="not_json"),
+    pytest.param({"content": b"\xff\xfe"}, id="not_utf8"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", WRONG_200_BODIES)
+@pytest.mark.parametrize("route", ROUTES)
+async def test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes(
+    network, make_client, real_transit_lookup, route, body
+):
+    """OPS-REPORT-8 and OPS-REPORT-9 (issue #1553): a 200 from cabling whose body is
+    not an object with a `devices` object fails the report closed with the fixed 503,
+    on the JSON and the CSV route alike."""
+    await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[uuid.uuid4()], hours=2, owner_name="ann"
+    )
+    batch = network.post(CABLING_BATCH_URL).mock(return_value=httpx.Response(200, **body))
+
+    async with make_client(ADMIN) as client:
+        resp = await _get(client, route, None, section="device")
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"detail": {"error": "transit_gear_unavailable"}}
+    assert batch.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ROUTES)
+async def test_wrongly_typed_entries_are_skipped_and_the_report_is_still_produced(
+    network, make_client, real_transit_lookup, route
+):
+    """OPS-REPORT-7 (issue #1553, owner decision): inside a well-formed map, a device
+    list that is not a list and device ids that are not strings are skipped; the
+    report answers 200 and still counts every well-typed transit device."""
+    reserved_a, reserved_b, switch_a, switch_b = (uuid.uuid4() for _ in range(4))
+    first = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[reserved_a], hours=3, owner_name="ann"
+    )
+    second = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[reserved_b], hours=5, owner_name="bo"
+    )
+    third = await _insert(
+        status=ReservationStatus.COMPLETED, device_ids=[uuid.uuid4()], hours=7, owner_name="cy"
+    )
+    network.post(CABLING_BATCH_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "devices": {
+                    str(first.id): [7, str(switch_a), True, None, {"k": 1}],
+                    str(second.id): [str(reserved_b), [str(uuid.uuid4())], str(switch_b)],
+                    str(third.id): 7,
+                }
+            },
+        )
+    )
+
+    async with make_client(ADMIN) as client:
+        rows = await _device_rows(client, route)
+
+    transit = {device: row for device, row in rows.items() if row[2]}
+    assert transit == {str(switch_a): (3.0, 1, 1, 3.0), str(switch_b): (5.0, 1, 1, 5.0)}
 
 
 @pytest.mark.asyncio

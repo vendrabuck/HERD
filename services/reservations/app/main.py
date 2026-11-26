@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from herd_common.background_tasks import log_task_crash
 from herd_common.cors import add_cors_middleware
 from herd_common.jetstream import connect_nats, ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
@@ -113,26 +114,39 @@ async def lifespan(app: FastAPI):
         )
     )
 
+    # Issue #1549: a task that ends with an exception while the service runs is
+    # logged the moment it ends (class name only), not first at shutdown.
+    background_tasks = {
+        "expiration_loop": expiration_task,
+        "purpose_classify_loop": purpose_classify_task,
+        "outbox_relay": outbox_task,
+    }
+    for task_name, task in background_tasks.items():
+        log_task_crash(task, name=task_name, log=logger)
+
     yield
 
-    # Cancel background tasks
-    expiration_task.cancel()
-    try:
-        await expiration_task
-    except asyncio.CancelledError:
-        pass
-
-    purpose_classify_task.cancel()
-    try:
-        await purpose_classify_task
-    except asyncio.CancelledError:
-        pass
-
-    outbox_task.cancel()
-    try:
-        await outbox_task
-    except asyncio.CancelledError:
-        pass
+    # Cancel every background task first, then await each one (issue #1549). A task
+    # that already ended with an exception re-raises it at its await; that is
+    # logged here and does not stop the remaining awaits or the NATS close below.
+    for task in background_tasks.values():
+        task.cancel()
+    for task_name, task in background_tasks.items():
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Background task %s had ended with %s; shutdown continues",
+                task_name,
+                type(exc).__name__,
+                extra={
+                    "action": "background_task_failed_at_shutdown",
+                    "task_name": task_name,
+                    "error_class": type(exc).__name__,
+                },
+            )
 
     # Close NATS connection on shutdown
     if app.state.nats is not None:

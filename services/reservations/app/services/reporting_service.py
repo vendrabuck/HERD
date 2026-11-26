@@ -44,7 +44,9 @@ _TRANSIT_BATCH_CHUNK_SIZE = 500
 
 
 class TransitGearUnavailable(RuntimeError):
-    """Cabling was unreachable, or returned a non-200, fetching transit devices.
+    """Cabling was unreachable, returned a non-200, or returned a 200 whose body is
+    not an object holding a ``devices`` object (issue #1553), fetching transit
+    devices.
 
     Raised by ``_fetch_transit_devices`` and caught at the router to produce the
     pinned 503 ``{"error": "transit_gear_unavailable"}`` (ADR 0013 phase 3, D4):
@@ -133,14 +135,26 @@ async def _fetch_transit_devices(
 ) -> dict[uuid.UUID, list[uuid.UUID]]:
     """Chunk reservation_ids by 500 and merge cabling's per-reservation device lists.
 
-    Fails CLOSED: a transport failure or any non-200 response from any chunk
-    raises TransitGearUnavailable rather than degrading to an empty transit set
-    for the reservations in that chunk (D4). A reservation absent from a
-    successful response's ``devices`` map has no fork and contributes nothing.
+    Fails CLOSED: a transport failure, any non-200 response, or a 200 whose body
+    is not a JSON object holding a ``devices`` object (issue #1553), from any
+    chunk, raises TransitGearUnavailable rather than degrading to an empty
+    transit set for the reservations in that chunk (D4). A reservation absent
+    from a successful response's ``devices`` map has no fork and contributes
+    nothing.
+
+    Inside a well-formed map each entry is read leniently, so one bad entry
+    never hides another reservation's transit devices: a key that is not a UUID
+    is ignored, a null device list adds nothing, and a device id string that is
+    not a UUID is ignored while the entry's other ids still count. A device list
+    that is not a list, and a device id that is not a string, are wrongly typed:
+    they are skipped the same way, and the report logs ONE warning
+    (``transit_gear_entries_skipped``) with the two counts and no body text.
     """
     if not reservation_ids:
         return {}
     devices: dict[uuid.UUID, list[uuid.UUID]] = {}
+    skipped_lists = 0
+    skipped_ids = 0
     for i in range(0, len(reservation_ids), _TRANSIT_BATCH_CHUNK_SIZE):
         chunk = reservation_ids[i : i + _TRANSIT_BATCH_CHUNK_SIZE]
         try:
@@ -151,19 +165,53 @@ async def _fetch_transit_devices(
             raise TransitGearUnavailable(
                 f"cabling /internal/forks/devices/batch returned {resp.status_code}"
             )
-        data = resp.json() or {}
-        for rid_str, device_id_strs in (data.get("devices") or {}).items():
+        try:
+            data = resp.json()
+        except ValueError:
+            # Not JSON (a json.JSONDecodeError or a UnicodeDecodeError, both
+            # ValueErrors): the same closed failure, raised from None so the
+            # decoder's text, which quotes the body, is not chained on.
+            raise TransitGearUnavailable(
+                "cabling /internal/forks/devices/batch returned a body that is not JSON"
+            ) from None
+        device_map = data.get("devices") if isinstance(data, dict) else None
+        if not isinstance(device_map, dict):
+            raise TransitGearUnavailable(
+                "cabling /internal/forks/devices/batch returned a body that is not an "
+                "object with a devices object"
+            )
+        for rid_str, device_id_strs in device_map.items():
             try:
                 rid = uuid.UUID(rid_str)
             except (ValueError, TypeError):
                 continue
+            if device_id_strs is None:
+                device_id_strs = []
+            elif not isinstance(device_id_strs, list):
+                skipped_lists += 1
+                continue
             parsed: list[uuid.UUID] = []
-            for did_str in device_id_strs or []:
+            for did_str in device_id_strs:
+                if not isinstance(did_str, str):
+                    skipped_ids += 1
+                    continue
                 try:
                     parsed.append(uuid.UUID(did_str))
-                except (ValueError, TypeError):
+                except ValueError:
                     continue
             devices[rid] = parsed
+    if skipped_lists or skipped_ids:
+        logger.warning(
+            "Cabling's transit answer held %d device list(s) and %d device id(s) of the "
+            "wrong type; they were skipped",
+            skipped_lists,
+            skipped_ids,
+            extra={
+                "action": "transit_gear_entries_skipped",
+                "skipped_device_lists": skipped_lists,
+                "skipped_device_ids": skipped_ids,
+            },
+        )
     return devices
 
 
