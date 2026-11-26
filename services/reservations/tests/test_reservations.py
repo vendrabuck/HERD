@@ -4334,11 +4334,15 @@ async def _stored(rid: str) -> Reservation:
 
 
 def _patch_mocks(*, visible: set[str], validate=None):
-    """The router's visibility helper plus the service's inventory and cabling helpers."""
+    """The router's visibility helper plus the service's inventory and cabling helpers.
+
+    The visibility helper is autospecced, so a call is compared after binding to the
+    real signature: the same values passed by position or by keyword match."""
     return (
         patch(
             "app.routers.reservations._fetch_visible_device_ids_strict",
-            new=AsyncMock(return_value=visible),
+            autospec=True,
+            return_value=visible,
         ),
         patch(
             "app.services.reservation_service._fetch_devices",
@@ -4355,20 +4359,22 @@ def _patch_mocks(*, visible: set[str], validate=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", _EDITABLE, ids=lambda s: s.value)
 @pytest.mark.parametrize("role", _ROLES)
-@pytest.mark.parametrize("field", ["end_time", "purpose"])
+@pytest.mark.parametrize("field", ["end_time", "purpose", "purpose_with_null_device_ids"])
 async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field, role, status):
     """RES-PATCH-7 applies to a non-admin's new device_ids only: a PATCH of only
-    end_time or only purpose, by any role, answers 200 with the field written and
-    never asks inventory for visibility, even though the lookup would answer with
-    a set that leaves out the row's own device."""
+    end_time or only purpose, or of purpose with `device_ids` sent as null (#1551),
+    by any role, answers 200 with the field written and the device set unchanged,
+    and never asks inventory for visibility, even though the lookup would answer
+    with a set that leaves out the row's own device."""
     rid = await _insert_editable_row(status, [DEVICE_A])
     before = await _stored(rid)
     end = before.end_time.replace(tzinfo=timezone.utc)
-    body = (
-        {"end_time": (end - timedelta(hours=1)).isoformat()}
-        if field == "end_time"
-        else {"purpose": "purpose set by #1533"}
-    )
+    if field == "end_time":
+        body = {"end_time": (end - timedelta(hours=1)).isoformat()}
+    elif field == "purpose":
+        body = {"purpose": "purpose set by #1533"}
+    else:
+        body = {"purpose": "purpose set by #1533", "device_ids": None}
     visible_mock, fetch, validate, statuses = _patch_mocks(visible={DEVICE_B})
     try:
         async with _client_as(CALLER_ID, role) as ac:
@@ -4380,6 +4386,7 @@ async def test_patch_without_device_ids_never_runs_the_visibility_precheck(field
     assert resp.status_code == 200, resp.text
     lookup.assert_not_awaited()
     after = await _stored(rid)
+    assert {str(d) for d in after.device_ids} == {DEVICE_A}
     if field == "end_time":
         assert after.end_time.replace(tzinfo=timezone.utc) == end - timedelta(hours=1)
         assert after.purpose == before.purpose
@@ -4436,6 +4443,93 @@ async def test_patch_device_ids_precheck_runs_for_a_non_admin_only(visible_case,
         return
     assert resp.status_code == 200, resp.text
     assert stored == {DEVICE_A, DEVICE_B}
+
+
+# --- PATCH check order: visibility before owner and status (issue #1551) ---
+
+# The PATCH target: a reservation id that does not exist, or a row holding DEVICE_A
+# owned by the caller or by another user, in every status.
+_ORDER_TARGETS = [("missing", None)] + [
+    (owner, status) for owner in ("own", "other") for status in ReservationStatus
+]
+# The visibility lookup answers {DEVICE_A}; "visible" names only DEVICE_A, "invisible"
+# also names DEVICE_B. Both keep DEVICE_A, so an edit that goes through only adds.
+_ORDER_BODIES = {"visible": [DEVICE_A], "invisible": [DEVICE_A, DEVICE_B]}
+
+
+def _expected_order_answer(role, body_case, owner, status) -> tuple[int, str | None]:
+    """The spec's order for PATCH /{id}: RES-PATCH-7 (non-admin visibility), then
+    RES-PATCH-2 (owner, 404), then RES-PATCH-1 (status, 400)."""
+    if role not in _ADMIN_ROLES and body_case == "invisible":
+        return 403, "You do not have access to one or more requested devices"
+    if owner != "own":
+        return 404, "Reservation not found"
+    if status not in _EDITABLE:
+        return 400, f"Cannot update a {status.value} reservation"
+    return 200, None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner,status",
+    _ORDER_TARGETS,
+    ids=[
+        owner if status is None else f"{owner}-{status.value}" for owner, status in _ORDER_TARGETS
+    ],
+)
+@pytest.mark.parametrize("role", _ROLES)
+@pytest.mark.parametrize("body_case", sorted(_ORDER_BODIES))
+async def test_patch_visibility_precheck_answers_before_the_owner_and_status_checks(
+    body_case, role, owner, status
+):
+    """RES-PATCH-7, RES-PATCH-1, RES-PATCH-2 (issue #1551): the router's visibility
+    pre-check runs before update_reservation's owner and status checks.
+
+    For a non-admin the 403 is a function of the body and the caller's visibility
+    only: naming the invisible DEVICE_B answers the same 403 for an id that does
+    not exist, for another user's row, and for the caller's own row, in every
+    status, and the visibility lookup is awaited exactly once, for the caller with
+    the caller's token. Naming only visible devices, the non-admin meets the owner
+    check (404 for a missing id or another user's row) and then the status check
+    (400 with the status named). An admin or superadmin is never looked up, so the
+    same invisible body meets the owner and status checks instead. Every refusal
+    leaves the stored device set unchanged and never reaches the device fetch.
+
+    The issue's eight-row table is the cases `missing`, `other-ACTIVE`, and
+    `own-COMPLETED` for role `user` with both bodies, plus `other-ACTIVE` and
+    `own-COMPLETED` for role `admin` with the invisible body."""
+    if owner == "missing":
+        rid = str(uuid.uuid4())
+    else:
+        future = status == ReservationStatus.PENDING
+        rid = await _insert_reservation_for_user(
+            user_id=CALLER_ID if owner == "own" else OTHER_USER_ID,
+            device_ids=[DEVICE_A],
+            status=status,
+            start_offset=timedelta(hours=2) if future else timedelta(minutes=-30),
+            end_offset=timedelta(hours=5) if future else timedelta(hours=3),
+        )
+    visible_mock, fetch, validate, statuses = _patch_mocks(visible={DEVICE_A})
+    try:
+        async with _client_as(CALLER_ID, role) as ac:
+            with visible_mock as lookup, fetch as fetch_mock, validate, statuses:
+                resp = await ac.patch(f"/{rid}", json={"device_ids": _ORDER_BODIES[body_case]})
+    finally:
+        app.dependency_overrides.clear()
+
+    code, detail = _expected_order_answer(role, body_case, owner, status)
+    assert resp.status_code == code, resp.text
+    if role in _ADMIN_ROLES:
+        lookup.assert_not_awaited()
+    else:
+        lookup.assert_awaited_once_with(uuid.UUID(CALLER_ID), CALLER_TOKEN)
+    stored = None if owner == "missing" else {str(d) for d in (await _stored(rid)).device_ids}
+    if code != 200:
+        assert resp.json() == {"detail": detail}
+        fetch_mock.assert_not_awaited()
+        assert stored == (None if owner == "missing" else {DEVICE_A})
+        return
+    assert stored == set(_ORDER_BODIES[body_case])
 
 
 @pytest.mark.asyncio
