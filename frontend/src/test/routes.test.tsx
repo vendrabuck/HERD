@@ -4,7 +4,8 @@ import { describe, it, expect } from "vitest";
 import { appRouteElements } from "@/routes";
 import { AuthGuard, AdminGuard, GuestGuard } from "@/components/guards";
 import { AppLayout } from "@/components/layout/AppLayout";
-import { ADMIN_NAV } from "@/lib/adminNav";
+import { ADMIN_NAV, MAIN_NAV, visibleAdminNav, visibleMainNav } from "@/lib/adminNav";
+import { isAdminRole } from "@/lib/roles";
 import { ROUTE_TITLES } from "@/lib/routeTitles";
 import { OidcCompletePage } from "@/pages/OidcCompletePage";
 
@@ -156,16 +157,92 @@ describe("ADMIN_NAV matches the AdminGuard route group (issue #1317)", () => {
     }
   });
 
-  it("every guarded list route except /reporting (main nav) has an ADMIN_NAV entry", () => {
+  it("every guarded list route has a link in ADMIN_NAV or MAIN_NAV, and only there once", () => {
     const listRoutes = guardedPaths
-      .filter((path) => !path.includes(":") && !path.endsWith("/new") && path !== "/reporting")
+      .filter((path) => !path.includes(":") && !path.endsWith("/new"))
       .sort();
-    expect(ADMIN_NAV.map((item) => item.to).sort()).toEqual(listRoutes);
+    const linked = [...ADMIN_NAV, ...MAIN_NAV]
+      .map((item) => item.to)
+      .filter((to) => guardedPaths.includes(to))
+      .sort();
+    expect(linked).toEqual(listRoutes);
   });
 
   it("has no duplicate paths or labels", () => {
     expect(new Set(ADMIN_NAV.map((item) => item.to)).size).toBe(ADMIN_NAV.length);
     expect(new Set(ADMIN_NAV.map((item) => item.label)).size).toBe(ADMIN_NAV.length);
+  });
+});
+
+// Issue #1402: Reporting sat in the main navigation with no requirement, so a
+// plain user saw a link whose route AdminGuard bounced to /topology. Every
+// header link now states its requirement, and the requirement must match the
+// guard on its target route in both directions: a link to a guarded route
+// requires "admin" (else a non-admin sees a link that bounces), and a link
+// that requires "admin" targets a guarded route (else an admin-only link hides
+// a page every user may open).
+describe("header links require exactly what their route's guard requires (issue #1402)", () => {
+  const guardedPaths = new Set(
+    [...guardsByPath.entries()].filter(([, guards]) => guards.adminGuarded).map(([path]) => path),
+  );
+  const appLayoutPaths = pathsUnderAppLayout(routeObjects, false, []);
+  const headerLinks = [
+    ...MAIN_NAV.map((item) => ["MAIN_NAV", item] as const),
+    ...ADMIN_NAV.map((item) => ["ADMIN_NAV", item] as const),
+  ];
+
+  it.each(headerLinks)("%s %o: requires admin exactly when its route is AdminGuard-guarded", (_list, item) => {
+    expect(appLayoutPaths, item.to).toContain(item.to);
+    expect(item.requires === "admin", item.to).toBe(guardedPaths.has(item.to));
+  });
+
+  it("MAIN_NAV lists the five main pages in display order, Reporting last and admin only", () => {
+    expect(MAIN_NAV).toEqual([
+      { to: "/inventory", label: "Inventory" },
+      { to: "/templates", label: "Templates" },
+      { to: "/topology", label: "Topology" },
+      { to: "/reservations", label: "Reservations" },
+      { to: "/reporting", label: "Reporting", requires: "admin" },
+    ]);
+  });
+
+  it("no path is linked from both lists, and MAIN_NAV has no duplicate path or label", () => {
+    const adminPaths = new Set(ADMIN_NAV.map((item) => item.to));
+    expect(MAIN_NAV.filter((item) => adminPaths.has(item.to))).toEqual([]);
+    expect(new Set(MAIN_NAV.map((item) => item.to)).size).toBe(MAIN_NAV.length);
+    expect(new Set(MAIN_NAV.map((item) => item.label)).size).toBe(MAIN_NAV.length);
+  });
+});
+
+// The role space times both filters. The guard's own rule (AdminGuard.test.tsx)
+// renders an admin page only when isAdminRole(user.role) holds, and renders
+// nothing for an unknown account; the filters must show a requirement-gated
+// link on exactly the same roles.
+describe("visibleMainNav and visibleAdminNav over the role space (issue #1402)", () => {
+  const plainMain = MAIN_NAV.filter((item) => item.requires === undefined).map((item) => item.to);
+  const allMain = MAIN_NAV.map((item) => item.to);
+  const allAdmin = ADMIN_NAV.map((item) => item.to);
+
+  const roles: [description: string, role: string | null | undefined, admin: boolean][] = [
+    ["user", "user", false],
+    ["admin", "admin", true],
+    ["superadmin", "superadmin", true],
+    ["unknown (undefined, account not loaded)", undefined, false],
+    ["unknown (null)", null, false],
+    ["malformed (empty string)", "", false],
+    ["malformed (wrong case, Admin)", "Admin", false],
+    ["malformed (padded, ' admin')", " admin", false],
+    ["malformed (unrecognized, auditor)", "auditor", false],
+  ];
+
+  it("the plain main links are every MAIN_NAV entry but Reporting", () => {
+    expect(plainMain).toEqual(["/inventory", "/templates", "/topology", "/reservations"]);
+  });
+
+  it.each(roles)("role %s: main and admin links match the guard's rule", (_d, role, admin) => {
+    expect(visibleMainNav(role).map((item) => item.to)).toEqual(admin ? allMain : plainMain);
+    expect(visibleAdminNav(role).map((item) => item.to)).toEqual(admin ? allAdmin : []);
+    expect(isAdminRole(role)).toBe(admin);
   });
 });
 

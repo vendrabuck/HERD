@@ -1,32 +1,60 @@
 import { isAdminRole } from "@/lib/roles";
 
 /**
- * The Administration menu's entries (issue #1317), in display order. The menu
- * in `components/layout/AppLayout.tsx` renders ONLY from this array, and the
- * page titles in `lib/routeTitles.ts` reuse its labels.
- *
- * This array is the "Administration dropdown" place of the admin-route rule
- * in docs/specs/CONVENTIONS.md: a new top-level admin page adds its route to
- * the AdminGuard group in `routes.tsx` AND an entry here. `src/test/routes.test.tsx`
- * fails when the two drift: every path here must be AdminGuard-guarded, and
- * every guarded list path (no `:param`, not `/new`) except `/reporting` (which
- * sits in the main nav) must be here.
+ * The header's two link lists, the main navigation and the Administration
+ * menu, both declared here and both filtered by role through the same
+ * `REQUIREMENT_CHECKS` table. `components/layout/AppLayout.tsx` renders the
+ * main navigation ONLY from `MAIN_NAV` (via `visibleMainNav`) and the menu ONLY
+ * from `ADMIN_NAV` (via `visibleAdminNav`); the page titles in
+ * `lib/routeTitles.ts` reuse the menu's labels.
  *
  * `requires` names the role predicate a viewer must satisfy to see the link.
- * Every entry requires an admin today; the field exists so a future entry with
- * a different gate is a data change, not a second hand-written block.
+ * The "admin" predicate is `isAdminRole`, the same predicate `AdminGuard` in
+ * `components/guards.tsx` applies, so a link and its route's guard agree on
+ * every role, an unknown one (no account loaded yet) included: neither shows
+ * an admin page to it. `src/test/routes.test.tsx` fails when a link's
+ * `requires` and its target's guard drift: an entry links to an
+ * AdminGuard-guarded route exactly when it requires "admin" (issue #1402,
+ * where Reporting sat in the main navigation with no requirement and bounced
+ * a plain user to /topology).
+ *
+ * `ADMIN_NAV` is the "Administration dropdown" place of the admin-route rule
+ * in docs/specs/CONVENTIONS.md: a new top-level admin page adds its route to
+ * the AdminGuard group in `routes.tsx` AND an entry here, in `ADMIN_NAV`, or,
+ * for a page that belongs in the main navigation as Reporting does, in
+ * `MAIN_NAV` with `requires: "admin"`. `src/test/routes.test.tsx` also fails
+ * when a guarded list path (no `:param`, not `/new`) has no entry in either
+ * list.
  */
 export type NavRequirement = "admin";
 
-export interface AdminNavItem {
+export interface NavItem {
   to: string;
   label: string;
+  /** Absent: every signed-in viewer sees the link. */
+  requires?: NavRequirement;
+}
+
+export interface AdminNavItem extends NavItem {
   requires: NavRequirement;
 }
 
 const REQUIREMENT_CHECKS: Record<NavRequirement, (role: string | undefined | null) => boolean> = {
   admin: isAdminRole,
 };
+
+function visibleTo(item: NavItem, role: string | undefined | null): boolean {
+  return item.requires === undefined || REQUIREMENT_CHECKS[item.requires](role);
+}
+
+/** The main navigation's entries, in display order. */
+export const MAIN_NAV: readonly NavItem[] = [
+  { to: "/inventory", label: "Inventory" },
+  { to: "/templates", label: "Templates" },
+  { to: "/topology", label: "Topology" },
+  { to: "/reservations", label: "Reservations" },
+  { to: "/reporting", label: "Reporting", requires: "admin" },
+];
 
 export const ADMIN_NAV: readonly AdminNavItem[] = [
   { to: "/admin/add-device", label: "Add Device", requires: "admin" },
@@ -42,7 +70,12 @@ export const ADMIN_NAV: readonly AdminNavItem[] = [
   { to: "/admin/about", label: "About", requires: "admin" },
 ];
 
+/** The main navigation entries this role may see, in display order. */
+export function visibleMainNav(role: string | undefined | null): NavItem[] {
+  return MAIN_NAV.filter((item) => visibleTo(item, role));
+}
+
 /** The admin menu entries this role may see, in display order. */
 export function visibleAdminNav(role: string | undefined | null): AdminNavItem[] {
-  return ADMIN_NAV.filter((item) => REQUIREMENT_CHECKS[item.requires](role));
+  return ADMIN_NAV.filter((item) => visibleTo(item, role));
 }
