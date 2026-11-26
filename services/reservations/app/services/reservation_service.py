@@ -925,29 +925,36 @@ def _parse_prune_marker_entry(entry: object) -> uuid.UUID | None:
 
 def _union_prune_marker(
     stored: object, removed_ids: list[uuid.UUID]
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], str | None, int | None]:
     """The marker a device-set PATCH stores: the stored ids plus the removed ones.
 
-    Returns (marker, discarded_type). The stored value counts only when
-    `_prune_marker_actionable` says it is a non-empty list, and then only its entries
-    that parse as UUIDs, written back in canonical form, so two spellings of one id
-    become one entry (issue #1554). Any other stored value is treated as empty.
+    Returns (marker, discarded_type, discarded_entries). The stored value counts only
+    when `_prune_marker_actionable` says it is a non-empty list, and then only its
+    entries that parse as UUIDs, written back in canonical form, so two spellings of
+    one id become one entry (issue #1554). Any other stored value is treated as empty.
     `discarded_type` names the stored value's type when something corrupt was
     discarded (a non-list value, or list entries that do not parse); it is None for a
     marker that was absent (SQL NULL or a JSON null) or an empty list.
+    `discarded_entries` counts the list entries that did not parse; it is None when
+    the whole stored value was discarded (not a list) or nothing was.
     """
     kept: set[uuid.UUID] = set(removed_ids)
     discarded_type: str | None = None
+    discarded_entries: int | None = None
     if _prune_marker_actionable(stored):
+        unparsed = 0
         for entry in stored:
             parsed = _parse_prune_marker_entry(entry)
             if parsed is None:
-                discarded_type = type(stored).__name__
+                unparsed += 1
             else:
                 kept.add(parsed)
+        if unparsed:
+            discarded_type = type(stored).__name__
+            discarded_entries = unparsed
     elif stored is not None and stored != []:
         discarded_type = type(stored).__name__
-    return sorted(str(d) for d in kept), discarded_type
+    return sorted(str(d) for d in kept), discarded_type, discarded_entries
 
 
 async def _heal_non_actionable_prune_marker(reservation_id: uuid.UUID) -> bool:
@@ -2860,10 +2867,12 @@ async def update_reservation(
     # ids are kept in canonical form (issue #1554); a discard is logged after the
     # commit below, so a lost status guard (which keeps nothing) logs nothing.
     discarded_marker_type: str | None = None
+    discarded_marker_entries: int | None = None
     if removed_ids and observed_status == ReservationStatus.ACTIVE:
         (
             reservation.pending_fork_prune_device_ids,
             discarded_marker_type,
+            discarded_marker_entries,
         ) = _union_prune_marker(reservation.pending_fork_prune_device_ids, removed_ids)
 
     reservation.modified_by = user_id
@@ -2924,6 +2933,8 @@ async def update_reservation(
                 "action": "pending_prune_corrupt_marker_discarded",
                 "reservation_id": str(reservation.id),
                 "marker_type": discarded_marker_type,
+                # A count for a partly bad list; None when the whole value went.
+                "discarded_entries": discarded_marker_entries,
             },
         )
 

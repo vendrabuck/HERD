@@ -744,14 +744,24 @@ class _ListenerDied(Exception):
     pass
 
 
-async def test_relay_logs_a_listener_that_dies_and_still_ends_cancelled(session_factory, caplog):
-    """A wake-up listener that ends with an exception is logged when it ends (by
-    `log_task_crash`, class name only), the relay keeps draining on its tick, and
-    a cancel ends the relay with `CancelledError`, not the listener's exception."""
+class _ListenerDiedHard(BaseException):
+    """Not an `Exception`; asyncio stores it on the task (only KeyboardInterrupt and
+    SystemExit also leave the event loop)."""
+
+
+@pytest.mark.parametrize("died_with", [_ListenerDied, _ListenerDiedHard])
+async def test_relay_logs_a_listener_that_dies_and_still_ends_cancelled(
+    session_factory, caplog, died_with
+):
+    """A wake-up listener that ends with an exception, an `Exception` or a
+    `BaseException` that is not one, is logged when it ends (by `log_task_crash`,
+    class name only), the relay keeps draining on its tick, and a cancel ends the
+    relay with `CancelledError`, not the listener's exception; the relay's shutdown
+    logs the dead listener once more (issue #1549)."""
     listener_text = "listener detail that must stay out of the log"
 
     async def dying_listener(engine, channel, wake, *, retry_seconds):
-        raise _ListenerDied(listener_text)
+        raise died_with(listener_text)
 
     nc = _always_connected_nc()
     with (
@@ -775,14 +785,70 @@ async def test_relay_logs_a_listener_that_dies_and_still_ends_cancelled(session_
                 r for r in caplog.records if getattr(r, "action", None) == "background_task_crashed"
             ]
             assert [(r.task_name, r.error_class) for r in crashed] == [
-                ("test-outbox listener", "_ListenerDied")
+                ("test-outbox listener", died_with.__name__)
             ], "the dead listener was not logged when it ended"
             assert not relay.done(), "a dead listener ended the relay"
         finally:
             relay.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await relay
+    at_shutdown = [
+        (r.levelname, r.task_name, r.error_class)
+        for r in caplog.records
+        if getattr(r, "action", None) == "background_task_failed_at_shutdown"
+    ]
+    assert at_shutdown == [("ERROR", "test-outbox listener", died_with.__name__)]
     assert listener_text not in caplog.text
+
+
+class _ThrownIntoRelay(BaseException):
+    """Thrown into the relay's frame from outside; never the listener's exception."""
+
+
+@pytest.mark.parametrize("thrown", [GeneratorExit, _ThrownIntoRelay])
+async def test_closing_the_relay_while_it_awaits_its_listener_lets_generator_exit_through(
+    session_factory, thrown
+):
+    """Issue #1549: what is thrown into the relay while its `finally` awaits the
+    cancelled listener is not the listener's exception: it propagates at once. A
+    GeneratorExit (the relay closed there) lets the coroutine close cleanly; caught
+    and carried on, the relay's own pending CancelledError would leave `close()`
+    instead. Python closes the awaited frames first and raises a GeneratorExit in the
+    relay's own frame; any other exception thrown in reaches `await_stopped_task`,
+    which must tell it from the listener's by identity."""
+    release = asyncio.Event()
+    listener_tasks: list[asyncio.Task] = []
+
+    async def held_listener(engine, channel, wake, *, retry_seconds):
+        listener_tasks.append(asyncio.current_task())
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise
+
+    with patch("herd_common.outbox._listen_for_wakeups", new=held_listener):
+        relay = run_outbox_relay(
+            session_factory,
+            lambda: None,  # no broker: the first tick goes straight to its sleep
+            OutboxEvent,
+            tick_seconds=3600.0,
+            engine=_fake_engine("postgresql"),
+        )
+        try:
+            relay.send(None)  # starts the listener task and suspends in the sleep
+            await _spin()  # the listener starts and blocks
+            relay.throw(asyncio.CancelledError())  # into the finally's listener await
+            if thrown is GeneratorExit:
+                relay.close()  # must not raise
+            else:
+                with pytest.raises(thrown):
+                    relay.throw(thrown())
+        finally:
+            release.set()
+            await _spin()
+    (listener,) = listener_tasks
+    assert listener.cancelled()
 
 
 async def test_listen_for_wakeups_setup_failure_is_logged_once_and_returns(monkeypatch, caplog):

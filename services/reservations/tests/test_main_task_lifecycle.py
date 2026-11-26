@@ -13,6 +13,7 @@ every wait by event-loop iterations.
 """
 
 import asyncio
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -290,6 +291,13 @@ async def _shut_down_holding(held: str) -> None:
             exit_task = asyncio.create_task(context.__aexit__(None, None, None))
             await _spin()
             assert held in loops.cancel_seen, f"shutdown never cancelled {held}"
+            # Issue #1549: every task is cancelled before any is awaited, so the tasks
+            # after a held one are already ending while it is held (a shutdown that
+            # cancels and awaits each in turn leaves them running here).
+            assert loops.cancel_seen == set(_LifespanLoops.NAMES), (
+                f"while {held} was held, shutdown had cancelled only "
+                f"{sorted(loops.cancel_seen)}: it must cancel every task before awaiting any"
+            )
             assert not exit_task.done(), (
                 f"shutdown returned while {held} was still ending: it must await the task"
             )
@@ -335,6 +343,12 @@ class _TaskDied(Exception):
     """A fake loop raises this at once, before the lifespan yields (issue #1549)."""
 
 
+class _TaskDiedHard(BaseException):
+    """The same, but not an `Exception`: issue #1549 names this case first. asyncio
+    stores it on the task like an Exception (only KeyboardInterrupt and SystemExit
+    also leave the event loop), so the test loop keeps running."""
+
+
 # Text an exception may carry from a driver, a model, or a stored value: the log lines
 # name the exception class only.
 _DEATH_TEXT = "upstream said: % Invalid input detected at marker"
@@ -347,9 +361,9 @@ _TASK_NAMES = {
 }
 
 
-async def _crash_one_then_shut_down(dead: str, caplog) -> None:
-    """Run the real lifespan with NATS connected, make the `dead` loop end with an
-    exception at once, and check that it is logged before shutdown and that shutdown
+async def _crash_one_then_shut_down(dead: str, caplog, died_with=_TaskDied) -> None:
+    """Run the real lifespan with NATS connected, make the `dead` loop end with
+    `died_with` at once, and check that it is logged before shutdown and that shutdown
     then cancels the other two, closes NATS, and returns without raising."""
     from app.main import lifespan
 
@@ -358,7 +372,7 @@ async def _crash_one_then_shut_down(dead: str, caplog) -> None:
 
     async def dies(*args, **kwargs):
         loops.tasks[dead] = asyncio.current_task()
-        raise _TaskDied(_DEATH_TEXT)
+        raise died_with(_DEATH_TEXT)
 
     patches = dict(zip(_LifespanLoops.NAMES, loops.patches(), strict=True))
     patches[dead] = patch(
@@ -396,7 +410,7 @@ async def _crash_one_then_shut_down(dead: str, caplog) -> None:
                 r for r in caplog.records if getattr(r, "action", None) == "background_task_crashed"
             ]
             assert [(r.levelname, r.task_name, r.error_class) for r in crashed] == [
-                ("ERROR", _TASK_NAMES[dead], "_TaskDied")
+                ("ERROR", _TASK_NAMES[dead], died_with.__name__)
             ], f"{dead} died and was not logged when it ended"
             for name in survivors:
                 assert not loops.tasks[name].done(), name
@@ -416,7 +430,7 @@ async def _crash_one_then_shut_down(dead: str, caplog) -> None:
                 if getattr(r, "action", None) == "background_task_failed_at_shutdown"
             ]
             assert [(r.levelname, r.task_name, r.error_class) for r in at_shutdown] == [
-                ("ERROR", _TASK_NAMES[dead], "_TaskDied")
+                ("ERROR", _TASK_NAMES[dead], died_with.__name__)
             ]
             assert _DEATH_TEXT not in caplog.text
         finally:
@@ -434,14 +448,213 @@ async def _crash_one_then_shut_down(dead: str, caplog) -> None:
 
 
 @pytest.mark.timeout(60)
+@pytest.mark.parametrize("died_with", [_TaskDied, _TaskDiedHard])
 @pytest.mark.parametrize("dead", _LifespanLoops.NAMES)
-async def test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step(dead, caplog):
+async def test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step(
+    dead, died_with, caplog
+):
     """Issue #1549: each of the three lifespan tasks in turn ends with an exception
-    before the lifespan yields. It is logged at ERROR the moment it ends (fixed
-    `action`, the task's name, the class name, no exception text), the others keep
-    running, and shutdown cancels the other two, logs the dead one again, closes
-    NATS, and returns without raising."""
-    await _crash_one_then_shut_down(dead, caplog)
+    before the lifespan yields, an `Exception` and a `BaseException` that is not one.
+    It is logged at ERROR the moment it ends (fixed `action`, the task's name, the
+    class name, no exception text), the others keep running, and shutdown cancels the
+    other two, logs the dead one again, closes NATS, and returns without raising."""
+    await _crash_one_then_shut_down(dead, caplog, died_with)
+
+
+_LOOP_TARGETS = {
+    "expiration_loop": "app.tasks.expiration.expiration_loop",
+    "purpose_classify_loop": "app.tasks.expiration.purpose_classify_loop",
+    "run_outbox_relay": "app.main.run_outbox_relay",
+}
+
+
+def _crash_patches(loops: "_LifespanLoops", dead: str, died_with: type[BaseException]):
+    """The three loop patches, with `dead` replaced by a fake that raises at once."""
+
+    async def dies(*args, **kwargs):
+        loops.tasks[dead] = asyncio.current_task()
+        raise died_with(_DEATH_TEXT)
+
+    patches = dict(zip(_LifespanLoops.NAMES, loops.patches(), strict=True))
+    patches[dead] = patch(_LOOP_TARGETS[dead], new=dies)
+    return [patches[name] for name in _LifespanLoops.NAMES]
+
+
+def _records(caplog, action: str) -> list[tuple[str, str, str]]:
+    return [
+        (r.levelname, r.task_name, r.error_class)
+        for r in caplog.records
+        if getattr(r, "action", None) == action
+    ]
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("dead", _LifespanLoops.NAMES)
+def test_a_process_exit_signal_a_task_ended_with_is_raised_after_every_shutdown_step(
+    dead, signal, caplog
+):
+    """Issue #1549: a task that ends with KeyboardInterrupt or SystemExit is logged
+    like any other, and shutdown still cancels the other two and closes NATS; then
+    the signal is raised, not swallowed. asyncio raises these two out of the event
+    loop when a task ends with one, so this test runs its own loop and counts each
+    one where it leaves `run_until_complete`: once when the loop dies, once when the
+    shutdown ends with it."""
+    from app.main import lifespan
+
+    loop = asyncio.new_event_loop()
+    loops = _LifespanLoops()
+    nc = MagicMock()
+    nc.close = AsyncMock()
+    survivors = [name for name in _LifespanLoops.NAMES if name != dead]
+
+    def drive(coro) -> tuple[asyncio.Task, int]:
+        """Run `coro` as a task to its end; count the signals that left the loop."""
+        task = loop.create_task(coro)
+        left_the_loop = 0
+        while not task.done():
+            try:
+                loop.run_until_complete(task)
+            except signal:
+                left_the_loop += 1
+            except RuntimeError:
+                # A signal that interrupted the previous run left that run's stop
+                # callback queued, so this run can stop early; run again.
+                if task.done():
+                    raise
+        return task, left_the_loop
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(caplog.at_level("ERROR", logger="app.main"))
+            stack.enter_context(patch("app.main.create_all_and_stamp", new=AsyncMock()))
+            stack.enter_context(patch("app.main.connect_nats", new=AsyncMock(return_value=nc)))
+            stack.enter_context(patch("app.main.ensure_stream", new=AsyncMock()))
+            for loop_patch in _crash_patches(loops, dead, signal):
+                stack.enter_context(loop_patch)
+            context = lifespan(MagicMock())
+            entered, during_start = drive(context.__aenter__())
+            _, during_spin = drive(_spin())
+            assert entered.exception() is None
+            assert during_start + during_spin == 1, "the dead task's signal left the loop"
+            assert _records(caplog, "background_task_crashed") == [
+                ("ERROR", _TASK_NAMES[dead], signal.__name__)
+            ]
+            for name in survivors:
+                assert not loops.tasks[name].done(), name
+
+            exited, during_shutdown = drive(context.__aexit__(None, None, None))
+
+            assert isinstance(exited.exception(), signal), "shutdown swallowed the signal"
+            assert during_shutdown == 1
+            nc.close.assert_awaited_once()
+            for name in survivors:
+                assert loops.tasks[name].cancelled(), name
+            assert _records(caplog, "background_task_failed_at_shutdown") == [
+                ("ERROR", _TASK_NAMES[dead], signal.__name__)
+            ]
+            assert _DEATH_TEXT not in caplog.text
+    finally:
+        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        for task in pending:
+            task.cancel()
+
+        async def _drain() -> None:
+            await asyncio.gather(*pending, return_exceptions=True)
+            await loop.shutdown_asyncgens()
+
+        drive(_drain())
+        loop.close()
+
+
+async def _enter_holding(held: str, nc=None):
+    """Enter the real lifespan with every loop faked and `held` held mid-cancellation;
+    return (loops, context, started tasks, patch stack)."""
+    from app.main import lifespan
+
+    loops = _LifespanLoops(held=held)
+    stack = ExitStack()
+    stack.enter_context(patch("app.main.create_all_and_stamp", new=AsyncMock()))
+    if nc is None:
+        stack.enter_context(
+            patch("app.main.connect_nats", new=AsyncMock(side_effect=_NoBrokerHere()))
+        )
+    else:
+        stack.enter_context(patch("app.main.connect_nats", new=AsyncMock(return_value=nc)))
+        stack.enter_context(patch("app.main.ensure_stream", new=AsyncMock()))
+    for loop_patch in loops.patches():
+        stack.enter_context(loop_patch)
+    before = asyncio.all_tasks()
+    context = lifespan(MagicMock())
+    await context.__aenter__()
+    await _spin()
+    return loops, context, asyncio.all_tasks() - before, stack
+
+
+async def _release_and_reap(loops, started, *extra) -> None:
+    for event in loops.release.values():
+        event.set()
+    for task in started:
+        task.cancel()
+    await _spin()
+    _retrieve(*started, *extra)
+
+
+class _ThrownIntoShutdown(BaseException):
+    """Thrown into the shutdown's frame from outside; never any task's exception."""
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("thrown", [GeneratorExit, _ThrownIntoShutdown])
+async def test_closing_the_lifespan_while_it_awaits_a_task_lets_generator_exit_through(thrown):
+    """Issue #1549: what is thrown into the shutdown while it awaits a task is not the
+    task's exception: it propagates at once instead of being logged as the task's and
+    swallowed. For a GeneratorExit (the lifespan closed while suspended there) Python
+    already closes the awaited frames first and raises it in the lifespan's own frame,
+    so the lifespan must let it through rather than await the next task ("coroutine
+    ignored GeneratorExit"); any other exception thrown in reaches `await_stopped_task`
+    itself, which must tell it from the task's own by identity."""
+    loops, context, started, stack = await _enter_holding("expiration_loop")
+    with stack:
+        try:
+            # Drive the lifespan's own async generator by hand (closing the context
+            # manager's `__aexit__` coroutine instead would close only its `asend`
+            # wrapper and never reach the lifespan's frame).
+            shutdown = context.gen.asend(None)  # resumes after the yield
+            awaited = shutdown.send(None)  # runs to the await of the held task
+            assert awaited is loops.tasks["expiration_loop"]
+            # Swallowed, the shutdown would go on to await the next task and yield it
+            # back here instead of raising.
+            with pytest.raises(thrown):
+                shutdown.throw(thrown())
+        finally:
+            await _release_and_reap(loops, started)
+
+
+@pytest.mark.timeout(60)
+async def test_a_lifespan_cancelled_during_shutdown_finishes_the_steps_then_ends_cancelled():
+    """Issue #1549: the lifespan itself cancelled while it awaits a task gets the same
+    CancelledError the task ends with. Shutdown still awaits the other tasks and
+    closes NATS, then ends cancelled: the caller's cancellation is not swallowed
+    (before this fix it was)."""
+    nc = MagicMock()
+    nc.close = AsyncMock()
+    loops, context, started, stack = await _enter_holding("expiration_loop", nc=nc)
+    exit_task = None
+    with stack:
+        try:
+            exit_task = asyncio.create_task(context.__aexit__(None, None, None))
+            await _spin()
+            assert not exit_task.done()
+            exit_task.cancel()
+            await _spin()
+            assert exit_task.done(), "shutdown did not finish after it was cancelled"
+            assert exit_task.cancelled(), "the lifespan swallowed its own cancellation"
+            nc.close.assert_awaited_once()
+            for name, task in loops.tasks.items():
+                assert task.cancelled(), name
+        finally:
+            await _release_and_reap(loops, started, *([exit_task] if exit_task else []))
 
 
 @pytest.mark.timeout(60)

@@ -527,6 +527,14 @@ WRONG_200_BODIES = [
     pytest.param({"json": {"devices": None}}, id="devices_null"),
     pytest.param({"content": b"<html>proxy error</html>"}, id="not_json"),
     pytest.param({"content": b"\xff\xfe"}, id="not_utf8"),
+    # Nested far past any plausible recursion limit (200,000 levels; the default limit
+    # is 1,000): the decoder raises RecursionError, which answered 500.
+    pytest.param({"content": b"[" * 200_000 + b"]" * 200_000}, id="deep_list"),
+    pytest.param(
+        {"content": b'{"devices": ' + b"[" * 200_000 + b"]" * 200_000 + b"}"},
+        id="deep_list_in_devices",
+    ),
+    pytest.param({"content": b'{"a":' * 200_000 + b"1" + b"}" * 200_000}, id="deep_object"),
 ]
 
 

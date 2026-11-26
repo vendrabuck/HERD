@@ -167,12 +167,13 @@ async def _fetch_transit_devices(
             )
         try:
             data = resp.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             # Not JSON (a json.JSONDecodeError or a UnicodeDecodeError, both
-            # ValueErrors): the same closed failure, raised from None so the
-            # decoder's text, which quotes the body, is not chained on.
+            # ValueErrors), or nested deeper than the decoder's recursion limit (a
+            # RecursionError, which is a RuntimeError): the same closed failure,
+            # raised from None so the decoder's text is not chained on.
             raise TransitGearUnavailable(
-                "cabling /internal/forks/devices/batch returned a body that is not JSON"
+                "cabling /internal/forks/devices/batch returned a body that does not parse"
             ) from None
         device_map = data.get("devices") if isinstance(data, dict) else None
         if not isinstance(device_map, dict):

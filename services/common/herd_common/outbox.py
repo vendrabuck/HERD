@@ -46,7 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Mapped, mapped_column
 
 from herd_common.advisory_lock import is_postgres_dialect
-from herd_common.background_tasks import log_task_crash
+from herd_common.background_tasks import await_stopped_task, log_task_crash
 
 logger = logging.getLogger(__name__)
 
@@ -473,15 +473,15 @@ async def run_outbox_relay(
             except asyncio.CancelledError:
                 raise
     finally:
-        # Issue #1549: a listener that already ended with an exception (logged when
-        # it ended, by `log_task_crash`) re-raises it here; it must not replace how
-        # the relay itself ends, so only the relay's own exit propagates.
+        # Issue #1549: a listener that already ended with an exception of any class
+        # (logged when it ended, by `log_task_crash`) re-raises it at its await;
+        # `await_stopped_task` logs it and returns it instead, so it never replaces
+        # how the relay itself ends. A KeyboardInterrupt or SystemExit in the listener
+        # already left the event loop when the listener died (asyncio re-raises both
+        # out of the loop), so it is not raised again here.
         if listener_task is not None:
             listener_task.cancel()
-            try:
-                await listener_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await await_stopped_task(listener_task, name=f"{name} listener", log=logger)
 
 
 def _stream_sequence_key(msg: Any) -> str | None:

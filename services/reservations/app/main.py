@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from herd_common.background_tasks import log_task_crash
+from herd_common.background_tasks import await_stopped_task, log_task_crash
 from herd_common.cors import add_cors_middleware
 from herd_common.jetstream import connect_nats, ensure_stream
 from herd_common.logging import RequestLoggingMiddleware, setup_logging
@@ -126,27 +126,18 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cancel every background task first, then await each one (issue #1549). A task
-    # that already ended with an exception re-raises it at its await; that is
-    # logged here and does not stop the remaining awaits or the NATS close below.
+    # Cancel every background task first, then await each one (issue #1549), so a
+    # task whose cancellation takes time (the relay awaits its listener) never keeps
+    # the tasks after it running. `await_stopped_task` returns, never raises, what a
+    # task ended with (any BaseException, logged by class name), so no dead task can
+    # stop the remaining awaits or the NATS close below.
     for task in background_tasks.values():
         task.cancel()
+    exit_signal: BaseException | None = None
     for task_name, task in background_tasks.items():
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error(
-                "Background task %s had ended with %s; shutdown continues",
-                task_name,
-                type(exc).__name__,
-                extra={
-                    "action": "background_task_failed_at_shutdown",
-                    "task_name": task_name,
-                    "error_class": type(exc).__name__,
-                },
-            )
+        ended_with = await await_stopped_task(task, name=task_name, log=logger)
+        if isinstance(ended_with, (KeyboardInterrupt, SystemExit)) and exit_signal is None:
+            exit_signal = ended_with
 
     # Close NATS connection on shutdown
     if app.state.nats is not None:
@@ -154,6 +145,18 @@ async def lifespan(app: FastAPI):
             await app.state.nats.close()
         except Exception:
             logger.warning("Error closing NATS connection", exc_info=True)
+
+    # A process-exit signal a task ended with is not swallowed: the first one seen is
+    # raised once every shutdown step has run.
+    if exit_signal is not None:
+        raise exit_signal
+    # The lifespan itself cancelled while it awaited a task raises the same
+    # CancelledError the task ends with, so await_stopped_task cannot tell them apart;
+    # this task's own pending cancel request can. It is honoured after the shutdown
+    # steps, never swallowed.
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        raise asyncio.CancelledError()
 
 
 app = FastAPI(

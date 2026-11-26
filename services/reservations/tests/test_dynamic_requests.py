@@ -744,8 +744,9 @@ async def test_callback_success_with_repeated_device_ids_attaches_each_once(inte
     assert [str(d) for d in other.device_ids] == [other_device]
 
 
-# Issue #1552: identity is the UUID, never its spelling. Every spelling Python's
-# `uuid.UUID` and pydantic accept for one id.
+# Issue #1552: identity is the UUID, never its spelling. The spellings of one id that
+# pydantic's UUID parser accepts: case, braces, the `urn:uuid:` prefix, and 32 hex
+# digits. The stdlib `uuid.UUID` accepts more (below), which pydantic refuses with 422.
 def _spellings(value: str) -> dict[str, str]:
     parsed = uuid.UUID(value)
     canonical = str(parsed)
@@ -833,6 +834,19 @@ _MALFORMED_DEVICE_IDS = {
     "valid_then_malformed": [str(uuid.uuid4()), "not-a-uuid"],
     "not_a_list": "not-a-list",
 }
+# Spellings only the stdlib `uuid.UUID` parser accepts; pydantic refuses each of them,
+# so they are 422 too, not an attach of the id they would name.
+_STDLIB_ONLY_SPELLINGS = {
+    "uuid_prefix": lambda u: "uuid:" + str(u),
+    "urn_without_uuid": lambda u: "urn:" + str(u),
+    "urn_braces": lambda u: "urn:uuid:{" + str(u) + "}",
+    "braces_hex32": lambda u: "{" + u.hex + "}",
+    "dashes_moved": lambda u: u.hex[:4] + "-" + u.hex[4:20] + "-" + u.hex[20:],
+}
+for _name, _spell in _STDLIB_ONLY_SPELLINGS.items():
+    _id = uuid.uuid4()
+    assert uuid.UUID(_spell(_id)) == _id  # the stdlib really does accept it
+    _MALFORMED_DEVICE_IDS[f"stdlib_only_{_name}"] = [_spell(_id)]
 
 
 @pytest.mark.parametrize("succeeded", [True, False], ids=["success", "failure"])

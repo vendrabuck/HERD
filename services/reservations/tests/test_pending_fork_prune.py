@@ -906,20 +906,31 @@ async def test_the_heal_leaves_sql_null_and_real_markers_unwritten():
 
 # --- Identity is the UUID, never its spelling (#1554) ---------------------------------
 #
-# Every spelling `uuid.UUID` accepts for one id. No writer at main stores anything but
-# the canonical form; these are seeded the way a hand edit or an older process would.
+# Spellings of one id that the stdlib `uuid.UUID` parser accepts, which is the parser
+# on both sides here (`_parse_prune_marker_entry` and the reconciler): case, braces,
+# the `urn:uuid:` and `uuid:` prefixes, 32 hex digits, and dashes anywhere. Not every
+# spelling it accepts (it also strips any number of braces), but every form it
+# normalizes. No writer at main stores anything but the canonical form; these are
+# seeded the way a hand edit or an older process would.
 
 
 def _spellings(device_id: uuid.UUID) -> dict[str, str]:
     canonical = str(device_id)
+    hex32 = device_id.hex
     return {
         "lowercase": canonical,
         "uppercase": canonical.upper(),
         "braces": "{" + canonical + "}",
         "braces_uppercase": "{" + canonical.upper() + "}",
         "urn": "urn:uuid:" + canonical,
-        "hex32": device_id.hex,
-        "hex32_uppercase": device_id.hex.upper(),
+        "hex32": hex32,
+        "hex32_uppercase": hex32.upper(),
+        # Accepted by the stdlib parser only; pydantic refuses these (RES-DYN-7).
+        "uuid_prefix": "uuid:" + canonical,
+        "urn_without_uuid": "urn:" + canonical,
+        "urn_braces": "urn:uuid:{" + canonical + "}",
+        "braces_hex32": "{" + hex32 + "}",
+        "dashes_moved": hex32[:4] + "-" + hex32[4:20] + "-" + hex32[20:],
     }
 
 
@@ -1054,9 +1065,11 @@ async def test_a_patch_over_a_corrupt_marker_answers_200_and_stores_only_the_rem
 
     assert json.loads(await _stored(rid)) == [remove]
     records = _discard_records(caplog)
-    assert [(r.levelname, r.reservation_id, r.marker_type) for r in records] == [
-        ("ERROR", str(rid), marker_type)
-    ]
+    # Each corrupt list here holds one bad entry; a non-list value is discarded whole.
+    discarded_entries = 1 if marker_type == "list" else None
+    assert [
+        (r.levelname, r.reservation_id, r.marker_type, r.discarded_entries) for r in records
+    ] == [("ERROR", str(rid), marker_type, discarded_entries)]
     assert records[0].getMessage() == (
         f"Reservation {rid} held a corrupt pending fork-prune marker of type {marker_type}; "
         "the device-set edit kept only its UUID entries and added the removed devices"
@@ -1086,19 +1099,19 @@ async def test_a_patch_over_an_empty_marker_stores_the_removed_ids_and_logs_noth
 async def test_a_patch_union_keeps_stored_ids_in_canonical_form_once(caplog, kind):
     """The union compares ids, not spellings (issue #1554): stored entries in `kind`
     (a pending id, and the id being removed now) are written back canonical, each
-    once, beside the removed id; a stored entry that does not parse is dropped and
-    logged as a discard of a `list`."""
+    once, beside the removed id; the two stored entries that do not parse are dropped
+    and logged as one discard of a `list` that counts them."""
     keep, remove = str(uuid.uuid4()), uuid.uuid4()
     pending = uuid.uuid4()
     rid = await _insert(ReservationStatus.ACTIVE, device_ids=[keep, str(remove)])
-    stored = [_spellings(pending)[kind], _spellings(remove)[kind], "not-a-uuid"]
+    stored = [_spellings(pending)[kind], "not-a-uuid", _spellings(remove)[kind], 7]
     await _store_raw(rid, json.dumps(stored))
     caplog.set_level("INFO", logger="app.services.reservation_service")
 
     assert await _patch_remove(rid, keep) == 200
 
     assert json.loads(await _stored(rid)) == sorted([str(pending), str(remove)])
-    assert [r.marker_type for r in _discard_records(caplog)] == ["list"]
+    assert [(r.marker_type, r.discarded_entries) for r in _discard_records(caplog)] == [("list", 2)]
 
 
 @pytest.mark.asyncio
@@ -1113,3 +1126,31 @@ async def test_a_patch_union_of_valid_canonical_entries_logs_nothing(caplog):
 
     assert json.loads(await _stored(rid)) == sorted([pending, remove])
     assert _discard_records(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw,parsed",
+    [('"abc"', "abc"), ('{"k": 1}', {"k": 1}), ("5", 5)],
+    ids=["string", "object", "number"],
+)
+async def test_the_clear_leaves_a_marker_that_is_not_a_list_for_the_heal(caplog, raw, parsed):
+    """RES-FORK-20 (issue #1554): the clear touches only a non-empty list. A stored
+    string, object, or number is left exactly as stored (the reconciler's heal owns
+    it), even when the pruned ids name what iterating it would yield: a string is not
+    rewritten as its characters, nor an object as its keys, and a number does not
+    make the clear fail."""
+    rid = await _insert(ReservationStatus.ACTIVE, pending=[str(uuid.uuid4())])
+    await _store_raw(rid, raw)
+    caplog.set_level("INFO", logger="app.services.reservation_service")
+
+    await _clear_pending_fork_prune(rid, ["a", "k", uuid.uuid4()])
+
+    # SQLite hands a stored JSON number back as a number even through the Text cast.
+    assert json.loads(str(await _stored(rid))) == parsed
+    clear_failed = [
+        r
+        for r in caplog.records
+        if getattr(r, "action", "") == "reservation_fork_prune_marker_clear_failed"
+    ]
+    assert clear_failed == []

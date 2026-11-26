@@ -555,12 +555,23 @@ WRONG_BODIES = {
     "devices_true": {"devices": True},
     "devices_null": {"devices": None},
 }
-# Bodies that are not JSON at all: also closed, and the decoder's text never travels.
+# Nesting depth for bodies the decoder refuses with RecursionError (a RuntimeError, not a
+# ValueError). It is chosen far above any plausible limit, not near one: CPython's
+# default recursion limit is 1,000 and the C decoder's stack guard trips long before
+# 200,000 levels on 3.12 and 3.14, so these never parse on a host that raised its limit.
+_DEEP = 200_000
+DEEP_BODIES = {
+    "deep_list": b"[" * _DEEP + b"]" * _DEEP,
+    "deep_list_in_devices": b'{"devices": ' + b"[" * _DEEP + b"]" * _DEEP + b"}",
+    "deep_object": b'{"a":' * _DEEP + b"1" + b"}" * _DEEP,
+}
+# Bodies that do not parse: also closed, and the decoder's text never travels.
 NOT_JSON_BODIES = {
     "plain_text": _BODY_TEXT.encode(),
     "empty": b"",
     "truncated_object": b'{"devices": {',
     "not_utf8": b"\xff\xfe\xfa",
+    **DEEP_BODIES,
 }
 
 
@@ -596,7 +607,8 @@ async def test_a_200_that_is_not_an_object_with_a_devices_object_is_unavailable(
 async def test_a_200_that_is_not_json_is_unavailable_without_its_text(content):
     """OPS-REPORT-8 (issue #1553): a 200 whose body does not parse raises
     TransitGearUnavailable, not the decoder's ValueError (which the report routes turn
-    into a 422 quoting the decoder's text), and nothing about the body is chained."""
+    into a 422 quoting the decoder's text) or its RecursionError for a body nested
+    too deep (a 500), and nothing about the body is chained."""
     with pytest.raises(TransitGearUnavailable) as raised:
         await _fetch_with_answers([uuid.uuid4()], [httpx.Response(200, content=content)])
     assert raised.value.__cause__ is None
