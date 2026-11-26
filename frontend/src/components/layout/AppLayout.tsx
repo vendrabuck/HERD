@@ -8,16 +8,8 @@ import { HeaderHelpLink } from "@/components/layout/HeaderHelpLink";
 import { RouteErrorBoundary } from "@/components/ui/ErrorBoundary";
 import { APP_VERSION } from "@/lib/appVersion";
 import { displayName } from "@/lib/profileEdit";
-import { visibleAdminNav } from "@/lib/adminNav";
+import { visibleAdminNav, visibleMainNav } from "@/lib/adminNav";
 import { useRouteTitle } from "@/hooks/useRouteTitle";
-
-const NAV_ITEMS = [
-  { to: "/inventory", label: "Inventory" },
-  { to: "/templates", label: "Templates" },
-  { to: "/topology", label: "Topology" },
-  { to: "/reservations", label: "Reservations" },
-  { to: "/reporting", label: "Reporting" },
-];
 
 export function AppLayout() {
   const { data: user } = useCurrentUser();
@@ -68,6 +60,10 @@ export function AppLayout() {
     navigate("/login");
   };
 
+  // Both lists are filtered by the role GET /me reported; while it is still
+  // loading the role is unknown and every entry with a requirement stays out
+  // of the DOM (issue #1402), as AdminGuard shows its pages to no unknown role.
+  const mainLinks = visibleMainNav(user?.role);
   const adminLinks = visibleAdminNav(user?.role);
   const adminActive = location.pathname.startsWith("/admin");
 
@@ -92,7 +88,7 @@ export function AppLayout() {
             </span>
           </span>
           <nav aria-label="Main" className="flex gap-1">
-            {NAV_ITEMS.map((item) => (
+            {mainLinks.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}

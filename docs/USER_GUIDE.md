@@ -133,8 +133,8 @@ Useful for finding a free window before creating a reservation.
 
 ### Reporting (admins only)
 
-**Reporting** appears in the nav for every signed-in user, but the page itself denies
-non-admins (you'll be redirected if you land on it without the role). It shows a
+**Reporting** appears in the nav only for admins; a non-admin who opens its address is
+redirected to Topology. It shows a
 utilization report for a 7-day, 30-day, or custom window: total reservation-hours, reservations counted, and execution runs at the top; a daily trend chart; a fleet utilization card with per-device utilization rates and an idle-device filter; tables broken out by user, device, group (cost center), topology type, and template; and CSV download per table. See [ADMIN_HANDBOOK.md](ADMIN_HANDBOOK.md#utilization-report).
 
 ## Inventory

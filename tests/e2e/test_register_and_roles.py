@@ -110,16 +110,30 @@ def test_registered_user_can_login(registered_user, browser, base_url):
 
 
 def test_non_admin_has_no_administration_menu(registered_user, browser, base_url):
-    """Role "user" sees the plain nav items but no Administration dropdown."""
+    """Role "user" sees the plain nav items but no Administration dropdown and
+    no Reporting link (issue #1402: both lead to AdminGuard pages)."""
     browser.get(f"{base_url}/topology")
     wait = WebDriverWait(browser, WAIT)
+    # The plain links render before GET /me answers and the role-gated ones only
+    # after, so wait for the header's username (the account has loaded) before
+    # asserting an absence; an earlier check would pass whatever the role.
     wait.until(
-        EC.presence_of_element_located((By.XPATH, "//nav//a[normalize-space()='Inventory']"))
-    )
-    for label in ("Templates", "Topology", "Reservations"):
-        assert browser.find_elements(By.XPATH, f"//nav//a[normalize-space()='{label}']"), (
-            f"nav item {label} missing for non-admin"
+        EC.presence_of_element_located(
+            (
+                By.XPATH,
+                f"//header//span[normalize-space()='{registered_user['username']}']",
+            )
         )
+    )
+    main_links = browser.find_elements(By.XPATH, "//nav[@aria-label='Main']/a")
+    assert [a.text.strip() for a in main_links] == [
+        "Inventory",
+        "Templates",
+        "Topology",
+        "Reservations",
+    ]
+    assert browser.find_elements(By.XPATH, "//a[normalize-space()='Reporting']") == []
+    assert browser.find_elements(By.CSS_SELECTOR, "a[href='/reporting']") == []
     admin_buttons = browser.find_elements(By.XPATH, "//button[normalize-space()='Administration']")
     assert admin_buttons == []
 
