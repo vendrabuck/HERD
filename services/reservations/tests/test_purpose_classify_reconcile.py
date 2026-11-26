@@ -760,3 +760,102 @@ async def test_classify_one_on_an_unknown_id_is_ok_without_a_call():
         assert await classify_purpose_one(uuid.uuid4()) == "ok"
     call.assert_not_awaited()
     assert await _snapshot(bystander) == bystander_before
+
+
+# --- Issue #1543 and the classify part of #1577: a 200 that is not a usable suggestion --
+
+UNUSABLE_200 = [a for a in ANSWERS if a.id.startswith("200-") and a.outcome == "failed"]
+UNUSABLE_200_IDS = [a.id for a in UNUSABLE_200]
+
+
+def _expected_reason(answer: Answer) -> str:
+    """The fixed reason code each unusable 200 is logged with: nested too deep (for the
+    decoder, or past the store bound), not JSON (it does not parse, or holds a number
+    that is not finite), or the wrong shape (anything else)."""
+    if "deep" in answer.id or "store-bound" in answer.id:
+        return "too_deep"
+    not_json = ("not-json", "empty-body", "html", "invalid-utf8", "nan", "infinity", "overflow")
+    if any(word in answer.id for word in not_json):
+        return "not_json"
+    return "wrong_shape"
+
+
+def test_the_unusable_200_table_covers_every_json_type_and_reason():
+    """The table holds a 200 of every JSON type that is not an object, an object of
+    every reason, and a body that parses to each of them, so a row dropped from it
+    shows here before it silently stops being tested."""
+    ids = set(UNUSABLE_200_IDS)
+    for kind in ("list", "string", "integer", "float", "true", "false", "null"):
+        assert f"200-json-{kind}" in ids
+    for kind in ("null", "integer", "float", "true", "list", "object"):
+        assert f"200-top-category-{kind}" in ids
+    assert {"200-deep-array", "200-deep-object", "200-no-top-category"} <= ids
+    assert {_expected_reason(a) for a in UNUSABLE_200} == {"not_json", "too_deep", "wrong_shape"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", UNUSABLE_200, ids=UNUSABLE_200_IDS)
+async def test_reconcile_unusable_200_reaches_the_attempt_cap_without_stalling(answer):
+    """RES-PURPOSE-5 and RES-PURPOSE-7 for every 200 that is not a usable suggestion,
+    on three eligible rows that all get it. Each tick calls every row, in stamp order,
+    and counts one attempt on each, so no row stalls the ones behind it (#1577: a body
+    nested past the decoder's limit used to end the tick after the first row with no
+    attempt counted, every tick). After PURPOSE_CLASSIFY_MAX_ATTEMPTS ticks the rows
+    are at the cap and the next tick makes no call (#1543: a JSON `null` used to count
+    no attempt and was sent again every tick with no cap). Nothing is stored."""
+    rids = [
+        await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=minutes))
+        for minutes in (30, 20, 10)
+    ]
+    sent: list[str] = []
+
+    async def _fake_call(*args, **kwargs):
+        sent.append(kwargs["json_body"]["reservation_id"])
+        return deliver(answer)
+
+    with patch("app.services.purpose_service.call_service", AsyncMock(side_effect=_fake_call)):
+        for tick in range(1, settings.purpose_classify_max_attempts + 1):
+            sent.clear()
+            await _run_purpose_classify_reconcile()
+            assert sent == [str(rid) for rid in rids], tick
+            for rid in rids:
+                row = await _get(rid)
+                assert row.purpose_classify_attempts == tick
+                assert row.purpose_suggestion is None
+                assert row.purpose_suggested_at is None
+        sent.clear()
+        await _run_purpose_classify_reconcile()
+    assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", UNUSABLE_200, ids=UNUSABLE_200_IDS)
+async def test_classify_one_logs_an_unusable_200_with_fixed_fields_only(answer, caplog):
+    """Nothing from the body reaches a log line: the classifier logs one WARNING with
+    the fixed action `purpose_classify_bad_body`, a fixed message naming only the
+    reservation id, the fixed reason code, and the parsed top-level type's name (none
+    when the body does not parse), with no exception attached. It logs nothing else at
+    WARNING or above."""
+    rid = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
+    call = AsyncMock(side_effect=lambda *a, **k: deliver(answer))
+    with (
+        patch("app.services.purpose_service.call_service", call),
+        caplog.at_level(logging.DEBUG, logger="app"),
+    ):
+        assert await classify_purpose_one(rid) == "failed"
+
+    loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(loud) == 1
+    record = loud[0]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == f"Purpose classify reconcile: unusable 200 body for {rid}"
+    assert record.action == "purpose_classify_bad_body"
+    assert record.reservation_id == str(rid)
+    assert record.reason == _expected_reason(answer)
+    try:
+        expected_type = type(deliver(answer).json()).__name__
+    except (ValueError, RecursionError):
+        expected_type = None
+    assert record.body_type == expected_type
+    assert record.exc_info is None
+    assert record.exc_text is None

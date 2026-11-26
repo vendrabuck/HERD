@@ -947,17 +947,35 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_skips_rows_at_attempt_cap`, `test_reconcile_respects_batch_size`, `test_reconcile_oldest_requested_first`, `test_reconcile_ignores_rows_not_yet_requested`, `test_reconcile_batch_is_filled_only_by_eligible_rows`)
 - **RES-PURPOSE-6.** A feature-off answer (403 with the disabled marker, or 404), a
   transient answer (429, 502, 503, 504, or a transport error other than a timeout), or
-  a 403 without the marker ends the tick and counts no attempt. \
+  a 403 without the marker ends the tick and counts no attempt. A 403 whose body does
+  not parse (not JSON, not UTF-8, or nested deeper than the decoder's recursion limit)
+  carries no marker (issue #1577). \
   Enforced in: `services/reservations/app/tasks/expiration.py` (`_PURPOSE_CLASSIFY_TICK_ENDING_OUTCOMES`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_structured_marker_ends_tick_without_touching_any_row`, `test_reconcile_transient_status_ends_tick_without_bump`, `test_reconcile_403_bad_token_is_not_feature_off`, `test_reconcile_transport_error_ends_tick_without_bump`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
-- **RES-PURPOSE-7.** A timeout, any other non-200, or an unparseable body counts one
-  attempt on that row and the tick continues. \
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_bump_purpose_classify_attempts`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`)
-- **RES-PURPOSE-8.** A 200 stores the orchestrator's body verbatim as the suggestion; it
-  never writes `purpose_category`. Known gap, see #1543. \
-  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`, `test_classify_one_maps_each_answer_to_its_outcome`)
+- **RES-PURPOSE-7.** A timeout, any other non-200, or a 200 whose body is not a usable
+  suggestion counts one attempt on that row, stores nothing, and the tick continues to
+  the next row. A 200 is a usable suggestion only when its body parses to a JSON object
+  whose `top_category` is a string (issue #1543), nested no deeper than 32 levels and
+  holding no number that is not finite (`NaN`, `Infinity`, or a literal such as `1e400`
+  that overflows a float), which the JSON encoder or Postgres would refuse on store.
+  Every other 200 is the same failure: a body that does not parse (not JSON, not UTF-8,
+  or nested deeper than the decoder's recursion limit, issue #1577), a list, a string, a
+  number, a boolean, a JSON `null`, or an object without a string `top_category`. It is
+  logged as one WARNING with the fixed action `purpose_classify_bad_body`, a fixed
+  `reason` (`not_json`, `too_deep`, or `wrong_shape`), and the parsed top-level type's
+  name as `body_type`, never body or exception text. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_read_classify_body`, `_suggestion_refusal`, `_bump_purpose_classify_attempts`) \
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`, `test_reconcile_unusable_200_reaches_the_attempt_cap_without_stalling`, `test_classify_one_logs_an_unusable_200_with_fixed_fields_only`, `test_the_unusable_200_table_covers_every_json_type_and_reason`)
+- **RES-PURPOSE-8.** A 200 whose body is a usable suggestion (RES-PURPOSE-7) stores it
+  verbatim as the suggestion; it never writes `purpose_category`. A suggestion stored
+  before RES-PURPOSE-7 checked the body (one that is not a JSON object with a string
+  `top_category`), and a suggestion time or dismissal left with no suggestion, are reset
+  by migration 0019: the suggestion, its time, and its dismissal become SQL NULL, the
+  stamp and the attempt count are kept, and the sweep classifies the row again
+  (issue #1543). Until `make migrate` runs it, such a row still answers 500 on the
+  routes that read it. \
+  Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`); `services/reservations/migrations/versions/0019_purpose_suggestion_unusable_reset.py` (`upgrade`) \
+  Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_stores_suggestion_on_200`, `test_classify_one_maps_each_answer_to_its_outcome`); `services/reservations/tests/test_purpose_suggestion_unusable_reset_migration.py` (`test_upgrade_resets_exactly_the_unusable_rows_and_runs_twice`, `test_upgrade_resets_every_unusable_row_across_batches`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_a_row_stored_before_the_fix_answers_after_migration_0019`); `services/reservations/tests/test_purpose_suggestion_reset_live_pg.py` (`test_migration_0019_resets_exactly_the_unusable_suggestions_on_postgres`)
 - **RES-PURPOSE-9.** The review list holds rows with an undismissed suggestion whose
   category is unset or differs from the suggestion's `top_category`. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`list_purpose_review_items`) \
@@ -978,9 +996,12 @@ routes in section 5; background work `purpose_classify_loop` every
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_backfill_marks_terminal_rows_without_suggestion`, `test_backfill_resets_capped_rows_without_suggestion`, `test_backfill_counts_newly_marked_and_reset_rows_together`)
 - **RES-PURPOSE-13.** Classify now runs the same single-row classifier immediately,
   ignores the attempt cap, and answers 200 with the outcome word for every outcome except
-  feature-off. Known gap, see #1543. \
+  feature-off: a 200 whose body is not a usable suggestion (RES-PURPOSE-7) is `failed`,
+  and afterwards the review list, accept, dismiss, and the owner's reads of the row
+  answer as for a row with no suggestion, and Classify now can be run on it again
+  (issues #1543 and #1577). \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`trigger_purpose_classify`) \
-  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`, `test_trigger_answers_the_outcome_word_for_every_answer`)
+  Pinned by: `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_ignores_the_attempt_cap`, `test_trigger_200_timeout_bumps_attempts`, `test_trigger_503_feature_off`, `test_trigger_answers_the_outcome_word_for_every_answer`, `test_every_reader_answers_after_classify_now_gets_an_unusable_200`)
 - **RES-PURPOSE-14.** Every purpose review route is admin-only. \
   Enforced in: `services/reservations/app/routers/purpose_review.py` (`require_admin`) \
   Pinned by: `services/reservations/tests/test_purpose_review.py` (`test_review_list_is_admin_only`, `test_accept_is_admin_only`, `test_backfill_is_admin_only`, `test_every_purpose_review_route_refuses_a_non_admin`); `services/reservations/tests/test_purpose_classify_trigger.py` (`test_trigger_is_admin_only`)
@@ -1362,7 +1383,7 @@ Calls into this area are in section 7; events are in section 6.
 | Out | cabling | `POST /internal/forks/{id}/prune-devices` (internal token) | release removed devices' wiring | Retried by the pending-prune marker every tick until converged or terminal |
 | Out | cabling | `GET /internal/forks` (internal token, paged by 200) | sweep's active-fork listing | The tick's archive, heal, and missing-fork steps are skipped |
 | Out | execution | `GET /internal/reservations/{id}/wiring-status`, `POST .../wiring/retry` (internal token, 30 s) | wiring proxies | 4xx relayed; 5xx and transport 503 |
-| Out | ai-orchestrator | `POST /internal/classify-purpose` (internal token, `PURPOSE_CLASSIFY_TIMEOUT_SECONDS`) | purpose suggestion | Never raises; outcome classes in RES-PURPOSE-6 and RES-PURPOSE-7 |
+| Out | ai-orchestrator | `POST /internal/classify-purpose` (internal token, `PURPOSE_CLASSIFY_TIMEOUT_SECONDS`) | purpose suggestion | Never raises; outcome classes in RES-PURPOSE-6 and RES-PURPOSE-7. A 200 whose body does not parse (not JSON, not UTF-8, or nested deeper than the decoder's recursion limit) or is not a usable suggestion is `failed`: one attempt, nothing stored, the tick continues (RES-PURPOSE-7); a 403 whose body does not parse is `forbidden` (RES-PURPOSE-6) |
 | Out | NATS | `HERD_RESERVATIONS` via the outbox relay | lifecycle events (section 6) | Events wait in the outbox until a NATS connection exists (at-least-once, RES-EVENT-4) |
 
 Utilization reporting additionally calls inventory, auth, execution, and cabling; it
@@ -1399,7 +1420,7 @@ before the missing-fork backstop gives up; 20 pending prunes per tick.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/reservations/tests/` (in-memory SQLite); `frontend/src/test/lib/reservationStatus.test.ts`, `frontend/src/test/lib/reservationBulk.test.ts`, `frontend/src/test/lib/reservationFilters.test.ts` | Advisory locks and `SKIP LOCKED` are no-ops on SQLite, so concurrency below the status CAS is not exercised here |
-| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_reservation_patch_race_live_pg.py`, `test_reservation_patch_end_time_live_pg.py`, `test_pending_fork_prune_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/reservations/tests/test_reservations.py`, `test_fork_endpoints.py`, `test_dynamic_requests.py`, `test_reservation_list_filters.py` (httpx against the app); the `*_live_pg.py` suites against a real Postgres: `test_reservation_status_cas_live_pg.py`, `test_reservation_sort_live_pg.py`, `test_reservation_list_filters_live_pg.py`, `test_sweep_claim_cancel_race_live_pg.py`, `test_reservation_patch_race_live_pg.py`, `test_reservation_patch_end_time_live_pg.py`, `test_pending_fork_prune_live_pg.py`, `test_purpose_suggestion_reset_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_reservation_lifecycle.py`, `test_reservation_patch.py`, `test_reservation_list_filters.py`, `test_provisioning_failed.py`, `test_dynamic_resources.py`, `test_reservation_fork_flow.py`, `test_device_set_patch_wiring.py`, `test_purpose_category_flow.py`, `test_purpose_review_flow.py` | `test_overlapping_reservation_is_rejected` accepts 409 or 422; the purpose review flow needs an AI provider and never runs in CI |
 | Stress and load | `tests/load/locustfile.py` (`ReservationUser`: list, calendar, create, release) | Create contention on one device is intended; no load test covers the sweep, PATCH, or the fork routes |
 | Browser end-to-end | `tests/e2e/test_reservations.py`, `test_reservation_cancel_ui.py`, `test_reservation_detail.py`, `test_reservations_bulk_playwright.py`, `test_reservations_filters_playwright.py`, `test_reservations_sort_playwright.py`, `test_live_edit_reservation_topology.py` | E2E runs nightly and in the `make master` and `make everything` gates, not per pull request |
@@ -1413,13 +1434,7 @@ so RES-PURPOSE-5 to RES-PURPOSE-8 are proven by unit tests only.
 
 ### Open defects
 
-- #1543 (RES-PURPOSE-8, RES-PURPOSE-13): a classify answer of 200 whose JSON body is
-  not an object is taken as the suggestion. A list, a string, or a number is stored
-  verbatim, and every route that then reads the row answers 500: Classify now, the
-  review list, accept, dismiss (after its write commits), and the owner's `GET /{id}`.
-  A JSON `null` stores nothing, counts no attempt, and is sent again on every sweep
-  tick with no cap. A real orchestrator cannot answer such a body; it takes a
-  deployment fault at the orchestrator's address.
+None at present.
 
 ### Limits by decision
 
