@@ -29,9 +29,7 @@ def _open_inventory(driver, base_url):
 
 def _expand_first_device(driver):
     """Click the first device row's chevron. Returns True if a row was found."""
-    chevrons = driver.find_elements(
-        By.CSS_SELECTOR, "tbody tr button[aria-label*='Expand']"
-    )
+    chevrons = driver.find_elements(By.CSS_SELECTOR, "tbody tr button[aria-label*='Expand']")
     if not chevrons:
         return False
     chevrons[0].click()
