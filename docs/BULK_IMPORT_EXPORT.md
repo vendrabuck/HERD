@@ -112,6 +112,15 @@ accepted). A file in any other encoding, such as a CSV saved by a spreadsheet to
 in Latin-1, is refused as a whole with HTTP 422 `Import file must be UTF-8
 encoded; re-save it as UTF-8 and retry`.
 
+A JSON import file, for devices, templates, or topologies, that the parser cannot
+read for its shape is refused as a whole with HTTP 422 `Invalid JSON: the document
+is nested too deeply or holds a number too long to read`: one nested deeper than
+Python's JSON parser recurses (just under 10,000 levels on the service image's
+Python 3.12), or one holding an integer longer than 4,300 digits. A device or
+template `field_data` or `sections` written as JSON text like that, a CSV cell or a
+JSON string in a JSON import, rejects only its row, with the reason `a JSON cell is
+nested too deeply or holds a number too long to read`.
+
 ### Devices
 
 JSON export is an object with a `resource`, a `version`, and an `items` list;

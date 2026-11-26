@@ -73,6 +73,15 @@ IMPORT_NOT_TEXT_DETAIL = (
 # same answer inventory's importers give (issue #1022).
 IMPORT_NOT_UTF8_DETAIL = "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
 
+# A JSON import file that `json.loads` refuses for its shape rather than its syntax
+# (issue #1511): nested deeper than the C parser's recursion budget (RecursionError),
+# or holding an integer literal longer than Python's integer string conversion limit,
+# 4,300 digits (a ValueError that is not a JSONDecodeError). The answer is fixed and
+# names no part of the file or the exception; inventory's importers give the same one.
+IMPORT_JSON_UNREADABLE_DETAIL = (
+    "Invalid JSON: the document is nested too deeply or holds a number too long to read"
+)
+
 
 def _decode_import(raw: bytes) -> str:
     try:
@@ -234,10 +243,14 @@ def records_to_csv(topologies: list[Topology]) -> str:
 
 
 def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
+    text = _decode_import(raw)
     try:
-        doc = json.loads(_decode_import(raw))
+        doc = json.loads(text)
     except json.JSONDecodeError as exc:
+        # The decoder's message names a position, never the file's content.
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=422, detail=IMPORT_JSON_UNREADABLE_DETAIL) from None
     if holds_lone_surrogate(doc):
         raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
