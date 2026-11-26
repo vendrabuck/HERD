@@ -1668,34 +1668,403 @@ async def test_a_removal_planned_on_one_number_never_settles_a_row_that_owes_ano
     )
 
 
-@pytest.mark.parametrize("row_allocation", ["driven", "other"])
-async def test_the_release_after_a_removal_skips_only_a_row_that_owes_another_number(
-    row_allocation,
+@pytest.mark.parametrize("removal_driven", [True, False])
+@pytest.mark.parametrize(
+    "kind",
+    ["owed_undo", "failed_leave", "pending_join", "active"],
+)
+@pytest.mark.parametrize("on_expected", [True, False])
+async def test_the_release_skips_a_row_moved_onto_another_allocation(
+    kind, on_expected, removal_driven
 ):
-    """release_l2_membership with the driven allocation: a row that owes a lost join's
-    removal on another allocation is not released; one that owes it on the driven
-    allocation, and a plain release row on any allocation, are released as before."""
+    """release_l2_membership with the allocation the caller acted on. A row on that
+    allocation is released whatever its kind. On another allocation: a FAILED row (an
+    owed undo, a plain failed leave, a pending join) is never released, its own removal
+    or join still pending; an ACTIVE row is released after a removal (as before; the
+    spec's Open defects say why) and not after a settlement with no driver call."""
     from app.services.l2_membership_service import (
+        JOIN_LOST_ALLOCATION_RELEASED,
         JOIN_UNDO_PENDING_REMOVAL,
         release_l2_membership,
     )
 
     n1 = await _released_alloc_with(1402)
     n2 = await _released_alloc_with(2222)
-    on = n1 if row_allocation == "driven" else n2
-    owed = await _seed_l2_failed("0/0/1", "RELEASED", on, attempts=1, err=JOIN_UNDO_PENDING_REMOVAL)
-    plain = await _seed_l2_failed("0/0/2", "RELEASED", n2, attempts=1, err="boom")
-    async with TestSessionLocal() as s:
-        first = await release_l2_membership(s, RES_ID, SW_L2, "0/0/1", driven_vlan_assignment_id=n1)
-    async with TestSessionLocal() as s:
-        second = await release_l2_membership(
-            s, RES_ID, SW_L2, "0/0/2", driven_vlan_assignment_id=n1
-        )
-    assert second is not None and (await _l2_row(plain)).status == "RELEASED"
-    if row_allocation == "driven":
-        assert first is not None and (await _l2_row(owed)).status == "RELEASED"
+    on = n1 if on_expected else n2
+    if kind == "active":
+        rid = await _seed_l2_active("0/0/1", on)
     else:
-        assert first is None and (await _l2_row(owed)).status == "FAILED"
+        intended, err = {
+            "owed_undo": ("RELEASED", JOIN_UNDO_PENDING_REMOVAL),
+            "failed_leave": ("RELEASED", "remove_from_vlan failed: boom"),
+            "pending_join": ("ACTIVE", JOIN_LOST_ALLOCATION_RELEASED),
+        }[kind]
+        rid = await _seed_l2_failed("0/0/1", intended, on, attempts=1, err=err)
+    async with TestSessionLocal() as s:
+        released = await release_l2_membership(
+            s,
+            RES_ID,
+            SW_L2,
+            "0/0/1",
+            expected_vlan_assignment_id=n1,
+            removal_driven=removal_driven,
+        )
+    taken = on_expected or (kind == "active" and removal_driven)
+    row = await _l2_row(rid)
+    if taken:
+        assert released is not None and row.status == "RELEASED"
+    else:
+        assert released is None and row.status != "RELEASED"
+
+
+@pytest.mark.parametrize("expected", ["not_given", "nil"])
+async def test_a_nil_expected_allocation_is_not_the_same_as_none_given(expected):
+    """The nil placeholder is an allocation like any other here: given, it spares a row
+    on a real allocation; None (not given) releases whatever row the key finds."""
+    from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
+        release_l2_membership,
+    )
+
+    n1 = await _released_alloc_with(1402)
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", n1, attempts=1, err=JOIN_UNDO_PENDING_REMOVAL)
+    kwargs = (
+        {}
+        if expected == "not_given"
+        else {"expected_vlan_assignment_id": uuid.UUID(int=0), "removal_driven": False}
+    )
+    async with TestSessionLocal() as s:
+        await release_l2_membership(s, RES_ID, SW_L2, "0/0/1", **kwargs)
+    assert (await _l2_row(rid)).status == ("RELEASED" if expected == "not_given" else "FAILED")
+
+
+@pytest.mark.parametrize("site", ["reconcile", "retry", "teardown"])
+async def test_a_settlement_with_no_driver_call_spares_a_row_moved_onto_a_real_number(site):
+    """The three settlements of a nil-allocation build with no driver call (the
+    reconcile's stale build, the retry's build whose intent is gone, the teardown) read
+    the row, then release it by key. A lost join's key-based owed write that lands in
+    between moves the row onto a real number N: the settlement leaves that row owing
+    the removal from N."""
+    from app.services import nats_consumer
+    from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL, record_l2_failed
+    from app.services.nats_consumer import (
+        _FetchContext,
+        _reconcile_l2_memberships,
+        _teardown_from_ledgers,
+    )
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    released, _ = await _seed_released_alloc()
+    rid = await _seed_l2_failed(
+        "0/0/1", "ACTIVE", uuid.UUID(int=0), attempts=0, err="recorded hop unresolvable"
+    )
+    if site == "teardown":
+        await _seed_state(frozen=True)
+
+    async def _owed_write():
+        async with TestSessionLocal() as s:
+            await record_l2_failed(
+                s,
+                RES_ID,
+                released,
+                SW_L2,
+                "0/0/1",
+                1,
+                JOIN_UNDO_PENDING_REMOVAL,
+                intended="RELEASED",
+            )
+
+    real_vlan_ids_for = nats_consumer._vlan_ids_for
+
+    async def _vlan_ids_for(ids, get_db_session):
+        await _owed_write()
+        return await real_vlan_ids_for(ids, get_db_session)
+
+    async def _no_intent(*args, **kwargs):
+        await _owed_write()
+        return []
+
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn, fork_wires=[]):
+        if site == "retry":
+            async with TestSessionLocal() as s:
+                rows = [await s.get(L2PortAssignment, rid)]
+            with patch("app.services.nats_consumer._fetch_fork_intended_wires", new=_no_intent):
+                await _reattempt_l2_rows(rows, _db_session_factory())
+        else:
+            with patch("app.services.nats_consumer._vlan_ids_for", new=_vlan_ids_for):
+                if site == "reconcile":
+                    await _reconcile_l2_memberships(
+                        RES_ID, [], _FetchContext(None), _db_session_factory()
+                    )
+                else:
+                    await _teardown_from_ledgers(RES_ID, _FetchContext(None), _db_session_factory())
+    assert _membership_ops(calls) == []
+    row = await _l2_row(rid)
+    assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+        "FAILED",
+        "RELEASED",
+        released,
+        JOIN_UNDO_PENDING_REMOVAL,
+    )
+
+
+# --- a failed removal keeps a landed add's reason and its own-number rule (#1413) ---
+
+
+@pytest.mark.parametrize("reason", ["owed_undo", "frozen_join"])
+async def test_a_failed_removal_keeps_a_landed_adds_reason_so_the_next_tick_still_drives(
+    reason, caplog
+):
+    """Another reservation holds the port in another number. Tick 1 drives the removal
+    of the row's number and it fails: the row keeps its reason (one WARNING line with
+    a fixed action says so), so tick 2 still judges it by its own number and drives the
+    removal again instead of settling it with no driver call."""
+    import logging
+
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        JOIN_UNDO_PENDING_REMOVAL,
+    )
+
+    err = JOIN_UNDO_PENDING_REMOVAL if reason == "owed_undo" else FROZEN_JOIN_PENDING_REMOVAL
+    released, released_vlan = await _seed_released_alloc()
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=1, err=err)
+    if reason == "frozen_join":
+        await _seed_state(frozen=True)
+    other = await _seed_alloc(reservation_id=OTHER_RES, vlan_id=777)
+    await _seed_l2_active("0/0/1", other, reservation_id=OTHER_RES)
+    caplog.set_level(logging.WARNING, logger="app.services.l2_membership_service")
+
+    execute_fn, calls = _vlan_recorder_failing("remove_from_vlan")
+    with _patches(execute_fn):
+        await reattempt_reservation(RES_ID, _db_session_factory())
+    assert _membership_ops(calls) == [("remove_from_vlan", "0/0/1", released_vlan)]
+    row = await _l2_row(rid)
+    assert (row.status, row.intended, row.last_error) == ("FAILED", "RELEASED", err)
+    lines = [
+        r for r in caplog.records if getattr(r, "action", None) == "l2_landed_add_removal_failed"
+    ]
+    assert len(lines) == 1 and "boom" not in lines[0].getMessage()
+
+    execute_fn, calls = _vlan_recorder()
+    with _patches(execute_fn):
+        result = await reattempt_reservation(RES_ID, _db_session_factory())
+    assert _membership_ops(calls) == [("remove_from_vlan", "0/0/1", released_vlan)]
+    assert result["results"][0]["outcome"] != "superseded"
+
+
+@pytest.mark.parametrize("path", ["key", "row_id"])
+@pytest.mark.parametrize("reason", ["owed_undo", "frozen_join", "failed_leave"])
+async def test_a_failed_removal_keeps_only_a_landed_adds_reason(path, reason, caplog):
+    """By key and by row id, a failed removal of a landed add's row keeps its reason and
+    logs one line with a fixed action and no error text; an ordinary failed leave takes
+    the new failure's reason and logs no such line."""
+    import logging
+
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        JOIN_UNDO_PENDING_REMOVAL,
+        record_l2_failed,
+    )
+
+    err = {
+        "owed_undo": JOIN_UNDO_PENDING_REMOVAL,
+        "frozen_join": FROZEN_JOIN_PENDING_REMOVAL,
+        "failed_leave": "old",
+    }[reason]
+    released, _ = await _seed_released_alloc()
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=1, err=err)
+    caplog.set_level(logging.WARNING, logger="app.services.l2_membership_service")
+    async with TestSessionLocal() as s:
+        await record_l2_failed(
+            s,
+            RES_ID,
+            released,
+            SW_L2,
+            "0/0/1",
+            1,
+            "remove_from_vlan failed: secret driver text",
+            intended="RELEASED",
+            row_id=rid if path == "row_id" else None,
+        )
+    row = await _l2_row(rid)
+    lines = [
+        r for r in caplog.records if getattr(r, "action", None) == "l2_landed_add_removal_failed"
+    ]
+    if reason == "failed_leave":
+        assert row.last_error == "remove_from_vlan failed: secret driver text"
+        assert lines == []
+    else:
+        assert row.last_error == err
+        assert len(lines) == 1 and "secret" not in lines[0].getMessage()
+
+
+# --- the frozen park on a row that moved since it was read (#1413) ---
+
+
+def _row_moves_after_read(change):
+    """A stand-in for _find_reusable_failed that returns the row as read, then applies
+    `change` to it from another session before the caller writes."""
+    from app.services import l2_membership_service
+
+    real = l2_membership_service._find_reusable_failed
+
+    async def _read_then_move(db, res, sw, port):
+        row = await real(db, res, sw, port)
+        async with TestSessionLocal() as s:
+            await change(s, await s.get(L2PortAssignment, row.id))
+            await s.commit()
+        return row
+
+    return patch("app.services.l2_membership_service._find_reusable_failed", new=_read_then_move)
+
+
+async def test_a_frozen_park_never_rewrites_a_row_released_since_it_was_read():
+    """The row is released after the park read it: the park's UPDATE (which requires
+    FAILED) matches nothing, the RELEASED row is left as it is, and a fresh row records
+    this join's allocation for the release channel."""
+    from datetime import datetime, timezone
+
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        record_l2_membership_active,
+    )
+
+    n1 = await _released_alloc_with(1402)
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", n1, attempts=1, err="boom")
+    fresh = await _seed_alloc(vlan_id=300)
+    await _seed_state(frozen=True)
+
+    async def _release(s, row):
+        row.status, row.intended, row.last_error = "RELEASED", "RELEASED", None
+        row.released_at = datetime.now(timezone.utc)
+
+    with _row_moves_after_read(_release):
+        async with TestSessionLocal() as s:
+            returned = await record_l2_membership_active(s, RES_ID, fresh, SW_L2, "0/0/1")
+    old = await _l2_row(rid)
+    assert (old.status, old.vlan_assignment_id, old.last_error) == ("RELEASED", n1, None)
+    assert returned.id != rid
+    new = await _l2_row(returned.id)
+    assert (new.status, new.intended, new.vlan_assignment_id, new.last_error) == (
+        "FAILED",
+        "RELEASED",
+        fresh,
+        FROZEN_JOIN_PENDING_REMOVAL,
+    )
+
+
+async def test_a_frozen_park_leaves_a_row_recorded_active_since_and_undoes_its_add(caplog):
+    """Another pass recorded the row ACTIVE on another allocation after the park read
+    it: the row is left ACTIVE (never a second live row for the key), the left line is
+    logged, and this join's add is undone at once."""
+    import logging
+
+    from app.services.l2_membership_service import record_l2_membership_active
+
+    n1 = await _released_alloc_with(1402)
+    other = await _seed_alloc(vlan_id=500)
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", n1, attempts=1, err="boom")
+    fresh = await _seed_alloc(vlan_id=300)
+    await _seed_state(frozen=True)
+
+    async def _activate(s, row):
+        row.status, row.intended, row.vlan_assignment_id = "ACTIVE", "ACTIVE", other
+
+    undo = AsyncMock(return_value=True)
+    caplog.set_level(logging.WARNING, logger="app.services.l2_membership_service")
+    with _row_moves_after_read(_activate):
+        async with TestSessionLocal() as s:
+            await record_l2_membership_active(s, RES_ID, fresh, SW_L2, "0/0/1", undo_lost_join=undo)
+    row = await _l2_row(rid)
+    assert (row.status, row.vlan_assignment_id) == ("ACTIVE", other)
+    assert len(await _own_rows()) == 1
+    undo.assert_awaited_once()
+    assert [
+        r for r in caplog.records if getattr(r, "action", None) == "l2_frozen_join_left_live_row"
+    ]
+
+
+@pytest.mark.parametrize("undo", ["removed", "failed", "held_live", "plain_row_parked"])
+async def test_a_frozen_join_left_off_an_owed_row_is_undone_at_once(undo, caplog):
+    """Through the apply: a frozen reservation's join on N' lands on a port whose row
+    owes the removal from N. The row stays on N, and N''s add is undone in the same
+    switch session: removed, or, when that removal fails, logged with a fixed action;
+    no removal when a live membership holds N''s number on the port."""
+    import logging
+
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        JOIN_UNDO_PENDING_REMOVAL,
+    )
+    from app.services.nats_consumer import _apply_one_vlan_action
+
+    released, _ = await _seed_released_alloc()
+    if undo == "plain_row_parked":
+        rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=1, err="boom")
+    else:
+        rid = await _owed_row(released)
+    fresh = await _seed_alloc(vlan_id=300)
+    await _seed_state(frozen=True)
+    if undo == "held_live":
+        async with TestSessionLocal() as s:
+            rival = VlanAssignment(
+                reservation_id=uuid.UUID(OTHER_RES),
+                fabric_id=uuid.uuid4(),
+                vlan_id=300,
+                switch_device_ids=[SW_L2],
+                defined_switch_ids=[SW_L2],
+                status="ACTIVE",
+            )
+            s.add(rival)
+            await s.commit()
+            rival_id = rival.id
+        await _seed_l2_active("0/0/1", rival_id, reservation_id=OTHER_RES)
+    execute_fn, calls = (
+        _vlan_recorder_failing("remove_from_vlan") if undo == "failed" else _vlan_recorder()
+    )
+    caplog.set_level(logging.WARNING, logger="app.services.l2_membership_service")
+    with _patches(execute_fn):
+        async with TestSessionLocal() as s:
+            await _apply_one_vlan_action(
+                s,
+                "add_to_vlan",
+                "/tmp/driver",
+                {},
+                set(),
+                uuid.UUID(SW_L2),
+                uuid.UUID(DRIVER_ID),
+                "sha",
+                uuid.UUID(RES_ID),
+                "0/0/1",
+                300,
+                fresh,
+            )
+    expected = [("add_to_vlan", "0/0/1", 300)]
+    if undo in ("removed", "failed"):
+        expected.append(("remove_from_vlan", "0/0/1", 300))
+    assert _membership_ops(calls) == expected
+    row = await _l2_row(rid)
+    if undo == "plain_row_parked":
+        # A row that owes nothing is parked on N' for the release channel, with no undo.
+        assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+            "FAILED",
+            "RELEASED",
+            fresh,
+            FROZEN_JOIN_PENDING_REMOVAL,
+        )
+    else:
+        assert (row.status, row.intended, row.vlan_assignment_id, row.last_error) == (
+            "FAILED",
+            "RELEASED",
+            released,
+            JOIN_UNDO_PENDING_REMOVAL,
+        )
+    failed_lines = [
+        r for r in caplog.records if getattr(r, "action", None) == "l2_frozen_join_undo_failed"
+    ]
+    assert len(failed_lines) == (1 if undo == "failed" else 0)
 
 
 # --- an undo interrupted inside a flush or commit still records the removal (#1413) ---
@@ -1776,3 +2145,55 @@ async def test_an_undo_ended_by_a_closing_or_exiting_exception_writes_nothing(ex
                     s, RES_ID, va, SW_L2, "0/0/1", undo_lost_join=_undo
                 )
     assert await _own_rows() == []
+
+
+@pytest.mark.parametrize("reason", ["owed_undo", "frozen_join", "failed_leave"])
+async def test_the_stale_build_park_leaves_a_row_already_in_the_release_direction(reason):
+    """A row read as a pending build that another writer moved into the release
+    direction before the park (a lost join's owed removal, a frozen join, a failed
+    leave) keeps its reason and attempts: the park takes only a FAILED intended-ACTIVE
+    row (issue #1413)."""
+    from app.services.l2_membership_service import (
+        FROZEN_JOIN_PENDING_REMOVAL,
+        JOIN_UNDO_PENDING_REMOVAL,
+        park_stale_l2_build,
+    )
+
+    err = {
+        "owed_undo": JOIN_UNDO_PENDING_REMOVAL,
+        "frozen_join": FROZEN_JOIN_PENDING_REMOVAL,
+        "failed_leave": "remove_from_vlan failed: boom",
+    }[reason]
+    released, _ = await _seed_released_alloc()
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", released, attempts=4, err=err)
+    async with TestSessionLocal() as s:
+        await park_stale_l2_build(s, rid, "stale build reason")
+    row = await _l2_row(rid)
+    assert (row.status, row.intended, row.last_error, row.attempts) == (
+        "FAILED",
+        "RELEASED",
+        err,
+        4,
+    )
+
+
+async def test_a_supersession_never_releases_a_row_moved_onto_another_allocation():
+    """The any-number supersession of an ordinary release row: the retry loaded it on
+    N1, and another writer moved it onto N2 before the check. Another reservation holds
+    the port, but the row is not released by the check (it is not the row the caller
+    read), and the check answers False, so the caller goes on to its planned removal."""
+    from app.services.l2_membership_service import supersede_l2_release_if_reclaimed
+
+    n1 = await _released_alloc_with(1402)
+    n2 = await _released_alloc_with(2222)
+    rid = await _seed_l2_failed("0/0/1", "RELEASED", n1, attempts=1, err="boom")
+    loaded = await _l2_row(rid)
+    async with TestSessionLocal() as s:
+        (await s.get(L2PortAssignment, rid)).vlan_assignment_id = n2
+        await s.commit()
+    other = await _seed_alloc(reservation_id=OTHER_RES, vlan_id=777)
+    await _seed_l2_active("0/0/1", other, reservation_id=OTHER_RES)
+    async with TestSessionLocal() as s:
+        assert await supersede_l2_release_if_reclaimed(s, loaded) is False
+    row = await _l2_row(rid)
+    assert (row.status, row.vlan_assignment_id) == ("FAILED", n2)

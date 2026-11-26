@@ -736,8 +736,15 @@ async def _reattempt_l2_rows(
                         write_guard(db, L2PortAssignment, row.id, claims) as writable,
                     ):
                         if writable:
+                            # Issue #1413: only the row this pass read, on its
+                            # nil or dangling allocation, never one moved since.
                             await release_l2_membership(
-                                db, row.reservation_id, row.switch_device_id, row.port
+                                db,
+                                row.reservation_id,
+                                row.switch_device_id,
+                                row.port,
+                                expected_vlan_assignment_id=row.vlan_assignment_id,
+                                removal_driven=False,
                             )
                     if writable:
                         logger.warning(

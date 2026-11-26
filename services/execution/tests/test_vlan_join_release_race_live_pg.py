@@ -1150,12 +1150,13 @@ async def test_a_lost_retry_join_owes_its_removal_until_it_succeeds_then_re_allo
 async def test_a_removal_planned_on_one_number_leaves_a_row_owing_another_on_a_used_ledger(
     session_factory, pending
 ):
-    """The settle and release after a removal, on a real Postgres (issue #1413): a retry
-    pass loads a failed leave on N1, then a lost join's key-based owed write moves the
-    row to owe the removal from N2. The pass drives the removal it planned, from N1,
-    and that success neither settles the row into a pending join nor releases it (the
-    compare-and-swap on the driven allocation, and the release's FOR UPDATE read): the
-    row still owes N2, and no foreign row changes."""
+    """The settle and release after a removal, on a real Postgres (issue #1413), run in
+    sequence: a retry pass loads a failed leave on N1, then a lost join's key-based owed
+    write moves the row to owe the removal from N2. The pass drives the removal it
+    planned, from N1, and that success neither settles the row into a pending join (the
+    compare-and-swap on the driven allocation) nor releases it (the release's filter on
+    the expected allocation): the row still owes N2, and no foreign row changes. The
+    release's row lock is pinned by the staged test below."""
     from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL, record_l2_failed
     from app.services.wiring_claim import WiringRowClaims
     from app.services.wiring_retry_service import _reattempt_l2_rows
@@ -1200,6 +1201,146 @@ async def test_a_removal_planned_on_one_number_leaves_a_row_owing_another_on_a_u
             JOIN_UNDO_PENDING_REMOVAL,
             n2,
         )
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await pending.settle()
+        await _cleanup(session_factory, h)
+
+
+async def test_a_release_holding_its_row_lock_makes_a_keyed_owed_write_record_a_fresh_row(
+    session_factory, pg_engine, tagged, pending
+):
+    """Two sessions, staged (issue #1413). R, the release after a removal from N1 of a
+    plain failed leave on N1, reads the row FOR UPDATE and is stopped before its commit
+    with that lock alone held. W, a lost join's key-based owed write onto N2 (the
+    reconcile's path), reads the key FOR UPDATE and is seen waiting on that lock. R
+    commits the row RELEASED; W's read then re-checks `status != RELEASED` on the row
+    as committed, finds no live row for the key, and inserts a fresh row owing N2. The
+    RELEASED row is not rewritten, a row names N2, and no foreign row changes."""
+    from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
+        record_l2_failed,
+        release_l2_membership,
+    )
+
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    n1_vlan, n2_vlan = await _free_vlan_numbers(session_factory, 2)
+    try:
+        n1 = await _seed(session_factory, h, n1_vlan, scope=[switch], defined=[], status="RELEASED")
+        n2 = await _seed(session_factory, h, n2_vlan, scope=[switch], defined=[], status="RELEASED")
+        rid = await _seed_failed_join(session_factory, h, n1, "0/0/1", "boom")
+        async with session_factory() as s:
+            await s.execute(
+                update(L2PortAssignment)
+                .where(L2PortAssignment.id == rid)
+                .values(intended="RELEASED")
+            )
+            await s.commit()
+        before = await _foreign_snapshot(session_factory, h)
+        gate = pending.gate(flush_first=False)
+        release_engine, _ = tagged("release")
+        writer_engine, writer_app = tagged("owedwrite")
+        outcome: list = []
+
+        async def _release():
+            async with _gated_maker(release_engine, gate)() as s:
+                outcome.append(
+                    await release_l2_membership(
+                        s, h.reservation, switch, "0/0/1", expected_vlan_assignment_id=n1
+                    )
+                )
+
+        async def _owed_write():
+            async with async_sessionmaker(writer_engine, expire_on_commit=False)() as s:
+                await record_l2_failed(
+                    s,
+                    h.reservation,
+                    n2,
+                    switch,
+                    "0/0/1",
+                    HIDDEN_ATTEMPTS,
+                    JOIN_UNDO_PENDING_REMOVAL,
+                    intended="RELEASED",
+                )
+
+        release = pending.task(_release())
+        await asyncio.wait_for(gate.inside.wait(), COORDINATION_TIMEOUT)
+        writer = pending.task(_owed_write())
+        waited = await _seen_waiting(pg_engine, writer_app, writer)
+        release_was_holding = not gate.returned
+        gate.proceed.set()
+        await asyncio.wait_for(asyncio.gather(release, writer), COORDINATION_TIMEOUT)
+        assert waited and release_was_holding
+        assert outcome and outcome[0] is not None and outcome[0].id == rid
+
+        old = await _own_row(session_factory, rid)
+        assert (old.status, old.intended, old.last_error, old.vlan_assignment_id) == (
+            "RELEASED",
+            "RELEASED",
+            None,
+            n1,
+        )
+        assert old.released_at is not None
+        live = [r for r in await _own_memberships(session_factory, h) if r.status != "RELEASED"]
+        assert [(r.status, r.intended, r.last_error, r.vlan_assignment_id) for r in live] == [
+            ("FAILED", "RELEASED", JOIN_UNDO_PENDING_REMOVAL, n2)
+        ]
+        assert live[0].id != rid and live[0].attempts >= HIDDEN_ATTEMPTS
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await pending.settle()
+        await _cleanup(session_factory, h)
+
+
+async def test_a_stale_build_park_waiting_on_a_release_never_rewrites_the_released_row(
+    session_factory, pg_engine, tagged, pending
+):
+    """Two sessions, staged (issue #1413). R, the release after a removal from N1 of a
+    pending build on N1, holds the row FOR UPDATE and is stopped before its commit. P,
+    the stale-build park (`park_stale_l2_build`) of the same row, reads it FOR UPDATE and
+    is seen waiting. R commits RELEASED; P then reads the row as committed, finds it no
+    longer FAILED, and writes nothing: the RELEASED row keeps its reason, attempts, and
+    release stamp, and no foreign row changes."""
+    from app.services.l2_membership_service import park_stale_l2_build, release_l2_membership
+
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    (n1_vlan,) = await _free_vlan_numbers(session_factory, 1)
+    try:
+        n1 = await _seed(session_factory, h, n1_vlan, scope=[switch], defined=[], status="RELEASED")
+        rid = await _seed_failed_join(session_factory, h, n1, "0/0/1", "boom")
+        before = await _foreign_snapshot(session_factory, h)
+        gate = pending.gate(flush_first=False)
+        release_engine, _ = tagged("release")
+        park_engine, park_app = tagged("stalepark")
+
+        async def _release():
+            async with _gated_maker(release_engine, gate)() as s:
+                await release_l2_membership(
+                    s, h.reservation, switch, "0/0/1", expected_vlan_assignment_id=n1
+                )
+
+        async def _park():
+            async with async_sessionmaker(park_engine, expire_on_commit=False)() as s:
+                await park_stale_l2_build(s, rid, "stale build reason")
+
+        release = pending.task(_release())
+        await asyncio.wait_for(gate.inside.wait(), COORDINATION_TIMEOUT)
+        park = pending.task(_park())
+        waited = await _seen_waiting(pg_engine, park_app, park)
+        release_was_holding = not gate.returned
+        gate.proceed.set()
+        await asyncio.wait_for(asyncio.gather(release, park), COORDINATION_TIMEOUT)
+        assert waited and release_was_holding
+        row = await _own_row(session_factory, rid)
+        assert (row.status, row.intended, row.last_error, row.attempts) == (
+            "RELEASED",
+            "RELEASED",
+            None,
+            HIDDEN_ATTEMPTS,
+        )
+        assert row.released_at is not None
         await _assert_invariants(session_factory, h, before)
     finally:
         await pending.settle()

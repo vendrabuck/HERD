@@ -3929,7 +3929,7 @@ async def _apply_one_vlan_action(
                 res_uuid,
                 switch_uuid,
                 port,
-                driven_vlan_assignment_id=vlan_assignment_id,
+                expected_vlan_assignment_id=vlan_assignment_id,
             )
     else:
         await update_execution_run(
@@ -4100,7 +4100,16 @@ async def _reconcile_l2_memberships(
         va_id = row.vlan_assignment_id
         if va_id is None or va_id == _nil or va_id not in vlan_by_alloc:
             async with get_db_session() as db:
-                await release_l2_membership(db, row.reservation_id, row.switch_device_id, row.port)
+                # Issue #1413: only the row this pass read, on its nil or dangling
+                # allocation, never one moved since.
+                await release_l2_membership(
+                    db,
+                    row.reservation_id,
+                    row.switch_device_id,
+                    row.port,
+                    expected_vlan_assignment_id=va_id,
+                    removal_driven=False,
+                )
             logger.warning(
                 "Stale L2 build for reservation %s switch %s port %s has no resolvable "
                 "VLAN allocation (%s); released directly with no driver call (issue #491)",
@@ -5628,7 +5637,16 @@ async def _teardown_from_ledgers(
                     write_guard(db, L2PortAssignment, row.id, WiringRowClaims()) as unclaimed_now,
                 ):
                     if unclaimed_now:
-                        await release_l2_membership(db, res_str, row.switch_device_id, row.port)
+                        # Issue #1413: only the row this teardown read, on its nil
+                        # or dangling allocation, never one moved since.
+                        await release_l2_membership(
+                            db,
+                            res_str,
+                            row.switch_device_id,
+                            row.port,
+                            expected_vlan_assignment_id=row.vlan_assignment_id,
+                            removal_driven=False,
+                        )
                 continue
             if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
                 continue
