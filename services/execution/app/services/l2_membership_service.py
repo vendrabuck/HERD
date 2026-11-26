@@ -318,10 +318,16 @@ async def record_l2_membership_active(
     (JOIN_UNDO_PENDING_REMOVAL): moving it to this join's allocation would leave the old
     number untracked. Such a flip is refused like a lost compare-and-swap and the
     row is returned as it is; the apply does not drive an add for such a port at all
-    (membership_owes_undo). The frozen park leaves such a row as it is too (one UPDATE
-    that does not match it, logged with the action `l2_frozen_join_left_owed_row`):
-    the owed number is a RELEASED one, while this join's number is the reservation's
-    own allocation, which is not handed out before its release.
+    (membership_owes_undo). The frozen park leaves such a row as it is too: its one
+    UPDATE matches the row only while it is FAILED and owes nothing, since the owed
+    number is a RELEASED one, while this join's number is the reservation's own
+    allocation, which is not handed out before its release. On a miss the row is read
+    again: gone (released since it was read), a fresh FROZEN_JOIN_PENDING_REMOVAL row
+    records this join; still there (it owes a removal, or another pass recorded it
+    ACTIVE), it is left as it is, one line is logged (`l2_frozen_join_left_owed_row` or
+    `l2_frozen_join_left_live_row`), and, after the commit, `undo_lost_join` removes
+    this join's add at once, its live-holder check first; a failed undo logs
+    `l2_frozen_join_undo_failed`, and an exception from it goes on, the row unchanged.
     """
     res_uuid = _as_uuid(reservation_id)
     vlan_uuid = _as_uuid(vlan_assignment_id)
@@ -1138,30 +1144,40 @@ async def supersede_l2_release_if_reclaimed(
     live membership already accounts for the port; True when it did, False when a
     driver remove is warranted. The L2 analogue of supersede_release_if_reclaimed.
 
-    Two driver models of a membership meet here, and HERD does not know which one a
-    switch follows. On the SR Linux driver (drivers/srl_l2) an add is a bridged
-    subinterface per VLAN number, so a port can be a member of several numbers at once
-    and a membership in one number leaves it in the others. On the seeded IOS-style
-    drivers (seedtools/drivers.py) an add sets the port's one access VLAN, so a newer
-    add replaces the old number. So the rule depends on the row:
+    Two device models of a membership meet here, and HERD does not know which one a
+    switch follows. On the SR Linux driver (drivers/srl_l2), the only real L2 driver in
+    the repo, an add is a bridged subinterface per VLAN number, so a port can be a
+    member of several numbers at once and a membership in one number leaves it in the
+    others. On a device with one access VLAN per port (classic IOS), a newer add
+    replaces the old number, and `no switchport access vlan <N>` resets the port's
+    access VLAN to the default; whether such a device ignores or rejects a removal
+    naming a number the port is not in is not verified here. The seeded drivers in
+    seedtools/drivers.py are record-only stubs that send IOS-like command strings
+    (their add sends `switchport mode tagged`, not a real IOS mode), not a model of
+    either device. So the rule depends on the row:
 
     - An ordinary release row (a failed leave, a parked stale or teardown build):
       another reservation's ACTIVE membership on the same (switch, port), in any
-      number, supersedes it. On a one-number-per-port device the new holder's add
-      already took the port out of this row's number, and re-firing remove_from_vlan
-      could strip the holder's membership. On a per-number device the port can stay
-      in this row's number; that window predates issue #1413 and is listed under the
-      spec's Open defects as an owner decision.
+      number, supersedes it. On a one-access-VLAN device the holder's add already took
+      the port out of this row's number, and re-firing remove_from_vlan could strip the
+      holder. On a per-number device the port can stay in this row's number; that
+      window predates issue #1413 and is listed under the spec's Open defects as an
+      owner decision.
     - A row parked for an add known to have landed on the row's own number, after the
       add could no longer be recorded ACTIVE (FROZEN_JOIN_PENDING_REMOVAL, issue #461,
       and JOIN_UNDO_PENDING_REMOVAL, issue #1413): only an ACTIVE membership on that
       (switch, port), of any reservation, on an ACTIVE allocation holding the row's own
       number (port_holds_number_live) supersedes it. A holder in another number does
-      not, and the removal of the row's number is driven.
+      not, and the removal of the row's number is driven; on a one-access-VLAN device
+      that removal may strip the holder. The two failure writers keep these reasons on
+      a failed removal, so the rule holds across retries.
 
     Which rule applies, and the row's number, are read from the row as it stands in
     `db` (the caller's write_guard holds its lock), not from `row`. A row of the second
-    kind whose allocation no longer resolves to a number is never settled here.
+    kind whose allocation no longer resolves to a number is never settled here. An
+    ordinary row is released only if it is still on the allocation the caller read
+    (release_l2_membership with that allocation and no driver call); otherwise nothing
+    is written and False sends the caller on to its planned removal.
     """
     from app.models.vlan_assignment import VlanAssignment
 
