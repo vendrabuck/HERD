@@ -1100,7 +1100,7 @@ async def test_a_reconcile_add_for_a_port_that_owes_a_removal_is_not_driven():
     )
 
 
-async def test_no_ledger_write_moves_a_row_off_the_number_it_owes_a_removal_from():
+async def test_the_flip_and_the_failure_writes_keep_a_row_on_the_number_it_owes_a_removal_from():
     """The judges behind the apply's check: the FAILED-to-ACTIVE flip refuses the row,
     a key-based build failure leaves it, and a release failure keeps its reason."""
     from app.services.l2_membership_service import (
