@@ -270,17 +270,33 @@ deactivate are plain ORM writes; only one sync run can execute at a time (IAM-SE
   Grouped". It is refused when the email is absent, not a string, empty, or whitespace
   only (`email_missing`); `email_verified` is present and not true (`email_unverified`;
   an absent claim is accepted); the email has leading or trailing whitespace, a Cc, Cf,
-  or Cs character, or not exactly one `@` with text on both sides (`email_invalid`);
-  the email is over 255 characters (`email_too_long`); the username is absent, not a
+  or Cs character, any character outside ASCII (owner option (a), issue #1400), or not
+  exactly one `@` with text on both sides (`email_invalid`); the email is over 255
+  characters (`email_too_long`); the username is absent, not a
   string, empty, or whitespace only (`username_missing`); it has leading or trailing
   whitespace or a Cc, Cf, or Cs character (`username_invalid`); it is over 100
   characters (`username_too_long`); or it does not match the option C allowlist
   `OIDC_USERNAME_PATTERN` in full (`username_invalid`, IAM-OIDC-19); a username of
   None is `username_invalid` instead of `username_missing` when the login is marked
   `username_unusable` (IAM-OIDC-19). No other
-  character rule applies to the email. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `create_oidc_user`, `_first_login_refusal`, `FederatedLogin`, `OIDC_USERNAME_PATTERN`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_refuses_a_username_outside_the_allowlist`, `test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_full_name_control_characters_are_replaced`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_email_and_username_content_refusals`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_control_characters_in_full_name_are_replaced_on_postgres`)
+  character rule applies to the email. The ASCII rule covers the whole address, local
+  part and domain, and is checked on the configured email claim exactly as it is
+  stored and as the collision check reads it: nothing between the ID token and the row
+  normalizes it (no NFC or NFKC, no case fold, no trim), so a fullwidth or
+  mathematical letter that NFKC would fold to ASCII is refused, never folded, and an
+  internationalized domain is accepted only in its ASCII `xn--` form, stored as sent
+  and never decoded. The rule applies to a first login only; a returning login never
+  reads the email (IAM-OIDC-8), so an account provisioned with a non-ASCII email
+  before the rule keeps signing in. The reasons above are those
+  `resolve_federated_user` gives for the login it is handed. Through the callback an
+  email claim holding a Cc or Cs character (a tab, a newline, any other C0 control,
+  DEL, a C1 control U+0080 to U+009F, which is also outside ASCII, or a lone
+  surrogate) never reaches them: `VerifiedIdToken` holds such a claim as None, so the
+  refusal logged is `email_missing`; a Cf character and every other non-ASCII
+  character reach the checks and are `email_invalid`. Either way the callback answers
+  the same generic failure (IAM-OIDC-18). \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `create_oidc_user`, `_first_login_refusal`, `FederatedLogin`, `OIDC_USERNAME_PATTERN`); `services/auth/app/services/oidc_service.py` (`_optional_string`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_first_login_refuses_a_username_outside_the_allowlist`, `test_first_login_creates_an_oidc_user_with_no_password_and_role_user`, `test_first_login_full_name_defaults_and_truncation`, `test_full_name_control_characters_are_replaced`, `test_first_login_auto_assigns_not_grouped`, `test_email_verified_true_or_absent_is_accepted`, `test_values_at_the_column_width_are_accepted`, `test_first_login_refusal_creates_nothing_and_logs_one_fixed_reason`, `test_email_and_username_content_refusals`, `test_create_oidc_user_rolls_back_both_rows_on_a_conflict`, `test_a_non_ascii_first_login_email_is_refused_before_any_name_query`, `test_the_ascii_refusal_keeps_the_reason_order`, `test_an_ascii_first_login_email_is_provisioned_and_stored_as_sent`, `test_a_non_ascii_display_name_with_an_ascii_email_is_provisioned`, `test_a_returning_login_never_reads_the_email_so_non_ascii_is_admitted`, `test_an_account_provisioned_before_the_rule_keeps_signing_in`); `services/auth/tests/test_oidc_routes.py` (`test_a_non_ascii_email_at_first_login_answers_failed_and_creates_nothing`, `test_a_control_character_in_the_email_claim_is_refused_as_email_missing`, `test_an_ascii_email_with_a_plus_tag_and_a_non_ascii_name_signs_in`, `test_a_returning_login_with_a_now_non_ascii_email_signs_in`); `services/auth/tests/test_oidc_service.py` (`test_an_optional_claim_with_a_control_character_is_none`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_control_characters_in_full_name_are_replaced_on_postgres`)
 - **IAM-OIDC-10.** A first login whose email or username is held by any account, local,
   LDAP, or `oidc`, active or not, compared case-insensitively with the database's
   `lower()`, is refused; no account is linked, converted, or changed. This holds between
@@ -289,12 +305,22 @@ deactivate are plain ORM writes; only one sync run can execute at a time (IAM-SE
   order, so of first logins whose emails or usernames differ only in case one account
   is created. On SQLite the locks are a no-op, so the unit suites prove the refusal and
   the lock wiring, and only the Postgres-live suite proves the concurrent case. The lock
-  key folds with Python's `str.casefold`, which agrees with `lower()` for ASCII; outside
-  ASCII the two may differ. There is no Unicode normalization or confusable check: a
-  visible look-alike (a dotless i, a fullwidth letter) is a different email or
-  username and is provisioned. \
-  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_email_taken`, `_username_taken`, `_lock_first_login_names`) \
-  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_collision_matrix_refuses_and_never_links`, `test_collision_refusal_holds_for_an_inactive_existing_account`, `test_another_account_taking_the_email_inside_the_window_is_refused`, `test_lookalike_of_an_existing_email_is_refused`, `test_visible_unicode_lookalikes_are_distinct_emails_today`, `test_first_login_takes_both_name_locks_in_key_order_before_the_checks`, `test_name_lock_keys_ignore_case`, `test_refusals_before_the_insert_take_no_name_lock`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_case_insensitive_email_collision_on_postgres`, `test_concurrent_first_logins_of_different_subjects_with_one_email_create_one_user`, `test_concurrent_first_logins_differing_only_in_case_create_one_account`)
+  key folds with Python's `str.casefold`, which agrees with `lower()` for ASCII, and
+  both names are ASCII by then (the email by IAM-OIDC-9, the username by IAM-OIDC-19).
+  There is no Unicode normalization or confusable check; instead a look-alike built
+  from a non-ASCII character (a Cyrillic or Greek letter, a dotless i, a fullwidth
+  form, a combining mark) is refused as `email_invalid` by IAM-OIDC-9 before the
+  locks and the collision check run, so the answer is the same whether or not the
+  account it imitates exists, and no relink candidate is kept for it. Not covered, by
+  the owner's choice of option (a) over a confusable skeleton: an all-ASCII
+  look-alike (`rn` for `m`, `1` or `I` for `l`) and a punycode (`xn--`) domain are
+  ASCII and compare as written. Not covered and still an open defect (section 13): an
+  account that already holds a non-ASCII email (a local or LDAP account, whose paths
+  have no such rule, or an `oidc` account provisioned before issue #1400) can be
+  imitated by an ASCII email, which compares as a different email and is
+  provisioned. \
+  Enforced in: `services/auth/app/services/auth_service.py` (`resolve_federated_user`, `_first_login_refusal`, `_email_taken`, `_username_taken`, `_lock_first_login_names`) \
+  Pinned by: `services/auth/tests/test_oidc_provisioning.py` (`test_collision_matrix_refuses_and_never_links`, `test_collision_refusal_holds_for_an_inactive_existing_account`, `test_another_account_taking_the_email_inside_the_window_is_refused`, `test_lookalike_of_an_existing_email_is_refused`, `test_a_non_ascii_first_login_email_is_refused_before_any_name_query`, `test_first_login_takes_both_name_locks_in_key_order_before_the_checks`, `test_name_lock_keys_ignore_case`, `test_refusals_before_the_insert_take_no_name_lock`); `services/auth/tests/test_oidc_flow_service_live_pg.py` (`test_case_insensitive_email_collision_on_postgres`, `test_concurrent_first_logins_of_different_subjects_with_one_email_create_one_user`, `test_concurrent_first_logins_differing_only_in_case_create_one_account`)
 - **IAM-OIDC-11.** Concurrent first logins of one (issuer, subject) create one account
   and one identity, and every one of them signs in as that account: a login that loses
   a collision check or the insert to it looks the identity up again and proceeds as a
@@ -2644,14 +2670,29 @@ the integration suite, the frontend tests, and the browser suite were read, not 
 
 - Issue #1396: the identity provider's responses have no size bound, and its JWKS no
   key-count bound (hardening before OIDC mode is supported).
-- Issue #1400: visible Unicode look-alikes of an existing email are provisioned as
-  separate accounts.
+- Issue #1400, the part IAM-OIDC-9 does not fix: a first single sign-on login whose
+  email is ASCII is provisioned as a second account beside an account that already
+  holds a non-ASCII look-alike of that email, since the collision check compares with
+  `lower()` only (IAM-OIDC-10). Such accounts come from local registration and LDAP,
+  which have no ASCII rule, and from `oidc` accounts provisioned before the rule. One
+  case needs no deliberate look-alike: local registration's `EmailStr` decodes a
+  punycode domain to Unicode before storing, so `admin@xn--bcher-kva.example` is
+  stored with the domain written `b`, u with diaeresis (U+00FC), `cher.example`, and a
+  first single sign-on login sending `admin@xn--bcher-kva.example` does not collide
+  with it and is provisioned as a second account for the same mailbox. Whether local
+  registration and LDAP get a rule is the owner's decision; no follow-up is filed.
 
-(#1420 is resolved by IAM-OIDC-28, #1399 by IAM-OIDC-29 to IAM-OIDC-39, #1403 by
-IAM-LDAP-12 and IAM-LDAP-13, #1404 by IAM-LOGIN-6, and #1447 by IAM-LDAP-16.)
+(#1400 is resolved in part by IAM-OIDC-9, see the entry above; #1420 by IAM-OIDC-28, #1399 by IAM-OIDC-29 to
+IAM-OIDC-39, #1403 by IAM-LDAP-12 and IAM-LDAP-13, #1404 by IAM-LOGIN-6, and #1447 by
+IAM-LDAP-16.)
 
 ### Limits by decision
 
+- A first single sign-on login's email must be ASCII (IAM-OIDC-9, owner option (a) on
+  issue #1400, 2026-11-25), so an internationalized mailbox cannot be provisioned.
+  Option (a) was chosen over a Unicode TR39 confusable skeleton, so an all-ASCII
+  look-alike (`rn` for `m`, `1` or `I` for `l`) and a domain in its punycode (`xn--`)
+  form are accepted and compare as written (IAM-OIDC-10). Recorded in ADR 0016 D4.
 - The login body has no NUL check, so a login password holding a NUL is not a 422: in
   local mode it is the 401 `Invalid credentials`, and in LDAP mode the same 401 before
   any directory call (IAM-LOGIN-5, IAM-HASH-3, IAM-LDAP-13). Recorded in issue #1426 (Expected and Suggested fix).
