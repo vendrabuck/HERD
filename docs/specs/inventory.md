@@ -1113,9 +1113,9 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   the document is nested too deeply or holds a number too long to read`, which names no
   part of the file or the exception: one nested deeper than the parser's C recursion
   budget (the interpreter's bound, not a HERD setting; just under 10,000 levels on
-  the service image's Python 3.12), or one holding an integer literal longer than Python's integer string
-  conversion limit (4,300 digits, sign not counted). Both were 500s before issue
-  #1511. \
+  the service image's Python 3.12), or one holding an integer literal longer than
+  Python's integer string conversion limit (4,300 digits, sign not counted). Both were
+  500s before issue #1511. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_json_invalid_document_raises_422`, `test_parse_json_accepts_bare_list`, `test_parse_json_accepts_items_wrapper`, `test_parse_json_scalar_document_rejected`, `test_parse_json_items_not_a_list_rejected`); `services/inventory/tests/test_bulk.py` (`test_the_bounds_these_tests_rest_on`, `test_parse_import_refuses_an_unreadable_document_with_the_fixed_detail`, `test_parse_import_reads_a_document_just_under_the_depth_bound`, `test_parse_import_reads_an_integer_at_the_digit_limit`, `test_parse_import_keeps_the_decoder_position_for_a_syntax_error`, `test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing`, `test_a_json_import_just_under_the_parser_bounds_imports`)
 - **INV-BULK-5.** The file is decoded as UTF-8, and a leading byte order mark is
@@ -1221,9 +1221,9 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   `Import file holds a lone surrogate escape, which is not valid text; fix it and retry`
   for the whole file, and nothing is written. A CSV row whose JSON cell (`field_data`,
   `sections`) holds one is rejected with the reason `a JSON cell holds a lone surrogate
-  escape, which is not valid text`, and the other rows are judged on their own. The file is a
-  multipart upload, which the shared body check (OPS-VALID-6) passes through, so the
-  importer checks the JSON it parses itself. Before issue #1456's sweep a device or
+  escape, which is not valid text`, and the other rows are judged on their own. The
+  file is a multipart upload, which the shared body check (OPS-VALID-6) passes through,
+  so the importer checks the JSON it parses itself. Before issue #1456's sweep a device or
   template name holding one made the report unencodable (a 500), and one in
   `field_data` was stored, so every later read of the device could not encode it. A
   character outside the BMP written as an escaped pair is imported. \

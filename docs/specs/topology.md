@@ -1226,9 +1226,9 @@ is the user guide.
   `Invalid JSON: the document is nested too deeply or holds a number too long to read`,
   which names no part of the file or the exception: one nested deeper than the parser's
   C recursion budget (the interpreter's bound, not a HERD setting; just under 10,000
-  levels on the service image's Python 3.12), or one holding an integer literal longer than Python's integer
-  string conversion limit (4,300 digits, sign not counted). Both were 500s before issue
-  #1511, reachable by any signed-in user; inventory's importers give the same answer
+  levels on the service image's Python 3.12), or one holding an integer literal longer
+  than Python's integer string conversion limit (4,300 digits, sign not counted). Both
+  were 500s before issue #1511, reachable by any signed-in user; inventory's importers give the same answer
   (INV-BULK-4 in `inventory.md`). \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_json_topologies`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
   Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_json_invalid_json_raises_422`, `test_parse_json_bare_list_accepted`, `test_parse_json_wrong_shape_raises_422`, `test_parse_json_items_not_a_list_raises_422`); `services/cabling/tests/test_bulk.py` (`test_the_bounds_these_tests_rest_on`, `test_parse_json_topologies_refuses_an_unreadable_document_with_the_fixed_detail`, `test_parse_json_topologies_reads_a_document_just_under_the_depth_bound`, `test_parse_json_topologies_reads_an_integer_at_the_digit_limit`, `test_parse_json_topologies_keeps_the_decoder_position_for_a_syntax_error`, `test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing`, `test_a_json_import_just_under_the_parser_bounds_imports`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_the_parser_refuses_is_a_fixed_422_for_a_non_admin`)
