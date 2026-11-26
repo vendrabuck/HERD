@@ -957,8 +957,7 @@ routes in section 5; background work `purpose_classify_loop` every
   the next row. Nothing is stored that the store, Postgres's `json` operators, or the
   response models refuse later: a 200 is a usable suggestion only when its body parses
   to a JSON object whose `top_category` is a string (issue #1543), nested no deeper than
-  32 levels (the JSON encoder that stores the column, and the response models past
-  about 255 levels, refuse deeper nesting), holding no number that is not finite
+  32 levels (the response models refuse nesting past about 255 levels, and the JSON encoder that stores the column refuses it past its recursion limit), holding no number that is not finite
   (`NaN`, `Infinity`, or a literal such as `1e400` that overflows a float; Postgres
   refuses the stored text), and holding no string, dict keys included, with a NUL or an
   unpaired surrogate (Postgres's `->` and `->>` refuse both, and the response models
