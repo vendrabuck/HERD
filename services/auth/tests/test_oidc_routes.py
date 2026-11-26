@@ -1050,6 +1050,94 @@ async def test_provisioning_refusals_answer_failed_and_link_nothing(client, idp,
         )
 
 
+def _hidden(idp: FakeIdP, value: str) -> None:
+    """Add a claim value to the log-hygiene needles as sent and as `JSONFormatter`
+    writes it: `json.dumps` escapes non-ASCII, so the raw text alone would never
+    match a log line that held it."""
+    idp.secrets += [value, json.dumps(value)[1:-1]]
+
+
+# Issue #1400, owner option (a), over HTTP: the ID token's email claim travels as JSON
+# (`\u` escapes decoded by PyJWT, no normalization), and a non-ASCII one is refused at
+# provisioning. Each is a look-alike of the local account `_local_account` creates.
+NON_ASCII_CALLBACK_EMAILS = {
+    "cyrillic-o-in-local": "\u043ewner@example.test",
+    "greek-omicron-in-domain": "owner@ex\u03bfmple.test",
+    "fullwidth-o": "\uff4fwner@example.test",
+    "math-sans-serif-o": "\U0001d5c8wner@example.test",
+    "combining-acute": "o\u0301wner@example.test",
+    "no-break-space": "owner\u00a0@example.test",
+    "idn-domain-in-unicode": "owner@ex\u00e4mple.test",
+    "zero-width-space": "ow\u200bner@example.test",
+    "right-to-left-override": "owner@\u202etset.elpmaxe",
+}
+
+
+@pytest.mark.parametrize("username_claim", ["fits", "absent"])
+@pytest.mark.parametrize("holder", [True, False], ids=["holder-exists", "no-holder"])
+@pytest.mark.parametrize("kind", sorted(NON_ASCII_CALLBACK_EMAILS))
+async def test_a_non_ascii_email_at_first_login_answers_failed_and_creates_nothing(
+    client, idp, caplog, kind, holder, username_claim
+):
+    """`/login?sso_error=failed`, one `email_invalid` refusal, the flow row failed,
+    nothing created; the same with or without the account it imitates, and whether
+    the username comes from the claim or would have fallen back to the email."""
+    if holder:
+        await _local_account()
+    email = NON_ASCII_CALLBACK_EMAILS[kind]
+    _hidden(idp, email)
+    idp.claim_changes["email"] = email
+    if username_claim == "absent":
+        idp.claim_changes["preferred_username"] = DROP
+    begun = await begin(client, idp)
+    response = await complete_callback(client, idp, begun)
+    assert response.headers["location"] == FAILED
+    assert oidc_router.HANDOFF_COOKIE not in set_cookies(response)
+    refusals = [
+        r.reason
+        for r in caplog.get_records("call")
+        if r.name == "app.services.auth_service" and getattr(r, "action", None) == "login_failure"
+    ]
+    assert refusals == ["email_invalid"]
+    assert (await flow_row(begun.state)).status == "failed"
+    users, identities, _ = await counts()
+    assert (users, identities) == (int(holder), 0)
+
+
+async def test_an_ascii_email_with_a_plus_tag_and_a_non_ascii_name_signs_in(client, idp):
+    """The rule is the email's alone: mixed case and a plus tag are ASCII, and a
+    non-ASCII display name is kept as sent."""
+    email = "Sentinel.Mixed+Tag@Example.TEST"
+    name = "J\u00f6rg \u0410\u043b\u0438\u0441\u0430"
+    _hidden(idp, email)
+    _hidden(idp, name)
+    idp.claim_changes.update(email=email, name=name)
+    _, _, handoff = await sign_in(client, idp)
+    body = (await exchange(client, handoff)).json()
+    idp.secrets += [body["access_token"], body["refresh_token"]]
+    async with TestSessionLocal() as db:
+        row = (await db.execute(select(User))).scalar_one()
+    assert (row.email, row.full_name, row.username) == (email, name, USERNAME)
+
+
+async def test_a_returning_login_with_a_now_non_ascii_email_signs_in(client, idp):
+    """IAM-OIDC-8: a returning login never reads the email, so the ASCII rule does
+    not apply to it; the stored email stays as first provisioned."""
+    _, _, handoff = await sign_in(client, idp)
+    body = (await exchange(client, handoff)).json()
+    idp.secrets += [body["access_token"], body["refresh_token"]]
+    changed = "s\u0435ntinel-email@example.test"
+    _hidden(idp, changed)
+    idp.claim_changes["email"] = changed
+    _, _, handoff = await sign_in(client, idp)
+    body = (await exchange(client, handoff)).json()
+    idp.secrets += [body["access_token"], body["refresh_token"]]
+    async with TestSessionLocal() as db:
+        row = (await db.execute(select(User))).scalar_one()
+    assert row.email == EMAIL
+    assert (await counts())[:2] == (1, 1)
+
+
 async def test_an_inactive_linked_account_is_refused_at_the_callback(client, idp):
     _, _, handoff = await sign_in(client, idp)
     body = (await exchange(client, handoff)).json()

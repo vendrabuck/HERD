@@ -293,6 +293,13 @@ login (IAM-LDAP-8).
   IAM-LDAP-5) and refuse when `email_verified` is present and false. If any `users`
   row has that email compared case-insensitively, refuse: the local or LDAP account is
   never linked or converted, and the federated user sees the generic failure. The
+  email must be ASCII, local part and domain (owner option (a), issue #1400, decided
+  2026-11-25): any other character refuses as `email_invalid` before the collision
+  check, so a look-alike of an ASCII email built from a Cyrillic, Greek, fullwidth, or
+  combining character can no longer be provisioned beside the account it imitates. The check
+  reads the claim as sent and stored, with no Unicode normalization before it, and
+  refuses internationalized mailboxes; an internationalized domain passes only in its
+  `xn--` form. A returning login never reads the email, so it does not apply there. The
   username follows the owner's option C (an owner decision, amended into this record
   in phase 3): the configured claim (default `preferred_username`) when it matches the
   ASCII allowlist `^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$` in full (1 to 100 characters,
@@ -942,7 +949,7 @@ row to `failed`):
 | OIDC settings incomplete; discovery, JWKS, or token endpoint unreachable, timed out, non-JSON, or answering 5xx | `/login?sso_error=unavailable` |
 | token endpoint answers 4xx (for example `invalid_grant`) or no `id_token` | `/login?sso_error=failed` |
 | ID-token verification fails (any D8 or D13 rule) | `/login?sso_error=failed` |
-| provisioning refused (D4: email missing or unverified, email or username taken, username too long) | `/login?sso_error=failed` |
+| provisioning refused (D4: email missing or unverified, email not ASCII (issue #1400), email or username taken, username too long) | `/login?sso_error=failed` |
 | linked user inactive | `/login?sso_error=failed` |
 | the flow row cannot be completed (`complete_flow` answers False) | `/login?sso_error=failed` |
 | success | `/login/sso` |
@@ -1445,7 +1452,8 @@ The first draft put five questions to the owner. All five were decided by the ow
 2026-11-11, each as recommended; no owner question remains open. A sixth owner decision,
 the username rule (option C), was made before phase 3; two more, the early `auth_method`
 widening and the lab's templated redirect URIs, were made in phase 5b; a ninth, the
-recovery routes of issue #1399 and their three refinements, on 2026-11-18. They are the last four rows below. The one condition
+recovery routes of issue #1399 and their three refinements, on 2026-11-18; and a tenth,
+the ASCII email rule of issue #1400, on 2026-11-25. They are the last five rows below. The one condition
 that could return D12 to the owner, the phase 5a measurement, is met: Dex was the
 smallest and fastest of the three, and it passed the issuer-reachability proof, refused
 a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed the
@@ -1462,3 +1470,4 @@ a wrong `code_verifier` (`invalid_grant`), accepted the right one, and echoed th
 | `auth_method` widened early (added in phase 5b, 2026-11-14) | auth admits `oidc` from phase 5b, since the stack tests cannot recreate auth in a mode it refuses; the config page and handbook stay phase 6; issues #1399 and #1420 block the 0.8.0 release (both since settled) | phase 5b |
 | Lab redirect URIs (added in phase 5b, 2026-11-14) | templated from `HERD_GATEWAY_BIND`, no host address in a tracked file | phase 5b |
 | D4 recovery (added 2026-11-18, issue #1399) | option (a): superadmin-only routes, API only, a bulk issuer rewrite and a single-identity relink (the "unlink so the next login links afresh" done in one step that names the new subject, since a bare unlink plus the next login cannot link without matching by email); from the review the same day, (A) refused identities kept as relink candidates, confirmed out of band, (B) colliding account ids named by the rewrite, (C) keyed fingerprints in the audit lines | the recovery routes, between phases 5b and 6 |
+| D4 email, option (a) (added 2026-11-25, issue #1400) | a first login's email must be ASCII, else `email_invalid`; chosen over a TR39 confusable skeleton (option (b)) and over recording the gap (option (c)), for symmetry with option C | the fix for issue #1400 |

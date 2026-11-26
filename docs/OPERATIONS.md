@@ -505,6 +505,21 @@ kept for it, and no route changes that. The person can be given a different emai
 username at the provider, so the first sign-in provisions a new account; carrying the
 old account's groups and ownership over is a manual step.
 
+### A user's first single sign-on login is refused as `email_invalid`
+
+The same log query shows `email_invalid` when the email the provider sends (the claim
+`OIDC_EMAIL_CLAIM` names, default `email`) is not a plain address: white space at
+either end, an invisible or control character, not exactly one `@` with text on both
+sides, or, since issue #1400, any character outside ASCII, in the part before the `@`
+or after it. The last
+rule keeps a look-alike (a Cyrillic or Greek letter, a fullwidth letter, an accented
+letter) from becoming a second account that reads like someone else's, and it also
+refuses a genuinely internationalized mailbox. HERD does not convert the address: give
+the person an ASCII email at the provider, or point `OIDC_EMAIL_CLAIM` at a claim that
+holds one. A domain written in its ASCII `xn--` form is accepted and shown that way.
+The rule applies only to a first sign-in: an account created with a non-ASCII email
+before it keeps signing in.
+
 ### Sessions after a relink or rewrite
 
 Neither route revokes a session. A sign-in already in flight when a relink or rewrite

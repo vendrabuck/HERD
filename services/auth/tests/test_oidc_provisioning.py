@@ -19,6 +19,7 @@ import uuid
 import pytest
 from app.database import Base
 from app.models.federated_identity import FederatedIdentity
+from app.models.federated_relink_candidate import FederatedRelinkCandidate
 from app.models.group import UserGroup
 from app.models.user import Role, User
 from app.services import auth_service
@@ -441,6 +442,7 @@ async def test_refusal_logs_carry_no_claim_values(caplog):
         dataclasses.replace(marker, username="u" * 101 + "MARKER-USERNAME"),
         dataclasses.replace(marker, email="bob@example.com"),
         dataclasses.replace(marker, username="bob"),
+        dataclasses.replace(marker, email="MARKER-EMAIL-\u0430@example.com"),
     ]
     with caplog.at_level(logging.DEBUG, logger="app"):
         async with TestSessionLocal() as db:
@@ -450,7 +452,7 @@ async def test_refusal_logs_carry_no_claim_values(caplog):
             await auth_service.set_user_active(db, user.id, False)
             assert await resolve_federated_user(db, marker) is None
     records = [r for r in caplog.records if r.name.startswith("app.")]
-    assert len(_refusals(caplog)) == 5
+    assert len(_refusals(caplog)) == 6
     for record in records:
         text = record.getMessage() + " " + " ".join(str(v) for v in record.__dict__.values())
         for value in ("MARKER-ISSUER", "MARKER-SUBJECT", "MARKER-EMAIL", "MARKER-NAME"):
@@ -567,16 +569,163 @@ async def test_lookalike_of_an_existing_email_is_refused(kind):
     assert await _counts() == (1, 0)
 
 
+# --- issue #1400, owner option (a): a first-login email must be ASCII ------------------
+
+# Every class of non-ASCII email, most of them a visible look-alike of the account
+# email LOOKALIKE_HOLDER. Non-ASCII characters are written as escapes so this file
+# stays reviewable. Each is refused as `email_invalid`; the Cf entries (zero width and
+# bidi controls) and the fullwidth `@` were refused before #1400 too, by the Cf rule
+# and the one-`@` rule, and are kept so the whole space stays enumerated.
+LOOKALIKE_HOLDER = "admin@corp.example"
+NON_ASCII_EMAILS = {
+    "cyrillic-a-in-local": "\u0430dmin@corp.example",
+    "cyrillic-o-in-domain": "admin@c\u043erp.example",
+    "greek-iota-in-local": "adm\u03b9n@corp.example",
+    "greek-omicron-in-domain": "admin@c\u03bfrp.example",
+    "dotless-i": "adm\u0131n@corp.example",
+    "dotless-i-plus-combining-dot": "adm\u0131\u0307n@corp.example",
+    "combining-acute-in-local": "a\u0301dmin@corp.example",
+    "combining-grave-in-domain": "admin@corp.exa\u0300mple",
+    "precomposed-latin-1": "\u00e0dmin@corp.example",
+    "fullwidth-a-in-local": "\uff41dmin@corp.example",
+    "fullwidth-full-stop-in-domain": "admin@corp\uff0eexample",
+    "fullwidth-commercial-at": "admin\uff20corp.example",
+    "math-sans-serif-a": "\U0001d5badmin@corp.example",
+    "no-break-space-inside": "admin\u00a0x@corp.example",
+    "idn-domain-in-unicode": "admin@b\u00fccher.example",
+    "zero-width-space": "ad\u200bmin@corp.example",
+    "zero-width-joiner": "ad\u200dmin@corp.example",
+    "word-joiner": "ad\u2060min@corp.example",
+    "byte-order-mark": "\ufeffadmin@corp.example",
+    "left-to-right-mark": "admin\u200e@corp.example",
+    "right-to-left-override": "admin@\u202eelpmaxe.proc",
+    "left-to-right-isolate": "admin@\u2066corp.example",
+}
+# Characters NFKC folds to ASCII; the check must see them as sent, so these are refused
+# rather than folded into the address they imitate.
+assert {
+    "\uff41",
+    "\uff0e",
+    "\uff20",
+    "\U0001d5ba",
+} <= {ch for value in NON_ASCII_EMAILS.values() for ch in value}
+
+
+@pytest.mark.parametrize("holder", [True, False], ids=["holder-exists", "no-holder"])
+@pytest.mark.parametrize("kind", sorted(NON_ASCII_EMAILS))
+async def test_a_non_ascii_first_login_email_is_refused_before_any_name_query(
+    monkeypatch, caplog, kind, holder
+):
+    """IAM-OIDC-9 (issue #1400): refused as `email_invalid`, nothing created, and the
+    same answer whether or not the account it imitates exists: no name lock, no
+    collision query, and so no relink candidate runs for it."""
+    if holder:
+        async with TestSessionLocal() as db:
+            await create_user(db, LOOKALIKE_HOLDER, "admin", "password123")
+    users_before, _ = await _counts()
+
+    async def not_reached(*args, **kwargs):
+        raise AssertionError("a non-ASCII email reached a name lock or a collision query")
+
+    for name in ("xact_lock", "_email_taken", "_username_taken", "_capture_relink_candidate"):
+        monkeypatch.setattr(auth_service, name, not_reached)
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            login = _login(email=NON_ASCII_EMAILS[kind], username="other")
+            assert await resolve_federated_user(db, login) is None
+    assert await _counts() == (users_before, 0)
+    [record] = _refusals(caplog)
+    assert record.reason == "email_invalid"
+
+
 @pytest.mark.parametrize(
-    "email", ["admın@t.example", "ａdmin@t.example"], ids=["dotless-i", "fullwidth-a"]
+    "overrides,reason",
+    [
+        ({"email": "\u0430" * 300 + "@corp.example"}, "email_invalid"),
+        ({"email": "\u0430dmin@corp.example", "email_verified": False}, "email_unverified"),
+        ({"email": "\u0430dmin@corp.example", "username": None}, "email_invalid"),
+        (
+            {"email": "\u0430dmin@corp.example", "username": None, "username_unusable": True},
+            "email_invalid",
+        ),
+    ],
+    ids=["over-255-and-non-ascii", "unverified-first", "before-username-missing", "unusable"],
 )
-async def test_visible_unicode_lookalikes_are_distinct_emails_today(email):
-    """No Unicode normalization or confusable check exists yet (no owner
-    decision): a visible look-alike is a different email and is provisioned.
-    Pinned so a change here is deliberate; see IAM-OIDC-10."""
+async def test_the_ascii_refusal_keeps_the_reason_order(caplog, overrides, reason):
+    """The ASCII rule is part of `email_invalid`: after `email_unverified`, before
+    `email_too_long` and every username reason."""
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            assert await resolve_federated_user(db, _login(**overrides)) is None
+    [record] = _refusals(caplog)
+    assert record.reason == reason
+
+
+ASCII_EMAILS = [
+    "alice@example.com",
+    "Alice.Smith+ops@Example.COM",
+    "ALICE+a.b-c_d@corp-1.example",
+    "o'brien@example.com",
+    "a@b",
+    "admin@xn--crp-sed.example",
+    "x@xn--bcher-kva.example",
+]
+
+
+@pytest.mark.parametrize("email", ASCII_EMAILS)
+async def test_an_ascii_first_login_email_is_provisioned_and_stored_as_sent(email):
+    """Plus tags, mixed case, other ASCII punctuation, and a punycode (`xn--`) domain
+    are ASCII and are provisioned; the row holds the claim exactly as sent: no case
+    fold, and a punycode domain is not decoded (`xn--crp-sed` is a Cyrillic look-alike
+    of "corp" in its ASCII form, which reads as what it is)."""
     async with TestSessionLocal() as db:
-        await create_user(db, "admin@t.example", "admin", "password123")
-        assert await resolve_federated_user(db, _login(email=email, username="other")) is not None
+        user = await resolve_federated_user(db, _login(email=email, username="alice"))
+    assert user is not None
+    assert (await _load(user.id)).email == email
+
+
+async def test_a_non_ascii_display_name_with_an_ascii_email_is_provisioned():
+    name = "J\u00f6rg \u0410\u043b\u0438\u0441\u0430 \u5c71\u7530 a\u0301"
+    async with TestSessionLocal() as db:
+        user = await resolve_federated_user(db, _login(full_name=name))
+    assert user is not None
+    row = await _load(user.id)
+    assert (row.email, row.full_name) == ("alice@example.com", name)
+
+
+async def test_a_returning_login_never_reads_the_email_so_non_ascii_is_admitted():
+    """The rule applies at provisioning only (IAM-OIDC-8): a known identity whose
+    provider now sends a non-ASCII email signs in, and its stored email is unchanged."""
+    async with TestSessionLocal() as db:
+        first = await resolve_federated_user(db, _login())
+    for email in ("\u0430lice@example.com", "alice@ex\u0430mple.com", "\uff41lice@example.com"):
+        async with TestSessionLocal() as db:
+            again = await resolve_federated_user(db, _login(email=email))
+        assert again is not None and again.id == first.id
+    assert (await _load(first.id)).email == "alice@example.com"
+    assert await _counts() == (1, 1)
+
+
+async def test_an_account_provisioned_before_the_rule_keeps_signing_in(caplog):
+    """An `oidc` account whose email is non-ASCII (provisioned before issue #1400;
+    built here with `create_oidc_user`, which does not validate) keeps signing in by
+    its (issuer, subject). Another identity sending that same email is refused as
+    `email_invalid`, not `email_taken`, so no relink candidate is captured for it."""
+    stored = "\u0430lice@example.com"
+    async with TestSessionLocal() as db:
+        old = await create_oidc_user(db, _login(email=stored))
+    async with TestSessionLocal() as db:
+        again = await resolve_federated_user(db, _login(email=stored))
+    assert again is not None and again.id == old.id
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        async with TestSessionLocal() as db:
+            other = _login(subject="sub-someone-else", email=stored, username="someone")
+            assert await resolve_federated_user(db, other) is None
+    assert [r.reason for r in _refusals(caplog)] == ["email_invalid"]
+    async with TestSessionLocal() as db:
+        captured = await db.execute(select(func.count()).select_from(FederatedRelinkCandidate))
+        assert captured.scalar_one() == 0
+    assert await _counts() == (1, 1)
 
 
 @pytest.mark.parametrize(

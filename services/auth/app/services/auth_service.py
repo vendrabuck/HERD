@@ -577,8 +577,14 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     Email: absent, empty, or whitespace only is `email_missing`; an
     `email_verified` that is present and not true is `email_unverified` (an
     absent claim is accepted, ADR 0016 D4); leading or trailing whitespace, a
-    Cc, Cf, or Cs character, or anything but exactly one `@` with text on both
-    sides is `email_invalid`; over 255 characters is `email_too_long`. The
+    Cc, Cf, or Cs character, any character outside ASCII (issue #1400, owner
+    option (a)), or anything but exactly one `@` with text on both sides is
+    `email_invalid`; over 255 characters is `email_too_long`. The ASCII check
+    runs on the claim exactly as it will be stored and compared: nothing
+    between the ID token and the `users` row normalizes it (no NFC or NFKC, no
+    case fold, no trim), so a fullwidth or Cyrillic look-alike is refused
+    here, not folded to ASCII first, and an internationalized domain passes
+    only in its ASCII `xn--` form. The
     username likewise: `username_invalid` when it is None and
     `username_unusable` is True (option C found a candidate but none fit),
     else `username_missing`, `username_invalid`,
@@ -593,7 +599,18 @@ def _first_login_refusal(login: FederatedLogin) -> str | None:
     if login.email_verified is not None and login.email_verified is not True:
         return "email_unverified"
     local, _, domain = email.partition("@")
-    if not _name_is_clean(email) or email.count("@") != 1 or not local or not domain:
+    if (
+        not _name_is_clean(email)
+        # Owner option (a), issue #1400: a non-ASCII email could be a visible
+        # look-alike of another account's (a Cyrillic or fullwidth letter, a
+        # combining mark), which the case-insensitive collision check would
+        # not catch. Checked before any query, so the refusal is the same
+        # whether or not a look-alike account exists.
+        or not email.isascii()
+        or email.count("@") != 1
+        or not local
+        or not domain
+    ):
         return "email_invalid"
     if len(email) > _EMAIL_MAX_LENGTH:
         return "email_too_long"
@@ -623,7 +640,9 @@ async def _lock_first_login_names(db: AsyncSession, email: str, username: str) -
     dialect (`herd_common.advisory_lock.xact_lock`): the SQLite unit suites
     cannot prove this; the Postgres-live suite does. The fold is Python's
     `str.casefold`, which equates at least every pair SQL `lower()` equates
-    for ASCII; outside ASCII the database's `lower()` may differ.
+    for ASCII; outside ASCII the database's `lower()` may differ, but both
+    names are ASCII by the time they get here (the username by option C, the
+    email by `_first_login_refusal`, issue #1400).
     """
     keys = sorted(
         {
