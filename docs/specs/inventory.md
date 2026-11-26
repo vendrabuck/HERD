@@ -1106,9 +1106,18 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`device_to_record`) \
   Pinned by: none
 - **INV-BULK-4.** Import accepts a JSON list or an object with an `items` list; invalid
-  JSON, any other shape, or a non-list `items` answers 422 for the whole file. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`) \
-  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_json_invalid_document_raises_422`, `test_parse_json_accepts_bare_list`, `test_parse_json_accepts_items_wrapper`, `test_parse_json_scalar_document_rejected`, `test_parse_json_items_not_a_list_rejected`)
+  JSON, any other shape, or a non-list `items` answers 422 for the whole file, and
+  nothing is written, dry run included. A syntax error answers `Invalid JSON: ` followed
+  by the decoder's message, which names a line, column, and character offset and no
+  content. A document the parser refuses for its shape answers the fixed `Invalid JSON:
+  the document is nested too deeply or holds a number too long to read`, which names no
+  part of the file or the exception: one nested deeper than the parser's C recursion
+  budget (the interpreter's bound, not a HERD setting; just under 10,000 levels on
+  Python 3.12), or one holding an integer literal longer than Python's integer string
+  conversion limit (4,300 digits, sign not counted). Both were 500s before issue
+  #1511. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
+  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_json_invalid_document_raises_422`, `test_parse_json_accepts_bare_list`, `test_parse_json_accepts_items_wrapper`, `test_parse_json_scalar_document_rejected`, `test_parse_json_items_not_a_list_rejected`); `services/inventory/tests/test_bulk.py` (`test_the_bounds_these_tests_rest_on`, `test_parse_import_refuses_an_unreadable_document_with_the_fixed_detail`, `test_parse_import_reads_a_document_just_under_the_depth_bound`, `test_parse_import_reads_an_integer_at_the_digit_limit`, `test_parse_import_keeps_the_decoder_position_for_a_syntax_error`, `test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing`, `test_a_json_import_just_under_the_parser_bounds_imports`)
 - **INV-BULK-5.** The file is decoded as UTF-8, and a leading byte order mark is
   dropped. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
@@ -1220,6 +1229,16 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   character outside the BMP written as an escaped pair is imported. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only`)
+- **INV-BULK-24.** A CSV row whose JSON cell (`field_data`, `sections`) the parser
+  refuses for its shape, nested deeper than its C recursion budget or holding an integer
+  literal longer than 4,300 digits (the bounds of INV-BULK-4), is rejected with the
+  fixed reason `a JSON cell is nested too deeply or holds a number too long to read`;
+  the other rows are imported. A cell with a syntax error is still rejected with the
+  decoder's message, which names a position and no content. Before issue #1511 the row
+  was rejected with Python's own exception text. A cell is bounded by the csv module's
+  field limit (131,072 characters) before it reaches the parser. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_coerce_json_cell`, `JSON_CELL_UNREADABLE_REASON`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_cell_the_parser_refuses_raises_the_fixed_reason`, `test_a_json_cell_just_under_the_bounds_still_parses`, `test_a_json_cell_syntax_error_keeps_the_decoder_error`, `test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only`)
 - **INV-BULK-23.** An import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB) answers
   413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"], "msg":
   "Request body is larger than <limit> bytes"}`, and nothing is parsed or written. The
@@ -1472,6 +1491,7 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `driver_metadata.json is larger than 1048576 bytes; nothing was stored`, `Driver package has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was stored` | driver upload or file replace whose metadata entry or tar header record is over 1 MiB | INV-DRV-7 |
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
 | 422 | `Invalid JSON: ...`, `JSON import must be a list of records or an object with an 'items' list`, `'items' must be a list` | unparseable JSON import | INV-BULK-4 |
+| 422 | `Invalid JSON: the document is nested too deeply or holds a number too long to read` | a JSON import nested past the parser's depth bound or holding an integer longer than 4,300 digits | INV-BULK-4 |
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
 | 422 | `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | a JSON import file holding a lone surrogate | INV-BULK-22 |
 | 422 | `Secret data cannot be read; an admin must replace it in the secrets service` | hypervisor with a secret whose stored data the secrets service cannot return | INV-HYP-4, INV-HYP-6 |
