@@ -10,23 +10,20 @@ SQLite unit tests skip the Postgres branch entirely), so a busted query
 assumption that doesn't hold) would pass every existing test and still fail
 in production.
 
-Skipped automatically when no Postgres is reachable at the configured DSN,
-so the suite stays green without one. Setting HERD_TEST_PG_REQUIRED=1
-disables the skip: an unreachable server then fails every test with an
-explicit message, mirroring services/auth/tests/test_ldap_service_live.py's
-HERD_TEST_LDAP_REQUIRED contract.
+Skipped, connecting to nothing, unless HERD_TEST_PG_DSN names a database
+(issue #1401: there is no default; the dev stack's Postgres is never assumed).
+Setting HERD_TEST_PG_REQUIRED=1 turns that skip into a failure, mirroring
+services/auth/tests/test_ldap_service_live.py's HERD_TEST_LDAP_REQUIRED
+contract, and a named database that does not answer fails every test with an
+explicit message either way. The rule lives in ONE helper,
+herd_common.pg_live_suite.pg_live_target, which every *_live_pg.py suite uses.
 
 Env contract:
-    HERD_TEST_PG_DSN       SQLAlchemy asyncpg DSN, e.g.
+    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use, e.g.
                             postgresql+asyncpg://user:pass@host:port/db
-                            Defaults to a DSN matching the dev stack's
-                            published postgres port (POSTGRES_PORT, default
-                            5433) so a local `make up` is reachable with no
-                            extra setup: see docker-compose.yml's postgres
-                            service `ports: ["${POSTGRES_PORT:-5433}:5432"]`.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns an
-                            unreachable DSN into a hard failure instead of a
-                            skip.
+                            Unset or empty, the suite is skipped.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip
+                            into a hard failure.
 
 Any reachable Postgres works: these tests create no tables and touch no
 application schema, since advisory locks are server-instance-scoped, not
@@ -36,60 +33,25 @@ server (e.g. someone else's dev stack) is left clean.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 from herd_common.advisory_lock import session_try_lock, session_unlock, xact_lock
+from herd_common.pg_live_suite import pg_live_target
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
-PG_DSN = os.getenv(
-    "HERD_TEST_PG_DSN",
-    f"postgresql+asyncpg://herd:herd@127.0.0.1:{DEFAULT_PG_PORT}/herd",
-)
-_PG_REQUIRED = os.getenv("HERD_TEST_PG_REQUIRED", "") not in ("", "0")
+_PG = pg_live_target()
+PG_DSN = _PG.dsn
 
 
-async def _pg_reachable() -> bool:
-    engine = create_async_engine(PG_DSN)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
-
-
-def _run_sync_reachable() -> bool:
-    import asyncio
-
-    return asyncio.run(_pg_reachable())
-
-
-_PG_REACHABLE = _run_sync_reachable()
-
-pytestmark = pytest.mark.skipif(
-    not _PG_REQUIRED and not _PG_REACHABLE,
-    reason=(
-        f"No Postgres reachable at {PG_DSN!r}; set HERD_TEST_PG_DSN to point at one "
-        "(e.g. the dev stack's published postgres port, or a throwaway "
-        "`docker run --rm -d -e POSTGRES_USER=herd -e POSTGRES_PASSWORD=herd "
-        "-e POSTGRES_DB=herd -p 5433:5432 postgres:16-alpine`) to run this suite."
-    ),
-)
+pytestmark = pytest.mark.skipif(_PG.skip_reason is not None, reason=_PG.skip_reason or "")
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unreachable():
-    if _PG_REQUIRED and not _PG_REACHABLE:
-        pytest.fail(
-            f"HERD_TEST_PG_REQUIRED is set but no Postgres is reachable at {PG_DSN!r}; "
-            "start one or unset HERD_TEST_PG_REQUIRED."
-        )
+def _fail_when_pg_live_cannot_run():
+    if _PG.failure is not None:
+        pytest.fail(_PG.failure)
 
 
 @pytest.fixture

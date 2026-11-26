@@ -13,9 +13,11 @@ Postgres so both dialects agree (the #902 lesson). This suite runs the REAL
 SQLite twin asserts, plus the search behavior on Postgres.
 
 Env contract identical to the sibling cabling live-PG files:
-    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns an unreachable
-                            server into a hard failure instead of the normal skip.
+    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
+                            empty, the suite is skipped and connects to nothing.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns that skip into
+                            a hard failure. A named database that does not answer
+                            fails every test either way (herd_common.pg_live_suite).
 
 Gate-ledger scoping (issue #819). The gate runs this suite against its ALREADY-USED
 cabling schema. Every row here is created by a random user id and named with a
@@ -27,15 +29,14 @@ in a finally.
 
 from __future__ import annotations
 
-import asyncio
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from app.models.topology import Topology
 from app.routes.topologies import list_topologies
-from sqlalchemy import delete, select, text
+from herd_common.pg_live_suite import pg_live_target
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # The rows and expected orders are shared with the SQLite twin
@@ -50,44 +51,17 @@ from tests.test_topology_list_controls import (
     OWNER_ROWS,
 )
 
-DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
-PG_DSN = os.getenv(
-    "HERD_TEST_PG_DSN",
-    f"postgresql+asyncpg://herd:herd@127.0.0.1:{DEFAULT_PG_PORT}/herd",
-)
-_PG_REQUIRED = os.getenv("HERD_TEST_PG_REQUIRED", "") not in ("", "0")
+_PG = pg_live_target()
+PG_DSN = _PG.dsn
 
 
-async def _pg_reachable() -> bool:
-    engine = create_async_engine(PG_DSN)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
-
-
-_PG_REACHABLE = asyncio.run(_pg_reachable())
-
-pytestmark = pytest.mark.skipif(
-    not _PG_REQUIRED and not _PG_REACHABLE,
-    reason=(
-        f"No Postgres reachable at {PG_DSN!r}; set HERD_TEST_PG_DSN to point at one "
-        "(e.g. the gate stack's published postgres port, 5433) to run this suite."
-    ),
-)
+pytestmark = pytest.mark.skipif(_PG.skip_reason is not None, reason=_PG.skip_reason or "")
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unreachable():
-    if _PG_REQUIRED and not _PG_REACHABLE:
-        pytest.fail(
-            f"HERD_TEST_PG_REQUIRED is set but no Postgres is reachable at {PG_DSN!r}; "
-            "start one or unset HERD_TEST_PG_REQUIRED."
-        )
+def _fail_when_pg_live_cannot_run():
+    if _PG.failure is not None:
+        pytest.fail(_PG.failure)
 
 
 @pytest.fixture(autouse=True)
