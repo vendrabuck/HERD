@@ -93,6 +93,17 @@ IMPORT_NOT_TEXT_DETAIL = (
 )
 JSON_CELL_NOT_TEXT_REASON = "a JSON cell holds a lone surrogate escape, which is not valid text"
 
+# A JSON import file, or a JSON cell of a CSV row, that `json.loads` refuses for its
+# shape rather than its syntax (issue #1511): nested deeper than the C parser's
+# recursion budget (RecursionError), or holding an integer literal longer than
+# Python's integer string conversion limit, 4,300 digits (a ValueError that is not a
+# JSONDecodeError). Both answers are fixed and name no part of the file or the
+# exception. The whole JSON file is refused; a CSV row with such a cell is rejected.
+IMPORT_JSON_UNREADABLE_DETAIL = (
+    "Invalid JSON: the document is nested too deeply or holds a number too long to read"
+)
+JSON_CELL_UNREADABLE_REASON = "a JSON cell is nested too deeply or holds a number too long to read"
+
 
 def _empty_report(dry_run: bool) -> BulkImportReport:
     return BulkImportReport(
@@ -223,7 +234,10 @@ def _parse_json(raw: str) -> list[dict[str, Any]]:
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as exc:
+        # The decoder's message names a position, never the file's content.
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=422, detail=IMPORT_JSON_UNREADABLE_DETAIL) from None
     if holds_lone_surrogate(doc):
         raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
@@ -265,13 +279,21 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
     """Decode a CSV cell that carries JSON (field_data, sections).
 
     JSON import passes through native objects; CSV import passes a string we
-    json.loads. An empty cell yields the supplied default.
+    json.loads. An empty cell yields the supplied default. A cell the parser
+    refuses for its depth or an over-long integer raises ValueError with the fixed
+    JSON_CELL_UNREADABLE_REASON (issue #1511); a syntax error keeps the decoder's
+    own message, which names a position, never the cell's content.
     """
     if value is None or value == "":
         return default
     if isinstance(value, (dict, list)):
         return value
-    parsed = json.loads(value)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        raise
+    except (ValueError, RecursionError):
+        raise ValueError(JSON_CELL_UNREADABLE_REASON) from None
     if holds_lone_surrogate(parsed):
         raise ValueError(JSON_CELL_NOT_TEXT_REASON)
     return parsed

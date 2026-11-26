@@ -300,3 +300,52 @@ async def test_topology_csv_roundtrip_preserves_chosen_ports(admin_client, fresh
         ] == [("eth1", "eth1"), ("eth2", "eth2")]
     finally:
         await delete_topology_checked(admin_client, tid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", ["true", "false"])
+@pytest.mark.parametrize("fragment", ["deep", "long_int"])
+async def test_topology_import_the_parser_refuses_is_a_fixed_422_for_a_non_admin(
+    user_client, dry_run, fragment
+):
+    """Issue #1511: a JSON import nested past the parser's depth bound (100,000 levels,
+    past every bound measured, 3.12 to 3.14) or holding a 4,301-digit integer answered
+    500 through the gateway to any signed-in user. It is a 422 with a fixed detail, and
+    nothing is written. The file is 200 KB at most, under the import's upload bound.
+
+    The cleanup deletes a topology the import should never have written; when the test
+    has already failed, a failing cleanup is added to that failure as a note instead of
+    replacing it."""
+    name = f"int-bulk-unreadable-{uuid.uuid4().hex[:8]}"
+    bad = "[" * 100_000 + "]" * 100_000 if fragment == "deep" else "1" * 4301
+    row = json.dumps({"name": name, "canvas": {"nodes": [], "edges": []}})
+    body = ('{"items": [' + row + '], "x": ' + bad + "}").encode()
+    failure: BaseException | None = None
+    try:
+        resp = await user_client.post(
+            "/cabling/topologies/import",
+            params={"format": "json", "dry_run": dry_run},
+            files={"file": ("t.json", io.BytesIO(body), "application/json")},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == {
+            "detail": (
+                "Invalid JSON: the document is nested too deeply or holds a number too long to read"
+            )
+        }
+        listing = await user_client.get("/cabling/topologies", params={"limit": 500})
+        assert listing.status_code == 200, listing.text
+        assert all(t["name"] != name for t in listing.json()["items"])
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            listing = await user_client.get("/cabling/topologies", params={"limit": 500})
+            assert listing.status_code == 200, listing.text
+            for leaked in [t for t in listing.json()["items"] if t["name"] == name]:
+                await delete_topology_checked(user_client, leaked["id"])
+        except Exception as cleanup_exc:
+            if failure is None:
+                raise
+            failure.add_note(f"cleanup after this failure also failed: {cleanup_exc!r}")
