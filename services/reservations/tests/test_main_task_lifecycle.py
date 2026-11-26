@@ -491,80 +491,45 @@ def _records(caplog, action: str) -> list[tuple[str, str, str]]:
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("dead", _LifespanLoops.NAMES)
-def test_a_process_exit_signal_a_task_ended_with_is_raised_after_every_shutdown_step(
-    dead, signal, caplog
-):
-    """Issue #1549: a task that ends with KeyboardInterrupt or SystemExit is logged
-    like any other, and shutdown still cancels the other two and closes NATS; then
-    the signal is raised, not swallowed. asyncio raises these two out of the event
-    loop when a task ends with one, so this test runs its own loop and counts each
-    one where it leaves `run_until_complete`: once when the loop dies, once when the
-    shutdown ends with it."""
+def test_a_process_exit_signal_in_a_task_cancels_the_lifespan_at_its_yield(dead, signal, caplog):
+    """Issue #1549, what is true for KeyboardInterrupt and SystemExit. Under
+    `asyncio.run` (how uvicorn runs the service), a task that ends with one makes
+    asyncio raise it out of the event loop at once, and `asyncio.run` then cancels
+    every remaining task. The lifespan, parked at its `yield` (held open here by a
+    coroutine standing in for the server), gets CancelledError there, so none of its
+    shutdown steps run: NATS is not closed and nothing is logged at shutdown. The
+    signal itself leaves `asyncio.run`."""
     from app.main import lifespan
 
-    loop = asyncio.new_event_loop()
     loops = _LifespanLoops()
     nc = MagicMock()
     nc.close = AsyncMock()
-    survivors = [name for name in _LifespanLoops.NAMES if name != dead]
+    server_saw: list[type[BaseException]] = []
 
-    def drive(coro) -> tuple[asyncio.Task, int]:
-        """Run `coro` as a task to its end; count the signals that left the loop."""
-        task = loop.create_task(coro)
-        left_the_loop = 0
-        while not task.done():
+    async def serve() -> None:
+        async with lifespan(MagicMock()):
             try:
-                loop.run_until_complete(task)
-            except signal:
-                left_the_loop += 1
-            except RuntimeError:
-                # A signal that interrupted the previous run left that run's stop
-                # callback queued, so this run can stop early; run again.
-                if task.done():
-                    raise
-        return task, left_the_loop
+                await asyncio.Event().wait()
+            except BaseException as exc:
+                server_saw.append(type(exc))
+                raise
 
-    try:
-        with ExitStack() as stack:
-            stack.enter_context(caplog.at_level("ERROR", logger="app.main"))
-            stack.enter_context(patch("app.main.create_all_and_stamp", new=AsyncMock()))
-            stack.enter_context(patch("app.main.connect_nats", new=AsyncMock(return_value=nc)))
-            stack.enter_context(patch("app.main.ensure_stream", new=AsyncMock()))
-            for loop_patch in _crash_patches(loops, dead, signal):
-                stack.enter_context(loop_patch)
-            context = lifespan(MagicMock())
-            entered, during_start = drive(context.__aenter__())
-            _, during_spin = drive(_spin())
-            assert entered.exception() is None
-            assert during_start + during_spin == 1, "the dead task's signal left the loop"
-            assert _records(caplog, "background_task_crashed") == [
-                ("ERROR", _TASK_NAMES[dead], signal.__name__)
-            ]
-            for name in survivors:
-                assert not loops.tasks[name].done(), name
+    with ExitStack() as stack:
+        stack.enter_context(caplog.at_level("ERROR", logger="app.main"))
+        stack.enter_context(patch("app.main.create_all_and_stamp", new=AsyncMock()))
+        stack.enter_context(patch("app.main.connect_nats", new=AsyncMock(return_value=nc)))
+        stack.enter_context(patch("app.main.ensure_stream", new=AsyncMock()))
+        for loop_patch in _crash_patches(loops, dead, signal):
+            stack.enter_context(loop_patch)
+        with pytest.raises(signal):
+            asyncio.run(serve())
 
-            exited, during_shutdown = drive(context.__aexit__(None, None, None))
-
-            assert isinstance(exited.exception(), signal), "shutdown swallowed the signal"
-            assert during_shutdown == 1
-            nc.close.assert_awaited_once()
-            for name in survivors:
-                assert loops.tasks[name].cancelled(), name
-            assert _records(caplog, "background_task_failed_at_shutdown") == [
-                ("ERROR", _TASK_NAMES[dead], signal.__name__)
-            ]
-            assert _DEATH_TEXT not in caplog.text
-    finally:
-        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-        for task in pending:
-            task.cancel()
-
-        async def _drain() -> None:
-            await asyncio.gather(*pending, return_exceptions=True)
-            await loop.shutdown_asyncgens()
-
-        drive(_drain())
-        loop.close()
+    assert server_saw == [asyncio.CancelledError]
+    nc.close.assert_not_awaited()
+    assert _records(caplog, "background_task_failed_at_shutdown") == []
+    for name, task in loops.tasks.items():
+        if name != dead:
+            assert task.cancelled(), name
 
 
 async def _enter_holding(held: str, nc=None):

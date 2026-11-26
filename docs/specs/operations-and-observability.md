@@ -944,15 +944,16 @@ relay task (reservations, started in `services/reservations/app/main.py`; execut
   engine's own driver arguments. A failure to build those arguments (or to import the
   driver) is not retried: it is logged once at ERROR with `action`
   `outbox_listener_setup_failed` and the exception class name only, and the listener
-  returns, leaving the relay on its tick. A listener task that ends with an exception of
-  any class (a `BaseException` that is not an `Exception` included) is logged when it ends
-  (OPS-OUTBOX-13) and again, by class name, when the relay's shutdown awaits it through
-  `await_stopped_task`; the relay, when cancelled, still ends with `CancelledError`, never
+  returns, leaving the relay on its tick. A listener task that ends with an `Exception`,
+  or a `BaseException` subclass that asyncio does not treat as a process-exit signal, is
+  logged when it ends (OPS-OUTBOX-13) and again, by class name, when the relay's shutdown
+  awaits it through `await_stopped_task` (a `KeyboardInterrupt` or `SystemExit` leaves the
+  event loop as the listener dies, OPS-OUTBOX-13); the relay, when cancelled, still ends with `CancelledError`, never
   the listener's exception. A `GeneratorExit` thrown into the relay while it awaits the
   listener (the relay coroutine closed there) is not the listener's and propagates at once
   (issue #1549). \
   Enforced in: `services/common/herd_common/outbox.py` (`_listen_for_wakeups`, `run_outbox_relay`); `services/common/herd_common/background_tasks.py` (`await_stopped_task`) \
-  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`, `test_listen_for_wakeups_setup_failure_is_logged_once_and_returns`, `test_relay_with_a_listener_whose_setup_fails_ends_cancelled`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`, `test_closing_the_relay_while_it_awaits_its_listener_lets_generator_exit_through`)
+  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`, `test_listen_for_wakeups_setup_failure_is_logged_once_and_returns`, `test_relay_with_a_listener_whose_setup_fails_ends_cancelled`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`, `test_closing_the_relay_while_it_awaits_its_listener_lets_generator_exit_through`, `test_a_relay_that_ends_with_its_own_exception_keeps_it_after_cancelling_its_listener`)
 - **OPS-OUTBOX-12.** A consumer's deduplication key is the payload `event_id`, else the
   JetStream `<stream>:<sequence>`, else none. \
   Enforced in: `services/common/herd_common/outbox.py` (`event_dedupe_key`) \
@@ -964,19 +965,21 @@ relay task (reservations, started in `services/reservations/app/main.py`; execut
   at ERROR, with `action` `background_task_crashed`, the task's name, and the exception
   class name only. At shutdown reservations cancels all three tasks before it awaits any,
   then awaits each in that order through `await_stopped_task`, which returns, never
-  raises, what a task ended with: an exception of any class (a `BaseException` that is not
-  an `Exception` included) is logged (`action` `background_task_failed_at_shutdown`, class
-  name only) and does not stop the rest, and the NATS connection, when there is one, is
-  closed after. Then the first `KeyboardInterrupt` or `SystemExit` a task ended with is
-  raised, so a process-exit signal is not swallowed; no other exception a task ended with
-  is raised. A `GeneratorExit` thrown into the shutdown while it awaits a task (the
-  lifespan closed while suspended there) propagates at once. When the lifespan itself is
-  cancelled while it awaits a task, the remaining steps still run and the lifespan then
-  ends cancelled. Execution's relay task keeps its own callback (issue #1549 leaves
+  raises, what a task ended with: an `Exception`, or a `BaseException` subclass that
+  asyncio does not treat as a process-exit signal, is logged (`action`
+  `background_task_failed_at_shutdown`, class name only) and does not stop the rest, and
+  the NATS connection, when there is one, is closed after; the lifespan raises none of
+  them. A `KeyboardInterrupt` or `SystemExit` never reaches these steps: asyncio raises it
+  out of the event loop as the task dies, `asyncio.run` then cancels the lifespan at its
+  `yield`, so in that case none of the shutdown steps run (the NATS close included), and
+  the signal leaves `asyncio.run`. A `GeneratorExit` thrown into the shutdown while it
+  awaits a task (the lifespan closed while suspended there) propagates at once. When the
+  lifespan itself is cancelled while it awaits a task, the remaining steps still run and
+  the lifespan then ends cancelled. Execution's relay task keeps its own callback (issue #1549 leaves
   moving it to the shared one for later). Against a running stack, an event staged by
   reservations reaches its consumers. \
   Enforced in: `services/execution/app/main.py` (`start_outbox_relay`, `stop_outbox_relay`); `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/background_tasks.py` (`log_task_crash`, `await_stopped_task`, `TASK_CRASHED_ACTION`, `TASK_FAILED_AT_SHUTDOWN_ACTION`) \
-  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`); `services/common/tests/test_background_tasks.py` (`test_a_task_that_raises_is_logged_when_it_ends_by_class_name_only`, `test_a_task_that_is_cancelled_or_returns_is_not_logged`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step`, `test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts`, `test_a_process_exit_signal_a_task_ended_with_is_raised_after_every_shutdown_step`, `test_closing_the_lifespan_while_it_awaits_a_task_lets_generator_exit_through`, `test_a_lifespan_cancelled_during_shutdown_finishes_the_steps_then_ends_cancelled`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
+  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`); `services/common/tests/test_background_tasks.py` (`test_a_task_that_raises_is_logged_when_it_ends_by_class_name_only`, `test_a_task_that_is_cancelled_or_returns_is_not_logged`, `test_await_stopped_task_returns_none_for_a_cancelled_or_returned_task`, `test_await_stopped_task_returns_a_dead_tasks_exception_and_logs_it_once`, `test_an_exception_thrown_into_the_caller_propagates_even_after_the_task_died`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step`, `test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts`, `test_a_process_exit_signal_in_a_task_cancels_the_lifespan_at_its_yield`, `test_closing_the_lifespan_while_it_awaits_a_task_lets_generator_exit_through`, `test_a_lifespan_cancelled_during_shutdown_finishes_the_steps_then_ends_cancelled`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
 - **OPS-OUTBOX-14.** A row is marked published when JetStream acknowledges it, and is not
   republished; an event the broker loses afterwards (an ephemeral store recreated before a
   consumer pulled it) is not recovered by the relay. By decision; recorded in

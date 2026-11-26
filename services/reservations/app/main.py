@@ -129,15 +129,15 @@ async def lifespan(app: FastAPI):
     # Cancel every background task first, then await each one (issue #1549), so a
     # task whose cancellation takes time (the relay awaits its listener) never keeps
     # the tasks after it running. `await_stopped_task` returns, never raises, what a
-    # task ended with (any BaseException, logged by class name), so no dead task can
-    # stop the remaining awaits or the NATS close below.
+    # task ended with (logged by class name), so no dead task can
+    # stop the remaining awaits or the NATS close below. A KeyboardInterrupt or
+    # SystemExit never reaches here: asyncio raises it out of the event loop the
+    # moment the task dies, and `asyncio.run` then cancels this lifespan at its
+    # `yield`, so none of these steps run in that case (the relay's listener the same).
     for task in background_tasks.values():
         task.cancel()
-    exit_signal: BaseException | None = None
     for task_name, task in background_tasks.items():
-        ended_with = await await_stopped_task(task, name=task_name, log=logger)
-        if isinstance(ended_with, (KeyboardInterrupt, SystemExit)) and exit_signal is None:
-            exit_signal = ended_with
+        await await_stopped_task(task, name=task_name, log=logger)
 
     # Close NATS connection on shutdown
     if app.state.nats is not None:
@@ -146,10 +146,6 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.warning("Error closing NATS connection", exc_info=True)
 
-    # A process-exit signal a task ended with is not swallowed: the first one seen is
-    # raised once every shutdown step has run.
-    if exit_signal is not None:
-        raise exit_signal
     # The lifespan itself cancelled while it awaited a task raises the same
     # CancelledError the task ends with, so await_stopped_task cannot tell them apart;
     # this task's own pending cancel request can. It is honoured after the shutdown

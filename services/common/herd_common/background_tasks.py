@@ -13,8 +13,8 @@ reach a log line (class-name-only errors). A task that ends cancelled or returns
 normally is not logged here.
 
 `await_stopped_task` is the shutdown half: it awaits a task its owner cancelled and
-returns, never raises, what the task ended with (any `BaseException`), so one dead
-task cannot stop the owner's remaining shutdown steps.
+returns, never raises, what the task ended with, so one dead task cannot stop the
+owner's remaining shutdown steps.
 
 Adopted by reservations' lifespan and the outbox relay's wake-up listener.
 Execution's three `_surface_crash` copies, the consumer schema gate's, and
@@ -64,15 +64,18 @@ async def await_stopped_task(
     """Await a task its owner has cancelled at shutdown; never raise what it ended with.
 
     Returns None when the task ended cancelled or returned. When it ended with an
-    exception of its own, any `BaseException` (a `KeyboardInterrupt`, a
-    `SystemExit`, a `BaseException` subclass, as well as an `Exception`), that
-    exception is logged at ERROR (`action` `TASK_FAILED_AT_SHUTDOWN_ACTION`, the task's
-    name, the class name only) and RETURNED, not raised, so the owner's remaining
-    shutdown steps still run; the owner decides whether to re-raise it after them.
+    exception of its own, of any class, that exception is logged at ERROR (`action`
+    `TASK_FAILED_AT_SHUTDOWN_ACTION`, the task's name, the class name only) and
+    RETURNED, not raised, so the owner's remaining shutdown steps still run. In a
+    running service that is an `Exception` or a `BaseException` subclass asyncio does
+    not treat as a process-exit signal: a task that ends with `KeyboardInterrupt` or
+    `SystemExit` makes asyncio raise it out of the event loop as the task dies, and
+    `asyncio.run` then cancels the owner where it waits (a lifespan at its `yield`), so
+    the owner's shutdown never gets here.
 
     What is thrown into the CALLER while it waits is not the task's and propagates at
-    once: a `GeneratorExit` when the calling coroutine is closed while suspended here
-    (handling it by awaiting again would raise "coroutine ignored GeneratorExit"). An
+    once (a `GeneratorExit` when the calling coroutine is closed while suspended here,
+    which CPython delivers to the caller's own frame as well). An
     exception counts as the task's only when the task is done, not cancelled, and
     holds that very object. A `CancelledError` is returned as None whether the task
     ended cancelled or the caller itself was cancelled while waiting (the two raise

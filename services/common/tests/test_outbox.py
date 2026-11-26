@@ -801,6 +801,57 @@ async def test_relay_logs_a_listener_that_dies_and_still_ends_cancelled(
     assert listener_text not in caplog.text
 
 
+class _RelayDied(BaseException):
+    """Ends the relay from inside its loop; not an `Exception`, so no tick catches it."""
+
+
+async def test_a_relay_that_ends_with_its_own_exception_keeps_it_after_cancelling_its_listener(
+    session_factory, caplog
+):
+    """Issue #1549: when the relay itself ends with an exception E (here a
+    `BaseException` from `get_nats`, which the per-tick `except Exception` does not
+    catch), its `finally` cancels the listener and awaits it; the listener's
+    cancellation is what the relay asked for, so it neither replaces E with a
+    CancelledError nor is logged: the relay ends with E."""
+    from herd_common import outbox
+
+    listener_tasks: list[asyncio.Task] = []
+    real_log_task_crash = outbox.log_task_crash
+
+    def record_listener(task, **kwargs):
+        # The relay hands its listener task to the crash callback as it creates it.
+        listener_tasks.append(task)
+        return real_log_task_crash(task, **kwargs)
+
+    async def listener(engine, channel, wake, *, retry_seconds):
+        await asyncio.Event().wait()
+
+    def get_nats():
+        raise _RelayDied()
+
+    with (
+        patch("herd_common.outbox._listen_for_wakeups", new=listener),
+        patch("herd_common.outbox.log_task_crash", new=record_listener),
+        caplog.at_level("DEBUG", logger="herd_common.outbox"),
+    ):
+        relay = asyncio.create_task(
+            run_outbox_relay(
+                session_factory,
+                get_nats,
+                OutboxEvent,
+                tick_seconds=60.0,
+                engine=_fake_engine("postgresql"),
+            )
+        )
+        await _spin()
+
+    assert relay.done() and not relay.cancelled(), "the listener's cancel replaced the relay's end"
+    assert isinstance(relay.exception(), _RelayDied)
+    (listener_task,) = listener_tasks
+    assert listener_task.cancelled()
+    assert [getattr(r, "action", None) for r in caplog.records if r.levelname == "ERROR"] == []
+
+
 class _ThrownIntoRelay(BaseException):
     """Thrown into the relay's frame from outside; never the listener's exception."""
 
