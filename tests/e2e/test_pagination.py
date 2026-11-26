@@ -26,13 +26,9 @@ def test_users_pagination_hidden_when_under_limit(admin_browser, base_url):
     rows = admin_browser.find_elements(By.CSS_SELECTOR, "tbody tr")
     if len(rows) >= 50:
         # Seeded environment: pagination should be visible instead.
-        assert admin_browser.find_elements(
-            By.XPATH, "//button[normalize-space()='Next']"
-        )
+        assert admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Next']")
         return
-    next_buttons = admin_browser.find_elements(
-        By.XPATH, "//button[normalize-space()='Next']"
-    )
+    next_buttons = admin_browser.find_elements(By.XPATH, "//button[normalize-space()='Next']")
     assert next_buttons == []
 
 
@@ -48,12 +44,8 @@ def test_inventory_pagination_shows_when_over_limit(logged_in_browser, base_url)
 
         pytest.skip("inventory has <50 devices; pagination not exercised")
 
-    next_btn = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Next']"
-    )
-    prev_btn = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Prev']"
-    )
+    next_btn = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='Next']")
+    prev_btn = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='Prev']")
     assert next_btn.is_displayed()
     # On page 1, Prev is disabled.
     assert prev_btn.get_attribute("disabled") is not None
@@ -75,23 +67,21 @@ def test_inventory_pagination_next_advances_page(logged_in_browser, base_url):
     )
     before = page_indicator.text
 
-    next_btn = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Next']"
-    )
+    next_btn = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='Next']")
     # Scroll into view so the click lands on the button rather than whatever
     # sticky header currently covers it, then JS-click as a fallback against
     # overlays the native click can hit.
-    logged_in_browser.execute_script(
-        "arguments[0].scrollIntoView({block: 'center'});", next_btn
-    )
+    logged_in_browser.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
     logged_in_browser.execute_script("arguments[0].click();", next_btn)
 
     WebDriverWait(logged_in_browser, WAIT).until(
-        lambda d: d.find_element(
-            By.XPATH,
-            "//*[starts-with(normalize-space(.), 'Page ') and contains(., ' of ')]",
-        ).text
-        != before
+        lambda d: (
+            d.find_element(
+                By.XPATH,
+                "//*[starts-with(normalize-space(.), 'Page ') and contains(., ' of ')]",
+            ).text
+            != before
+        )
     )
     after = logged_in_browser.find_element(
         By.XPATH, "//*[starts-with(normalize-space(.), 'Page ') and contains(., ' of ')]"

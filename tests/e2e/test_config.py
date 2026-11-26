@@ -31,13 +31,9 @@ def test_config_login_form_renders(browser, base_url):
     """Config login form has a password input and sign-in button."""
     browser.get(f"{base_url}/config")
     wait = WebDriverWait(browser, WAIT)
-    pw = wait.until(
-        EC.presence_of_element_located((By.ID, "config-password"))
-    )
+    pw = wait.until(EC.presence_of_element_located((By.ID, "config-password")))
     assert pw.is_displayed()
-    btn = browser.find_element(
-        By.XPATH, "//button[normalize-space()='Sign in']"
-    )
+    btn = browser.find_element(By.XPATH, "//button[normalize-space()='Sign in']")
     assert btn.is_displayed()
 
 
@@ -57,9 +53,7 @@ def test_config_wrong_password_shows_toast(browser, base_url):
     pw = wait.until(EC.presence_of_element_located((By.ID, "config-password")))
     pw.clear()
     pw.send_keys("not-the-real-password")
-    browser.find_element(
-        By.XPATH, "//button[normalize-space()='Sign in']"
-    ).click()
+    browser.find_element(By.XPATH, "//button[normalize-space()='Sign in']").click()
 
     # The refusal toast itself, by exact text (issue #1148: "password" anywhere in
     # the body matched the login form's own label). The login limiter (#1109) can

@@ -31,9 +31,7 @@ def test_drivers_page_has_upload_button(admin_browser, base_url):
 def test_drivers_upload_modal_opens(admin_browser, base_url):
     """Clicking Upload Driver opens the upload modal with required fields."""
     _open_drivers(admin_browser, base_url)
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Upload Driver')]"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[contains(., 'Upload Driver')]").click()
 
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(EC.presence_of_element_located((By.ID, "driver-name")))
@@ -42,28 +40,20 @@ def test_drivers_upload_modal_opens(admin_browser, base_url):
     assert admin_browser.find_element(By.ID, "driver-file").is_displayed()
 
     # Close the modal so subsequent tests start clean.
-    cancel = admin_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Cancel']"
-    )
+    cancel = admin_browser.find_element(By.XPATH, "//button[normalize-space()='Cancel']")
     cancel.click()
 
 
 def test_drivers_connection_type_dropdown_has_all_options(admin_browser, base_url):
     """Connection type dropdown offers Management and switch tiers."""
     _open_drivers(admin_browser, base_url)
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Upload Driver')]"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[contains(., 'Upload Driver')]").click()
     wait = WebDriverWait(admin_browser, WAIT)
-    select = wait.until(
-        EC.presence_of_element_located((By.ID, "driver-connection-type"))
-    )
+    select = wait.until(EC.presence_of_element_located((By.ID, "driver-connection-type")))
     option_texts = [o.text for o in select.find_elements(By.TAG_NAME, "option")]
     for expected in ("Management", "Layer 1 Switch", "Layer 2 Switch", "Layer 3 Switch"):
         assert expected in option_texts
-    admin_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Cancel']"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[normalize-space()='Cancel']").click()
 
 
 def test_drivers_upload_requires_name(admin_browser, base_url):
@@ -72,16 +62,12 @@ def test_drivers_upload_requires_name(admin_browser, base_url):
     _open_drivers(admin_browser, base_url)
     before = api_request(admin_browser, "GET", "/inventory/drivers", params={"limit": 1})
     total_before = before.json()["total"]
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Upload Driver')]"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[contains(., 'Upload Driver')]").click()
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(EC.presence_of_element_located((By.ID, "driver-name")))
 
     # Submit with nothing filled in; a toast should appear.
-    admin_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Upload']"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[normalize-space()='Upload']").click()
     # The validation toast by exact text (issue #1148: "name" matched the
     # modal's own Name label and the table header).
     wait.until(
@@ -96,9 +82,7 @@ def test_drivers_upload_requires_name(admin_browser, base_url):
     after = api_request(admin_browser, "GET", "/inventory/drivers", params={"limit": 1})
     assert after.json()["total"] == total_before, "a refused upload must create no driver"
 
-    admin_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Cancel']"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[normalize-space()='Cancel']").click()
 
 
 def test_drivers_delete_confirmation_rendered(admin_browser, base_url, transient_driver):
@@ -121,9 +105,7 @@ def test_drivers_delete_confirmation_rendered(admin_browser, base_url, transient
     admin_browser.execute_script("arguments[0].click();", delete_btn)
 
     wait.until(
-        EC.visibility_of_element_located(
-            (By.XPATH, "//*[contains(text(), 'Delete Driver')]")
-        )
+        EC.visibility_of_element_located((By.XPATH, "//*[contains(text(), 'Delete Driver')]"))
     )
     # Cancel so the fixture cleanup path still works. Scope to the dialog so
     # we don't pick up a stale Cancel elsewhere, and click via JS since
