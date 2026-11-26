@@ -51,9 +51,9 @@ This file collects the developer-workflow rules for HERD: how to install, run, b
 
 ## Lint and format
 
-- `make lint` runs `uv run ruff check` over `services/` plus the repo-root scripts in the Makefile's `ROOT_PY` list (currently `seedtools/`, `scripts/check_image_matches_lock.py`, `scripts/build_manual_search_index.py`, `tests/ai_eval/`, `tests/unit/`, and `infra/restarter/`), and `cd frontend && npx eslint src --max-warnings 0`.
+- `make lint` runs `uv run ruff check` over `services/` plus the repo-root scripts in the Makefile's `ROOT_PY` list (currently `seedtools/`, `scripts/check_image_matches_lock.py`, `scripts/build_manual_search_index.py`, all of `tests/`, `drivers/`, and `infra/restarter/`), and `cd frontend && npx eslint src --max-warnings 0`.
 - `make format` runs `uv run ruff format` then `uv run ruff check --fix` over the same Python paths.
-- CI lints the same paths with `ruff format --check` (no mutation), so run `make format` before pushing; a new tracked repo-root Python script must be added to `ROOT_PY` and the CI lint lines or it goes unlinted.
+- CI lints the same paths with `ruff format --check` (no mutation), so run `make format` before pushing; a new tracked repo-root Python script must be added to `ROOT_PY` and the CI lint lines or it goes unlinted. Everything under `tests/` and `drivers/` is covered without a list edit (#1557); the two lists are kept identical by hand, no guard compares them. Python code blocks in markdown are not in either list, but ruff 0.17 formats them, so a bare `ruff format .` from the root also rewrites a block such as the one in `docs/EXTERNAL_API.md`; keep those blocks in the formatter's style.
 - `make audit` runs `pip-audit` (Python) and `npm audit` (frontend) for known-vulnerability scanning; set `AUDIT_STRICT=1` to make it fail on findings.
 - ruff config (root `pyproject.toml`): line length 100, lint rules `E`, `F`, `I`. Frontend eslint runs with `--max-warnings 0`, so warnings break the build.
 

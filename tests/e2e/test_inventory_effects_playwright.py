@@ -299,8 +299,8 @@ def test_connection_create_and_delete_own_devices(pw_page):
     finally:
         # Connection first (a device delete while a connection references it
         # 409s with device_cabled since issue #940 and the best-effort cleanup
-        # below would then leave the device behind), then the tracked resources in reverse creation order
-        # (devices, then templates, then driver).
+        # below would then leave the device behind), then the tracked resources in
+        # reverse creation order (devices, then templates, then driver).
         if connection_id:
             _api(pw_page, "DELETE", f"/cabling/connections/{connection_id}", allow_errors=True)
         for method, path in reversed(cleanup):

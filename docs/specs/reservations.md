@@ -140,9 +140,17 @@ same devices are serialized by advisory locks (RES-CONFLICT-4).
   Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_repeat_success_is_noop`, `test_callback_after_cancel_does_not_retransition`, `test_callback_after_failed_does_not_resurrect`)
 - **RES-DYN-7.** A successful callback attaches the reported `device_ids` (skipping ones
   already booked), moves to `ACTIVE` with `reservation.created` in that transaction, then
-  creates the fork best-effort. \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
-  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`)
+  creates the fork best-effort. The ids are parsed by pydantic's UUID type and compared
+  as UUIDs, never by spelling: two spellings of one id that it accepts (case, braces,
+  `urn:uuid:`, 32 hex digits without dashes), or a spelling of an id already booked,
+  attach it once (issue #1552). A callback, success or failure, whose `device_ids` is not
+  a list of UUIDs that parser accepts is refused with 422 before anything runs; that
+  includes spellings only the stdlib `uuid.UUID` accepts (a `uuid:` or bare `urn:`
+  prefix, braces around 32 hex digits or inside `urn:uuid:`, dashes in other places).
+  The row keeps its status and devices, nothing is staged, and the provisioning timeout
+  backstop owns it (RES-SWEEP-6). \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ProvisionResultRequest`); `services/reservations/app/services/reservation_service.py` (`apply_provision_result`) \
+  Pinned by: `services/reservations/tests/test_dynamic_requests.py` (`test_callback_success_activates_and_attaches_devices`, `test_dynamic_only_callback_success_attaches_instances`, `test_callback_success_with_repeated_device_ids_attaches_each_once`, `test_callback_success_attaches_each_spelling_of_one_id_once`, `test_callback_success_attaches_every_spelling_together_once`, `test_callback_with_a_malformed_device_id_is_422_and_changes_nothing`)
 - **RES-DYN-8.** A failed callback moves to `FAILED` with `reservation.failed` and the
   purpose marker in that transaction, then releases exclusive devices (holder-aware) and
   archives the fork. \
@@ -664,14 +672,18 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
 
 **Rules.**
 
-- **RES-PATCH-1.** Only `ACTIVE` and `PENDING` reservations can be edited; any other
-  status answers 400 with no side effect. \
+- **RES-PATCH-1.** Only `ACTIVE` and `PENDING` reservations can be edited; after the
+  visibility check of RES-PATCH-7 and the owner check of RES-PATCH-2, any other status
+  answers 400 with no side effect. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_completed_reservation_rejected`); `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_on_pending_provision_is_refused_with_zero_inventory_calls`)
-- **RES-PATCH-2.** Only the owner can edit; every other caller, an admin included, gets
-  404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_completed_reservation_rejected`, `test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`); `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_on_pending_provision_is_refused_with_zero_inventory_calls`)
+- **RES-PATCH-2.** Only the owner can edit; after the visibility check of RES-PATCH-7,
+  every other caller, an admin included, gets 404. By decision ([ROLES.md](../ROLES.md):
+  owner-scoped, no admin bypass). The owner check comes before the status check of
+  RES-PATCH-1, so the 404 a non-owner gets is the same as for an id that does not
+  exist, whatever the row's status: they learn neither its status nor that it exists. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
-  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`); `services/reservations/tests/test_reservations.py` (`test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`)
 - **RES-PATCH-3.** A new `end_time` is taken as the instant it names: a value with an
   offset is converted to UTC and a value without one is taken as UTC, and that UTC value
   is what every check below compares and what is stored. It must be after `start_time`
@@ -705,12 +717,17 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_held_instance_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`); `services/reservations/tests/test_dynamic_gating.py` (`test_mixed_reservation_adds_a_device_and_keeps_its_instance`, `test_mixed_reservation_can_drop_a_physical_device_and_keep_its_instance`, `test_a_cloud_device_the_reservation_does_not_hold_is_still_refused`, `test_a_held_cloud_device_of_another_template_is_still_refused`, `test_without_dynamic_requests_the_whole_set_is_judged`, `test_mixed_patch_through_the_route_is_200`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
-  otherwise). When the visibility lookup cannot be answered the router skips this
-  pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still
-  refuses an invisible device as not found (400). The calendar, which returns rows,
-  fails closed instead (RES-CAL-3). \
+  otherwise). When the lookup answers, this check runs before the owner and status
+  checks, so a non-admin naming an invisible device gets 403 whatever the reservation's
+  owner or status, including an id that does not exist; it depends only on the body and
+  the caller's visibility. It never runs for an admin or a superadmin, or for a body
+  whose `device_ids` is absent or null; for those requests the owner check and then the
+  status check come first. When the visibility lookup cannot be answered the router
+  skips this pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6
+  still refuses an invisible device as not found (400). The calendar, which returns
+  rows, fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`, `test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
   (`l3=0`). \
@@ -745,9 +762,19 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Pinned by: `services/reservations/tests/test_reservation_patch_hold.py` (`test_active_add_reserves_only_after_the_edit_committed`, `test_active_add_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_active_remove_inventory_failure_is_retried_logged_and_the_edit_stands`, `test_commit_failure_writes_nothing_to_inventory`, `test_patch_losing_its_status_guard_keeps_nothing`, `test_cancel_committing_after_the_edit_reverts_the_added_hold`, `test_patch_route_answers_409_when_the_status_guard_loses`); `services/reservations/tests/test_reservation_patch_race_live_pg.py` (`test_cancel_during_the_patch_checks_keeps_nothing_of_the_patch`, `test_cancel_during_the_post_commit_flip_leaves_the_added_device_released`, `test_patch_versus_cancel_jittered_around_the_patch_commit`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_add_exclusive_device_marks_reserved`, `test_update_reservation_remove_exclusive_device_marks_available`)
 - **RES-PATCH-11.** Removing devices from an `ACTIVE` reservation records them in
   `pending_fork_prune_device_ids` in the edit's transaction, unioned with any ids still
-  pending, then asks cabling to prune them from the fork (RES-FORK-16). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_prune_removed_devices_from_fork_best_effort`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_patch_remove_writes_marker_with_the_edit`, `test_patch_remove_unions_into_existing_marker`)
+  pending, then asks cabling to prune them from the fork (RES-FORK-16). The union
+  compares ids, not spellings: a stored marker counts only when it is a non-empty list,
+  and then only its entries whose text parses as a UUID, written back in canonical form,
+  each id once; any other stored value (a number, a boolean, a string, an object) is
+  treated as empty. When the union discards a corrupt stored value or entry (JSON `null`
+  and an empty list are empty, not corrupt), it logs at ERROR after the edit commits,
+  with `action` `pending_prune_corrupt_marker_discarded`, the stored value's type name,
+  and, for a list, the number of entries it dropped (`discarded_entries`; null when the
+  whole value was dropped), never the stored text. An edit that loses its status guard
+  (RES-PATCH-10) keeps nothing, leaves the stored marker as it was, and logs no
+  discard (issue #1554). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_union_prune_marker`, `_parse_prune_marker_entry`, `_prune_removed_devices_from_fork_best_effort`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_patch_remove_writes_marker_with_the_edit`, `test_patch_remove_unions_into_existing_marker`, `test_a_patch_over_a_corrupt_marker_answers_200_and_stores_only_the_removed_ids`, `test_a_patch_over_an_empty_marker_stores_the_removed_ids_and_logs_nothing`, `test_a_patch_union_keeps_stored_ids_in_canonical_form_once`, `test_a_patch_union_of_valid_canonical_entries_logs_nothing`); `services/reservations/tests/test_reservation_patch_hold.py` (`test_a_corrupt_marker_discard_is_logged_only_when_the_edit_commits`)
 - **RES-PATCH-12.** Adding a device wires nothing; its connections are built only by a
   later fork save. By decision (ADR 0009 Decision 6). \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
@@ -1066,9 +1093,15 @@ reconcile on the expiration loop.
   cleared without a prune, and one holding nothing actionable is healed (RES-FORK-20).
   On an `ACTIVE` row, marker entries that do not parse as a UUID are cleared in the
   same tick without a prune, and the row's other entries are retried as usual
-  (RES-FORK-16). \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`) \
-  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`)
+  (RES-FORK-16). Entries are matched as UUIDs, never by spelling: an entry in any
+  spelling the stdlib `uuid.UUID` parser accepts (case, braces, the `urn:uuid:`, `urn:`,
+  and `uuid:` prefixes, 32 hex digits, dashes in any place) is pruned as its canonical
+  id, and the clear after a converged prune removes every stored entry whose text parses
+  to a pruned id, so the row leaves the batch; an entry that does not parse is cleared
+  by its text. The clear rewrites only a non-empty list: any other stored value is left
+  exactly as stored, for the heal (RES-FORK-20) (issue #1554). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_pending_prune_reconcile`, `_pending_prune_stmt`, `_PENDING_PRUNE_BATCH`); `services/reservations/app/services/reservation_service.py` (`_clear_pending_fork_prune`, `_parse_prune_marker_entry`) \
+  Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_sweep_retries_pending_prune_and_clears_on_success`, `test_sweep_terminal_reservation_clears_marker_without_prune`, `test_each_tick_retries_the_oldest_batch_oldest_first_and_the_rest_next_tick`, `test_non_uuid_entries_are_cleared_and_every_valid_entry_is_kept_and_pruned`, `test_a_spelled_entry_is_pruned_once_then_cleared_and_leaves_the_batch`, `test_the_clear_matches_entries_by_uuid_and_keeps_the_rest`, `test_a_terminal_row_with_spelled_entries_clears_to_sql_null`, `test_the_clear_leaves_a_marker_that_is_not_a_list_for_the_heal`)
 - **RES-FORK-20.** The pending prune marker is SQL NULL exactly when nothing is pending,
   held by three parts. Every writer stores SQL NULL or a non-empty list, whichever path
   empties the marker (a full clear, a partial clear followed by a full one, a terminal or
@@ -1251,16 +1284,16 @@ sweep, and event delivery never return an error to a caller.
 
 | Status | Error key or detail | When | Rule |
 |---|---|---|---|
-| 400 | `Cannot update a <STATUS> reservation` | PATCH on a status other than `ACTIVE` or `PENDING` | RES-PATCH-1 |
+| 400 | `Cannot update a <STATUS> reservation` | PATCH on a status other than `ACTIVE` or `PENDING`, after the visibility check of RES-PATCH-7 and the owner check of RES-PATCH-2 | RES-PATCH-1 |
 | 400 | `end_time must be after start_time` or `end_time must be in the future` | PATCH with a bad end time | RES-PATCH-3 |
 | 400 | the plain-string detail create uses for the same condition | PATCH: missing device, mixed types, unavailable device, unreachable edges | RES-PATCH-6, RES-PATCH-7, RES-PATCH-8, RES-PATCH-9 |
 | 400 | `{"error": "topology_device_not_member", "device_ids": [...]}` | PATCH device set leaves a canvas device unbooked | RES-PATCH-8 |
-| 403 | `You do not have access to one or more requested devices` | a non-admin names an invisible device on create or PATCH | RES-CREATE-7, RES-PATCH-7 |
+| 403 | `You do not have access to one or more requested devices` | a non-admin names an invisible device on create or PATCH; on PATCH before the owner and status checks, so whatever the reservation's owner or status, an unknown id included | RES-CREATE-7, RES-PATCH-7 |
 | 403 | `Only admins can list all reservations` | `GET /?all=true` as a non-admin | RES-LIST-1 |
 | 403 | `Only the reservation owner or an admin may set its purpose category` | purpose-category PATCH by a third user | RES-PURPOSE-2 |
 | 403 | `Admin or superadmin role required` | a purpose review route as a non-admin | RES-PURPOSE-14 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | RES-INTERNAL-1 |
-| 404 | `Reservation not found` | `GET /{id}`, `PATCH /{id}`, or release by anyone but the owner; cancel by a non-owner non-admin; any route on an unknown id | RES-VIEW-1, RES-VIEW-2, RES-PATCH-2, RES-CANCEL-1, RES-RELEASE-1, RES-RELEASE-2, RES-PURPOSE-2, RES-PURPOSE-13 |
+| 404 | `Reservation not found` | `GET /{id}`, `PATCH /{id}`, or release by anyone but the owner; cancel by a non-owner non-admin; any route on an unknown id; on `PATCH /{id}`, a non-admin naming an invisible device gets the 403 of RES-PATCH-7 instead when the visibility lookup answers | RES-VIEW-1, RES-VIEW-2, RES-PATCH-2, RES-CANCEL-1, RES-RELEASE-1, RES-RELEASE-2, RES-PURPOSE-2, RES-PURPOSE-13 |
 | 404 | `Reservation not found` | a fork or wiring route by anyone but the owner or an admin | RES-FORK-4 |
 | 404 | `Reservation not found` | an internal status lookup or provision result for an unknown id | RES-INTERNAL-2, RES-DYN-6 |
 | 404 | `Fork not found` | reading the fork of a non-`ACTIVE` reservation that has none | RES-FORK-5 |
@@ -1282,6 +1315,7 @@ sweep, and event delivery never return an error to a caller.
 | 422 | validation list | list: unknown sort field or direction, unknown status, naive or bad timestamp, search over 200 characters | RES-LIST-3, RES-LIST-6, RES-LIST-8 |
 | 422 | `<parameter> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC` | list: a time bound whose instant has no UTC equivalent (an offset near year 1 or year 9999) | RES-LIST-8 |
 | 422 | validation list | calendar without `range_start` or `range_end`; internal route without the token header | RES-CAL-1, RES-INTERNAL-1 |
+| 422 | validation list | provision-result callback whose `device_ids` is not a list of UUIDs; the row is unchanged | RES-DYN-7 |
 | 422 | `Unknown purpose_category; allowed: <list>` | an unknown category on create, purpose-category PATCH, accept, or the list filter | RES-PURPOSE-1, RES-PURPOSE-10, RES-LIST-7 |
 | 422 | `Device <id> not found in inventory` | create names a device that does not exist or that the caller cannot see | RES-CREATE-8, RES-CREATE-9 |
 | 422 | `All devices must share the same topology type. Found: ...` | create mixes physical and cloud devices | RES-CREATE-10 |

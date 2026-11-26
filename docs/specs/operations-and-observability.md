@@ -941,17 +941,45 @@ relay task (reservations, started in `services/reservations/app/main.py`; execut
 - **OPS-OUTBOX-11.** The listener retries a failed connect or a lost connection after one
   tick, closes the connection it opened on every exit, sets the wake once per successful
   registration (catching up rows committed while it was away), and connects with the
-  engine's own driver arguments. \
-  Enforced in: `services/common/herd_common/outbox.py` (`_listen_for_wakeups`) \
-  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`)
+  engine's own driver arguments. A failure to build those arguments (or to import the
+  driver) is not retried: it is logged once at ERROR with `action`
+  `outbox_listener_setup_failed` and the exception class name only, and the listener
+  returns, leaving the relay on its tick. A listener task that ends with an `Exception`,
+  or a `BaseException` subclass that asyncio does not treat as a process-exit signal, is
+  logged when it ends (OPS-OUTBOX-13) and again, by class name, when the relay's shutdown
+  awaits it through `await_stopped_task` (a `KeyboardInterrupt` or `SystemExit` leaves the
+  event loop as the listener dies, OPS-OUTBOX-13); the relay, when cancelled, still ends with `CancelledError`, never
+  the listener's exception. A `GeneratorExit` thrown into the relay while it awaits the
+  listener (the relay coroutine closed there) is not the listener's and propagates at once
+  (issue #1549). \
+  Enforced in: `services/common/herd_common/outbox.py` (`_listen_for_wakeups`, `run_outbox_relay`); `services/common/herd_common/background_tasks.py` (`await_stopped_task`) \
+  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`, `test_listen_for_wakeups_setup_failure_is_logged_once_and_returns`, `test_relay_with_a_listener_whose_setup_fails_ends_cancelled`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`, `test_closing_the_relay_while_it_awaits_its_listener_lets_generator_exit_through`, `test_a_relay_that_ends_with_its_own_exception_keeps_it_after_cancelling_its_listener`)
 - **OPS-OUTBOX-12.** A consumer's deduplication key is the payload `event_id`, else the
   JetStream `<stream>:<sequence>`, else none. \
   Enforced in: `services/common/herd_common/outbox.py` (`event_dedupe_key`) \
   Pinned by: `services/common/tests/test_outbox.py` (`test_dedupe_key_prefers_payload_event_id`, `test_dedupe_key_falls_back_to_stream_sequence`, `test_dedupe_key_none_when_no_id_and_no_metadata`, `test_dedupe_key_stable_across_resequence`)
-- **OPS-OUTBOX-13.** The relay task is cancelled at shutdown and a crash of it is logged.
-  Against a running stack, an event staged by reservations reaches its consumers. \
-  Enforced in: `services/execution/app/main.py` (`start_outbox_relay`, `stop_outbox_relay`) \
-  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
+- **OPS-OUTBOX-13.** The relay task is cancelled at shutdown and a crash of it is logged
+  when it happens. Reservations logs a crash of any of its three lifespan tasks (the
+  expiration loop, the purpose-classify loop, and the relay), and every relay logs a
+  crash of its wake-up listener, through the ONE shared done callback `log_task_crash`:
+  at ERROR, with `action` `background_task_crashed`, the task's name, and the exception
+  class name only. At shutdown reservations cancels all three tasks before it awaits any,
+  then awaits each in that order through `await_stopped_task`, which returns, never
+  raises, what a task ended with: an `Exception`, or a `BaseException` subclass that
+  asyncio does not treat as a process-exit signal, is logged (`action`
+  `background_task_failed_at_shutdown`, class name only) and does not stop the rest, and
+  the NATS connection, when there is one, is closed after; the lifespan raises none of
+  them. A `KeyboardInterrupt` or `SystemExit` never reaches these steps: asyncio raises it
+  out of the event loop as the task dies, `asyncio.run` then cancels the lifespan at its
+  `yield`, so in that case none of the shutdown steps run (the NATS close included), and
+  the signal leaves `asyncio.run`. A `GeneratorExit` thrown into the shutdown while it
+  awaits a task (the lifespan closed while suspended there) propagates at once. When the
+  lifespan itself is cancelled while it awaits a task, the remaining steps still run and
+  the lifespan then ends cancelled. Execution's relay task keeps its own callback (issue #1549 leaves
+  moving it to the shared one for later). Against a running stack, an event staged by
+  reservations reaches its consumers. \
+  Enforced in: `services/execution/app/main.py` (`start_outbox_relay`, `stop_outbox_relay`); `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/background_tasks.py` (`log_task_crash`, `await_stopped_task`, `TASK_CRASHED_ACTION`, `TASK_FAILED_AT_SHUTDOWN_ACTION`) \
+  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`); `services/common/tests/test_background_tasks.py` (`test_a_task_that_raises_is_logged_when_it_ends_by_class_name_only`, `test_a_task_that_is_cancelled_or_returns_is_not_logged`, `test_await_stopped_task_returns_none_for_a_cancelled_or_returned_task`, `test_await_stopped_task_returns_a_dead_tasks_exception_and_logs_it_once`, `test_an_exception_thrown_into_the_caller_propagates_even_after_the_task_died`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step`, `test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts`, `test_a_process_exit_signal_in_a_task_cancels_the_lifespan_at_its_yield`, `test_closing_the_lifespan_while_it_awaits_a_task_lets_generator_exit_through`, `test_a_lifespan_cancelled_during_shutdown_finishes_the_steps_then_ends_cancelled`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
 - **OPS-OUTBOX-14.** A row is marked published when JetStream acknowledges it, and is not
   republished; an event the broker loses afterwards (an ephemeral store recreated before a
   consumer pulled it) is not recovered by the relay. By decision; recorded in
@@ -1520,19 +1548,29 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   as reserved, and a suggestion-only reservation adds transit hours but no transit
   purpose rows. In a 200 answer from cabling, an entry whose reservation id is not a UUID
   string is ignored, a device id string that is not a UUID is ignored while the entry's
-  other device ids still count, and a null device list adds no transit devices. \
+  other device ids still count, and a null device list adds no transit devices. A device
+  list that is not a list (a number, a string, a boolean, an object) adds no transit
+  devices either, and a device id that is not a string (a number, a boolean, null, an
+  object, a list) is ignored while the entry's other device ids still count; these
+  wrongly typed values are logged once per report at WARNING with `action`
+  `transit_gear_entries_skipped` and the two counts, never the body (issue #1553). The
+  report is still produced. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`, `_fetch_transit_devices`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`, `test_wrongly_typed_entries_are_skipped_and_the_report_is_still_produced`); `services/reservations/tests/test_transit_gear_rollup.py` (`test_a_device_list_of_the_wrong_type_is_skipped_and_logged_once`, `test_device_ids_of_the_wrong_type_are_skipped_and_the_rest_count`, `test_wrongly_typed_entries_across_chunks_log_one_line_per_report`, `test_the_pinned_leniency_logs_nothing`)
 - **OPS-REPORT-8.** Transit devices are read from cabling in chunks of 500 reservations;
-  a transport error or non-200 from any chunk fails the report closed with 503
-  `{"error": "transit_gear_unavailable"}`, and `include_transit=false` makes no cabling
-  call. \
+  a transport error, a non-200, or a 200 whose body is not the declared shape (a body
+  that does not parse: not JSON, not UTF-8, or nested deeper than the decoder's recursion
+  limit; or one that is not an object holding a `devices` object: a list, a string, a
+  boolean, a number, null, an object without `devices`, or `devices` that is not an
+  object) from any chunk
+  fails the report closed with 503 `{"error": "transit_gear_unavailable"}`, and
+  `include_transit=false` makes no cabling call. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`_fetch_transit_devices`, `_TRANSIT_BATCH_CHUNK_SIZE`, `TransitGearUnavailable`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`, `test_a_200_that_is_not_an_object_with_a_devices_object_is_unavailable`, `test_a_200_that_is_not_json_is_unavailable_without_its_text`, `test_a_wrongly_shaped_body_in_any_chunk_is_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
 - **OPS-REPORT-9.** The routes map that failure to 503 `{"error":
   "transit_gear_unavailable"}`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
 - **OPS-REPORT-10.** The fleet section lists every device inventory returns (paged by 500,
   with the caller's token, stopping at 100,000), each with its hours over the whole
   window as `utilization_pct`, unclamped; devices with no hours are the idle count, and a
@@ -2167,7 +2205,7 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
 | 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, `<start or end> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, a validation list | a bad report window, a bound with no UTC equivalent, or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
-| 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices | OPS-REPORT-8, OPS-REPORT-9 |
+| 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices, or answers 200 with a body that is not an object holding a `devices` object | OPS-REPORT-8, OPS-REPORT-9 |
 | 503 | `Inventory service is unreachable` | the fleet CSV when inventory cannot answer | OPS-REPORT-14 |
 
 Startup refusals (no HTTP answer; the container exits or waits):
@@ -2194,7 +2232,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
 | Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503, a malformed 200 included (OPS-SECRET-14) |
-| Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed: 503 (OPS-REPORT-8) |
+| Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed, a 200 of the wrong shape included: 503 (OPS-REPORT-8); a wrongly typed entry is skipped and logged (OPS-REPORT-7) |
 | Out (reservations, report) | inventory | `GET /devices` with the caller's token (10 s, paged by 500) | fleet section | Fail open: `fleet` null, or 503 for the fleet CSV (OPS-REPORT-11, OPS-REPORT-14) |
 | Out (reservations, report) | auth | `POST /groups/users/groups` with the caller's token (5 s) | group section | Fail open: every user `Ungrouped` (OPS-REPORT-5) |
 | Out (reservations, report) | execution | `GET /runs` with the caller's token (5 s) | run count | Fail open: null (OPS-REPORT-12) |
