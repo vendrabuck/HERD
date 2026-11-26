@@ -38,9 +38,7 @@ def _open_templates_page(driver, base_url):
 def test_topology_templates_page_loads(admin_browser, base_url):
     """The /topology-templates page renders its header."""
     _open_templates_page(admin_browser, base_url)
-    h2 = admin_browser.find_element(
-        By.XPATH, "//h2[contains(., 'Topology Templates')]"
-    )
+    h2 = admin_browser.find_element(By.XPATH, "//h2[contains(., 'Topology Templates')]")
     assert h2.is_displayed()
 
 
@@ -56,9 +54,7 @@ def test_topology_templates_page_shows_list_or_empty(admin_browser, base_url):
         )
     )
     tables = admin_browser.find_elements(By.TAG_NAME, "table")
-    empties = admin_browser.find_elements(
-        By.XPATH, "//*[contains(text(), 'No templates yet')]"
-    )
+    empties = admin_browser.find_elements(By.XPATH, "//*[contains(text(), 'No templates yet')]")
     assert tables or empties
 
 
@@ -70,9 +66,7 @@ def seeded_topology_template(admin_browser, base_url):
     """
     # Make sure the browser has a live session so api_request can read the JWT.
     admin_browser.get(f"{base_url}/topology")
-    WebDriverWait(admin_browser, WAIT).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+    WebDriverWait(admin_browser, WAIT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
     topo_name = f"e2e-tmpl-src-{uuid.uuid4().hex[:8]}"
     topo_resp = api_request(
@@ -101,9 +95,7 @@ def seeded_topology_template(admin_browser, base_url):
             f"/cabling/topologies/{topology['id']}",
             allow_errors=True,
         )
-        pytest.skip(
-            f"create template failed: {tmpl_resp.status_code} {tmpl_resp.text}"
-        )
+        pytest.skip(f"create template failed: {tmpl_resp.status_code} {tmpl_resp.text}")
     template = tmpl_resp.json()
 
     yield template
@@ -130,16 +122,12 @@ def test_topology_template_instantiate_dialog_opens(
     _open_templates_page(admin_browser, base_url)
     wait = WebDriverWait(admin_browser, WAIT)
     row = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, f"//tr[.//td[contains(., '{tmpl_name}')]]")
-        )
+        EC.presence_of_element_located((By.XPATH, f"//tr[.//td[contains(., '{tmpl_name}')]]"))
     )
     row.find_element(By.XPATH, ".//button[normalize-space()='Use']").click()
 
     # Name input renders inside the modal.
-    name_input = wait.until(
-        EC.element_to_be_clickable((By.ID, "instantiate-name"))
-    )
+    name_input = wait.until(EC.element_to_be_clickable((By.ID, "instantiate-name")))
     assert name_input.is_displayed()
 
     # The role-assignment region is present even when there are no roles, the

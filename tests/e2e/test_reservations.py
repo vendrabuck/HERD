@@ -82,9 +82,7 @@ def test_calendar_day_view_toggles(logged_in_browser, base_url):
     week_label = wait.until(EC.presence_of_element_located(header)).text
     assert " - " in week_label, f"the default week view label is not a range: {week_label!r}"
 
-    day_btn = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='day']"
-    )
+    day_btn = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='day']")
     day_btn.click()
 
     wait.until(lambda d: d.find_element(*header).text != week_label)

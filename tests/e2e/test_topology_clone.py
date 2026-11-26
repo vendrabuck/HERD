@@ -56,22 +56,16 @@ def test_topology_clone_via_ui(logged_in_browser, base_url, source_topology):
     wait = WebDriverWait(logged_in_browser, WAIT)
     wait.until(EC.presence_of_element_located((By.TAG_NAME, "table")))
     row = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, f"//tr[.//td[contains(., '{src_name}')]]")
-        )
+        EC.presence_of_element_located((By.XPATH, f"//tr[.//td[contains(., '{src_name}')]]"))
     )
 
     # Click that row's Clone button. Use stopPropagation expectation: this
     # opens the modal rather than navigating to the editor.
-    clone_btn = row.find_element(
-        By.XPATH, ".//button[normalize-space()='Clone']"
-    )
+    clone_btn = row.find_element(By.XPATH, ".//button[normalize-space()='Clone']")
     clone_btn.click()
 
     # Modal appears with the clone-name input prefilled.
-    name_input = wait.until(
-        EC.element_to_be_clickable((By.ID, "clone-topology-name"))
-    )
+    name_input = wait.until(EC.element_to_be_clickable((By.ID, "clone-topology-name")))
     assert name_input.is_displayed()
     prefilled = name_input.get_attribute("value") or ""
     assert "copy" in prefilled.lower() or src_name in prefilled
