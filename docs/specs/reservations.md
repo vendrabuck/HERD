@@ -669,14 +669,18 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
 
 **Rules.**
 
-- **RES-PATCH-1.** Only `ACTIVE` and `PENDING` reservations can be edited; any other
-  status answers 400 with no side effect. \
+- **RES-PATCH-1.** Only `ACTIVE` and `PENDING` reservations can be edited; after the
+  visibility check of RES-PATCH-7 and the owner check of RES-PATCH-2, any other status
+  answers 400 with no side effect. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_completed_reservation_rejected`); `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_on_pending_provision_is_refused_with_zero_inventory_calls`)
-- **RES-PATCH-2.** Only the owner can edit; every other caller, an admin included, gets
-  404. By decision ([ROLES.md](../ROLES.md): owner-scoped, no admin bypass). \
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_completed_reservation_rejected`, `test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`); `services/reservations/tests/test_reservation_hold_invariant.py` (`test_patch_on_pending_provision_is_refused_with_zero_inventory_calls`)
+- **RES-PATCH-2.** Only the owner can edit; after the visibility check of RES-PATCH-7,
+  every other caller, an admin included, gets 404. By decision ([ROLES.md](../ROLES.md):
+  owner-scoped, no admin bypass). The owner check comes before the status check of
+  RES-PATCH-1, so the 404 a non-owner gets is the same as for an id that does not
+  exist, whatever the row's status: they learn neither its status nor that it exists. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `get_reservation`) \
-  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`)
+  Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_patch_is_404_and_changes_nothing`, `test_non_owner_user_patch_is_404_and_changes_nothing`, `test_owner_patch_still_succeeds`); `services/reservations/tests/test_reservations.py` (`test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`)
 - **RES-PATCH-3.** A new `end_time` is taken as the instant it names: a value with an
   offset is converted to UTC and a value without one is taken as UTC, and that UTC value
   is what every check below compares and what is stored. It must be after `start_time`
@@ -710,12 +714,17 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/schemas/reservation.py` (`device_ids_not_empty`); `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_held_instance_device_ids`) \
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_empty_device_ids_rejected`, `test_update_reservation_topology_mismatch_rejected`); `services/reservations/tests/test_schema_bounds.py` (`test_update_device_ids_over_cap_rejected`); `services/reservations/tests/test_dynamic_gating.py` (`test_mixed_reservation_adds_a_device_and_keeps_its_instance`, `test_mixed_reservation_can_drop_a_physical_device_and_keep_its_instance`, `test_a_cloud_device_the_reservation_does_not_hold_is_still_refused`, `test_a_held_cloud_device_of_another_template_is_still_refused`, `test_without_dynamic_requests_the_whole_set_is_judged`, `test_mixed_patch_through_the_route_is_200`)
 - **RES-PATCH-7.** A non-admin's new `device_ids` must all be visible to them (403
-  otherwise). When the visibility lookup cannot be answered the router skips this
-  pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6 still
-  refuses an invisible device as not found (400). The calendar, which returns rows,
-  fails closed instead (RES-CAL-3). \
+  otherwise). When the lookup answers, this check runs before the owner and status
+  checks, so a non-admin naming an invisible device gets 403 whatever the reservation's
+  owner or status, including an id that does not exist; it depends only on the body and
+  the caller's visibility. It never runs for an admin or a superadmin, or for a body
+  whose `device_ids` is absent or null; for those requests the owner check and then the
+  status check come first. When the visibility lookup cannot be answered the router
+  skips this pre-check, as on create (RES-CREATE-8), and the device fetch of RES-PATCH-6
+  still refuses an invisible device as not found (400). The calendar, which returns
+  rows, fails closed instead (RES-CAL-3). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`update_reservation_by_id`, `_fetch_visible_device_ids`); `services/reservations/app/services/reservation_service.py` (`_fetch_devices`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`, `test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
   (`l3=0`). \
@@ -1267,16 +1276,16 @@ sweep, and event delivery never return an error to a caller.
 
 | Status | Error key or detail | When | Rule |
 |---|---|---|---|
-| 400 | `Cannot update a <STATUS> reservation` | PATCH on a status other than `ACTIVE` or `PENDING` | RES-PATCH-1 |
+| 400 | `Cannot update a <STATUS> reservation` | PATCH on a status other than `ACTIVE` or `PENDING`, after the visibility check of RES-PATCH-7 and the owner check of RES-PATCH-2 | RES-PATCH-1 |
 | 400 | `end_time must be after start_time` or `end_time must be in the future` | PATCH with a bad end time | RES-PATCH-3 |
 | 400 | the plain-string detail create uses for the same condition | PATCH: missing device, mixed types, unavailable device, unreachable edges | RES-PATCH-6, RES-PATCH-7, RES-PATCH-8, RES-PATCH-9 |
 | 400 | `{"error": "topology_device_not_member", "device_ids": [...]}` | PATCH device set leaves a canvas device unbooked | RES-PATCH-8 |
-| 403 | `You do not have access to one or more requested devices` | a non-admin names an invisible device on create or PATCH | RES-CREATE-7, RES-PATCH-7 |
+| 403 | `You do not have access to one or more requested devices` | a non-admin names an invisible device on create or PATCH; on PATCH before the owner and status checks, so whatever the reservation's owner or status, an unknown id included | RES-CREATE-7, RES-PATCH-7 |
 | 403 | `Only admins can list all reservations` | `GET /?all=true` as a non-admin | RES-LIST-1 |
 | 403 | `Only the reservation owner or an admin may set its purpose category` | purpose-category PATCH by a third user | RES-PURPOSE-2 |
 | 403 | `Admin or superadmin role required` | a purpose review route as a non-admin | RES-PURPOSE-14 |
 | 403 | `Invalid internal token` | an internal route with a wrong token | RES-INTERNAL-1 |
-| 404 | `Reservation not found` | `GET /{id}`, `PATCH /{id}`, or release by anyone but the owner; cancel by a non-owner non-admin; any route on an unknown id | RES-VIEW-1, RES-VIEW-2, RES-PATCH-2, RES-CANCEL-1, RES-RELEASE-1, RES-RELEASE-2, RES-PURPOSE-2, RES-PURPOSE-13 |
+| 404 | `Reservation not found` | `GET /{id}`, `PATCH /{id}`, or release by anyone but the owner; cancel by a non-owner non-admin; any route on an unknown id; on `PATCH /{id}`, a non-admin naming an invisible device gets the 403 of RES-PATCH-7 instead when the visibility lookup answers | RES-VIEW-1, RES-VIEW-2, RES-PATCH-2, RES-CANCEL-1, RES-RELEASE-1, RES-RELEASE-2, RES-PURPOSE-2, RES-PURPOSE-13 |
 | 404 | `Reservation not found` | a fork or wiring route by anyone but the owner or an admin | RES-FORK-4 |
 | 404 | `Reservation not found` | an internal status lookup or provision result for an unknown id | RES-INTERNAL-2, RES-DYN-6 |
 | 404 | `Fork not found` | reading the fork of a non-`ACTIVE` reservation that has none | RES-FORK-5 |
