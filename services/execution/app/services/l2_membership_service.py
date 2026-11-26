@@ -275,9 +275,14 @@ async def record_l2_membership_active(
     by a live membership) and False otherwise. The row is then failed through
     record_l2_failed, the allocation it used kept on the row, one attempt: with no undo
     or an undo that answered True, intended ACTIVE under JOIN_LOST_ALLOCATION_RELEASED
-    (the build retry re-allocates it); with an undo that answered False or raised,
-    intended RELEASED under JOIN_UNDO_PENDING_REMOVAL (the removal is still owed), and
-    an exception from the undo is raised again after that write. `row_id` and `claims`
+    (the build retry re-allocates it); with an undo that answered False or raised
+    (any BaseException, asyncio.CancelledError included), intended RELEASED under
+    JOIN_UNDO_PENDING_REMOVAL (the removal is still owed), and the exception from the
+    undo is raised again after that write; if that write itself raises an Exception,
+    one line is logged with the action `l2_join_undo_owed_write_failed` and the class
+    name, and the undo's exception is the one raised. The owed write runs after the
+    undo, not before it, so a process that dies inside the undo writes nothing.
+    `row_id` and `claims`
     are the retry channel's, used only for that failure write (the row-identity
     compare-and-swap of WIRE-LEDGER-8); the reconcile passes neither and the write is
     the key-based upsert. The returned row is that failure write's. The existing-ACTIVE
@@ -431,9 +436,29 @@ async def record_l2_membership_active(
             return await _fail(True)
         try:
             undone = await undo_lost_join()
-        except Exception:
-            await db.rollback()
-            await _fail(False)
+        except BaseException:
+            # Issue #1413: any end of the undo other than its answer, a cancellation
+            # included, may leave the add on the port, so the removal is recorded as
+            # owed before the exception goes on. A failure of that write is logged by
+            # class name and does not replace the exception being raised.
+            try:
+                await db.rollback()
+                await _fail(False)
+            except Exception as write_exc:
+                logger.error(
+                    "Could not record the owed removal of the lost join of reservation "
+                    "%s on switch %s port %s after its undo was interrupted (%s)",
+                    res_uuid,
+                    switch_uuid,
+                    port,
+                    type(write_exc).__name__,
+                    extra={
+                        "action": "l2_join_undo_owed_write_failed",
+                        "error_class": type(write_exc).__name__,
+                        "reservation_id": str(res_uuid),
+                        "vlan_assignment_id": str(vlan_uuid),
+                    },
+                )
             raise
         return await _fail(undone)
 
@@ -939,7 +964,35 @@ async def supersede_l2_release_if_reclaimed(
     reservation's live membership, so we flip the row RELEASED in place and skip the
     driver. The cross-reservation analogue of supersede_release_if_reclaimed for L1.
     Returns True when superseded (now RELEASED), False when a driver remove is warranted.
+
+    Issue #1413: a row that owes the removal of a lost join's add
+    (JOIN_UNDO_PENDING_REMOVAL) is settled this way only when a live membership holds the
+    row's own number on the port (port_holds_number_live, of any reservation). An add is
+    a per-VLAN membership (on SR Linux a subinterface per VLAN), so another reservation's
+    membership in a different number does not take the port out of the released one,
+    and the removal is still driven. Whether the row owes it, and the number, are read
+    from the row as it stands in `db` (the caller's write_guard holds its lock), not
+    from `row`.
     """
+    from app.models.vlan_assignment import VlanAssignment
+
+    owed = (
+        await db.execute(
+            select(L2PortAssignment.vlan_assignment_id).where(
+                L2PortAssignment.id == row.id, _owes_undo()
+            )
+        )
+    ).first()
+    if owed is not None:
+        number = (
+            await db.execute(select(VlanAssignment.vlan_id).where(VlanAssignment.id == owed[0]))
+        ).scalar_one_or_none()
+        if number is None or not await port_holds_number_live(
+            db, row.switch_device_id, row.port, number
+        ):
+            return False
+        await release_l2_membership(db, row.reservation_id, row.switch_device_id, row.port)
+        return True
     result = await db.execute(
         select(L2PortAssignment.id).where(
             L2PortAssignment.switch_device_id == row.switch_device_id,
