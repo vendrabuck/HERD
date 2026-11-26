@@ -11,11 +11,12 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # explicitly. Add new repo-root packages or scripts here so they are linted and
 # format-checked locally and in CI. Today this is the seedtools seeding package
 # (issue #791), the CI image-vs-lock guard script (issue #593), the manual search
-# index generator (issue #1298), the AI generate evaluation harness
-# (tests/ai_eval/), the repo-root unit tests (tests/unit/), and the restarter with
-# its tests (infra/restarter/, issue #1326); the rest of tests/ is not covered by
-# make lint or CI's ruff steps.
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/ infra/restarter/
+# index generator (issue #1298), all of tests/ (the e2e, integration, contract,
+# load, NOS lab, AI eval, and repo-root unit suites; issue #1557), the driver
+# packages under drivers/ (issue #1557), and the restarter with its tests
+# (infra/restarter/, issue #1326). The same list is spelled out in CI's two ruff
+# steps (.github/workflows/ci.yml); keep them identical.
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ drivers/ infra/restarter/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh

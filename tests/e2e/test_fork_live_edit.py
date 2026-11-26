@@ -131,18 +131,14 @@ def _create_reserved_topology(browser):
     status = reservation.get("status")
     while status != "ACTIVE" and time.time() < deadline:
         time.sleep(1)
-        poll = api_request(
-            browser, "GET", f"/reservations/{reservation['id']}", allow_errors=True
-        )
+        poll = api_request(browser, "GET", f"/reservations/{reservation['id']}", allow_errors=True)
         if poll.status_code == 200:
             status = poll.json().get("status")
             reservation = poll.json()
         if status in ("FAILED", "CANCELLED", "COMPLETED"):
             break
     if status != "ACTIVE":
-        api_request(
-            browser, "DELETE", f"/reservations/{reservation['id']}", allow_errors=True
-        )
+        api_request(browser, "DELETE", f"/reservations/{reservation['id']}", allow_errors=True)
         api_request(browser, "DELETE", f"/cabling/topologies/{topology['id']}", allow_errors=True)
         return None
 
@@ -152,9 +148,7 @@ def _create_reserved_topology(browser):
 def _cleanup_reserved_topology(browser, setup):
     if not setup:
         return
-    api_request(
-        browser, "DELETE", f"/reservations/{setup['reservation']['id']}", allow_errors=True
-    )
+    api_request(browser, "DELETE", f"/reservations/{setup['reservation']['id']}", allow_errors=True)
     api_request(
         browser, "DELETE", f"/cabling/topologies/{setup['topology']['id']}", allow_errors=True
     )
@@ -164,9 +158,7 @@ def _cleanup_reserved_topology(browser, setup):
 def fork_reservation(admin_browser, base_url):
     """An ACTIVE reservation owning a topology, for the commit and history tests."""
     admin_browser.get(f"{base_url}/topology")
-    WebDriverWait(admin_browser, WAIT).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+    WebDriverWait(admin_browser, WAIT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     setup = _create_reserved_topology(admin_browser)
     if not setup:
         pytest.skip("could not provision an ACTIVE reserved topology for the fork e2e")
@@ -188,7 +180,9 @@ def test_commit_shows_released_built_save_toast(admin_browser, base_url, fork_re
     wait = _open_live_editor(admin_browser, base_url, fork_reservation)
 
     commit = wait.until(
-        EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Commit to reservation']"))
+        EC.element_to_be_clickable(
+            (By.XPATH, "//button[normalize-space()='Commit to reservation']")
+        )
     )
     admin_browser.execute_script("arguments[0].scrollIntoView(true);", commit)
     time.sleep(0.2)
@@ -211,9 +205,7 @@ def test_commit_shows_released_built_save_toast(admin_browser, base_url, fork_re
     )
 
 
-def test_parent_topology_history_unchanged_after_commit(
-    admin_browser, base_url, fork_reservation
-):
+def test_parent_topology_history_unchanged_after_commit(admin_browser, base_url, fork_reservation):
     """A fork commit must not append a version to the PARENT topology's history."""
     topology_id = fork_reservation["topology"]["id"]
 
@@ -234,7 +226,9 @@ def test_parent_topology_history_unchanged_after_commit(
 
     wait = _open_live_editor(admin_browser, base_url, fork_reservation)
     commit = wait.until(
-        EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Commit to reservation']"))
+        EC.element_to_be_clickable(
+            (By.XPATH, "//button[normalize-space()='Commit to reservation']")
+        )
     )
     admin_browser.execute_script("arguments[0].scrollIntoView(true);", commit)
     time.sleep(0.2)
@@ -258,9 +252,7 @@ def test_parent_topology_history_unchanged_after_commit(
 def test_ended_reservation_fork_view_is_read_only(admin_browser, base_url):
     """Completing a reservation freezes its fork; the fork view renders read-only."""
     admin_browser.get(f"{base_url}/topology")
-    WebDriverWait(admin_browser, WAIT).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+    WebDriverWait(admin_browser, WAIT).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     # A dedicated reservation so completing it does not disturb the module fixture.
     setup = _create_reserved_topology(admin_browser)
     if not setup:
@@ -282,9 +274,7 @@ def test_ended_reservation_fork_view_is_read_only(admin_browser, base_url):
         assert release.status_code in (200, 204), release.text
 
         # Open the fork view; it must render read-only (as-built), with no commit.
-        admin_browser.get(
-            f"{base_url}/topology/{topology['id']}?reservationId={reservation['id']}"
-        )
+        admin_browser.get(f"{base_url}/topology/{topology['id']}?reservationId={reservation['id']}")
         wait = WebDriverWait(admin_browser, WAIT)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".react-flow")))
         wait.until(

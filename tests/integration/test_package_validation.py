@@ -25,9 +25,7 @@ MOCK_HYPERVISOR_DIR = Path(__file__).parents[2] / "drivers" / "mock_hypervisor"
 
 
 def _package_b64(replacements: dict[str, str] | None = None) -> str:
-    files = {
-        p.name: p.read_text() for p in MOCK_HYPERVISOR_DIR.iterdir() if p.is_file()
-    }
+    files = {p.name: p.read_text() for p in MOCK_HYPERVISOR_DIR.iterdir() if p.is_file()}
     if replacements:
         files.update(replacements)
     buf = io.BytesIO()
@@ -115,8 +113,9 @@ async def test_broken_package_returns_red_report_live(base_url):
     assert resp.status_code == 200, resp.text
     report = resp.json()
     assert report["valid"] is False
-    assert "Driver class is missing required method: create_instance" in (
-        report["structural"]["errors"]
+    assert (
+        "Driver class is missing required method: create_instance"
+        in (report["structural"]["errors"])
     )
     assert report["dry_run"]["error"] == "not run"
 

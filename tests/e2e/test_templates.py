@@ -32,18 +32,14 @@ def test_templates_page_shows_type_filter(admin_browser, base_url):
 def test_templates_create_button_visible_for_admin(admin_browser, base_url):
     """Admin sees the Create Template button."""
     _open_templates(admin_browser, base_url)
-    btn = admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Create Template')]"
-    )
+    btn = admin_browser.find_element(By.XPATH, "//button[contains(., 'Create Template')]")
     assert btn.is_displayed()
 
 
 def test_template_editor_opens_with_name_type_fields(admin_browser, base_url):
     """Clicking Create Template navigates to the editor with name + type inputs."""
     _open_templates(admin_browser, base_url)
-    admin_browser.find_element(
-        By.XPATH, "//button[contains(., 'Create Template')]"
-    ).click()
+    admin_browser.find_element(By.XPATH, "//button[contains(., 'Create Template')]").click()
 
     wait = WebDriverWait(admin_browser, WAIT)
     wait.until(EC.url_contains("/templates/new"))

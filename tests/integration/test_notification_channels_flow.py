@@ -55,9 +55,7 @@ async def test_channel_preferences_round_trip(user_client):
         "channels": {"in_app": True, "email": True, "chat": False, "webhook": True},
         "events": {"reservation.expiring_soon": True},
     }
-    put_resp = await user_client.put(
-        "/notifications/notifications/preferences", json=update
-    )
+    put_resp = await user_client.put("/notifications/notifications/preferences", json=update)
     assert put_resp.status_code == 200, put_resp.text
     got = put_resp.json()
     assert got["channels"]["email"] is True
