@@ -14,6 +14,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetOnSignOut } from "@/queryClient";
 import type { User } from "@/types/auth.types";
 import { APP_VERSION } from "@/lib/appVersion";
+import { flushPending } from "../flushPending";
 
 function user(overrides: Partial<User> = {}): User {
   return {
@@ -602,11 +603,16 @@ describe("AppLayout main navigation by role (issue #1402)", () => {
     return [...mainNav().querySelectorAll(":scope > a")].map((a) => a.textContent);
   }
 
-  function expectNoReportingAnywhere() {
+  // Neither admin-only header entry (IAM-UI-17): no Reporting link and no
+  // Administration menu. Every caller first anchors on the state it is about
+  // (the account rendered, the request in flight, or the failed answer
+  // handled), since both are already absent before GET /me answers.
+  function expectNoAdminOnlyEntries() {
     expect(screen.queryByRole("link", { name: "Reporting" })).toBe(null);
     // Not merely hidden from the accessibility tree: no element links there.
     expect(document.querySelector('a[href="/reporting"]')).toBe(null);
     expect(screen.queryByText("Reporting")).toBe(null);
+    expect(screen.queryByRole("button", { name: "Administration" })).toBe(null);
   }
 
   it.each([
@@ -634,7 +640,7 @@ describe("AppLayout main navigation by role (issue #1402)", () => {
     renderLayoutInDataRouter("/inventory");
     await screen.findByText("alice");
     expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
-    expectNoReportingAnywhere();
+    expectNoAdminOnlyEntries();
   });
 
   it("omits Reporting while the account is still loading, and shows it once an admin loads", async () => {
@@ -648,17 +654,28 @@ describe("AppLayout main navigation by role (issue #1402)", () => {
     await waitFor(() => expect(answer).not.toBe(null));
     // The plain links do not wait for the account.
     expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
-    expectNoReportingAnywhere();
+    expectNoAdminOnlyEntries();
 
     await act(async () => answer!(HttpResponse.json(user({ role: "admin" }))));
     expect(await screen.findByRole("link", { name: "Reporting" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Administration" })).toBeInTheDocument();
   });
 
   it("omits Reporting when the account cannot be loaded", async () => {
-    server.use(http.get("/api/auth/me", () => new HttpResponse(null, { status: 500 })));
+    let answered = false;
+    server.use(
+      http.get("/api/auth/me", () => {
+        answered = true;
+        return new HttpResponse(null, { status: 500 });
+      }),
+    );
     renderLayoutInDataRouter("/inventory");
-    await waitFor(() => expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS));
-    expectNoReportingAnywhere();
+    // The plain links and the absences below already hold while GET /me is
+    // pending, so anchor on the 500 having been served and handled first.
+    await waitFor(() => expect(answered).toBe(true));
+    await flushPending();
+    expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
+    expectNoAdminOnlyEntries();
   });
 
   it("Tab walks a plain user's main navigation without a Reporting stop", async () => {
@@ -708,6 +725,6 @@ describe("AppLayout main navigation by role (issue #1402)", () => {
     await screen.findByText("alice");
     const current = [...mainNav().querySelectorAll('[aria-current="page"]')];
     expect(current).toEqual([screen.getByRole("link", { name: "Topology" })]);
-    expectNoReportingAnywhere();
+    expectNoAdminOnlyEntries();
   });
 });
