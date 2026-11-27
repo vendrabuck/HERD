@@ -1,5 +1,10 @@
 import { Modal } from "@/components/ui/Modal";
+import { detailText } from "@/lib/errors";
 import type { ForkConflictDetail } from "@/types/reservation.types";
+
+// Shown when the server sends no message, or a blank one.
+const FORK_CONFLICT_FALLBACK_MESSAGE =
+  "One or more ports are already claimed by another active reservation.";
 
 interface ForkConflictDialogProps {
   open: boolean;
@@ -14,14 +19,15 @@ function shortId(id: string): string {
 // Shown when a fork save is refused with a cross-reservation port-claim 409
 // (ADR 0006 Decision 4). Lists every blocking reservation, device, and port from
 // the structured detail. The editor keeps the user's drawing so they can rework
-// the wiring and save again.
+// the wiring and save again. `detail` comes only from `forkConflictDetail`,
+// which has checked every field rendered here (issue #1406); the message still
+// goes through `detailText` so a blank one falls back and a long one is cut.
 export function ForkConflictDialog({ open, detail, onClose }: ForkConflictDialogProps) {
   const conflicts = detail?.conflicts ?? [];
   return (
     <Modal open={open} onClose={onClose} title="Ports already claimed" className="max-w-lg">
       <p className="text-sm text-gray-700">
-        {detail?.message ??
-          "One or more ports are already claimed by another active reservation."}
+        {detailText(detail?.message, FORK_CONFLICT_FALLBACK_MESSAGE)}
       </p>
       <p className="text-xs text-gray-500 mt-1">
         Your drawing is kept on the canvas. Re-wire the conflicting ports and save again.
