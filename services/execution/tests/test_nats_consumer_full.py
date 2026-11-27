@@ -410,7 +410,35 @@ async def test_setup_failure_after_a_good_connect_is_not_called_a_connect_failur
     assert _records(caplog)[0].exc_info is None
     assert "tok3n-value" not in caplog.text
     assert app.state.nats is mock_nc
+    # "The connection is kept": the failed setup neither closes nor drains it.
+    mock_nc.close.assert_not_awaited()
+    mock_nc.drain.assert_not_awaited()
     assert not hasattr(app.state, "nats_consumer_task")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", ["connect", "setup"])
+async def test_a_cancelled_start_propagates_the_cancellation(caplog, step):
+    """Issue #1418 review: the start catches `Exception` only, so a
+    CancelledError raised by the connect or by a setup step leaves
+    start_nats_consumer instead of being logged as a failed start."""
+    from app.services.nats_consumer import start_nats_consumer
+
+    mock_nats_module, _ = _connect_then_fail_setup("add_consumer")
+    mock_js = mock_nats_module.connect.return_value.jetstream.return_value
+    mock_js.add_consumer.side_effect = asyncio.CancelledError()
+    if step == "connect":
+        mock_nats_module.connect.side_effect = asyncio.CancelledError()
+    app = SimpleNamespace(state=SimpleNamespace())
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        caplog.at_level(logging.WARNING, logger=_LOGGER),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await start_nats_consumer(app)
+
+    assert _warnings(caplog) == []
 
 
 @pytest.mark.asyncio

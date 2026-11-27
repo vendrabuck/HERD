@@ -497,10 +497,14 @@ the stream nor causes a duplicate.
   Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_consumer_loop_fetches_one_message_at_a_time_on_both_subscriptions`, `test_consumer_loop_continues_after_idle_timeout`, `test_consumer_loop_survives_fetch_exception_and_retries`)
 - **INTEG-CONSUME-3.** A failed start is logged and the service serves its API; nothing
-  retries the connect or the setup in that process, and no event is lost by it: the
-  durables read every message they have not acked, and the streams keep a message up to
-  their max age, so the events wait and are processed after a restart (issue #1418). Each warning carries the exception class name only, never its text or the NATS
-  URL. A failed connect (bounded, `operations-and-observability.md` OPS-NATS-1) starts
+  retries the connect or the setup in that process. The durables read every message they
+  have not acked that the stream still holds, and the streams keep a message up to their
+  max age, so an event waits and is processed after a restart that comes while it is
+  still within the stream's max age (issue #1418). Each warning carries the exception
+  class name only (the setup and stream-check lines add a JetStream API error's integer
+  `err_code`, as `NotFoundError, err_code=10059`), never its text, a server description,
+  or the NATS URL. A cancellation raised by the connect or a setup step is not logged and
+  propagates. A failed connect (bounded, `operations-and-observability.md` OPS-NATS-1) starts
   neither consumer and logs `NATS connect failed (<class>); not running:
   integration-webhooks-consumer, integration-webhooks-health-consumer. Nothing retries
   the connect, so these consumers start only when the service is restarted with the
@@ -508,16 +512,16 @@ the stream nor causes a duplicate.
   each stream's max age, and are processed after that restart`. A connect that succeeds
   keeps the connection; the reservations durable is set up first, then the health one,
   and a setup that raises stops the start there and logs `NATS consumer setup failed for
-  durable <durable> on stream <stream> (<class>); not running: <durables>; still running:
+  durable <durable> on stream <stream> (<class>[, err_code=<n>]); not running: <durables>; still running:
   <durables or none>. The connection is kept, but nothing retries the setup, so a
   consumer that is not running starts only when the service is restarted; events
   published to its stream meanwhile wait there, kept up to the stream's max age, and are
   processed after that restart`, so a failed health setup leaves the reservations
   consumer running. A failure to ensure a stream logs `JetStream stream <stream> could
-  not be checked or created (<class>); the consumer setup on it goes ahead, and fails if
+  not be checked or created (<class>[, err_code=<n>]); the consumer setup on it goes ahead, and fails if
   the stream is missing`, and the setup goes on. \
   Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`, `log_consumer_connect_failure`, `log_consumer_setup_failure`, `log_consumer_stream_check_failure`) \
-  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`); `services/common/tests/test_consumer_startup_logs.py` (`test_connect_failure_wording`, `test_setup_failure_wording_names_the_durable_and_both_lists`, `test_stream_check_failure_wording`)
+  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`, `test_a_cancelled_start_propagates_the_cancellation`); `services/common/tests/test_consumer_startup_logs.py` (`test_connect_failure_wording`, `test_setup_failure_wording_names_the_durable_and_both_lists`, `test_stream_check_failure_wording`, `test_setup_and_stream_check_lines_add_only_an_integer_err_code`)
 - **INTEG-CONSUME-4.** On a migration-managed schema missing a model table, the consumers
   start only once the tables exist, so events wait on the stream. \
   Enforced in: `services/integration/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -624,15 +628,18 @@ event is delivered twice.
 - **INTEG-NCONSUME-3.** A failed start is logged in the INTEG-CONSUME-3 wording (the
   same `herd_common.jetstream` helpers) and the service serves its API; nothing retries
   the connect or the setup in that process, and the events wait on their streams and are
-  processed after a restart (issue #1418). A failed connect lists
+  processed after a restart that comes while they are still within the stream's max age
+  (issue #1418). A failed connect lists
   `notifications-consumer, notifications-health-consumer` as not running. A connect that
   succeeds keeps the connection; the reservations durable is set up first, then the
   health one, and a setup that raises stops the start there and names that durable, its
   stream, the durables not running, and the ones still running, so a failed health setup
   leaves the reservations consumer running. A failure to ensure a stream is logged and
-  the setup goes on. Each warning carries the exception class name only. \
+  the setup goes on. Each warning carries the exception class name only (plus the
+  integer `err_code` of a JetStream API error on the setup and stream-check lines), and
+  a cancellation propagates unlogged. \
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`, `log_consumer_connect_failure`, `log_consumer_setup_failure`, `log_consumer_stream_check_failure`) \
-  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`)
+  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`, `test_a_cancelled_start_propagates_the_cancellation`)
 - **INTEG-NCONSUME-4.** On a migration-managed schema missing a model table, the
   consumers start only once the tables exist. \
   Enforced in: `services/notifications/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \

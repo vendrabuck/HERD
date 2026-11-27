@@ -91,8 +91,9 @@ async def test_ensure_dlq_stream_swallows_broker_error(monkeypatch, caplog):
     assert _main_warnings(caplog) == [
         "JetStream stream HERD_DLQ could not be created or updated (Exception); if it "
         "exists, dead-lettered messages are kept on it, and while it is missing a "
-        "dead-letter publish fails and the original message is acked, so that "
-        "message is kept nowhere"
+        "dead-letter publish fails and the original message is acked, so it is not "
+        "dead-lettered and the consumer that failed it does not receive it again; it "
+        "stays only on its source stream, up to that stream's max age"
     ]
     assert "tok3n-value" not in caplog.text
 

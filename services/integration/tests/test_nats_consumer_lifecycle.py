@@ -23,6 +23,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from app.database import Base
 from app.services import nats_consumer
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
@@ -214,19 +215,20 @@ class _FailingJetStream(_FakeJetStream):
     durable, or whose pull_subscribe raises for one subject, after a good
     connect (issue #1418)."""
 
-    def __init__(self, *, fail_add_consumer_for=None, fail_subscribe_for=None):
+    def __init__(self, *, fail_add_consumer_for=None, fail_subscribe_for=None, error=None):
         super().__init__()
         self._fail_add_consumer_for = fail_add_consumer_for
         self._fail_subscribe_for = fail_subscribe_for
+        self._error = error if error is not None else RuntimeError(_EXC_TEXT)
 
     async def add_consumer(self, stream, config):
         if config.durable_name == self._fail_add_consumer_for:
-            raise RuntimeError(_EXC_TEXT)
+            raise self._error
         await super().add_consumer(stream, config)
 
     async def pull_subscribe(self, subject_pattern, durable, config):
         if subject_pattern == self._fail_subscribe_for:
-            raise RuntimeError(_EXC_TEXT)
+            raise self._error
         return await super().pull_subscribe(subject_pattern, durable, config)
 
 
@@ -278,6 +280,9 @@ async def test_reservations_setup_failure_is_not_called_a_connect_failure(caplog
     # No "consumers started" line: nothing started.
     assert [r.levelno for r in _records(caplog)] == [logging.WARNING]
     assert app.state.nats is mock_nc
+    # "The connection is kept": the failed setup neither closes nor drains it.
+    mock_nc.close.assert_not_awaited()
+    mock_nc.drain.assert_not_awaited()
     assert not hasattr(app.state, "nats_consumer_task")
     assert not hasattr(app.state, "nats_health_consumer_task")
     assert js.subscribe_calls == []
@@ -301,6 +306,8 @@ async def test_health_setup_failure_leaves_the_reservations_consumer_running(cap
         ]
         assert "tok3n-value" not in caplog.text
         assert app.state.nats is mock_nc
+        mock_nc.close.assert_not_awaited()
+        mock_nc.drain.assert_not_awaited()
         task = app.state.nats_consumer_task
         assert isinstance(task, asyncio.Task)
         await asyncio.sleep(0.05)
@@ -308,6 +315,33 @@ async def test_health_setup_failure_leaves_the_reservations_consumer_running(cap
         assert not hasattr(app.state, "nats_health_consumer_task")
     finally:
         await _cancel_both(app)
+
+
+@pytest.mark.parametrize("step", ["connect", "setup"])
+async def test_a_cancelled_start_propagates_the_cancellation(caplog, step):
+    """Issue #1418 review: the start catches `Exception` only, so a
+    CancelledError raised by the connect or by a setup step leaves
+    start_nats_consumer instead of being logged as a failed start."""
+    app = SimpleNamespace(state=SimpleNamespace())
+    js = _FailingJetStream(
+        fail_add_consumer_for=nats_consumer.NATS_DURABLE, error=asyncio.CancelledError()
+    )
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=js)
+    mock_nats = MagicMock()
+    if step == "connect":
+        mock_nats.connect = AsyncMock(side_effect=asyncio.CancelledError())
+    else:
+        mock_nats.connect = AsyncMock(return_value=mock_nc)
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+        caplog.at_level(logging.WARNING, logger=_LOGGER),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await start_nats_consumer(app)
+
+    assert _warnings(caplog) == []
 
 
 async def test_start_nats_consumer_wires_both_subscriptions():

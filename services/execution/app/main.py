@@ -81,9 +81,12 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
     deliberately one token longer than any consumer's 3-token filter so a
     DLQ'd message is never redelivered to the consumer that failed it; the
     flip side is that no producing stream captures them, so without this
-    stream _publish_to_dlq publishes into the void and the message is lost.
-    The "herd.*.dlq.>" pattern binds all current and future DLQ subjects
-    into one inspectable stream.
+    stream _publish_to_dlq's publish fails and the caller acks the original:
+    the message is not dead-lettered, the failing consumer never sees it
+    again, and it stays only on its source stream (limits retention, so an
+    ack removes nothing) until that stream's max age. The "herd.*.dlq.>"
+    pattern binds all current and future DLQ subjects into one inspectable
+    stream.
 
     Idempotent: ensure_stream creates the stream if it does not exist, or
     updates it in place if it exists with a different configuration (e.g. a
@@ -108,8 +111,9 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
         logger.warning(
             "JetStream stream HERD_DLQ could not be created or updated (%s); if it "
             "exists, dead-lettered messages are kept on it, and while it is missing a "
-            "dead-letter publish fails and the original message is acked, so that "
-            "message is kept nowhere",
+            "dead-letter publish fails and the original message is acked, so it is not "
+            "dead-lettered and the consumer that failed it does not receive it again; "
+            "it stays only on its source stream, up to that stream's max age",
             type(exc).__name__,
         )
 

@@ -14,6 +14,7 @@ from herd_common.jetstream import (
     log_consumer_setup_failure,
     log_consumer_stream_check_failure,
 )
+from nats.js.errors import APIError, NotFoundError
 
 LOGGER_NAME = "test.consumer_startup"
 # Text an exception could carry: a URL with credentials, a broker reply.
@@ -112,3 +113,52 @@ def test_no_line_says_events_are_lost_or_that_the_connect_failed_after_a_good_co
         assert "will not be delivered" not in message
         assert "Failed to connect" not in message
     assert "connect failed" not in messages[1]
+
+
+@pytest.mark.parametrize(
+    ("exc", "label"),
+    [
+        # A JetStream API error with an integer code: the class name and the code.
+        (
+            NotFoundError(code=404, err_code=10059, description=f"stream not found {EXC_TEXT}"),
+            "NotFoundError, err_code=10059",
+        ),
+        # An API error the server sent without an err_code: the class name only.
+        (APIError(code=503, description=f"unavailable {EXC_TEXT}"), "APIError"),
+        # Not an API error, even with an err_code attribute: the class name only.
+        (BrokerReplyError(EXC_TEXT), "BrokerReplyError"),
+    ],
+)
+def test_setup_and_stream_check_lines_add_only_an_integer_err_code(caplog, exc, label):
+    """Issue #1418 review: a JetStream APIError's integer `err_code` says which
+    server error it was; its description is server text and never appears."""
+    if isinstance(exc, BrokerReplyError):
+        exc.err_code = 10059
+    log = logging.getLogger(LOGGER_NAME)
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        log_consumer_setup_failure(
+            log, exc, durable="a", stream="HERD_X", not_running=["a"], running=[]
+        )
+        log_consumer_stream_check_failure(log, exc, stream="HERD_X")
+
+    messages = [r.getMessage() for r in caplog.records if r.name == LOGGER_NAME]
+    assert messages[0].startswith(
+        f"NATS consumer setup failed for durable a on stream HERD_X ({label}); "
+    )
+    assert messages[1].startswith(
+        f"JetStream stream HERD_X could not be checked or created ({label}); "
+    )
+    for message in messages:
+        assert "tok3n-value" not in message
+        assert "not found" not in message
+        assert "unavailable" not in message
+
+
+def test_connect_line_carries_the_class_name_only_even_for_an_api_error(caplog):
+    log = logging.getLogger(LOGGER_NAME)
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        log_consumer_connect_failure(
+            log, NotFoundError(code=404, err_code=10059, description=EXC_TEXT), not_running=["a"]
+        )
+
+    assert _only_record(caplog).getMessage().startswith("NATS connect failed (NotFoundError); ")
