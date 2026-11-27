@@ -39,6 +39,7 @@ directly for one reservation and therefore does not go through that cap.
 """
 
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -161,6 +162,86 @@ async def _bump_purpose_classify_attempts(reservation_id: uuid.UUID) -> None:
         await db.commit()
 
 
+# The deepest nesting a stored suggestion may have (issue #1543). The orchestrator's
+# answer (`PurposeClassification`) nests three levels; a body that parses can still
+# be too deep for the JSON encoder that serializes the column on store, whose limit
+# depends on the interpreter and on how deep the call stack already is, so a fixed
+# bound far below every interpreter's limit is the only depth that is safe to store.
+_PURPOSE_SUGGESTION_MAX_DEPTH = 32
+
+
+def _read_classify_body(resp) -> tuple[object, str | None]:
+    """Parse an orchestrator answer's body: (value, None), or (None, reason) when it
+    does not parse.
+
+    The reason is a fixed code, never body text: "not_json" for a body that is not
+    JSON or not UTF-8 (both `ValueError`), "too_deep" for one nested past the
+    decoder's recursion limit (`RecursionError`, which is a `RuntimeError`, not a
+    `ValueError`; issue #1577). No exception is chained or logged here.
+    """
+    try:
+        return resp.json(), None
+    except ValueError:
+        return None, "not_json"
+    except RecursionError:
+        return None, "too_deep"
+
+
+def _unstorable_text(text: str) -> bool:
+    """True for a string that would break a reader once stored (issue #1543 review):
+    one holding a NUL, which Postgres's `json` operators (`->`, `->>`) refuse to
+    de-escape, or an unpaired surrogate, which those operators and the response
+    models' JSON encoder both refuse. A surrogate pair in the body decodes to one
+    code point, so it is not unpaired and passes."""
+    if "\x00" in text:
+        return True
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _suggestion_refusal(body: object) -> str | None:
+    """None when a parsed 200 body is a usable suggestion; otherwise the fixed reason
+    it is not (issue #1543).
+
+    The invariant: nothing is stored that the store, Postgres's `json` operators, or
+    the response models refuse later. Usable means a JSON object whose `top_category`
+    is a string (the owner's decision on #1543), nested no deeper than
+    `_PURPOSE_SUGGESTION_MAX_DEPTH` (the encoder that serializes the column, and the
+    response models past about 255 levels, refuse deeper nesting), holding no
+    non-finite number (`NaN`, `Infinity`, or a literal such as `1e400` that Python
+    reads as infinity: none is JSON, and Postgres refuses the stored text), and
+    holding no string, dict keys included, that `_unstorable_text` refuses.
+    Reasons: "wrong_shape", "too_deep", "not_json", "bad_text". Walked
+    iteratively, pushing only containers, so the check itself cannot hit a
+    recursion limit and a flat answer is one pass.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("top_category"), str):
+        return "wrong_shape"
+    pending: list[tuple[dict | list, int]] = [(body, 1)]
+    while pending:
+        container, depth = pending.pop()
+        if depth > _PURPOSE_SUGGESTION_MAX_DEPTH:
+            return "too_deep"
+        if isinstance(container, dict):
+            if any(_unstorable_text(key) for key in container):
+                return "bad_text"
+            children = container.values()
+        else:
+            children = container
+        for child in children:
+            if isinstance(child, (dict, list)):
+                pending.append((child, depth + 1))
+            elif isinstance(child, str):
+                if _unstorable_text(child):
+                    return "bad_text"
+            elif isinstance(child, float) and not math.isfinite(child):
+                return "not_json"
+    return None
+
+
 def _purpose_classify_403_is_feature_off(resp) -> tuple[bool, object]:
     """Decide whether a 403 from the orchestrator means "the feature is off
     there" (issue #706), and return the detail for logging either way.
@@ -175,10 +256,12 @@ def _purpose_classify_403_is_feature_off(resp) -> tuple[bool, object]:
     ...}``; a pre-fix orchestrator image instead answers the exact legacy
     plain-string detail, which is accepted as a fallback so a mixed-version
     deployment still reads it as feature-off rather than burning attempts.
+
+    A body that does not parse (not JSON, not UTF-8, or nested past the decoder's
+    recursion limit, issue #1577) carries no marker: (False, None).
     """
-    try:
-        body = resp.json()
-    except ValueError:
+    body, unreadable = _read_classify_body(resp)
+    if unreadable is not None:
         return False, None
     detail = body.get("detail") if isinstance(body, dict) else None
     if isinstance(detail, dict) and detail.get("error") == _PURPOSE_CLASSIFICATION_DISABLED_MARKER:
@@ -231,8 +314,14 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
       untouched and no attempt is counted: a sustained transient condition
       would otherwise burn a row's whole attempt cap before it ever gets a
       real classification try.
-    - "failed": any other non-200 status, a 200 with an unparseable body,
-      purpose_classify_attempts is incremented.
+    - "failed": any other non-200 status, or a 200 whose body is not a usable
+      suggestion (issue #1543, and #1577 for the depth): one that does not parse
+      (not JSON, not UTF-8, or nested past the decoder's recursion limit), or that
+      parses to anything but a JSON object with a string `top_category`, nested no
+      deeper than _PURPOSE_SUGGESTION_MAX_DEPTH, holding no non-finite number, and
+      holding no string or key with a NUL or an unpaired surrogate
+      (_suggestion_refusal). purpose_classify_attempts is incremented and
+      nothing is stored, so a JSON `null` counts an attempt like any other.
 
     Each outcome that mutates the row does so in its own session/commit, so
     one row's failure never affects another row in the same batch.
@@ -386,13 +475,25 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
         await _bump_purpose_classify_attempts(reservation_id)
         return "failed"
 
-    try:
-        suggestion = resp.json()
-    except ValueError:
+    suggestion, refusal = _read_classify_body(resp)
+    # The parsed top-level type's name (None when the body did not parse).
+    body_type = None
+    if refusal is None:
+        body_type = type(suggestion).__name__
+        refusal = _suggestion_refusal(suggestion)
+    if refusal is not None:
+        # Issue #1543 and the classify part of #1577: every 200 that is not a usable
+        # suggestion is the same per-row failure. Nothing from the body reaches the
+        # row or this line: the reason is a fixed code and body_type a type name.
         logger.warning(
-            "Purpose classify reconcile: unparseable 200 body for %s",
+            "Purpose classify reconcile: unusable 200 body for %s",
             reservation_id,
-            extra={"action": "purpose_classify_bad_body", "reservation_id": str(reservation_id)},
+            extra={
+                "action": "purpose_classify_bad_body",
+                "reservation_id": str(reservation_id),
+                "reason": refusal,
+                "body_type": body_type,
+            },
         )
         await _bump_purpose_classify_attempts(reservation_id)
         return "failed"
