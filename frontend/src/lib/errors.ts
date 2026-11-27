@@ -108,6 +108,60 @@ export function errorDetail(err: unknown, fallback: string): string {
   return detailText(responseDetail(err), fallback);
 }
 
+// Field checks for the structured narrowers (issue #1406). A narrower's
+// return type is a promise to its caller that every field it names holds that
+// type, and callers render those fields straight into JSX or a toast; a body
+// that breaks the promise (an object `message`, a number where an id should
+// be, a null list entry) would throw while rendering. So a narrower checks
+// every field its type names, the list entries included, and answers null for
+// a body that does not match, which sends the caller to its plain fallback. A
+// field typed `unknown` is left for its caller to check.
+
+/** A field check: true when the value has the type the field declares. */
+export type FieldCheck = (value: unknown) => boolean;
+
+export const isString: FieldCheck = (value) => typeof value === "string";
+export const isStringOrNull: FieldCheck = (value) => value === null || typeof value === "string";
+/** A field that may be absent; when present it is a string. */
+export const isOptionalString: FieldCheck = (value) =>
+  value === undefined || typeof value === "string";
+export const isStringList: FieldCheck = (value) => isListOf(value, isString);
+
+/** True for an array whose every entry passes `entry`; an empty array passes. */
+export function isListOf(value: unknown, entry: FieldCheck): value is unknown[] {
+  return Array.isArray(value) && value.every((item) => entry(item));
+}
+
+/**
+ * True for a plain object (not null, not an array) whose own field named by
+ * each key of `fields` passes that key's check. A missing field reads as
+ * undefined, so only `isOptionalString` (or a check written to accept
+ * undefined) lets it be absent. Fields not named are not looked at.
+ */
+export function hasFields(value: unknown, fields: Record<string, FieldCheck>): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(fields).every((key) =>
+    fields[key](Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined),
+  );
+}
+
+/**
+ * One cabling `InvalidRoute` entry (ADR 0014): string `node_id` and `reason`,
+ * `device_id` and `detail` a string or null, `index` a whole number or null.
+ * Shared by every narrower that carries an `invalid_routes` list, since the
+ * editor renders `reason` and `detail` in the Routing panel.
+ */
+export function isInvalidRoute(value: unknown): boolean {
+  return hasFields(value, {
+    node_id: isString,
+    device_id: isStringOrNull,
+    index: (index) => index === null || Number.isInteger(index),
+    reason: isString,
+    detail: isStringOrNull,
+  });
+}
+
 /**
  * Narrows an axios error's response `detail` to a structured, object-shaped
  * body carrying a given HTTP status (review fix F9, issue #34): the shared
@@ -118,9 +172,11 @@ export function errorDetail(err: unknown, fallback: string): string {
  * it is confirmed to be one (never called otherwise) and does the caller's
  * own discriminant check, since not every structured detail shares one field
  * name: the port-claim conflict body has no `error` key at all (only
- * `message` + `conflicts`), while every ADR 0014 body keys on `error`.
- * Returns null for any status mismatch, a non-object detail, or a `matches`
- * failure, so callers keep their existing "try each narrower in turn" style.
+ * `message` + `conflicts`), while every ADR 0014 body keys on `error`. Since
+ * issue #1406 `matches` also checks every other field `T` names (see
+ * `hasFields` above). Returns null for any status mismatch, a non-object
+ * detail, or a `matches` failure, so callers keep their existing "try each
+ * narrower in turn" style.
  */
 export function structuredDetail<T>(
   err: unknown,
@@ -154,7 +210,17 @@ export function aiCommitTopologyUnwireableDetail(
   return structuredDetail<AICommitTopologyUnwireableDetail>(
     err,
     422,
-    (d) => d.error === "topology_unwireable" && Array.isArray(d.invalid_edges),
+    (d) =>
+      d.error === "topology_unwireable" &&
+      isString(d.message) &&
+      isListOf(d.invalid_edges, (edge) =>
+        hasFields(edge, {
+          edge_id: isString,
+          source_role: isString,
+          target_role: isString,
+          reason: isString,
+        }),
+      ),
   );
 }
 
@@ -188,7 +254,17 @@ export function topologyUnconnectableDetail(err: unknown): TopologyUnconnectable
   return structuredDetail<TopologyUnconnectableDetail>(
     err,
     422,
-    (d) => d.error === "topology_unconnectable" && Array.isArray(d.pairs),
+    (d) =>
+      d.error === "topology_unconnectable" &&
+      isString(d.message) &&
+      isListOf(d.pairs, (pair) =>
+        hasFields(pair, {
+          source_role: isString,
+          target_role: isString,
+          source_template: isString,
+          target_template: isString,
+        }),
+      ),
   );
 }
 
@@ -218,7 +294,16 @@ export function topologyMixedTypesDetail(err: unknown): TopologyMixedTypesDetail
   return structuredDetail<TopologyMixedTypesDetail>(
     err,
     422,
-    (d) => d.error === "topology_mixed_types" && Array.isArray(d.groups),
+    (d) =>
+      d.error === "topology_mixed_types" &&
+      isString(d.message) &&
+      isListOf(d.groups, (group) =>
+        hasFields(group, {
+          topology_type: isString,
+          roles: isStringList,
+          templates: isStringList,
+        }),
+      ),
   );
 }
 
@@ -521,6 +606,21 @@ export function configChangePasswordErrorText(err: unknown): string {
   const detail = responseDetail(err);
   if (status !== 422 || typeof detail !== "string") return CONFIG_CHANGE_PASSWORD_FALLBACK;
   return detailText(detail, CONFIG_CHANGE_PASSWORD_FALLBACK);
+}
+
+/**
+ * The text for a failed bulk import (issue #1575). A 413 (the upload is over
+ * the import bound) or a 422 (the file is not UTF-8, not readable JSON, or not
+ * the expected shape) is the server's refusal of the file itself, in fixed
+ * copy written for the user to act on, so its detail is shown through
+ * `errorDetail`, and a body with no usable detail is the fallback. Any other
+ * failure (a 403, a 503 from an upstream lookup, a 5xx, no answer at all) is
+ * not about the file, and is the fallback whatever its detail says.
+ */
+export function importErrorText(err: unknown, fallback: string): string {
+  const status = (err as { response?: { status?: unknown } } | null | undefined)?.response?.status;
+  if (status !== 413 && status !== 422) return fallback;
+  return errorDetail(err, fallback);
 }
 
 // Field labels for the profile 422 list (issue #1252), matching the labels on

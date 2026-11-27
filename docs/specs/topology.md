@@ -1179,7 +1179,9 @@ their own by name. A dry run reports what would happen without writing.
 **Surfaces.** User interface `frontend/src/components/ui/BulkImportExport.tsx` on the
 topologies page; routes `GET /topologies/export` and `POST /topologies/import`; inventory
 `POST /devices/resolve-by-name` (section 10). [BULK_IMPORT_EXPORT.md](../BULK_IMPORT_EXPORT.md)
-is the user guide.
+is the user guide. The dialog is shared with inventory, so how it shows a refused import
+(the server's detail for a 413 or 422, `Failed to import topologies` for anything else,
+inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
 
 **Rules.**
 
@@ -1643,9 +1645,17 @@ reservation's fork opens read-only.
   Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`disables the Commit button with the invalid-edge count when an edge has no physical path, and never calls the fork save`, `PATCH-adds a newly drawn device to the reservation BEFORE saving the fork (issue #701)`, `a failed device-set PATCH blocks the fork save entirely (issue #701)`, `PATCH-removes a device from the reservation only AFTER the fork save succeeds (issue #701)`, `commit calls the fork save and the device PATCH, never the parent topology PUT`)
 - **TOPO-UIFORK-3.** A port-claim 409 opens the conflict dialog and keeps the drawing; a
   membership 409 names the devices; routing refusals toast their count, the parser's
-  message, or the inventory outage; any other string detail is shown as sent. \
-  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
-  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`)
+  message, or the inventory outage; any other string detail is shown as sent. Each of
+  those structured bodies is used only when every field the dialog or toast reads has
+  its type: a string or absent port-claim `message`, string `reservation_id`,
+  `device_id`, and `port` in every conflict, string membership ids, well-formed
+  `invalid_routes` entries, a string parser `message`. Any other body, an HTML page
+  included, never opens the dialog: it toasts its `message` when that is a non-blank string,
+  else the plain detail or `Failed to save the reservation fork`, and the editor and
+  the drawing stay as they were (issue #1406). A blank parser message toasts
+  `Routing intent malformed: no reason given`. \
+  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`); `frontend/src/api/reservations.ts` (`forkConflictDetail`, `forkDeviceNotMemberDetail`, `forkL3IntentInvalidDetail`, `forkL3IntentMalformedDetail`); `frontend/src/lib/errors.ts` (`hasFields`, `isListOf`, `isInvalidRoute`); `frontend/src/components/topology-editor/ForkConflictDialog.tsx` (`ForkConflictDialog`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`, `a port-claim 409 whose fields are not in shape keeps the editor and its drawing (issue #1406)`, `an l3_intent_malformed 422 whose message is not usable text toasts fixed text (issue #1406)`); `frontend/src/test/api/reservationFork.test.tsx` (`forkConflictDetail checks every field the dialog renders (issue #1406)`, `the other fork narrowers check what they hand on (issue #1406)`); `frontend/src/test/components/ForkConflictDialog.test.tsx` (`cuts a very long message to the shared detail bound`, `renders markup in the message as text, never as HTML`)
 - **TOPO-UIFORK-4.** The draft is sent as a canvas PUT 2000 ms after the last edit, never
   for the canvas as loaded, and flushed when the page closes; a read-only fork never
   autosaves. \

@@ -31,7 +31,7 @@ import {
   forkL3IntentInvalidDetail,
   forkL3IntentMalformedDetail,
 } from "@/api/reservations";
-import { errorDetail, responseDetail, restoreBlockedDetail } from "@/lib/errors";
+import { detailText, errorDetail, responseDetail, restoreBlockedDetail } from "@/lib/errors";
 import { useForkVersionPreview } from "@/hooks/useForkVersionPreview";
 import { usePathfindPairs, type DevicePair } from "@/api/connections";
 import { useAIStatus } from "@/api/ai";
@@ -1406,20 +1406,27 @@ function TopologyEditorInner() {
           const count = l3Invalid.invalid_routes.filter(isBlockingRouteProblem).length;
           toast.error(`Routing intent refused: ${count} problem${count === 1 ? "" : "s"}`);
         } else if (l3Malformed) {
-          toast.error(`Routing intent malformed: ${l3Malformed.message}`);
+          toast.error(
+            `Routing intent malformed: ${detailText(l3Malformed.message, "no reason given")}`,
+          );
         } else if (l3Unavailable) {
           toast.error("Could not verify routing intent: inventory unavailable");
         } else {
+          // Issue #1406: a structured body none of the narrowers above
+          // accepted (a port-claim 409 whose fields are not in shape among
+          // them) lands here. Its `message` is shown only when it is a
+          // non-blank string, bounded like any other detail; everything else
+          // is the plain detail or the fixed fallback. The drawing is never
+          // touched on this path.
+          const fallback = errorDetail(err, "Failed to save the reservation fork");
           const detail = responseDetail(err);
           const objectMessage =
             detail && typeof detail === "object" && !Array.isArray(detail)
               ? (detail as { message?: unknown }).message
               : undefined;
-          const message =
-            typeof objectMessage === "string" && objectMessage
-              ? objectMessage
-              : errorDetail(err, "Failed to save the reservation fork");
-          toast.error(message);
+          toast.error(
+            typeof objectMessage === "string" ? detailText(objectMessage, fallback) : fallback,
+          );
         }
         return;
       }
