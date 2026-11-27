@@ -1053,8 +1053,17 @@ async def _run_purpose_classify_reconcile() -> None:
     bumps that row's own attempt count and the loop continues to the next
     candidate rather than ending the tick. Any other failure (an ordinary
     per-row rejection) also only affects its own row; the loop continues to
-    the next candidate. This function never raises: every per-row failure is
-    caught inside app.services.purpose_service.classify_purpose_one.
+    the next candidate. Every per-row failure is caught inside
+    app.services.purpose_service.classify_purpose_one, a 200 whose body is not a
+    usable suggestion included (issues #1543 and #1577: one nested past the JSON
+    decoder's recursion limit used to raise RecursionError out of it, which ended
+    the tick at purpose_classify_loop's catch with no attempt counted, so the same
+    oldest row was retried first on every tick and the rows behind it were never
+    reached). The catch sits there, not around the call below, because only the
+    classifier knows a failure is the row's own and should count an attempt; an
+    exception that still reaches this loop (a database error, say) is not per-row
+    evidence: it ends the tick at purpose_classify_loop's catch, counts no attempt,
+    and the rows after it wait for the next tick.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
