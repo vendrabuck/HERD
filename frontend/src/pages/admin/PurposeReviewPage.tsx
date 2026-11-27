@@ -16,7 +16,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState } from "@/lib/loadState";
 import type { PurposeReviewItem } from "@/types/reservation.types";
 
@@ -145,6 +145,7 @@ export function PurposeReviewPage() {
           </select>
         </div>
 
+        <LoadErrorNotice what="the review queue" query={reviewQuery} className="mb-3" />
         {state === "loading" ? (
           <Card>
             <SkeletonRows rows={5} />

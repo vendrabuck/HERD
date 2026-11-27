@@ -310,7 +310,7 @@ guard in `identity-and-access.md`), `frontend/src/components/layout/AppLayout.ts
 - **OPS-ABOUT-7.** A 200 whose body is not the four-key version shape is `invalid
   response`, distinct from `unreachable`, and is never compared. \
   Enforced in: `frontend/src/api/about.ts` (`fetchServiceVersion`, `InvalidVersionResponseError`) \
-  Pinned by: `frontend/src/test/api/about.test.ts` (`throws InvalidVersionResponseError for an HTML string body (proxy error page served with 200)`, `throws InvalidVersionResponseError for a body missing version`); `frontend/src/test/pages/AboutPage.test.tsx` (`renders 'invalid response' with dashed cells and no 'differs' for a malformed 200 body (issue #874)`, `still renders 'unreachable' (not 'invalid response') for an ordinary transport/HTTP failure`)
+  Pinned by: `frontend/src/test/api/about.test.ts` (`throws InvalidVersionResponseError for an HTML string body (proxy error page served with 200)`, `throws InvalidVersionResponseError for a body missing version`); `frontend/src/test/pages/AboutPage.test.tsx` (`renders 'invalid response' with dashed cells and no 'differs' for a malformed 200 body (issue #874)`, `still renders 'unreachable' (not 'invalid response') for an ordinary transport/HTTP failure`); `frontend/src/test/api/answerGuard.test.tsx` (`the About page still reads an HTML /version answer as an invalid response`)
 - **OPS-ABOUT-8.** A service row is marked `differs` when its version is not the
   frontend's release (OPS-ABOUT-3) or its build differs (OPS-ABOUT-4); Refresh asks every
   service again. \
@@ -814,9 +814,12 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   the saved settings. When either read fails, it shows `Could not load the configuration
   schema.` or `Could not load the saved configuration.` with the server's reason, Retry,
   and Sign out, and renders no form, Save, or Save and Restart, so a save never writes a
-  blank form over settings the page never read (issue #1320). \
+  blank form over settings the page never read (issue #1320). An answer that is not the
+  JSON the read expects (the web app's HTML page, a schema that is not a list, settings
+  that are not an object) is such a failure. When a later refresh of either fails, the
+  form stays and `Could not refresh ...` with Retry shows above it. \
   Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigEditor`) \
-  Pinned by: `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the saved values, not the schema defaults`)
+  Pinned by: `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the saved values, not the schema defaults`, `ConfigPage: settings answered with HTML show the alert and no Save`, `keeps the record on screen and says the refresh failed, with Retry`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -1669,7 +1672,7 @@ from `.env`, nothing but the gateway listens beyond the host, the gateway serves
 certificate the checkout generated, and the images run the locked dependency set.
 
 **Surfaces.** `docker-compose.yml`, `docker-compose.override.yml`, the service
-Dockerfiles, the Makefile's `certs` target with `scripts/make_certs.sh` and
+Dockerfiles, `frontend/nginx.conf`, the Makefile's `certs` target with `scripts/make_certs.sh` and
 `infra/traefik/dynamic.yml`, and the unit tests under `tests/unit/` named below; the CI
 backend job (`.github/workflows/ci.yml`).
 
@@ -1752,6 +1755,15 @@ backend job (`.github/workflows/ci.yml`).
   still run as root. \
   Enforced in: `services/config/Dockerfile` (`appuser`); `infra/restarter/Dockerfile` (`root`) \
   Pinned by: `tests/unit/test_dockerfile_users.py` (`test_every_service_dockerfile_is_scanned`, `test_the_image_runs_as_a_non_root_user_unless_exempt`, `test_every_exemption_names_a_scanned_file`, `test_reads_root`, `test_reads_non_root`)
+- **OPS-GUARD-8.** An `/api/` path that no service router claims (its service stopped or
+  unhealthy, so Traefik dropped the route, or a prefix no service owns) reaches the
+  frontend's catch-all router, and the frontend's nginx answers it 503 with
+  `application/json` and `{"detail": "This part of HERD is not answering right now. Try
+  again in a moment."}`, never the web app's `index.html` with a 200, for any method and
+  for a path ending like a static asset (`location ^~ /api/`, issue #1320). Page routes
+  outside `/api/` are still the web app. \
+  Enforced in: `frontend/nginx.conf` (`location ^~ /api/`) \
+  Pinned by: `tests/unit/test_frontend_nginx_api_fallback.py` (`test_api_block_answers_503_json_with_the_fixed_detail`, `test_api_block_is_prefix_priority_so_the_asset_regex_cannot_claim_it`, `test_api_block_does_not_fall_back_to_the_spa`); `tests/integration/test_gateway_unrouted_api.py` (`test_an_unrouted_api_path_is_a_json_503_not_the_web_app`, `test_an_unrouted_api_path_ending_like_a_static_asset_is_still_the_json_503`, `test_a_page_route_still_serves_the_web_app`)
 
 **Out of scope.** The build-identifier wiring guard (OPS-BUILD-2, OPS-BUILD-3); the NATS
 CLI documentation guard (OPS-NATS-14).

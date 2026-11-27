@@ -17,8 +17,10 @@ vi.mock("react-hot-toast", () => ({
   default: { success: vi.fn(), error: vi.fn() },
 }));
 
+import toast from "react-hot-toast";
 import { useAuthStore } from "@/stores/authStore";
 import { server } from "../mocks/server";
+import { flushPending } from "../flushPending";
 import { HypervisorsPage } from "@/pages/admin/HypervisorsPage";
 import { GrantsPage } from "@/pages/admin/GrantsPage";
 import { AddDevicePage } from "@/pages/admin/AddDevicePage";
@@ -77,6 +79,19 @@ const PORT = {
   field_data: {},
   created_at: STAMP,
   updated_at: STAMP,
+};
+
+// A topology template with one role, so the instantiate dialog shows a device
+// picker for it.
+const INSTANTIATE_TEMPLATE = {
+  id: "tt1",
+  name: "Two Router Lab",
+  description: null,
+  created_by: "1",
+  owner_name: "admin",
+  created_at: STAMP,
+  updated_at: STAMP,
+  canvas_data: { nodes: [{ id: "n1", data: { device: { role: "edge" } } }], edges: [] },
 };
 
 interface SecondarySpec {
@@ -236,6 +251,82 @@ const SPECS: SecondarySpec[] = [
     neverText: "No ports configured on this device",
   },
   {
+    name: "ConnectionsPage single-pair port picker, Device B",
+    element: () => <ConnectionsPage />,
+    handlers: () => [
+      ok("/api/cabling/connections", page([])),
+      ok("/api/inventory/devices", page([DEVICE])),
+      flaky("/api/inventory/devices/dev-1/ports", [PORT], "inventory is restarting"),
+    ],
+    open: async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Single" }));
+      fireEvent.click(screen.getByRole("button", { name: "Create Connection" }));
+      const [, searchB] = screen.getAllByPlaceholderText("Search devices...");
+      fireEvent.change(searchB, { target: { value: "core" } });
+      fireEvent.click(await screen.findByRole("button", { name: "core-fw-01" }));
+    },
+    alertText: "Could not load this device's ports. inventory is restarting",
+    retryName: "Retry loading this device's ports",
+    neverText: "No ports configured on this device",
+  },
+  {
+    name: "TopologyTemplatesPage instantiate dialog device pickers",
+    element: () => <TopologyTemplatesPage />,
+    handlers: () => [
+      ok(
+        "/api/cabling/templates",
+        page([
+          {
+            id: "tt1",
+            name: "Two Router Lab",
+            description: null,
+            created_by: "1",
+            owner_name: "admin",
+            created_at: STAMP,
+            updated_at: STAMP,
+          },
+        ]),
+      ),
+      ok("/api/cabling/templates/tt1", INSTANTIATE_TEMPLATE),
+      flaky("/api/inventory/devices", page([DEVICE]), "inventory is restarting"),
+    ],
+    open: async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Use" }));
+    },
+    alertText: "Could not load devices. inventory is restarting",
+    retryName: "Retry loading devices",
+  },
+  {
+    name: "PortsSection add-port template picker",
+    element: () => <PortsSection deviceId="dev-1" isAdmin />,
+    handlers: () => [
+      ok("/api/inventory/devices/dev-1/ports", [PORT]),
+      ok("/api/cabling/connections", page([])),
+      ok("/api/inventory/devices", page([])),
+      flaky("/api/inventory/templates", page([]), "inventory is restarting"),
+    ],
+    open: async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "+ Add Port" }));
+    },
+    alertText: "Could not load port templates. inventory is restarting",
+    retryName: "Retry loading port templates",
+  },
+  {
+    name: "PortsSection bulk-add template picker",
+    element: () => <PortsSection deviceId="dev-1" isAdmin />,
+    handlers: () => [
+      ok("/api/inventory/devices/dev-1/ports", [PORT]),
+      ok("/api/cabling/connections", page([])),
+      ok("/api/inventory/devices", page([])),
+      flaky("/api/inventory/templates", page([]), "inventory is restarting"),
+    ],
+    open: async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "+ Add Multiple Ports" }));
+    },
+    alertText: "Could not load port templates. inventory is restarting",
+    retryName: "Retry loading port templates",
+  },
+  {
     name: "TopologyTemplatesPage instantiate dialog",
     element: () => <TopologyTemplatesPage />,
     handlers: () => [
@@ -355,6 +446,7 @@ function renderSpec(spec: SecondarySpec) {
 
 beforeEach(() => {
   failing = true;
+  vi.mocked(toast.error).mockClear();
   useAuthStore.setState({
     user: { id: "1", role: "admin", username: "admin", email: "a@b.c" },
     accessToken: "t",
@@ -376,5 +468,121 @@ describe.each(SPECS)("$name (issue #1320)", (spec) => {
     failing = false;
     fireEvent.click(screen.getByRole("button", { name: spec.retryName }));
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+  });
+});
+
+// Issue #1320 review: LoadError's Retry is `type="button"`. Inside a <form> a
+// default (submit) button would submit the form on Retry; the two forms that
+// hold one would then run their submit handler.
+describe("Retry inside a form submits nothing (issue #1320)", () => {
+  it("Add Device's template Retry does not submit the device form", async () => {
+    const posts: string[] = [];
+    server.use(
+      flaky("/api/inventory/templates", page([]), "inventory is restarting"),
+      http.post("/api/inventory/devices", ({ request }) => {
+        posts.push(request.url);
+        return HttpResponse.json({});
+      }),
+    );
+    renderSpec({
+      name: "AddDevicePage",
+      element: () => <AddDevicePage />,
+      handlers: () => [],
+      alertText: "",
+      retryName: "",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "edge-9" } });
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading device templates" }));
+    await flushPending();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    expect(posts).toEqual([]);
+  });
+
+  it("the instantiate dialog's device Retry does not submit the dialog", async () => {
+    const posts: string[] = [];
+    server.use(
+      ok(
+        "/api/cabling/templates",
+        page([
+          {
+            id: "tt1",
+            name: "Two Router Lab",
+            description: null,
+            created_by: "1",
+            owner_name: "admin",
+            created_at: STAMP,
+            updated_at: STAMP,
+          },
+        ]),
+      ),
+      ok("/api/cabling/templates/tt1", INSTANTIATE_TEMPLATE),
+      flaky("/api/inventory/devices", page([DEVICE]), "inventory is restarting"),
+      http.post("/api/cabling/templates/tt1/instantiate", ({ request }) => {
+        posts.push(request.url);
+        return HttpResponse.json({ id: "topo-1" });
+      }),
+    );
+    renderSpec({
+      name: "TopologyTemplatesPage",
+      element: () => <TopologyTemplatesPage />,
+      handlers: () => [],
+      alertText: "",
+      retryName: "",
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Use" }));
+    fireEvent.change(await screen.findByLabelText("New topology name"), {
+      target: { value: "copy" },
+    });
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading devices" }));
+    await flushPending();
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+    expect(posts).toEqual([]);
+  });
+});
+
+describe("where a failed connections read shows (issue #1320)", () => {
+  it("PortsSection shows only the ports failure when both reads fail", async () => {
+    server.use(
+      ok("/api/inventory/templates", page([])),
+      ok("/api/inventory/devices", page([])),
+      flaky("/api/inventory/devices/dev-1/ports", [PORT], "inventory is restarting"),
+      flaky("/api/cabling/connections", page([]), "cabling is restarting"),
+    );
+    renderSpec({
+      name: "PortsSection",
+      element: () => <PortsSection deviceId="dev-1" isAdmin />,
+      handlers: () => [],
+      alertText: "",
+      retryName: "",
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load this device's ports. inventory is restarting",
+    );
+    await flushPending();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("PortsSection shows the connections failure above a loaded port table, not in it", async () => {
+    server.use(
+      ok("/api/inventory/templates", page([])),
+      ok("/api/inventory/devices", page([])),
+      ok("/api/inventory/devices/dev-1/ports", [PORT]),
+      flaky("/api/cabling/connections", page([]), "cabling is restarting"),
+    );
+    renderSpec({
+      name: "PortsSection",
+      element: () => <PortsSection deviceId="dev-1" isAdmin />,
+      handlers: () => [],
+      alertText: "",
+      retryName: "",
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not load this device's connections. cabling is restarting");
+    const table = screen.getByRole("table");
+    expect(alert.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(table).not.toContainElement(alert);
   });
 });

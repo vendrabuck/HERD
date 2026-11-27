@@ -7,6 +7,8 @@ import type { Port } from "@/types/port.types";
 import type { EdgeLayerType } from "@/types/topology.types";
 import type { TopologyType } from "@/types/device.types";
 import { LAYER_STYLES } from "../edges/layerStyles";
+import { LoadError } from "@/components/ui/LoadError";
+import type { PortSideLoadError } from "./usePortAvailability";
 
 export type Side = "source" | "target";
 
@@ -161,6 +163,9 @@ export interface PortColumnProps {
   ports: Port[];
   totalCount: number;
   isLoading: boolean;
+  // Issue #1320: set when this side's ports or connections failed to load;
+  // the column then shows the failure with Retry instead of its ports.
+  loadError?: PortSideLoadError | null;
   visuals: Map<string, PortRowVisual>;
   cabledCount: number;
   filter: string;
@@ -185,6 +190,7 @@ function PortColumnImpl({
   ports,
   totalCount,
   isLoading,
+  loadError = null,
   visuals,
   cabledCount,
   filter,
@@ -247,7 +253,15 @@ function PortColumnImpl({
         </span>
       </div>
       <div className="flex-1 min-h-0 overflow-hidden">
-        {isLoading ? (
+        {loadError ? (
+          <LoadError
+            what={loadError.what}
+            error={loadError.error}
+            onRetry={loadError.retry}
+            retrying={loadError.retrying}
+            className="m-2 flex-col items-start gap-2 text-xs"
+          />
+        ) : isLoading ? (
           <p className="text-xs text-gray-400 p-2">Loading ports...</p>
         ) : totalCount === 0 ? (
           <p className="text-xs text-gray-400 p-2">No ports configured</p>

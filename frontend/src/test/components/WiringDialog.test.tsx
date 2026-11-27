@@ -9,6 +9,7 @@ import {
   EMPTY_CONNECTIONS,
   mockStandardPorts,
   connectionFixture,
+  failedQuery,
 } from "../fixtures/wiringFixtures";
 
 const mockUsePorts = vi.fn();
@@ -503,5 +504,53 @@ describe("WiringDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onCancel).toHaveBeenCalled();
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #1320: a side whose ports or connections failed to load shows that
+// failure with Retry, never "No ports configured", and a failed connections
+// read never leaves a port free to cable.
+describe("WiringDialog load failures", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStandardPorts(mockUsePorts);
+    mockUseDeviceConnections.mockReturnValue({ data: EMPTY_CONNECTIONS, isLoading: false });
+  });
+
+  it("a failed ports read shows the load error in that column, with Retry", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("inventory is down", refetch);
+    mockUsePorts.mockImplementation((deviceId: string) =>
+      deviceId === SOURCE_DEVICE ? failed : { data: TARGET_PORTS, isLoading: false },
+    );
+    render(<WiringDialog {...baseProps()} />);
+    const column = screen.getByTestId("port-column-source");
+    expect(within(column).getByRole("alert")).toHaveTextContent(
+      "Could not load this device's ports. inventory is down",
+    );
+    expect(within(column).queryByText("No ports configured")).not.toBeInTheDocument();
+    fireEvent.click(within(column).getByRole("button", { name: "Retry loading this device's ports" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed connections read shows the load error and leaves no port free to cable", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("cabling is down", refetch);
+    mockUseDeviceConnections.mockImplementation((deviceId: string) =>
+      deviceId === SOURCE_DEVICE ? failed : { data: EMPTY_CONNECTIONS, isLoading: false },
+    );
+    const onConfirm = vi.fn();
+    render(<WiringDialog {...baseProps({ onConfirm })} />);
+    const column = screen.getByTestId("port-column-source");
+    expect(within(column).getByRole("alert")).toHaveTextContent(
+      "Could not load this device's connections. cabling is down",
+    );
+    // The source ports are not listed as free; the target side cannot arm.
+    expect(within(column).queryByText("eth1")).not.toBeInTheDocument();
+    clickPort("0/0/1");
+    expect(screen.queryByText(/selected\. Click a port/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect 1:1 in order" })).toBeDisabled();
+    fireEvent.click(within(column).getByRole("button", { name: "Retry loading this device's connections" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 });

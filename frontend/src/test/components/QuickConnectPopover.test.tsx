@@ -9,6 +9,7 @@ import {
   mockStandardPorts,
   mockNoConnections,
   connectionFixture,
+  failedQuery,
 } from "../fixtures/wiringFixtures";
 
 const mockUsePorts = vi.fn();
@@ -209,5 +210,48 @@ describe("QuickConnectPopover - cabling semantics", () => {
     expect(screen.getByText("No ports configured")).toBeInTheDocument();
     const selects = screen.getAllByRole("combobox", { hidden: true }) as HTMLSelectElement[];
     expect(selects[0]).toBeDisabled();
+  });
+});
+
+// Issue #1320: a failed ports or connections read is a load error with Retry,
+// never "No ports configured" or every port labelled "(no cable)".
+describe("QuickConnectPopover load failures", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStandardPorts(mockUsePorts);
+    mockNoConnections(mockUseDeviceConnections);
+  });
+
+  it("a failed ports read shows the load error for that side", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("inventory is down", refetch);
+    mockUsePorts.mockImplementation((deviceId: string) =>
+      deviceId === SOURCE_DEVICE ? failed : { data: TARGET_PORTS, isLoading: false },
+    );
+    render(<QuickConnectPopover {...baseProps()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this device's ports. inventory is down",
+    );
+    expect(screen.queryByText("No ports configured")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this device's ports" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed connections read shows the load error and Connect stays disabled", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("cabling is down", refetch);
+    mockUseDeviceConnections.mockImplementation((deviceId: string) =>
+      deviceId === TARGET_DEVICE ? failed : { data: EMPTY_PORTS, isLoading: false },
+    );
+    render(<QuickConnectPopover {...baseProps()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this device's connections. cabling is down",
+    );
+    // The target side lists no ports at all, so none reads "(no cable)" there.
+    const labels = screen.queryAllByRole("option", { hidden: true }).map((o) => o.textContent);
+    expect(labels.some((l) => l?.startsWith("0/0/"))).toBe(false);
+    // The source select is not usable while cabling is unknown.
+    for (const select of screen.queryAllByRole("combobox")) expect(select).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
   });
 });

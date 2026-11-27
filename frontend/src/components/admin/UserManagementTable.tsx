@@ -3,7 +3,7 @@ import { usePaginatedUsers, useSetUserRole } from "@/api/admin";
 import { Pagination } from "@/components/ui/Pagination";
 import { EditProfileDialog } from "@/components/admin/EditProfileDialog";
 import { displayName } from "@/lib/profileEdit";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 import type { User } from "@/types/auth.types";
 
@@ -41,12 +41,22 @@ export function UserManagementTable({ currentUserId, showRoleControls = true }: 
     );
   }
 
+  const notice = (
+    <LoadErrorNotice what="users" query={usersQuery} isEmpty={noItems} className="m-4" />
+  );
+
   if (state === "empty") {
-    return <p className="text-sm text-gray-500 py-4">No users found</p>;
+    return (
+      <>
+        {notice}
+        <p className="text-sm text-gray-500 py-4">No users found</p>
+      </>
+    );
   }
 
   return (
     <div className="overflow-x-auto">
+      {notice}
       <table className="w-full min-w-[760px] text-sm text-left">
         <thead className="bg-gray-50 text-gray-600 uppercase text-xs">
           <tr>

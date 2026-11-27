@@ -44,7 +44,7 @@ import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportTopologies, importTopologies } from "@/api/bulk";
 import type { Topology } from "@/types/topology.types";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 
 const TH_CLASS = "px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide";
@@ -459,6 +459,7 @@ export function TopologyPage() {
           </div>
 
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <LoadErrorNotice what="topologies" query={topologiesQuery} isEmpty={noItems} className="m-4" />
             {state === "loading" && (
               <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
                 Loading topologies...

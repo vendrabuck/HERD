@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useCalendarReservations } from "@/api/reservations";
 import { useAllDevices } from "@/api/inventory";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState } from "@/lib/loadState";
 import { ReservationDetailModal } from "@/components/reservations/ReservationDetailModal";
 import { getDayRange, getWeekRange, getMonthRange } from "@/utils/dateUtils";
@@ -215,6 +215,7 @@ export function ReservationCalendarPage() {
 
         {/* Timeline */}
         <div className="bg-white rounded-lg border border-gray-200 overflow-x-auto">
+          <LoadErrorNotice what="the calendar" query={calendarQuery} className="m-4" />
           {isLoading && (
             <p className="text-sm text-gray-400 text-center py-8">Loading calendar...</p>
           )}

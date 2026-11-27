@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -576,6 +576,47 @@ describe("ReportingPage", () => {
       expect(
         screen.getByText("End date must be after start date."),
       ).toBeInTheDocument(),
+    );
+  });
+});
+
+describe("ReportingPage failed refresh (issue #1320 review)", () => {
+  it("keeps the report and says the refresh failed, with Retry, instead of an error strip", async () => {
+    let failing = false;
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        failing
+          ? HttpResponse.json({ detail: "reservations is restarting" }, { status: 503 })
+          : HttpResponse.json(REPORT),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReportingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText("By User")).toBeInTheDocument();
+
+    failing = true;
+    await act(async () => {
+      await client.refetchQueries();
+    });
+    const notice = await screen.findByText(/^Could not refresh the report\./);
+    expect(notice.closest("[role=status]")).toHaveTextContent(
+      "Could not refresh the report. reservations is restarting",
+    );
+    expect(screen.getByText("By User")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    failing = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the report" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/^Could not refresh the report\./)).not.toBeInTheDocument(),
     );
   });
 });

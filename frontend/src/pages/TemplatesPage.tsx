@@ -4,7 +4,7 @@ import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 import { isAdminRole } from "@/lib/roles";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
@@ -141,6 +141,7 @@ export function TemplatesPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="templates" query={templatesQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" && (
             <p
               role="status"

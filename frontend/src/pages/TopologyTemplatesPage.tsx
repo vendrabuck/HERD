@@ -15,7 +15,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import toast from "react-hot-toast";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 
 export function TopologyTemplatesPage() {
@@ -46,6 +46,7 @@ export function TopologyTemplatesPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="topology templates" query={templatesQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" && (
             <p role="status" className="text-sm text-gray-400 text-center py-8">
               Loading templates...

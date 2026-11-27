@@ -19,8 +19,8 @@ import type {
   SectionDefinition,
 } from "@/types/template.types";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 const DEFAULT_FIELD: FieldDefinition = {
   key: "",
@@ -50,7 +50,7 @@ export function TemplateEditorPage() {
   const { data: existing } = templateQuery;
   // Issue #1320: a 404 reads "Template not found"; any other failed load is a
   // load error with Retry, never an editor over a template that never loaded.
-  const templateState = isNew ? "loaded" : loadState(templateQuery);
+  const templateState = isNew ? "loaded" : loadState(templateQuery, undefined, isPlainObject);
   const createTemplate = useCreateTemplate();
   const updateTemplate = useUpdateTemplate();
   const driversQuery = useDrivers();
@@ -346,6 +346,13 @@ export function TemplateEditorPage() {
       {/* Issue #988: the page ends in the full-width "+ Add Section" button at
           the bottom centre; the bottom padding lets it scroll clear of a toast. */}
       <div className={`max-w-4xl mx-auto px-6 pt-6 space-y-6 ${TOAST_CLEARANCE_CLASS}`}>
+        {!isNew && (
+          <LoadErrorNotice
+            what="this template"
+            query={templateQuery}
+            isValid={isPlainObject}
+          />
+        )}
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-900">
             {isNew ? "Create Template" : editing ? "Edit Template" : "Template Details"}

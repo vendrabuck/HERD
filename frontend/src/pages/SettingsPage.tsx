@@ -3,8 +3,8 @@ import toast from "react-hot-toast";
 import { useCurrentUser, useUpdateMyProfile } from "@/api/auth";
 import { ProfileForm } from "@/components/profile/ProfileForm";
 import { profileSaveErrorText } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 import type { ProfileUpdate } from "@/types/auth.types";
 import {
   useNotificationPreferences,
@@ -70,7 +70,13 @@ function ProfileSection() {
       <h2 id="settings-profile-heading" className="text-base font-semibold mb-3">
         Profile
       </h2>
-      {user ? (
+      <LoadErrorNotice
+        what="your profile"
+        query={userQuery}
+        isValid={isPlainObject}
+        className="mb-3"
+      />
+      {user && loadState(userQuery, undefined, isPlainObject) === "loaded" ? (
         <ProfileForm
           key={`${user.id}:${user.updated_at ?? ""}:${user.full_name}:${user.contact_email ?? ""}:${user.phone ?? ""}`}
           user={user}
@@ -78,7 +84,7 @@ function ProfileSection() {
           isPending={update.isPending}
           onSave={handleSave}
         />
-      ) : loadState(userQuery) === "error" ? (
+      ) : loadState(userQuery, undefined, isPlainObject) === "error" ? (
         <LoadError
           what="your profile"
           error={userQuery.error}
@@ -95,7 +101,7 @@ function ProfileSection() {
 export function SettingsPage() {
   const prefsQuery = useNotificationPreferences();
   const { data: prefs } = prefsQuery;
-  const prefsState = loadState(prefsQuery);
+  const prefsState = loadState(prefsQuery, undefined, isPlainObject);
   const update = useUpdateNotificationPreferences();
 
   const [overrides, setOverrides] = useState<{
@@ -151,6 +157,12 @@ export function SettingsPage() {
           {/* Issue #1320: preferences that never loaded show no checkboxes and
               no Save, so a save cannot replace the stored choices with the
               defaults. */}
+          <LoadErrorNotice
+            what="your notification preferences"
+            query={prefsQuery}
+            isValid={isPlainObject}
+            className="mb-3"
+          />
           {prefsState === "error" ? (
             <LoadError
               what="your notification preferences"

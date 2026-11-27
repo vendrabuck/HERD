@@ -20,8 +20,8 @@ import { DeviceInfoPanel } from "@/components/inventory/DeviceInfoPanel";
 import { deviceEditPayload, type DeviceEditFields } from "@/lib/deviceEdit";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 const STATUS_COLORS: Record<string, string> = {
   AVAILABLE: "bg-green-100 text-green-800",
@@ -39,7 +39,8 @@ export function DevicePage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const deviceQuery = useDevice(id);
-  const { data: device, isLoading, isError } = deviceQuery;
+  const { data: device } = deviceQuery;
+  const deviceState = loadState(deviceQuery, undefined, isPlainObject);
   const templateQuery = useTemplate(device?.template_id);
   const { data: template } = templateQuery;
   const updateDevice = useUpdateDevice();
@@ -122,7 +123,7 @@ export function DevicePage() {
     setEditing(false);
   };
 
-  if (isLoading) {
+  if (deviceState === "loading") {
     return (
       <div className="h-full flex items-center justify-center">
         <p className="text-sm text-gray-400">Loading device...</p>
@@ -130,11 +131,13 @@ export function DevicePage() {
     );
   }
 
-  // Issue #1320: only a 404 reads "Device not found"; any other failed load
-  // is a load error with Retry, never a page (or an editor) without its device.
+  // Issue #1320: a 404 reads "Device not found" (also when a refetch finds the
+  // device gone); any other failed load is a load error with Retry, never a
+  // page (or an editor) without its device. A failed refetch of a device
+  // already shown keeps the page, with LoadErrorNotice above it.
   const deviceMissing =
     isAxiosError(deviceQuery.error) && deviceQuery.error.response?.status === 404;
-  if (isError && !device && !deviceMissing) {
+  if (!deviceMissing && deviceState === "error") {
     return (
       <div className="h-full overflow-y-auto">
         <div className="max-w-6xl mx-auto px-6 py-6 space-y-4">
@@ -155,7 +158,7 @@ export function DevicePage() {
     );
   }
 
-  if (isError || !device) {
+  if (deviceMissing || !device) {
     return (
       <div className="h-full flex items-center justify-center">
         <p className="text-sm text-red-500">Device not found</p>
@@ -219,6 +222,8 @@ export function DevicePage() {
             )}
           </div>
         </div>
+
+        <LoadErrorNotice what="this device" query={deviceQuery} isValid={isPlainObject} />
 
         {cabledRefusal && (
           <div

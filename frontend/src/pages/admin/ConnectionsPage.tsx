@@ -15,7 +15,7 @@ import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectD
 import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noEntries, noItems } from "@/lib/loadState";
 
 // The multi-connection dialog is the default create surface; the original
@@ -268,6 +268,7 @@ export function ConnectionsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="connections" query={connectionsQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading connections...</p>
           ) : state === "error" ? (

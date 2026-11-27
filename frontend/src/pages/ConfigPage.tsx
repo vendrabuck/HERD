@@ -11,8 +11,8 @@ import {
 } from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { AuthorCredit } from "@/components/layout/AuthorCredit";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 import { useConfigStore } from "@/stores/configStore";
 import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
@@ -292,8 +292,8 @@ function ConfigEditor() {
   const { data: schema } = schemaQuery;
   const settingsQuery = useConfigSettings();
   const { data: settings } = settingsQuery;
-  const schemaState = loadState(schemaQuery);
-  const settingsState = loadState(settingsQuery);
+  const schemaState = loadState(schemaQuery, undefined, Array.isArray);
+  const settingsState = loadState(settingsQuery, undefined, isPlainObject);
   const saveSettings = useSaveConfigSettings();
   const applyConfig = useApplyConfig();
   const clearConfigToken = useConfigStore((s) => s.clearConfigToken);
@@ -444,6 +444,18 @@ function ConfigEditor() {
         </button>
       </div>
 
+      <LoadErrorNotice
+        what="the configuration schema"
+        query={schemaQuery}
+        isValid={Array.isArray}
+        className="mb-4"
+      />
+      <LoadErrorNotice
+        what="the saved configuration"
+        query={settingsQuery}
+        isValid={isPlainObject}
+        className="mb-4"
+      />
       <div className="space-y-4">
         {groups.map((group) => {
           const groupFields = schema.filter((f) => f.group === group);

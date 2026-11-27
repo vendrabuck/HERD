@@ -13,9 +13,8 @@ import { SkeletonRows } from "@/components/ui/Skeleton";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { isUnclassifiedCategory, purposeCategoryLabel } from "@/lib/purposeCategories";
 import { csvSafeCell } from "@/lib/csvSafety";
-import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 function triggerCsvDownload(filename: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
@@ -178,7 +177,7 @@ export function ReportingPage() {
 
   // Issue #1320: a report that never loaded shows the failure and Retry, not
   // zero hours, empty charts, and "No data in this window" tables.
-  if (loadState(report) === "error") {
+  if (loadState(report, undefined, isPlainObject) === "error") {
     return (
       <div className="h-full overflow-y-auto">
         <div className="px-6 xl:px-12 2xl:px-16 py-6 space-y-6">
@@ -206,11 +205,7 @@ export function ReportingPage() {
           loading={report.isLoading}
         />
 
-        {report.isError && (
-          <AlertStrip variant="error">
-            Failed to load report. {errorDetail(report.error, "Try again in a moment.")}
-          </AlertStrip>
-        )}
+        <LoadErrorNotice what="the report" query={report} isValid={isPlainObject} />
 
         {!windowValid && (
           <AlertStrip variant="warning">End date must be after start date.</AlertStrip>

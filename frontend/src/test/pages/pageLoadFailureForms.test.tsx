@@ -6,7 +6,7 @@
  * Driven through the real hooks and MSW.
  */
 import { http, HttpResponse, type JsonBodyType, type RequestHandler } from "msw";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import type { ReactElement } from "react";
@@ -37,19 +37,27 @@ import { TemplateEditorPage } from "@/pages/TemplateEditorPage";
 import { DevicePage } from "@/pages/DevicePage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { ConfigPage } from "@/pages/ConfigPage";
+import { LdapSyncPage } from "@/pages/admin/LdapSyncPage";
 
 const STAMP = "2026-01-01T00:00:00Z";
 const page = (items: unknown[]) => ({ items, total: items.length, skip: 0, limit: 50 });
 const ok = (path: string, body: JsonBodyType) => http.get(path, () => HttpResponse.json(body));
 
-type Failure = "network" | "server";
+type Failure = "network" | "server" | "html" | "hang";
 let failure: Failure | null = "server";
 let writes: string[] = [];
+let lastClient: QueryClient | null = null;
+
+// What nginx answered for an /api path whose service was stopped, before the
+// `location ^~ /api/` guard: the web app, with a 200 (issue #1320 review).
+const SPA_PAGE = '<!doctype html><html><body><div id="root"></div></body></html>';
 
 /** A GET that fails per `failure` until it is cleared, then answers `body`. */
 function failing(path: string, body: JsonBodyType, detail: string): RequestHandler {
-  return http.get(path, () => {
+  return http.get(path, async () => {
+    if (failure === "hang") await new Promise(() => {});
     if (failure === "network") return HttpResponse.error();
+    if (failure === "html") return HttpResponse.html(SPA_PAGE);
     if (failure === "server") return HttpResponse.json({ detail }, { status: 500 });
     return HttpResponse.json(body);
   });
@@ -68,6 +76,7 @@ function renderAt(path: string, url: string, element: ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  lastClient = client;
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[url]}>
@@ -498,5 +507,296 @@ describe("ConfigPage load failure (issue #1320)", () => {
     expect(await screen.findByDisplayValue("DEBUG")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Save and Restart" })).toBeInTheDocument();
+  });
+});
+
+const SETTINGS_PREFS = { channels: { in_app: true, email: true }, events: {} };
+const SETTINGS_ME = {
+  id: "1",
+  email: "admin@example.com",
+  username: "admin",
+  full_name: "Admin",
+  contact_email: null,
+  phone: null,
+  is_active: true,
+  role: "admin",
+  created_at: STAMP,
+  updated_at: STAMP,
+};
+const CONFIG_SCHEMA = {
+  fields: [
+    {
+      key: "LOG_LEVEL",
+      label: "Log level",
+      type: "string",
+      required: false,
+      group: "General",
+      secret: false,
+      description: "",
+      default: "INFO",
+    },
+  ],
+};
+
+describe("a 200 web-app page read as a record is a load error (issue #1320 review)", () => {
+  it("SettingsPage: preferences answered with HTML show the alert and no form or Save", async () => {
+    failure = "html";
+    server.use(
+      failing("/api/notifications/notifications/preferences", SETTINGS_PREFS, "unused"),
+      ok("/api/auth/me", SETTINGS_ME),
+    );
+    renderAt("/settings", "/settings", <SettingsPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load your notification preferences. The server's answer could not be read.",
+    );
+    expect(screen.queryByLabelText("Show in-app notifications")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("SettingsPage: preferences answered with a JSON list show the alert and no form", async () => {
+    failure = null;
+    server.use(
+      ok("/api/notifications/notifications/preferences", []),
+      ok("/api/auth/me", SETTINGS_ME),
+    );
+    renderAt("/settings", "/settings", <SettingsPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load your notification preferences. The server's answer could not be read.",
+    );
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("GroupDetailPage: a group answered with HTML shows the alert and no form", async () => {
+    failure = "html";
+    server.use(
+      failing("/api/auth/groups/g1", GROUP, "unused"),
+      ok("/api/auth/users", page([])),
+    );
+    renderAt("/admin/groups/:id", "/admin/groups/g1", <GroupDetailPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load this user group. The server's answer could not be read.",
+    );
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("ConfigPage: settings answered with HTML show the alert and no Save", async () => {
+    failure = "html";
+    useConfigStore.getState().setConfigToken("ct");
+    server.use(
+      ok("/api/config/status", { configured: true, password_changed: true }),
+      ok("/api/config/schema", CONFIG_SCHEMA),
+      failing("/api/config/settings", { values: { LOG_LEVEL: "DEBUG" } }, "unused"),
+    );
+    renderAt("/config", "/config", <ConfigPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the saved configuration. The server's answer could not be read.",
+    );
+    expect(screen.queryByRole("button", { name: "Save and Restart" })).not.toBeInTheDocument();
+  });
+});
+
+interface RefreshSpec {
+  name: string;
+  what: string;
+  path: string;
+  url: string;
+  element: () => ReactElement;
+  handlers: () => RequestHandler[];
+  /** Text that proves the record is still on screen. */
+  content: () => Promise<HTMLElement>;
+}
+
+const REFRESH_SPECS: RefreshSpec[] = [
+  {
+    name: "GroupDetailPage",
+    what: "this user group",
+    path: "/admin/groups/:id",
+    url: "/admin/groups/g1",
+    element: () => <GroupDetailPage />,
+    handlers: () => [
+      failing("/api/auth/groups/g1", GROUP, "auth is restarting"),
+      ok("/api/auth/users", page([])),
+    ],
+    content: () => screen.findByDisplayValue("Network Team"),
+  },
+  {
+    name: "DeviceGroupDetailPage",
+    what: "this device group",
+    path: "/admin/device-groups/:id",
+    url: "/admin/device-groups/dg1",
+    element: () => <DeviceGroupDetailPage />,
+    handlers: () => [
+      failing("/api/inventory/device-groups/dg1", DEVICE_GROUP, "inventory is restarting"),
+      ok("/api/inventory/devices", page([])),
+      ok("/api/auth/groups", page([])),
+    ],
+    content: () => screen.findByDisplayValue("Lab Rack"),
+  },
+  {
+    name: "TemplateEditorPage",
+    what: "this template",
+    path: "/templates/:id",
+    url: "/templates/t1",
+    element: () => <TemplateEditorPage />,
+    handlers: () => [
+      failing("/api/inventory/templates/t1", TEMPLATE, "inventory is restarting"),
+      ok("/api/inventory/drivers", page([])),
+      ok("/api/inventory/hypervisors", page([])),
+      ok("/api/ai/status", { enabled: false }),
+    ],
+    content: () => screen.findByText("Template Details"),
+  },
+  {
+    name: "DevicePage",
+    what: "this device",
+    path: "/inventory/:id",
+    url: "/inventory/dev-1",
+    element: () => <DevicePage />,
+    handlers: () => [failing("/api/inventory/devices/dev-1", DEVICE, "inventory is restarting")],
+    content: () => screen.findByText("core-fw-01"),
+  },
+  {
+    name: "SettingsPage",
+    what: "your notification preferences",
+    path: "/settings",
+    url: "/settings",
+    element: () => <SettingsPage />,
+    handlers: () => [
+      failing("/api/notifications/notifications/preferences", SETTINGS_PREFS, "notifications is down"),
+      ok("/api/auth/me", SETTINGS_ME),
+    ],
+    content: () => screen.findByRole("checkbox", { name: "Email" }),
+  },
+  {
+    name: "ConfigPage",
+    what: "the saved configuration",
+    path: "/config",
+    url: "/config",
+    element: () => <ConfigPage />,
+    handlers: () => [
+      ok("/api/config/status", { configured: true, password_changed: true }),
+      ok("/api/config/schema", CONFIG_SCHEMA),
+      failing("/api/config/settings", { values: { LOG_LEVEL: "DEBUG" } }, "config store unreadable"),
+    ],
+    content: () => screen.findByDisplayValue("DEBUG"),
+  },
+  {
+    name: "LdapSyncPage status",
+    what: "directory sync status",
+    path: "/admin/ldap-sync",
+    url: "/admin/ldap-sync",
+    element: () => <LdapSyncPage />,
+    handlers: () => [
+      failing(
+        "/api/auth/admin/ldap-sync/status",
+        { auth_method: "local", group_sync_enabled: false, sync_interval_seconds: 3600 },
+        "auth is restarting",
+      ),
+      ok("/api/auth/admin/ldap-sync/mappings", page([])),
+      ok("/api/auth/admin/ldap-sync/runs", page([])),
+      ok("/api/auth/groups", page([])),
+    ],
+    content: () => screen.findByText(/This deployment uses local authentication/),
+  },
+];
+
+describe.each(REFRESH_SPECS)("$name failed refresh (issue #1320 review)", (spec) => {
+  it("keeps the record on screen and says the refresh failed, with Retry", async () => {
+    failure = null;
+    useConfigStore.getState().setConfigToken("ct");
+    server.use(...spec.handlers());
+    renderAt(spec.path, spec.url, spec.element());
+    await spec.content();
+
+    failure = "server";
+    await act(async () => {
+      await lastClient!.refetchQueries();
+    });
+    const pattern = new RegExp("^Could not refresh " + spec.what + "\\.");
+    const notice = await screen.findByText(pattern);
+    expect(notice.closest("[role=status]")).not.toBeNull();
+    expect(await spec.content()).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    failure = null;
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading " + spec.what }));
+    await waitFor(() => expect(screen.queryByText(pattern)).not.toBeInTheDocument());
+    expect(await spec.content()).toBeInTheDocument();
+  });
+});
+
+describe("Retrying state (issue #1320 review)", () => {
+  it("DevicePage: Retry on a load that never succeeded shows the loading state again", async () => {
+    // TanStack Query moves a query with no data back to pending on refetch,
+    // so the full error gives way to the loading text, not a Retrying label.
+    server.use(failing("/api/inventory/devices/dev-1", DEVICE, "inventory is restarting"));
+    renderAt("/inventory/:id", "/inventory/dev-1", <DevicePage />);
+    await screen.findByRole("alert");
+    failure = "hang";
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this device" }));
+    expect(await screen.findByText("Loading device...")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("DevicePage: a refresh Retry reads Retrying..., is aria-disabled, and keeps focus", async () => {
+    failure = null;
+    server.use(failing("/api/inventory/devices/dev-1", DEVICE, "inventory is restarting"));
+    renderAt("/inventory/:id", "/inventory/dev-1", <DevicePage />);
+    await screen.findByText("core-fw-01");
+    failure = "server";
+    await act(async () => {
+      await lastClient!.refetchQueries();
+    });
+    await screen.findByText(/^Could not refresh this device\./);
+    failure = "hang";
+    const retry = screen.getByRole("button", { name: "Retry loading this device" });
+    retry.focus();
+    fireEvent.click(retry);
+    const retrying = await screen.findByRole("button", { name: "Retrying..." });
+    expect(retrying).toHaveAttribute("aria-disabled", "true");
+    expect(retrying).not.toBeDisabled();
+    expect(document.activeElement).toBe(retrying);
+    expect(screen.getByText("core-fw-01")).toBeInTheDocument();
+  });
+});
+
+describe("DevicePage 404 on refresh (issue #1320, INV-DEV-16)", () => {
+  it("a refresh that answers 404 shows Device not found, not the stale device", async () => {
+    let gone = false;
+    server.use(
+      http.get("/api/inventory/devices/dev-1", () =>
+        gone
+          ? HttpResponse.json({ detail: "Device not found" }, { status: 404 })
+          : HttpResponse.json(DEVICE),
+      ),
+    );
+    renderAt("/inventory/:id", "/inventory/dev-1", <DevicePage />);
+    await screen.findByText("core-fw-01");
+    gone = true;
+    await act(async () => {
+      await lastClient!.refetchQueries();
+    });
+    expect(await screen.findByText("Device not found")).toBeInTheDocument();
+    expect(screen.queryByText("core-fw-01")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+  });
+});
+
+describe("TemplateEditorPage hypervisor picker (issue #1320, INV-TPL-26)", () => {
+  it("a failed hypervisor list shows its own load error under the hypervisor picker", async () => {
+    failure = null;
+    server.use(
+      ok("/api/inventory/drivers", page([])),
+      http.get("/api/inventory/hypervisors", () =>
+        HttpResponse.json({ detail: "inventory is restarting" }, { status: 500 }),
+      ),
+      ok("/api/ai/status", { enabled: false }),
+    );
+    renderAt("/templates/:id", "/templates/new", <TemplateEditorPage />);
+    fireEvent.change(await screen.findByLabelText("Type"), { target: { value: "dynamic" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load hypervisors. inventory is restarting",
+    );
+    expect(screen.queryByText(/No hypervisors registered/)).not.toBeInTheDocument();
   });
 });

@@ -1,4 +1,6 @@
+import { isAxiosError } from "axios";
 import type { AICommitTopologyUnwireableDetail } from "@/types/ai.types";
+import { isUnreadableAnswer } from "@/api/answerGuard";
 
 /**
  * The raw `detail` of an axios error's response body, typed `unknown` on
@@ -112,20 +114,31 @@ export function errorDetail(err: unknown, fallback: string): string {
 export const LOAD_FAILURE_NO_ANSWER = "The server did not answer.";
 
 /**
- * The second sentence of a failed page load (issue #1320, `LoadError`): the
- * server's `detail` through `errorDetail`, or, when the body carries none, a
- * fixed sentence naming the HTTP status (a number axios read from the
- * response, never body text), or LOAD_FAILURE_NO_ANSWER when no response
- * arrived (a network error, a refused connection).
+ * What a failed load says when an answer arrived but could not be used
+ * (issue #1320): a 2xx the client refused as not JSON (`isUnreadableAnswer`),
+ * or a body of the wrong shape that made the query fail.
+ */
+export const LOAD_FAILURE_UNREADABLE = "The server's answer could not be read.";
+
+/**
+ * The second sentence of a failed page load (issue #1320, `LoadError`):
+ *
+ * - an error carrying an HTTP status: the server's `detail` through
+ *   `errorDetail`, or, when the body carries none, a fixed sentence naming the
+ *   status (a number axios read from the response, never body text);
+ * - an axios error with no response (a network error, a refused connection, a
+ *   timeout): LOAD_FAILURE_NO_ANSWER;
+ * - anything else (the client's refusal of an unreadable 2xx, a body of the
+ *   wrong shape, no error object at all): LOAD_FAILURE_UNREADABLE.
  */
 export function loadFailureDetail(err: unknown): string {
   const status = (err as { response?: { status?: unknown } } | null | undefined)?.response
     ?.status;
-  const fallback =
-    typeof status === "number" && Number.isInteger(status)
-      ? "The server answered with HTTP " + status + "."
-      : LOAD_FAILURE_NO_ANSWER;
-  return errorDetail(err, fallback);
+  if (typeof status === "number" && Number.isInteger(status)) {
+    return errorDetail(err, "The server answered with HTTP " + status + ".");
+  }
+  if (isAxiosError(err) && !isUnreadableAnswer(err)) return LOAD_FAILURE_NO_ANSWER;
+  return LOAD_FAILURE_UNREADABLE;
 }
 
 // Field checks for the structured narrowers (issue #1406). A narrower's

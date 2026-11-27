@@ -18,8 +18,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { TransferList } from "@/components/ui/TransferList";
 import type { TransferItem } from "@/components/ui/TransferList";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
-import { loadState } from "@/lib/loadState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 export function DeviceGroupDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -30,7 +30,7 @@ export function DeviceGroupDetailPage() {
   const { data: group } = groupQuery;
   // Issue #1320: an existing device group whose fetch failed renders no form
   // and no Delete, so neither can act on a group the page never loaded.
-  const groupState = isNew ? "loaded" : loadState(groupQuery);
+  const groupState = isNew ? "loaded" : loadState(groupQuery, undefined, isPlainObject);
   const createGroup = useCreateDeviceGroup();
   const updateGroup = useUpdateDeviceGroup();
   const deleteGroup = useDeleteDeviceGroup();
@@ -242,6 +242,13 @@ export function DeviceGroupDetailPage() {
         <h2 className="text-lg font-semibold text-gray-900 mb-4">
           {isNew ? "Create Device Group" : "Edit Device Group"}
         </h2>
+
+        <LoadErrorNotice
+          what="this device group"
+          query={groupQuery}
+          isValid={isPlainObject}
+          className="mb-4"
+        />
 
         {/* Group form */}
         <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">

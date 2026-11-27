@@ -374,9 +374,10 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   answer, a 5xx) shows `Could not load this template.` with the server's reason and
   Retry. A failed driver or hypervisor list shows `Could not load drivers.` or `Could not
   load hypervisors.` with Retry under its picker instead of an empty picker (issue
-  #1320). \
+  #1320). When a refresh of a template already shown fails, the page stays and
+  `Could not refresh this template.` with Retry shows above it. \
   Enforced in: `frontend/src/pages/TemplateEditorPage.tsx` (`TemplateEditorPage`) \
-  Pinned by: `frontend/src/test/pages/TemplateEditorPage.editflow.test.tsx` (`shows the not-found message when the fetch answered 404`, `shows a load error with Retry, and no editor, when the fetch failed otherwise (#1320)`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`a 404 keeps the deliberate 'Template not found'`, `Retry loads the template`, `a failed driver list shows its own load error under the driver picker`)
+  Pinned by: `frontend/src/test/pages/TemplateEditorPage.editflow.test.tsx` (`shows the not-found message when the fetch answered 404`, `shows a load error with Retry, and no editor, when the fetch failed otherwise (#1320)`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`a 404 keeps the deliberate 'Template not found'`, `Retry loads the template`, `a failed driver list shows its own load error under the driver picker`, `a failed hypervisor list shows its own load error under the hypervisor picker`, `keeps the record on screen and says the refresh failed, with Retry`)
 
 **Out of scope.** The AI identity suggestion in the editor (`ai-features.md`). What a
 dynamic template does at booking time (`dynamic-resources.md`).
@@ -464,9 +465,12 @@ deleted, and can be booked.
   Edit, and no sections: a 404 shows `Device not found`, and any other failure shows
   `Could not load this device.` with the server's reason, Retry, and Back to Inventory.
   When the device's template read fails, the page says `Could not load this device's
-  template.` with Retry where the template's fields would be (issue #1320). \
+  template.` with Retry where the template's fields would be (issue #1320). When a
+  refresh of a device already shown fails with anything but a 404, the page stays and
+  `Could not refresh this device.` with Retry shows above it; a 404 on refresh shows
+  `Device not found`. \
   Enforced in: `frontend/src/pages/DevicePage.tsx` (`DevicePage`) \
-  Pinned by: `frontend/src/test/pages/DevicePage.test.tsx` (`renders an error state when the device is not found`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the device`, `a failed template load says so where the device's fields would be`)
+  Pinned by: `frontend/src/test/pages/DevicePage.test.tsx` (`renders an error state when the device is not found`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the device`, `a failed template load says so where the device's fields would be`, `DevicePage: a refresh Retry reads Retrying..., is aria-disabled, and keeps focus`, `a refresh that answers 404 shows Device not found, not the stale device`, `keeps the record on screen and says the refresh failed, with Retry`)
 
 **Out of scope.** Changing a device's template: the update body has no template
 field. The configuration section of the device page and the ports section's

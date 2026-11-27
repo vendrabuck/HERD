@@ -5,7 +5,7 @@ import { usePaginatedDeviceGroups, useDeleteDeviceGroup } from "@/api/deviceGrou
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 
@@ -47,6 +47,7 @@ export function DeviceGroupsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="device groups" query={groupsQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading device groups...</p>
           ) : state === "error" ? (

@@ -7,7 +7,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { Grant, GrantCreate } from "@/types/acl.types";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 
 const RESOURCE_TYPES: Grant["resource_type"][] = ["device", "topology", "reservation", "secret"];
@@ -211,6 +211,7 @@ export function GrantsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="grants" query={grantsQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading grants...</p>
           ) : state === "error" ? (

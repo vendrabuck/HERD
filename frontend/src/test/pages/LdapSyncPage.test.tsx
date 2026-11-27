@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+import { AxiosError } from "axios";
 
 // Mock HTMLDialogElement methods (jsdom has no native <dialog> support)
 beforeAll(() => {
@@ -202,6 +203,7 @@ describe("LdapSyncPage", () => {
       data: undefined,
       isLoading: false,
       isError: true,
+      error: new AxiosError("Network Error", "ERR_NETWORK"),
       refetch: mockRefetch,
     });
     render(<LdapSyncPage />);

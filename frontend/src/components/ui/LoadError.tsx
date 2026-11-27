@@ -1,5 +1,64 @@
 import { cn } from "@/lib/cn";
 import { loadFailureDetail } from "@/lib/errors";
+import { refreshFailed } from "@/lib/loadState";
+
+/** The slice of a TanStack Query result `LoadErrorNotice` reads. */
+export interface RefreshableQuery<T = unknown> {
+  data: T | undefined;
+  isError: boolean;
+  error: unknown;
+  isFetching: boolean;
+  refetch: () => unknown;
+}
+
+/**
+ * The notice for a refresh that failed while the page still shows an earlier
+ * answer (issue #1320, `refreshFailed`): the content stays, and above it a
+ * compact strip says `Could not refresh <what>.` plus the reason, with Retry.
+ * Renders nothing in every other state, so a page places it once above its
+ * content. `role="status"`: the page still works, so it is announced politely.
+ */
+export function LoadErrorNotice<T>({
+  what,
+  query,
+  isEmpty,
+  isValid,
+  className,
+}: {
+  what: string;
+  query: RefreshableQuery<T>;
+  /** The same predicates the page passes to `loadState`. */
+  isEmpty?: (data: T) => boolean;
+  isValid?: (data: T) => boolean;
+  className?: string;
+}) {
+  if (!refreshFailed(query, isEmpty, isValid)) return null;
+  const retrying = query.isFetching;
+  return (
+    <div
+      role="status"
+      className={cn(
+        "flex items-center justify-between gap-4 px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-800",
+        className,
+      )}
+    >
+      <p>
+        Could not refresh {what}. {loadFailureDetail(query.error)}
+      </p>
+      <button
+        type="button"
+        onClick={() => {
+          if (!retrying) void query.refetch();
+        }}
+        aria-disabled={retrying || undefined}
+        aria-label={retrying ? undefined : "Retry loading " + what}
+        className="shrink-0 px-2 py-1 text-xs font-medium text-amber-800 bg-white border border-amber-300 rounded hover:bg-amber-100 aria-disabled:opacity-50 transition-colors"
+      >
+        {retrying ? "Retrying..." : "Retry"}
+      </button>
+    </div>
+  );
+}
 
 /**
  * The ONE error state for a load that failed (issue #1320): a red alert strip

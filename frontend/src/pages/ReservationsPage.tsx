@@ -51,7 +51,7 @@ import { CreateReservationModal } from "@/components/reservations/CreateReservat
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState } from "@/lib/loadState";
 import type {
   Reservation,
@@ -577,6 +577,7 @@ export function ReservationsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="reservations" query={reservationsQuery} className="m-4" />
           {listLoading && (
             <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
               Loading reservations...

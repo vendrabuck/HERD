@@ -13,7 +13,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { ConnectionType } from "@/types/driver.types";
 import { errorDetail } from "@/lib/errors";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noItems } from "@/lib/loadState";
 
 const CONNECTION_TYPES: ConnectionType[] = [
@@ -146,6 +146,7 @@ export function DriversPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="drivers" query={driversQuery} isEmpty={noItems} className="m-4" />
           {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading drivers...</p>
           ) : state === "error" ? (

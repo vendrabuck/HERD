@@ -33,7 +33,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { TopoBadge } from "@/components/ui/TopoBadge";
 import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
-import { LoadError } from "@/components/ui/LoadError";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
 import { loadState, noEntries } from "@/lib/loadState";
 import type { Device, DeviceFilters, DeviceStatus, TopologyType } from "@/types/device.types";
 
@@ -564,6 +564,7 @@ export function InventoryPage() {
               </div>
             )}
             <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+              <LoadErrorNotice what="devices" query={devicesQuery} className="m-4" />
               {listLoading && (
                 <div role="status" aria-live="polite">
                   <SkeletonRows rows={5} />

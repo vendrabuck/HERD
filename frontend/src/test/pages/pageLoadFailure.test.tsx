@@ -7,11 +7,15 @@
  * - error: a network error and a 500 with a detail each render the shared
  *   LoadError (role alert, "Could not load <what>." plus the reason), never
  *   the empty-state text; Retry refetches, and a good answer replaces it;
+ * - a 200 that is the web app's HTML page, or JSON without the list, is a
+ *   load error saying the answer could not be read, never a crash;
+ * - a refresh that fails after rows loaded keeps the rows and shows the
+ *   LoadErrorNotice above them, with Retry;
  * - empty: only a successful empty answer renders the empty-state text;
  * - loaded: a successful answer renders its rows and no alert.
  */
 import { http, HttpResponse, type JsonBodyType, type RequestHandler } from "msw";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactElement } from "react";
@@ -42,7 +46,11 @@ function page(items: unknown[]) {
 
 const ok = (path: string, body: JsonBodyType) => http.get(path, () => HttpResponse.json(body));
 
-type Mode = "pending" | "network" | "server" | "empty" | "loaded";
+type Mode = "pending" | "network" | "server" | "html" | "shape" | "empty" | "loaded";
+
+// What nginx answered for an /api path whose service was stopped, before the
+// `location ^~ /api/` guard (issue #1320 review): the web app, with a 200.
+const SPA_PAGE = '<!doctype html><html><head><title>HERD</title></head><body><div id="root"></div></body></html>';
 
 interface PageSpec {
   name: string;
@@ -322,6 +330,7 @@ const SPECS: PageSpec[] = [
 
 let mode: Mode = "loaded";
 let requests = 0;
+let lastClient: QueryClient | null = null;
 
 function primaryHandler(spec: PageSpec) {
   return http.get(spec.endpoint, async () => {
@@ -337,6 +346,10 @@ function primaryHandler(spec: PageSpec) {
           { detail: spec.name + " backend is down" },
           { status: 500 },
         );
+      case "html":
+        return HttpResponse.html(SPA_PAGE);
+      case "shape":
+        return HttpResponse.json({ unexpected: true });
       case "empty":
         return HttpResponse.json(spec.emptyBody);
       case "loaded":
@@ -349,6 +362,7 @@ function renderSpec(spec: PageSpec) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+  lastClient = client;
   // The primary handler goes first so it outranks a catch-all in `others`.
   server.use(primaryHandler(spec), ...spec.others());
   return render(
@@ -404,6 +418,53 @@ describe.each(SPECS)("$name load states (issue #1320)", (spec) => {
     expect(requests).toBe(before + 1);
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
     expect(screen.queryByText(spec.emptyText)).not.toBeInTheDocument();
+  });
+
+  it("a 200 web-app page instead of JSON is a load error, never a crash or the empty state", async () => {
+    mode = "html";
+    renderSpec(spec);
+    const alert = await alertFor();
+    expect(alert).toHaveTextContent(
+      `Could not load ${spec.what}. The server's answer could not be read.`,
+    );
+    expect(screen.queryByText(spec.emptyText)).not.toBeInTheDocument();
+    expect(screen.queryByText("Something went wrong")).not.toBeInTheDocument();
+  });
+
+  it("a 200 JSON answer without the expected list is a load error, never a crash", async () => {
+    mode = "shape";
+    renderSpec(spec);
+    const alert = await alertFor();
+    expect(alert).toHaveTextContent(
+      `Could not load ${spec.what}. The server's answer could not be read.`,
+    );
+    expect(screen.queryByText(spec.emptyText)).not.toBeInTheDocument();
+  });
+
+  it("a failed refresh keeps the rows and says so above them, with Retry", async () => {
+    mode = "loaded";
+    renderSpec(spec);
+    expect(await screen.findByText(spec.loadedText)).toBeInTheDocument();
+
+    mode = "server";
+    await act(async () => {
+      await lastClient!.refetchQueries();
+    });
+    const notice = await screen.findByText(new RegExp(`^Could not refresh ${spec.what}\\.`));
+    expect(notice.closest("[role=status]")).toHaveTextContent(
+      `Could not refresh ${spec.what}. ${spec.name} backend is down`,
+    );
+    // The content stays: rows, not the full error, not the empty text.
+    expect(screen.getByText(spec.loadedText)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(spec.emptyText)).not.toBeInTheDocument();
+
+    mode = "loaded";
+    fireEvent.click(screen.getByRole("button", { name: `Retry loading ${spec.what}` }));
+    await waitFor(() =>
+      expect(screen.queryByText(new RegExp(`^Could not refresh ${spec.what}\\.`))).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText(spec.loadedText)).toBeInTheDocument();
   });
 
   it("only a successful empty answer renders the empty state", async () => {
