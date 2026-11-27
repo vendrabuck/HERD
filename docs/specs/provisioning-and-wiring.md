@@ -217,10 +217,12 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   frozen; a row of an unfrozen reservation is left alone. The other reservations'
   ACTIVE rows are read `FOR UPDATE` (#1413), before the allocation's share lock, so a
   row a release holds is re-read as committed once it commits and a row released
-  meanwhile is not rewritten. A join that loses to the release of its allocation
+  meanwhile is not rewritten. The rows are locked in id order (`ORDER BY id`; Postgres
+  takes the locks above the sort), so two joins on one port lock its foreign rows in
+  one order whatever plan each connection runs, and cannot deadlock on them. A join that loses to the release of its allocation
   (WIRE-VLAN-4) parks nothing. \
   Enforced in: `services/execution/app/services/l2_membership_service.py` (`record_l2_membership_active`) \
-  Pinned by: `services/execution/tests/test_l2_membership_service.py` (`test_record_parks_stale_cross_reservation_active_row`, `test_record_parks_every_stale_row_on_the_port`, `test_record_leaves_unfrozen_cross_reservation_row_alone`, `test_record_leaves_unfrozen_state_row_cross_reservation_alone`, `test_a_lost_join_parks_no_other_reservations_row`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_join_waiting_on_a_release_of_a_frozen_holders_row_never_rewrites_it`)
+  Pinned by: `services/execution/tests/test_l2_membership_service.py` (`test_record_parks_stale_cross_reservation_active_row`, `test_record_parks_every_stale_row_on_the_port`, `test_record_leaves_unfrozen_cross_reservation_row_alone`, `test_record_leaves_unfrozen_state_row_cross_reservation_alone`, `test_a_lost_join_parks_no_other_reservations_row`); `services/execution/tests/test_vlan_join_release_race_live_pg.py` (`test_a_join_waiting_on_a_release_of_a_frozen_holders_row_never_rewrites_it`, `test_two_joins_on_one_port_lock_its_foreign_rows_in_one_order`)
 - **WIRE-LEDGER-13.** Parking a stale build flips a FAILED row to intended `RELEASED`
   with attempts 0 and the given reason; a row that is no longer FAILED is returned
   untouched. On L2 the row is read `FOR UPDATE` and parked only while it is still
@@ -426,7 +428,8 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   the row as committed and never rewrites a row released meanwhile; the owed write by
   key then records on a fresh row. `record_l2_failed`'s two returns that write nothing
   commit, so its lock is not held past the call.
-  Until a removal succeeds, these writers leave the row on its number: the apply drives
+  Until a removal succeeds, or fails with a pinned non-retryable reason (WIRE-LEDGER-16,
+  Open defects), these writers leave the row on its number: the apply drives
   no add, define, or build write for that port (`membership_owes_undo`), the FAILED
   flip of WIRE-LEDGER-2 refuses the row (it is returned as it is), a join recorded on a
   frozen reservation (WIRE-LEDGER-4) leaves it as it is and undoes its own add at once
@@ -1984,7 +1987,7 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   removal succeeds, but the ledger has one row per (reservation, switch, port), and
   one row names one VLAN number: when the port is in two numbers at once, at most one
   of them is tracked. The owner chose on #1413 to keep that key and to list each such
-  window here. The 13 windows:
+  window here. The 12 windows:
   - While the removal is owed, the number is tracked, not held: allocation counts only
     ACTIVE allocations (WIRE-VLAN-2), so the number can be given to another
     reservation in reach before the removal succeeds, and until then the port is a
@@ -1998,7 +2001,12 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
     non-retryable reason (a deleted switch, a broken driver package) records that
     reason in place of the landed add's (WIRE-LEDGER-16): the row still names the
     number, but the tick no longer selects it and the own-number rules no longer apply
-    to it; on an ended reservation it is then the #1199 case above.
+    to it; on an ended reservation it is then the #1199 case above. Such a row no
+    longer counts as owing a removal either: the apply drives joins on the port again
+    (`membership_owes_undo` is false), the FAILED flip of a later join and the frozen
+    park can move it off its number (the plain failed leave case below), after which
+    no row names the released number, and the terminal teardown no longer removes its
+    port (its owed-row filter selects only `JOIN_UNDO_PENDING_REMOVAL`).
   - The check for a live membership holding the number on the port and the
     `remove_from_vlan` after it are two steps, as in WIRE-VLAN-11, in the undo, in the
     frozen park's undo, and in the retry's supersession check of a row parked for a
@@ -2056,7 +2064,9 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
     the retry's claim) keeps naming the other number. That is right on a device that
     keeps one membership per number, such as the SR Linux driver, when the two numbers
     differ. It is wrong when the other number's add reached the device before this
-    removal and either the two numbers are equal (a re-allocation can reuse a number),
+    removal and either the two numbers are equal (a re-allocation of the same
+    reservation usually takes the same number, since its preferred VLAN is derived
+    from its id, WIRE-VLAN-2),
     or the device keeps one access VLAN per port, where `no switchport access vlan <N1>`
     may reset the port's access VLAN: the row then names a membership the device no
     longer has, and nothing drives an `ACTIVE` row again. Before #1413 such a row was
