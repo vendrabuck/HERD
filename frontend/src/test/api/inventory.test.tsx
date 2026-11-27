@@ -8,7 +8,6 @@ import { server } from "../mocks/server";
 import {
   deleteDeviceErrorMessage,
   useDevice,
-  useDevices,
   usePaginatedDevices,
   useAllDeviceNames,
   useAllDevices,
@@ -51,7 +50,7 @@ describe("inventory api hooks", () => {
     expect(result.current.data?.id).toBe("dev-1");
   });
 
-  it("useDevices forwards filter query params", async () => {
+  it("useAllDevices forwards the status filter too", async () => {
     let capturedUrl = "";
     server.use(
       http.get("/api/inventory/devices", ({ request }) => {
@@ -60,7 +59,7 @@ describe("inventory api hooks", () => {
       }),
     );
     const { result } = renderHook(
-      () => useDevices({ template_id: "tpl-1", status: "AVAILABLE", dut_only: true, search: "foo" }),
+      () => useAllDevices({ template_id: "tpl-1", status: "AVAILABLE", dut_only: true, search: "foo" }),
       { wrapper },
     );
     await waitFor(() => expect(result.current.isSuccess).toBe(true));

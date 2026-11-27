@@ -21,7 +21,7 @@ import toast from "react-hot-toast";
 
 import { useTopology, useUpdateTopology, useRestoreVersion, validateTopology } from "@/api/topologies";
 import {
-  useReservations,
+  useReservation,
   useUpdateReservation,
   useReservationFork,
   useSaveReservationFork,
@@ -75,7 +75,10 @@ import { QuickConnectPopover } from "@/components/topology-editor/QuickConnectPo
 import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
 import { AIProposalBar } from "@/components/topology-editor/AIProposalBar";
-import { LiveEditBar } from "@/components/topology-editor/LiveEditBar";
+import {
+  LiveEditBar,
+  type LiveEditReservationStatus,
+} from "@/components/topology-editor/LiveEditBar";
 import { AsBuiltBar } from "@/components/topology-editor/AsBuiltBar";
 import { ForkSaveResultToast } from "@/components/topology-editor/ForkSaveResultToast";
 import { ForkConflictDialog } from "@/components/topology-editor/ForkConflictDialog";
@@ -202,11 +205,22 @@ function TopologyEditorInner() {
   // fork version (never touching the parent's TopologyVersion history), and the
   // device-set PATCH still drives incremental provisioning.
   const reservationId = searchParams.get("reservationId");
-  const { data: reservations } = useReservations();
-  const liveReservation = useMemo(
-    () => reservations?.find((r) => r.id === reservationId) ?? null,
-    [reservations, reservationId],
-  );
+  // Read by id (issue #1319), never found by scanning a page of the owner's
+  // list: a reservation past that page left this null, and Commit then
+  // computed the device-set union from an empty set. Null while the read is
+  // in flight or after it failed with nothing cached; Commit refuses in both
+  // cases (handleCommitToReservation, LiveEditBar). A cached copy counts as
+  // loaded even when a later background refetch failed: Commit unions with
+  // that set, and the server still refuses a reservation that left ACTIVE.
+  const { data: reservationData, error: reservationError } = useReservation(reservationId);
+  const liveReservation = reservationData ?? null;
+  const reservationStatus: LiveEditReservationStatus = liveReservation
+    ? "loaded"
+    : !reservationError
+      ? "loading"
+      : isAxiosError(reservationError) && reservationError.response?.status === 404
+        ? "not-owner"
+        : "failed";
   const isLiveEdit = !!reservationId;
   const updateReservation = useUpdateReservation();
   const { data: fork } = useReservationFork(isLiveEdit ? reservationId : null);
@@ -1346,7 +1360,22 @@ function TopologyEditorInner() {
       toast.error("Fix unreachable edges before committing");
       return;
     }
-    const currentDeviceIds = liveReservation?.device_ids ?? [];
+    // Issue #1319: the device-set union below needs the reservation's own
+    // current set. Without it (still loading, or the read failed) the union
+    // would start from nothing, every canvas device would count as added, and
+    // the pre-save PATCH would drop the devices not yet removed from the
+    // canvas. Fail closed: no PATCH, no fork save.
+    if (!liveReservation) {
+      toast.error(
+        reservationStatus === "not-owner"
+          ? "Only the reservation's owner can commit from this editor"
+          : reservationStatus === "failed"
+            ? "Could not load this reservation, so nothing was committed; reload the page to try again"
+            : "The reservation is still loading; try again in a moment",
+      );
+      return;
+    }
+    const currentDeviceIds = liveReservation.device_ids;
     const addedDeviceIds = allDeviceIds.filter((deviceId) => !currentDeviceIds.includes(deviceId));
     const removedDeviceIds = currentDeviceIds.filter(
       (deviceId) => !allDeviceIds.includes(deviceId),
@@ -1488,6 +1517,7 @@ function TopologyEditorInner() {
     forkLoaded,
     hasInvalidEdges,
     liveReservation,
+    reservationStatus,
     saveFork,
     autosave,
     persistableCanvas,
@@ -1825,6 +1855,7 @@ function TopologyEditorInner() {
               serverInvalidEdgeCount={serverOnlyInvalidEdgeCount}
               isCommitting={isCommitting}
               forkLoaded={forkLoaded}
+              reservationStatus={reservationStatus}
               autosaveStatus={autosave.status}
               onCommit={handleCommitToReservation}
               onCancel={handleCancelLiveEdit}
