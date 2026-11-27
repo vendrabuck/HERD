@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.services.dispatchers.base import DispatchMessage
 from app.services.health_recipients import resolve_health_recipients
@@ -8,13 +8,24 @@ from app.services.health_recipients import resolve_health_recipients
 logger = logging.getLogger(__name__)
 
 
-def _format_end_time(end_time: str | None) -> str:
-    if not end_time:
+def _format_end_time(end_time: object) -> str:
+    """Render an event's ISO 8601 end time as the UTC instant it names (issue #1564).
+
+    An aware value is converted to UTC before formatting, so the label is true
+    whatever offset the event carried; a naive one is taken as UTC, never as the
+    host's local zone. Seconds and fractions are dropped, not rounded. A missing
+    or non-string value renders as ``unknown end``; a string that does not parse,
+    or whose instant has no UTC equivalent, is returned unchanged. Nothing raises,
+    so a bad value never fails the consumer's message.
+    """
+    if not end_time or not isinstance(end_time, str):
         return "unknown end"
     try:
         dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
-    except ValueError:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, OverflowError):
         return end_time
 
 
