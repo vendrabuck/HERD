@@ -22,6 +22,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
 from herd_common.validation_errors import holds_lone_surrogate
@@ -103,6 +104,30 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
     "Invalid JSON: the document is nested too deeply or holds a number too long to read"
 )
 JSON_CELL_UNREADABLE_REASON = "a JSON cell is nested too deeply or holds a number too long to read"
+
+# A JSON import item the row loop cannot read (issue #1573): an item that is not an
+# object (a list, string, number, boolean, or null), or an object whose `name` is not
+# a string. A non-object item, or a name that is a nonzero number, true, or a non-empty
+# list or object, answered 500 at the first `.get` or `.strip`; a name that is 0,
+# false, [], or {} was read as missing. The item is now a rejected row with one of
+# these fixed reasons and the other rows are judged on their own. A CSV row is always
+# an object of strings, so it never meets either.
+ROW_NOT_AN_OBJECT_REASON = "row is not an object"
+NAME_NOT_A_STRING_REASON = "name: must be a string"
+
+
+def _row_shape_reason(raw_row: Any) -> str | None:
+    """The fixed reject reason for an item the row loop cannot read, else None.
+
+    Checked before anything reads the item. A `name` that is absent or null passes
+    here and is rejected later as `missing required field: name`.
+    """
+    if not isinstance(raw_row, dict):
+        return ROW_NOT_AN_OBJECT_REASON
+    name = raw_row.get("name")
+    if name is not None and not isinstance(name, str):
+        return NAME_NOT_A_STRING_REASON
+    return None
 
 
 def _empty_report(dry_run: bool) -> BulkImportReport:
@@ -216,10 +241,11 @@ def records_to_json(records: list[dict[str, Any]], resource: str) -> str:
 def _parse_csv(
     raw: str, columns: list[str], text_columns: set[str] | None = None
 ) -> list[dict[str, Any]]:
+    # read_csv_rows (issue #1574) reads every line ending, lifts the field limit for
+    # the read, and answers 422 for anything the csv module still refuses.
     text_columns = text_columns or set()
-    reader = csv.DictReader(io.StringIO(raw))
     rows: list[dict[str, Any]] = []
-    for row in reader:
+    for row in read_csv_rows(raw):
         # Strip the columns we do not recognize; keep the recognized ones.
         # A text_columns cell gets csv_unsafe_cell (issue #910), the inverse
         # of the csv_safe_cell neutralization records_to_csv applies, so an
@@ -368,6 +394,10 @@ async def _import_device_rows(
     template_ids_by_name = {t.name: t.id for t in template_rows}
 
     for index, raw_row in enumerate(rows):
+        shape_reason = _row_shape_reason(raw_row)
+        if shape_reason is not None:
+            report.rows.append(RowResult(row=index, action="reject", reason=shape_reason))
+            continue
         name = (raw_row.get("name") or "").strip()
         try:
             if not name:
@@ -515,6 +545,10 @@ async def _import_template_rows(
     hypervisor_ids_by_name = {hv_name: hv_id for hv_name, hv_id in hypervisor_rows}
 
     for index, raw_row in enumerate(rows):
+        shape_reason = _row_shape_reason(raw_row)
+        if shape_reason is not None:
+            report.rows.append(RowResult(row=index, action="reject", reason=shape_reason))
+            continue
         name = (raw_row.get("name") or "").strip()
         try:
             if not name:

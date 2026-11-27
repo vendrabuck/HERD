@@ -1033,10 +1033,14 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   Enforced in: `services/common/herd_common/jetstream.py` (`ensure_stream`) \
   Pinned by: `services/common/tests/test_jetstream.py` (`test_max_age_seconds_none_yields_config_with_no_max_age`, `test_max_age_seconds_zero_yields_config_with_no_max_age`)
 - **OPS-NATS-4.** Execution owns `HERD_HEALTH` (`herd.health.*`) and declares it with
-  `ensure_stream` once its consumer has connected; a failed declaration is logged and the
-  service keeps running. \
+  `ensure_stream` once its consumer has connected (also when the consumer's durable
+  setup then failed, since the connection is kept); a failed declaration is logged with
+  the exception class name only and the service keeps running (issue #1418): `JetStream
+  stream HERD_HEALTH could not be created or updated (<class>); the connection is kept,
+  so health events publish if the stream exists, and while it is missing they wait in
+  the outbox and the relay retries them every tick`. \
   Enforced in: `services/execution/app/main.py` (`_ensure_health_stream`, `_start_consumer_and_streams`) \
-  Pinned by: `services/execution/tests/test_main.py` (`test_lifespan_starts_consumer_immediately_when_schema_ready`)
+  Pinned by: `services/execution/tests/test_main.py` (`test_lifespan_starts_consumer_immediately_when_schema_ready`, `test_ensure_health_stream_failure_says_health_events_wait_in_the_outbox`); `services/execution/tests/test_nats_consumer_full.py` (`test_setup_failure_keeps_the_connection_for_the_stream_ensures`)
 - **OPS-NATS-15.** Reservations owns `HERD_RESERVATIONS` (`herd.reservations.*`) and
   declares it with `ensure_stream` right after connecting; a failed declaration is logged
   and the service keeps running with the connection it has. \

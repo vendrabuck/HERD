@@ -499,15 +499,29 @@ for an operator.
   Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_loop_fetches_one_message_at_a_time`)
 - **WIRE-CONSUME-3.** The consumer never writes the stream's config: it creates
   `HERD_RESERVATIONS` (with no `max_age`) only when the stream is missing, and a failure
-  there is logged while the consumer still starts. \
+  there is logged (`JetStream stream HERD_RESERVATIONS could not be checked or created
+  (<class>); ...`) while the consumer setup goes on; when the stream is missing, the
+  setup then fails with WIRE-CONSUME-4's setup warning. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`ensure_stream_exists`) \
   Pinned by: `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_stream_create_failure`); `services/common/tests/test_jetstream.py` (`test_ensure_stream_exists_existing_stream_never_calls_add_stream`, `test_ensure_stream_exists_not_found_triggers_one_add_stream_with_no_max_age`)
-- **WIRE-CONSUME-4.** When NATS is unreachable at startup the failure is logged and the
-  service runs without the consumer until it is restarted; once connected, the client
-  reconnects without limit. The first connect is bounded (`operations-and-observability.md`,
-  OPS-NATS-1). \
-  Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
-  Pinned by: `services/execution/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_connection_failure`)
+- **WIRE-CONSUME-4.** A failed consumer start is logged in the `integration.md`
+  INTEG-CONSUME-3 wording (the same `herd_common.jetstream` helpers, issue #1418), with
+  the exception class name only (plus a JetStream API error's integer `err_code` on the
+  setup and stream-check lines), and the service runs without the consumer until it is
+  restarted; nothing retries the connect or the setup in that process, and reservation
+  events wait on `HERD_RESERVATIONS` and are processed after a restart that comes while
+  they are still within the stream's max age. A cancellation raised by the connect or a
+  setup step propagates unlogged. A failed
+  connect (bounded, `operations-and-observability.md` OPS-NATS-1) logs `NATS connect
+  failed (<class>); not running: execution-consumer. ...` and leaves no connection, so
+  the HERD_HEALTH and HERD_DLQ ensures are skipped and the outbox relay publishes
+  nothing. A connect that succeeds keeps the connection; a durable setup that raises
+  logs `NATS consumer setup failed for durable execution-consumer on stream
+  HERD_RESERVATIONS (<class>); not running: execution-consumer; still running: none.
+  ...`, and the stream ensures and the outbox relay still use the kept connection. Once
+  connected, the client reconnects without limit. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`, `EXECUTION_STREAM`, `EXECUTION_DURABLE`); `services/execution/app/main.py` (`_start_consumer_and_streams`); `services/common/herd_common/jetstream.py` (`connect_nats`, `log_consumer_connect_failure`, `log_consumer_setup_failure`) \
+  Pinned by: `services/execution/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`, `test_consumer_start_with_broker_down_skips_the_stream_ensures`); `services/execution/tests/test_nats_consumer_full.py` (`test_start_nats_consumer_connection_failure`, `test_setup_failure_after_a_good_connect_is_not_called_a_connect_failure`, `test_setup_failure_keeps_the_connection_for_the_stream_ensures`, `test_a_cancelled_start_propagates_the_cancellation`)
 - **WIRE-CONSUME-5.** On a migration-managed schema that lacks a model table, the
   consumer start is deferred until the table appears, so events wait on the stream
   instead of failing. \
@@ -547,7 +561,13 @@ for an operator.
 - **WIRE-CONSUME-13.** The dead-letter subject has four tokens, so the consumer's
   three-token filter never redelivers it; startup creates or updates the `HERD_DLQ`
   stream over `herd.*.dlq.>` with `NATS_STREAM_MAX_AGE_SECONDS`, and a failure there is
-  logged without stopping the service. \
+  logged without stopping the service, with the exception class name only (issue
+  #1418): `JetStream stream HERD_DLQ could not be created or updated (<class>); if it
+  exists, dead-lettered messages are kept on it, and while it is missing a dead-letter
+  publish fails and the original message is acked, so it is not dead-lettered and the
+  consumer that failed it does not receive it again; it stays only on its source stream,
+  up to that stream's max age` (the source streams use limits retention, so the ack
+  removes nothing from them). \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`NATS_DLQ_SUBJECT`); `services/execution/app/main.py` (`_ensure_dlq_stream`) \
   Pinned by: `services/execution/tests/test_nats_consumer.py` (`test_dlq_subject_not_redelivered_to_consumer`); `services/execution/tests/test_main.py` (`test_ensure_dlq_stream_binds_shared_stream`, `test_ensure_dlq_stream_swallows_broker_error`)
 - **WIRE-CONSUME-14.** A handler that returns normally acks the message. \

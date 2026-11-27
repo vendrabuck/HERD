@@ -9,10 +9,10 @@ import { server } from "../mocks/server";
 import { EquipmentBrowser } from "@/components/equipment-browser/EquipmentBrowser";
 import type { Device } from "@/types/device.types";
 
-// EquipmentBrowser is data-driven through two TanStack Query hooks:
-// useTemplates("device") -> GET /api/inventory/templates
-// useDevices({...})       -> GET /api/inventory/devices
-// Both unwrap a paginated { items, total } envelope, so the MSW handlers
+// EquipmentBrowser is data-driven through TanStack Query hooks:
+// useTemplates("device") and useTemplates("dynamic") read GET /api/inventory/templates,
+// useAllDevices({...}) reads GET /api/inventory/devices.
+// Both walk a paginated { items, total } envelope, so the MSW handlers
 // below return that shape. We drive the component end to end through MSW
 // rather than mocking the hooks, which exercises the real query wiring.
 
