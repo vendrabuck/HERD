@@ -31,9 +31,10 @@ Scope notes:
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -309,13 +310,15 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
     and reads container state from the host's docker CLI, which it requires.
 
     Assertions, in order: before the click every service in the restarter's
-    allowlist has at least one container; the Restart Result panel names exactly
+    allowlist has at least one container and no Restart Result panel is on the page;
+    the Restart Result panel names exactly
     the allowlist, in sorted order, and renders no error line; within
     RESTART_HEALTHY_SECONDS every one of those containers has a StartedAt later
     than before the click (it was restarted) and is running and healthy, else the
     test fails naming each service that did not return and why; the saved value
     reads back through the config API; GET /api/config/apply/last answers the same
-    finished result, and the panel shows it again after a page reload (issue #1433).
+    finished result with a UTC finish time, and after a page reload the result shows
+    again under a "Last restart, finished ..." heading (issue #1433).
 
     On the Docker host the restart can cut the page's POST /apply off
     (ERR_NETWORK_CHANGED); the page then reads the result from GET /apply/last, so
@@ -331,11 +334,16 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
         _ui_login(pw_page)
         _filter_field(pw_page).fill(SENTINEL_FILTER)
 
+        # No "Restart Result" panel before the click: on a fresh record there is no
+        # panel at all, and an earlier run is shown only under its own "Last restart,
+        # finished ..." heading (issue #1433), never as this click's result.
+        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
+        expect(panel).to_have_count(0)
+
         pw_page.get_by_role("button", name="Save and Restart").click()
 
         # The panel reflects the restarter's answer, which Docker gives once each
         # container has started; the container poll below is the real effect.
-        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
         expect(panel).to_be_visible(timeout=RESTART_PANEL_MS)
         expect(panel.get_by_text(expected, exact=True)).to_be_visible(timeout=10_000)
         # The errors list is red text under the Restarted line; none must render.
@@ -355,14 +363,18 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
         assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
 
         # The config service kept the run (issue #1433): the API answers the same
-        # result, and a reload of the page shows it again.
+        # result with its UTC finish time, and a reload of the page shows it again
+        # under a "Last restart, finished <local time>" heading.
         last = config_api.get("/api/config/apply/last").json()
         assert (last["state"], last["result"]) == (
             "done",
             {"restarted": allowlist, "errors": []},
         )
+        finished = datetime.fromisoformat(last["finished_at"])
+        assert finished.utcoffset() == timedelta(0)
         pw_page.reload()
-        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
-        expect(panel.get_by_text(expected, exact=True)).to_be_visible(timeout=30_000)
+        reloaded = pw_page.get_by_test_id("restart-result")
+        expect(reloaded.get_by_text(expected, exact=True)).to_be_visible(timeout=30_000)
+        expect(reloaded.locator("h3")).to_have_text(re.compile(r"^Last restart, finished "))
     finally:
         config_api.put("/api/config/settings", json={"values": baseline})

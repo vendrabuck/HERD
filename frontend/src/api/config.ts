@@ -40,15 +40,17 @@ export interface RestartResult {
 }
 
 // The config service's record of the last restart it started (GET /apply/last,
-// issue #1433): no run yet, one running, or one done with its result.
+// issue #1433): no run yet, one running, or one done with its result and the UTC
+// time it was recorded (ISO 8601 with its offset).
 export interface LastRestart {
   id: string | null;
   state: "none" | "running" | "done";
   result: RestartResult | null;
+  finished_at: string | null;
 }
 
-export async function fetchLastRestart(): Promise<LastRestart> {
-  const { data } = await configClient.get("/apply/last");
+export async function fetchLastRestart(signal?: AbortSignal): Promise<LastRestart> {
+  const { data } = await configClient.get("/apply/last", { signal });
   return data as LastRestart;
 }
 

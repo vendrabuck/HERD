@@ -17,6 +17,7 @@ import logging
 import socket
 import sys
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -284,7 +285,19 @@ async def test_apply_without_a_session_makes_no_call(async_client, restarter):
 
 # -- The last restart, read back (issue #1433) --
 
-NO_RUN = {"id": None, "state": "none", "result": None}
+NO_RUN = {"id": None, "state": "none", "result": None, "finished_at": None}
+# The record's clock in these tests (the record itself is pinned in test_restart_record.py).
+FINISHED = datetime(2026, 11, 27, 16, 51, 23, tzinfo=timezone.utc)
+FINISHED_TEXT = "2026-11-27T16:51:23+00:00"
+
+
+@pytest.fixture(autouse=True)
+def fixed_record_clock(monkeypatch):
+    import app.restart_record as restart_record
+
+    monkeypatch.setattr(
+        restart_record, "RECORD", restart_record.RestartRecord(clock=lambda: FINISHED)
+    )
 
 
 async def _last(client, headers) -> dict:
@@ -324,7 +337,7 @@ async def test_last_holds_the_finished_result_and_each_run_has_a_new_id(async_cl
     first = await async_client.post("/apply", headers=headers)
     last = await _last(async_client, headers)
     assert first.json() == GOOD
-    assert (last["state"], last["result"]) == ("done", GOOD)
+    assert (last["state"], last["result"], last["finished_at"]) == ("done", GOOD, FINISHED_TEXT)
     assert _is_run_id(last["id"])
 
     restarter.body = json.dumps({"restarted": ["auth"], "errors": []}).encode()
@@ -378,7 +391,11 @@ async def test_last_is_running_during_the_restart_and_a_second_apply_is_refused(
     pending = asyncio.create_task(async_client.post("/apply", headers=headers))
     assert await asyncio.to_thread(restarter.arrived.wait, 10)
     running = await _last(async_client, headers)
-    assert (running["state"], running["result"]) == ("running", None)
+    assert (running["state"], running["result"], running["finished_at"]) == (
+        "running",
+        None,
+        None,
+    )
     assert _is_run_id(running["id"])
 
     # A second click while the first restart runs: the in-progress entry, no second
@@ -401,6 +418,7 @@ async def test_last_is_running_during_the_restart_and_a_second_apply_is_refused(
         "id": running["id"],
         "state": "done",
         "result": first,
+        "finished_at": FINISHED_TEXT,
     }
 
 
@@ -418,7 +436,7 @@ async def test_the_result_is_recorded_when_the_request_is_cut_off(
             super().finish(run_id, result)
             finished.set()
 
-    monkeypatch.setattr(restart_record, "RECORD", SignallingRecord())
+    monkeypatch.setattr(restart_record, "RECORD", SignallingRecord(clock=lambda: FINISHED))
     restarter.hold = True
     headers = await _configured_session(async_client)
 
@@ -440,6 +458,7 @@ async def test_the_result_is_recorded_when_the_request_is_cut_off(
             "restarted": [],
             "errors": ["Cannot reach the restart service: RemoteDisconnected"],
         },
+        "finished_at": FINISHED_TEXT,
     }
 
 
@@ -458,9 +477,10 @@ async def test_a_restart_that_raises_is_recorded_as_lost_and_frees_the_next(
         with pytest.raises(RuntimeError):
             await async_client.post("/apply", headers=headers)
     lost = await _last(async_client, headers)
-    assert (lost["state"], lost["result"]) == (
+    assert (lost["state"], lost["result"], lost["finished_at"]) == (
         "done",
         {"restarted": [], "errors": ["The restart ended without a result; check service health"]},
+        FINISHED_TEXT,
     )
 
     # The run is over, so the next apply reaches the restarter again.

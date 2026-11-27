@@ -104,7 +104,12 @@ describe("config api hooks", () => {
   it("fetchLastRestart reads GET /apply/last with the bearer token (issue #1433)", async () => {
     useConfigStore.setState({ configToken: "cfg-tok" });
     let auth = "";
-    const record = { id: "e".repeat(32), state: "done", result: { restarted: ["auth"], errors: [] } };
+    const record = {
+      id: "e".repeat(32),
+      state: "done",
+      result: { restarted: ["auth"], errors: [] },
+      finished_at: "2026-11-27T16:51:23+00:00",
+    };
     server.use(
       http.get("/api/config/apply/last", ({ request }) => {
         auth = request.headers.get("authorization") ?? "";

@@ -15,8 +15,12 @@ import { useConfigStore } from "@/stores/configStore";
 import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
   answerWasLost,
+  lastRestartHeading,
+  readOnOpen,
+  readWithin,
   waitForRestart,
   RESTART_FOLLOW_LOST_TEXT,
+  RESTART_RESULT_HEADING,
   RESTART_NOT_STARTED_TEXT,
   RESTART_TIMED_OUT_TEXT,
   RESTART_UNREADABLE_TEXT,
@@ -31,7 +35,6 @@ import {
   useSaveConfigSettings,
   useApplyConfig,
   type ConfigField,
-  type LastRestart,
   type RestartResult,
 } from "@/api/config";
 
@@ -306,15 +309,23 @@ function ConfigEditor() {
 
   const [values, setValues] = useState<Record<string, string | number | boolean>>({});
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
-  const [restartResult, setRestartResult] = useState<RestartResult | null>(null);
+  // The Restart Result panel: this click's own run under RESTART_RESULT_HEADING, or a
+  // run the page did not start under a "Last restart, finished ..." heading.
+  const [restartPanel, setRestartPanel] = useState<{
+    result: RestartResult;
+    heading: string;
+  } | null>(null);
   // True while the page waits on a restart: its own Save and Restart, or one the
   // config service reports as running when the editor opens (issue #1433).
   const [awaitingRestart, setAwaitingRestart] = useState(false);
   // Aborted when the editor goes away, which ends any wait for a restart result.
   const pageLife = useRef<AbortController | null>(null);
+  // Set by the first Save and Restart click: the read made on open then neither shows
+  // nor follows anything, so one run is never reported twice.
+  const clickStarted = useRef(false);
 
-  const showRestartResult = (result: RestartResult) => {
-    setRestartResult(result);
+  const showRestartResult = (result: RestartResult, heading: string) => {
+    setRestartPanel({ result, heading });
     if (result.errors.length === 0) {
       toast.success(`Restarted ${result.restarted.length} services`);
     } else {
@@ -324,20 +335,16 @@ function ConfigEditor() {
 
   // Issue #1433: the last restart the config service started, read when the editor
   // opens, so a reload during or after a restart shows its true outcome. A finished
-  // one is shown as is; a running one is waited for, as a lost answer is.
+  // one is shown as is, labelled with its finish time; a running one is waited for,
+  // as a lost answer is.
   useEffect(() => {
     const life = new AbortController();
     pageLife.current = life;
     const follow = async () => {
-      let last: LastRestart;
-      try {
-        last = await fetchLastRestart();
-      } catch {
-        return;
-      }
-      if (life.signal.aborted) return;
+      const last = await readOnOpen(fetchLastRestart, life.signal);
+      if (!last || clickStarted.current) return;
       if (last.state === "done" && last.result) {
-        setRestartResult(last.result);
+        setRestartPanel({ result: last.result, heading: lastRestartHeading(last.finished_at) });
         return;
       }
       if (last.state !== "running") return;
@@ -346,7 +353,7 @@ function ConfigEditor() {
       if (outcome.kind === "cancelled") return;
       setAwaitingRestart(false);
       if (outcome.kind === "done") {
-        showRestartResult(outcome.result);
+        showRestartResult(outcome.result, lastRestartHeading(outcome.finishedAt));
       } else {
         toast.error(RESTART_FOLLOW_LOST_TEXT);
       }
@@ -431,19 +438,23 @@ function ConfigEditor() {
   };
 
   const handleSaveAndRestart = async () => {
+    clickStarted.current = true;
     try {
       await saveSettings.mutateAsync(values);
     } catch {
       toast.error("Failed to save or restart");
       return;
     }
+    // From here on any panel would read as this click's result: an earlier run's
+    // result must not stay up when this one fails or has no known outcome.
+    setRestartPanel(null);
     toast.success("Configuration saved, restarting services...");
     setAwaitingRestart(true);
     try {
       // The record's id before this apply, so an older run is never taken for this one.
       let priorId: string | null;
       try {
-        priorId = (await fetchLastRestart()).id;
+        priorId = (await readWithin(fetchLastRestart)).id;
       } catch {
         toast.error(RESTART_NOT_STARTED_TEXT);
         return;
@@ -468,7 +479,7 @@ function ConfigEditor() {
         }
         result = outcome.result;
       }
-      showRestartResult(result);
+      showRestartResult(result, RESTART_RESULT_HEADING);
     } finally {
       setAwaitingRestart(false);
     }
@@ -553,17 +564,20 @@ function ConfigEditor() {
         })}
       </div>
 
-      {restartResult && (
-        <div className="mt-4 bg-white rounded-xl shadow-sm border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-2">Restart Result</h3>
-          {restartResult.restarted.length > 0 && (
+      {restartPanel && (
+        <div
+          data-testid="restart-result"
+          className="mt-4 bg-white rounded-xl shadow-sm border border-gray-200 p-4"
+        >
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">{restartPanel.heading}</h3>
+          {restartPanel.result.restarted.length > 0 && (
             <p className="text-sm text-green-600">
-              Restarted: {restartResult.restarted.join(", ")}
+              Restarted: {restartPanel.result.restarted.join(", ")}
             </p>
           )}
-          {restartResult.errors.length > 0 && (
+          {restartPanel.result.errors.length > 0 && (
             <div className="text-sm text-red-600 mt-1">
-              {restartResult.errors.map((err, i) => (
+              {restartPanel.result.errors.map((err, i) => (
                 <p key={i}>{err}</p>
               ))}
             </div>
