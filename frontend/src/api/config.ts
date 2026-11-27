@@ -34,6 +34,24 @@ export interface ConfigStatus {
   password_changed: boolean;
 }
 
+export interface RestartResult {
+  restarted: string[];
+  errors: string[];
+}
+
+// The config service's record of the last restart it started (GET /apply/last,
+// issue #1433): no run yet, one running, or one done with its result.
+export interface LastRestart {
+  id: string | null;
+  state: "none" | "running" | "done";
+  result: RestartResult | null;
+}
+
+export async function fetchLastRestart(): Promise<LastRestart> {
+  const { data } = await configClient.get("/apply/last");
+  return data as LastRestart;
+}
+
 // -- Queries --
 
 export function useConfigStatus() {
@@ -111,7 +129,7 @@ export function useApplyConfig() {
   return useMutation({
     mutationFn: async () => {
       const { data } = await configClient.post("/apply");
-      return data as { restarted: string[]; errors: string[] };
+      return data as RestartResult;
     },
   });
 }

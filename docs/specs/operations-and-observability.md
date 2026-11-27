@@ -126,7 +126,8 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
 | PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23, OPS-CONFIG-31 |
-| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 |
+| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24, OPS-CONFIG-32 |
+| GET | `/apply/last` (config) | config session | 200 | OPS-CONFIG-32 |
 | POST | `/secrets` (secrets) | admin | 201 | OPS-SECRET-1, OPS-SECRET-2 |
 | GET | `/secrets` (secrets) | any signed-in user | 200 | OPS-SECRET-5 |
 | GET | `/secrets/{secret_id}` (secrets) | admin, or a `view` or `manage` grant | 200 | OPS-SECRET-6 |
@@ -487,10 +488,10 @@ config service cannot be reached, the form stays enabled and a sign-in goes to a
 usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
-`docker_ctl.py`, `config_schema.py`, `auth_rules.py`, `validation_errors.py`); the restarter,
+`docker_ctl.py`, `restart_record.py`, `config_schema.py`, `auth_rules.py`, `validation_errors.py`); the restarter,
 `infra/restarter/restarter.py`, the one HERD container that holds the Docker socket
 ([ADR 0017](../design/0017-config-restart-without-the-docker-socket.md));
-`frontend/src/pages/ConfigPage.tsx` and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
+`frontend/src/pages/ConfigPage.tsx`, `frontend/src/lib/configRestart.ts`, and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
 `identity-and-access.md` (IAM-UI-9).
 
 **Rules.**
@@ -670,13 +671,16 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Enforced in: `frontend/src/stores/configStore.ts` (`setConfigToken`, `clearConfigToken`); `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
   Pinned by: `frontend/src/test/stores/configStore.test.ts` (`setConfigToken updates the state and persists to sessionStorage`, `clearConfigToken nulls the state and removes the sessionStorage entry`); `frontend/src/test/pages/ConfigPage.test.tsx` (`renders the config login form when no token is present`, `posts the password and stores the token on success`, `toasts an error when the config login is rejected`)
 - **OPS-CONFIG-19.** Save and Restart saves, then applies, and shows the restarted
-  services and each error under "Restart Result". The browser test runs only with
-  `HERD_E2E_RESTART=1`; nightly.yml sets it in its last test step, where the test
-  asserts the panel lists exactly `RESTART_SERVICES` and no error, then that every
-  container of those services has a later start time than before the click and is
-  running and healthy within 300 seconds (issue #1326). \
-  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`); `.github/workflows/nightly.yml` (`HERD_E2E_RESTART`) \
-  Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`)
+  services and each error under "Restart Result", from the answer to `POST /apply` or,
+  when that answer is lost, from the config service's record of the run
+  (OPS-CONFIG-33). The browser test runs only with `HERD_E2E_RESTART=1`; nightly.yml
+  sets it in its last test step, with IPv6 on, where the test asserts the panel lists
+  exactly `RESTART_SERVICES` and no error, then that every container of those services
+  has a later start time than before the click and is running and healthy within 300
+  seconds (issue #1326), then that `GET /apply/last` answers that same result and the
+  panel shows it again after a page reload (issue #1433). \
+  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`, `showRestartResult`); `.github/workflows/nightly.yml` (`HERD_E2E_RESTART`) \
+  Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`); `frontend/src/test/pages/ConfigPage.test.tsx` (`shows the answered result directly when POST /apply answers`, `shows an answered result with errors as a partial failure`)
 - **OPS-CONFIG-20.** Against a running stack, a value saved in the config page reads back
   through `GET /settings`. \
   Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
@@ -810,6 +814,50 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   unencodable (a 500). Other non-ASCII text and a character outside the BMP are saved. \
   Enforced in: `services/config/app/main.py` (`update_settings`, `SETTINGS_NOT_UTF8_DETAIL`); `services/config/app/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/config/tests/test_config.py` (`test_a_lone_surrogate_is_the_fixed_422_and_writes_nothing`, `test_a_surrogate_pair_and_other_non_ascii_text_are_saved`)
+- **OPS-CONFIG-32.** The config service keeps its last restart in memory, and
+  `GET /apply/last` (a config session) answers it as `{id, state, result}`. `state` is
+  `none`, with `id` and `result` null, until the first restart this process starts;
+  `running`, with a new random 32-character lowercase hex `id` and `result` null, from
+  the moment a `POST /apply` has passed its session, rotation, and configured checks;
+  and `done` once the restart call returns, with `result` exactly what that
+  `POST /apply` answers (OPS-CONFIG-24). The worker thread that runs the restart
+  records the result itself, so it is kept when the apply request is cut off
+  mid-restart; a restart call that raises is recorded as `The restart ended without a
+  result; check service health` and the apply answers 500. A refused apply (401, 403,
+  or 400) leaves the record unchanged. While a run is `running`, another `POST /apply`
+  answers 200 `{"restarted": [], "errors": ["A restart is already in progress"]}`,
+  makes no call to the restarter, and leaves the record unchanged. The record is per
+  process: a restart of the config container itself forgets it. Before issue #1433
+  the result existed only in the answer to the one `POST /apply`. \
+  Enforced in: `services/config/app/restart_record.py` (`RestartRecord`, `RECORD`, `RESULT_LOST_ERROR`, `STATE_NONE`, `STATE_RUNNING`, `STATE_DONE`); `services/config/app/main.py` (`apply_config`, `_restart_and_record`, `last_apply`) \
+  Pinned by: `services/config/tests/test_restart_record.py` (`test_a_new_record_holds_no_run`, `test_begin_records_a_running_run_with_a_random_hex_id`, `test_begin_while_a_run_is_running_is_refused_and_keeps_that_run`, `test_finish_records_the_result_and_frees_the_next_run`, `test_every_run_gets_a_distinct_id`, `test_finish_with_a_stale_id_changes_nothing`, `test_a_second_finish_of_the_same_run_changes_nothing`, `test_the_snapshot_and_the_stored_result_are_copies`, `test_the_lost_result_wording`, `test_restart_record_imports_only_the_standard_library`); `services/config/tests/test_docker_ctl.py` (`test_last_is_no_run_before_any_restart`, `test_last_needs_a_session`, `test_last_holds_the_finished_result_and_each_run_has_a_new_id`, `test_last_records_an_error_result_as_answered`, `test_a_refused_apply_leaves_the_record`, `test_last_is_running_during_the_restart_and_a_second_apply_is_refused`, `test_the_result_is_recorded_when_the_request_is_cut_off`, `test_a_restart_that_raises_is_recorded_as_lost_and_frees_the_next`)
+- **OPS-CONFIG-33.** The config page judges Save and Restart by whether the restart
+  finished, not by whether its one `POST /apply` got an answer. After a successful save
+  it reads `GET /apply/last` for the current `id` (when that read fails it sends no
+  apply and says `The restart did not start; try Save and Restart again`), then sends
+  `POST /apply`. An answer from the config service decides: a 200 is shown as
+  OPS-CONFIG-19 says, any other status is `Failed to save or restart`. A lost answer is
+  not a failure: no response at all (a restart on a Linux Docker host aborts the
+  requests of a browser on that host with `ERR_NETWORK_CHANGED`), or a 502, 503, or 504
+  whose body has no string `detail` (every refusal of the config service carries one).
+  The page then reads `GET /apply/last` every 2 seconds and shows the result of the
+  first run whose `id` differs from the one read before, once it is `done`, exactly as
+  an answered result. A read that is itself lost is retried; the wait ends with
+  `The restart did not start; try Save and Restart again` when a read that answered
+  still shows no new run 10 seconds or more after the wait began, with `The connection
+  dropped during the restart and its result could not be read; check service health`
+  when the config service refuses a read, and with `The connection dropped during the
+  restart and no result arrived in time; check service health` after 750 seconds, above
+  the config service's own 720 second wait (OPS-CONFIG-28). Save and Restart stays
+  disabled, reading `Restarting...`, while the page waits. When the editor opens it
+  reads `GET /apply/last` once: a `done` run's result is shown under "Restart Result"
+  with no toast, a `running` one is waited for the same way (ending with `The restart
+  that was running did not report a result; check service health` when no result
+  comes), and nothing is shown for `none` or a failed read, so a reload during or after
+  a restart shows its outcome. Before issue #1433 any failure of the one request was
+  `Failed to save or restart` and nothing could show the result afterward. \
+  Enforced in: `frontend/src/lib/configRestart.ts` (`answerWasLost`, `waitForRestart`, `RESTART_POLL_INTERVAL_MS`, `RESTART_NOT_STARTED_GRACE_MS`, `RESTART_WAIT_MS`, `RESTART_NOT_STARTED_TEXT`, `RESTART_TIMED_OUT_TEXT`, `RESTART_UNREADABLE_TEXT`, `RESTART_FOLLOW_LOST_TEXT`); `frontend/src/api/config.ts` (`fetchLastRestart`); `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`, `reportLostAnswer`, `awaitingRestart`) \
+  Pinned by: `frontend/src/test/lib/configRestart.test.ts` (`answerWasLost (issue #1433)`, `waitForRestart (issue #1433)`); `frontend/src/test/pages/ConfigPage.test.tsx` (`ConfigPage Save and Restart outcome (issue #1433)`, `ConfigPage last restart on open (issue #1433)`); `frontend/src/test/api/config.test.tsx` (`fetchLastRestart reads GET /apply/last with the bearer token (issue #1433)`); `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).

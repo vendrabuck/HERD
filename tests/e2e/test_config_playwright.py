@@ -314,7 +314,12 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
     RESTART_HEALTHY_SECONDS every one of those containers has a StartedAt later
     than before the click (it was restarted) and is running and healthy, else the
     test fails naming each service that did not return and why; the saved value
-    reads back through the config API.
+    reads back through the config API; GET /api/config/apply/last answers the same
+    finished result, and the panel shows it again after a page reload (issue #1433).
+
+    On the Docker host the restart can cut the page's POST /apply off
+    (ERR_NETWORK_CHANGED); the page then reads the result from GET /apply/last, so
+    the panel assertions hold on either path.
     """
     allowlist = _restart_allowlist()
     expected = "Restarted: " + ", ".join(allowlist)
@@ -348,5 +353,16 @@ def test_config_save_and_restart_gated(pw_page, config_api, preserve_precedence_
 
         saved = config_api.get("/api/config/settings").json()["values"]
         assert saved["LDAP_USER_FILTER"] == SENTINEL_FILTER
+
+        # The config service kept the run (issue #1433): the API answers the same
+        # result, and a reload of the page shows it again.
+        last = config_api.get("/api/config/apply/last").json()
+        assert (last["state"], last["result"]) == (
+            "done",
+            {"restarted": allowlist, "errors": []},
+        )
+        pw_page.reload()
+        panel = pw_page.locator("div", has=pw_page.get_by_text("Restart Result", exact=True)).last
+        expect(panel.get_by_text(expected, exact=True)).to_be_visible(timeout=30_000)
     finally:
         config_api.put("/api/config/settings", json={"values": baseline})

@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 
 import { server } from "../mocks/server";
 import {
+  fetchLastRestart,
   useConfigStatus,
   useConfigSchema,
   useConfigLogin,
@@ -98,5 +99,19 @@ describe("config api hooks", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(auth).toBe("Bearer cfg-tok");
     expect(result.current.data?.restarted).toEqual(["auth"]);
+  });
+
+  it("fetchLastRestart reads GET /apply/last with the bearer token (issue #1433)", async () => {
+    useConfigStore.setState({ configToken: "cfg-tok" });
+    let auth = "";
+    const record = { id: "e".repeat(32), state: "done", result: { restarted: ["auth"], errors: [] } };
+    server.use(
+      http.get("/api/config/apply/last", ({ request }) => {
+        auth = request.headers.get("authorization") ?? "";
+        return HttpResponse.json(record);
+      }),
+    );
+    expect(await fetchLastRestart()).toEqual(record);
+    expect(auth).toBe("Bearer cfg-tok");
   });
 });

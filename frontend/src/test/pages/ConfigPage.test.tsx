@@ -385,3 +385,332 @@ describe("ConfigPage change password (issue #1452)", () => {
     expect(toastError).toHaveBeenCalledTimes(1);
   });
 });
+
+// Issue #1433: Save and Restart's verdict comes from whether the restart finished,
+// not from whether the one POST /apply survived the network change the restart
+// itself causes. A lost answer (no response, or a 502, 503, or 504 from the gateway)
+// is followed by reads of GET /apply/last; a refusal from the config service is a
+// failure at once.
+describe("ConfigPage Save and Restart outcome (issue #1433)", () => {
+  const OLD = "a".repeat(32);
+  const NEW = "b".repeat(32);
+  const GOOD = { restarted: ["acl", "auth"], errors: [] };
+  const PARTIAL = { restarted: ["auth"], errors: ["Failed to restart acl: DockerAPIError"] };
+  type Last = { id: string | null; state: string; result: unknown };
+  const done = (id: string, result: unknown): Last => ({ id, state: "done", result });
+  const running = (id: string): Last => ({ id, state: "running", result: null });
+  const NO_RUN: Last = { id: null, state: "none", result: null };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The editor's backend. `lasts` answers GET /apply/last in turn (the last one
+   * repeats); each entry is a record, or a Response for a refused or lost read.
+   */
+  function stack({
+    lasts,
+    apply,
+    save = () => HttpResponse.json({ message: "Configuration saved" }),
+  }: {
+    lasts: (Last | (() => Response))[];
+    apply: () => Response;
+    save?: () => Response;
+  }) {
+    const calls = { last: 0, apply: 0, save: 0 };
+    server.use(
+      http.get("/api/config/status", () =>
+        HttpResponse.json({ configured: true, password_changed: true }),
+      ),
+      http.get("/api/config/schema", () =>
+        HttpResponse.json({
+          fields: [
+            {
+              key: "LOG_LEVEL",
+              label: "Log level",
+              type: "string",
+              required: false,
+              group: "General",
+              secret: false,
+              description: "",
+            },
+          ],
+        }),
+      ),
+      http.get("/api/config/settings", () => HttpResponse.json({ values: { LOG_LEVEL: "INFO" } })),
+      http.put("/api/config/settings", () => {
+        calls.save += 1;
+        return save();
+      }),
+      http.get("/api/config/apply/last", () => {
+        const step = lasts[Math.min(calls.last, lasts.length - 1)];
+        calls.last += 1;
+        return typeof step === "function" ? step() : HttpResponse.json(step);
+      }),
+      http.post("/api/config/apply", () => {
+        calls.apply += 1;
+        return apply();
+      }),
+    );
+    useConfigStore.getState().setConfigToken("ct");
+    renderWithProviders(<ConfigPage />);
+    return calls;
+  }
+
+  async function clickSaveAndRestart(calls: { last: number }) {
+    const button = await screen.findByRole("button", { name: "Save and Restart" });
+    // The editor's own read of the last restart on open comes first.
+    await waitFor(() => expect(calls.last).toBeGreaterThanOrEqual(1));
+    fireEvent.click(button);
+  }
+
+  function panelText(): string | null {
+    const heading = screen.queryByText("Restart Result", { exact: true });
+    return heading ? (heading.parentElement as HTMLElement).textContent : null;
+  }
+
+  const lostAnswer = () => HttpResponse.error();
+  const gateway = (status: number) => () =>
+    new HttpResponse("Bad Gateway", { status, headers: { "Content-Type": "text/plain" } });
+
+  it("shows the answered result directly when POST /apply answers", async () => {
+    const calls = stack({ lasts: [NO_RUN], apply: () => HttpResponse.json(GOOD) });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Restarted 2 services"));
+    expect(panelText()).toContain("Restarted: acl, auth");
+    // The read on open plus the read before the apply; no poll.
+    expect(calls.last).toBe(2);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("shows an answered result with errors as a partial failure", async () => {
+    const calls = stack({ lasts: [NO_RUN], apply: () => HttpResponse.json(PARTIAL) });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Some services failed to restart"));
+    expect(panelText()).toContain("Failed to restart acl: DockerAPIError");
+  });
+
+  it.each([
+    ["a network error (ERR_NETWORK_CHANGED)", lostAnswer],
+    ["a 502 from the gateway", gateway(502)],
+    ["a 503 from the gateway", gateway(503)],
+    ["a 504 from the gateway", gateway(504)],
+  ])("reads the record after %s and shows the finished run", async (_name, apply) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({
+      lasts: [done(OLD, PARTIAL), done(OLD, PARTIAL), running(NEW), lostAnswer, done(NEW, GOOD)],
+      apply,
+    });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(calls.apply).toBe(1));
+    await vi.advanceTimersByTimeAsync(3 * 2_000);
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Restarted 2 services"));
+    expect(panelText()).toContain("Restarted: acl, auth");
+    expect(panelText()).not.toContain("DockerAPIError");
+    expect(toastError).not.toHaveBeenCalled();
+    expect(calls.apply).toBe(1);
+  });
+
+  it("reports a finished run's errors after a lost answer", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({ lasts: [NO_RUN, NO_RUN, done(NEW, PARTIAL)], apply: lostAnswer });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Some services failed to restart"));
+    expect(panelText()).toContain("Failed to restart acl: DockerAPIError");
+  });
+
+  it("keeps Save and Restart disabled while it waits for the result", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({ lasts: [NO_RUN, NO_RUN, running(NEW)], apply: lostAnswer });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(calls.last).toBeGreaterThanOrEqual(3));
+    const button = screen.getByRole("button", { name: "Restarting..." });
+    expect(button).toBeDisabled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["400 No configuration to apply", 400, { detail: "No configuration to apply" }],
+    [
+      "403 rotate first",
+      403,
+      { detail: "Change the config password before modifying or applying configuration" },
+    ],
+    ["401", 401, { detail: "Not authenticated" }],
+    [
+      "config's own 503",
+      503,
+      { detail: "The config password store is unusable; the config service log names the cause" },
+    ],
+    ["500", 500, { detail: "Internal Server Error" }],
+  ])("fails at once on a refusal from the config service: %s", async (_name, status, body) => {
+    const calls = stack({ lasts: [NO_RUN], apply: () => HttpResponse.json(body, { status }) });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Failed to save or restart"));
+    expect(calls.last).toBe(2);
+    expect(panelText()).toBeNull();
+    expect(screen.getByRole("button", { name: "Save and Restart" })).toBeEnabled();
+  });
+
+  it("fails without an apply when the save is refused", async () => {
+    const calls = stack({
+      lasts: [NO_RUN],
+      apply: () => HttpResponse.json(GOOD),
+      save: () =>
+        HttpResponse.json({ detail: { errors: ["LOG_LEVEL is required"] } }, { status: 422 }),
+    });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Failed to save or restart"));
+    expect(calls.apply).toBe(0);
+  });
+
+  it("says the restart did not start, and sends no apply, when the record cannot be read first", async () => {
+    const calls = stack({ lasts: [NO_RUN, lostAnswer], apply: () => HttpResponse.json(GOOD) });
+    await clickSaveAndRestart(calls);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "The restart did not start; try Save and Restart again",
+      ),
+    );
+    expect(calls.apply).toBe(0);
+    expect(screen.getByRole("button", { name: "Save and Restart" })).toBeEnabled();
+  });
+
+  it("says the restart did not start when the record never shows a new run", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({ lasts: [done(OLD, GOOD)], apply: lostAnswer });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(calls.apply).toBe(1));
+    await vi.advanceTimersByTimeAsync(12_000);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "The restart did not start; try Save and Restart again",
+      ),
+    );
+    // The earlier run's result is shown from the read on open, never announced as this one.
+    expect(toastSuccess).not.toHaveBeenCalledWith("Restarted 2 services");
+  });
+
+  it("reports an unknown outcome when the record cannot be read", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({
+      lasts: [
+        NO_RUN,
+        NO_RUN,
+        running(NEW),
+        () => HttpResponse.json({ detail: "Invalid token" }, { status: 401 }),
+      ],
+      apply: lostAnswer,
+    });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(calls.apply).toBe(1));
+    await vi.advanceTimersByTimeAsync(2 * 2_000);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "The connection dropped during the restart and its result could not be read; check service health",
+      ),
+    );
+    expect(panelText()).toBeNull();
+  });
+
+  it("reports an unknown outcome when no result arrives within the wait", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = stack({ lasts: [NO_RUN, NO_RUN, running(NEW)], apply: lostAnswer });
+    await clickSaveAndRestart(calls);
+    await waitFor(() => expect(calls.apply).toBe(1));
+    await vi.advanceTimersByTimeAsync(752_000);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "The connection dropped during the restart and no result arrived in time; check service health",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Save and Restart" })).toBeEnabled();
+    expect(panelText()).toBeNull();
+  });
+});
+
+// Issue #1433: a reload during or after a restart shows its true outcome.
+describe("ConfigPage last restart on open (issue #1433)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function openEditor(lasts: (object | (() => Response))[]) {
+    let reads = 0;
+    server.use(
+      http.get("/api/config/status", () =>
+        HttpResponse.json({ configured: true, password_changed: true }),
+      ),
+      http.get("/api/config/schema", () => HttpResponse.json({ fields: [] })),
+      http.get("/api/config/settings", () => HttpResponse.json({ values: {} })),
+      http.get("/api/config/apply/last", () => {
+        const step = lasts[Math.min(reads, lasts.length - 1)];
+        reads += 1;
+        return typeof step === "function" ? step() : HttpResponse.json(step);
+      }),
+    );
+    useConfigStore.getState().setConfigToken("ct");
+    renderWithProviders(<ConfigPage />);
+    return () => reads;
+  }
+
+  it("shows a finished restart's result without announcing it again", async () => {
+    openEditor([
+      { id: "c".repeat(32), state: "done", result: { restarted: ["auth"], errors: ["x failed"] } },
+    ]);
+    expect(await screen.findByText("Restart Result")).toBeInTheDocument();
+    expect(screen.getByText("Restarted: auth")).toBeInTheDocument();
+    expect(screen.getByText("x failed")).toBeInTheDocument();
+    expect(toastSuccess).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("shows nothing when no restart was recorded", async () => {
+    const reads = openEditor([{ id: null, state: "none", result: null }]);
+    await screen.findByRole("button", { name: "Save and Restart" });
+    await waitFor(() => expect(reads()).toBe(1));
+    expect(screen.queryByText("Restart Result")).toBeNull();
+  });
+
+  it("shows nothing and stays usable when the record cannot be read", async () => {
+    const reads = openEditor([() => HttpResponse.error()]);
+    await waitFor(() => expect(reads()).toBe(1));
+    expect(await screen.findByRole("button", { name: "Save and Restart" })).toBeEnabled();
+    expect(screen.queryByText("Restart Result")).toBeNull();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("waits for a running restart and then shows its result", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const id = "d".repeat(32);
+    openEditor([
+      { id, state: "running", result: null },
+      { id, state: "running", result: null },
+      { id, state: "done", result: { restarted: ["acl"], errors: [] } },
+    ]);
+    expect(await screen.findByRole("button", { name: "Restarting..." })).toBeDisabled();
+    await vi.advanceTimersByTimeAsync(2 * 2_000);
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalledWith("Restarted 1 services"));
+    expect(screen.getByText("Restarted: acl")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save and Restart" })).toBeEnabled();
+  });
+
+  it("says so when a running restart ends without a result to show", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const id = "d".repeat(32);
+    openEditor([
+      { id, state: "running", result: null },
+      { id, state: "running", result: null },
+      () => HttpResponse.json({ detail: "Invalid token" }, { status: 401 }),
+    ]);
+    await screen.findByRole("button", { name: "Restarting..." });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await waitFor(() =>
+      expect(toastError).toHaveBeenCalledWith(
+        "The restart that was running did not report a result; check service health",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Save and Restart" })).toBeEnabled();
+  });
+});
