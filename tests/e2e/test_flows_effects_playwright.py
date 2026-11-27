@@ -340,6 +340,72 @@ def test_bulk_topology_import_dialog_dry_run_then_commit(pw_page):
 
 
 # ---------------------------------------------------------------------------
+# issue #1575: a refused import shows the server's reason inside the dialog
+# ---------------------------------------------------------------------------
+
+
+def _unreadable_import(name: str) -> tuple[bytes, str]:
+    """A JSON file cut off mid-document that still names `name`, and the 422 detail.
+
+    The importers answer `Invalid JSON: <decoder message>` with the stdlib
+    decoder's own message, so the expected text is computed the same way here
+    rather than hand-written. The name is in the file so the read-back has
+    something specific to look for.
+    """
+    text = json.dumps([{"name": name}])[:-2]
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        return text.encode(), f"Invalid JSON: {exc}"
+    raise AssertionError("the truncated document parsed; the test file is wrong")
+
+
+def _import_unreadable_file(page, path: str, label: str, name: str) -> None:
+    """Open the import dialog on `path`, commit the cut-off file, assert the reason."""
+    file_bytes, expected = _unreadable_import(name)
+    page.goto(f"{HOST_BASE_URL}{path}")
+    import_btn = page.get_by_role("button", name="Import", exact=True)
+    expect(import_btn).to_be_visible()
+    import_btn.click()
+
+    dialog = page.locator("dialog[open]")
+    expect(dialog.get_by_text(f"Import {label}")).to_be_visible()
+    page.set_input_files(
+        "#bulk-file",
+        files=[{"name": f"{label}-bad.json", "mimeType": "application/json", "buffer": file_bytes}],
+    )
+    # Import now, not a dry run: even a committed run of a refused file writes nothing.
+    dialog.get_by_role("button", name="Import now", exact=True).click()
+    expect(dialog.get_by_role("alert")).to_have_text(expected)
+    # No report: the server refused the file before judging any row.
+    expect(dialog.locator('[role="status"]')).to_have_count(0)
+
+
+def test_bulk_device_import_dialog_shows_the_servers_reason_for_a_refused_file(pw_page):
+    pw_login(pw_page)
+    device_name = f"pw-bulk-bad-dev-{uuid.uuid4().hex[:8]}"
+    _import_unreadable_file(pw_page, "/inventory", "devices", device_name)
+
+    found = _api(
+        pw_page, "GET", "/inventory/devices", params={"search": device_name, "limit": 50}
+    ).json()["items"]
+    assert not any(d["name"] == device_name for d in found), (
+        "a refused import must not create the device it names"
+    )
+
+
+def test_bulk_topology_import_dialog_shows_the_servers_reason_for_a_refused_file(pw_page):
+    pw_login(pw_page)
+    topo_name = f"pw-bulk-bad-topo-{uuid.uuid4().hex[:8]}"
+    _import_unreadable_file(pw_page, "/topology", "topologies", topo_name)
+
+    items = _api(pw_page, "GET", "/cabling/topologies", params={"limit": 500}).json()["items"]
+    assert not any(t["name"] == topo_name for t in items), (
+        "a refused import must not create the topology it names"
+    )
+
+
+# ---------------------------------------------------------------------------
 # item 7: device config-version cycle
 # ---------------------------------------------------------------------------
 

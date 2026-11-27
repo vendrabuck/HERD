@@ -1,4 +1,6 @@
+import time
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from app.services import event_router
@@ -239,3 +241,126 @@ async def test_other_unrendered_reservation_events_are_still_skipped():
     for name in ("reservation.provision_requested", "reservation.wiring_changed"):
         event = {"event": name, "reservation_id": "r1", "user_id": _user(), "device_ids": []}
         assert await event_router.build_messages(event) == []
+
+
+# Issue #1564: every time printed with the label UTC is the UTC instant the event's
+# end_time names, whatever offset it carried. Each row is (input, rendered).
+_END_TIME_RENDERINGS = [
+    ("2026-11-25T18:00:00+00:00", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T18:00:00Z", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T18:00:00-00:00", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T10:00:00-08:00", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T23:45:00+05:45", "2026-11-25 18:00 UTC"),
+    # Offsets whose conversion crosses a date, month, or year boundary.
+    ("2026-11-26T03:00:00+09:00", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T20:00:00-05:30", "2026-11-26 01:30 UTC"),
+    ("2026-12-31T19:00:00-05:00", "2027-01-01 00:00 UTC"),
+    ("2027-01-01T08:00:00+14:00", "2026-12-31 18:00 UTC"),
+    # Fractional seconds are dropped, not rounded, before and after conversion.
+    ("2026-11-25T09:59:59.999999-08:00", "2026-11-25 17:59 UTC"),
+    ("2026-11-25T18:00:30.5Z", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T18:59:59.999+01:00", "2026-11-25 17:59 UTC"),
+    # Naive values are taken as UTC.
+    ("2026-11-25T18:00:00", "2026-11-25 18:00 UTC"),
+    ("2026-11-25T18:00:00.123456", "2026-11-25 18:00 UTC"),
+    ("2026-11-25", "2026-11-25 00:00 UTC"),
+]
+
+
+@pytest.mark.parametrize(("end_time", "expected"), _END_TIME_RENDERINGS)
+def test_format_end_time_renders_the_utc_instant(end_time, expected):
+    assert event_router._format_end_time(end_time) == expected
+
+
+@pytest.fixture
+def host_zone_far_from_utc(monkeypatch):
+    """Run with the process's local zone at a fixed -12:00 (POSIX TZ, no zone files)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX only")
+    monkeypatch.setenv("TZ", "XST12")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.parametrize(("end_time", "expected"), _END_TIME_RENDERINGS)
+def test_format_end_time_ignores_the_host_zone(host_zone_far_from_utc, end_time, expected):
+    """A naive value is UTC, never the process's local zone (which astimezone assumes)."""
+    assert datetime(2031, 1, 1).astimezone(UTC).hour == 12  # the fixture took effect
+    assert event_router._format_end_time(end_time) == expected
+
+
+@pytest.mark.parametrize(
+    "end_time",
+    [
+        "not-a-time",
+        "Zulu",
+        "2026-13-01T00:00:00Z",
+        "2026-11-25T25:00:00+00:00",
+        "2026-11-25T18:00:00+24:00",
+        # Whitespace is not stripped before parsing, and a long value is not cut.
+        " 2026-11-25T18:00:00Z ",
+        "the end time could not be read from this event payload at all",
+        # Parseable, but the instant has no UTC equivalent (before year 1, after 9999).
+        "0001-01-01T00:00:00+05:00",
+        "9999-12-31T23:00:00-05:00",
+    ],
+)
+def test_format_end_time_returns_an_unusable_string_unchanged(end_time):
+    assert event_router._format_end_time(end_time) == end_time
+
+
+@pytest.mark.parametrize("end_time", [None, "", 1764093600, 0, ["2026-11-25T18:00:00Z"], {}])
+def test_format_end_time_missing_or_non_string_is_unknown_end(end_time):
+    assert event_router._format_end_time(end_time) == "unknown end"
+
+
+def _end_time_event(event_type: str, end_time) -> dict:
+    """An event of `event_type` that renders its end time, carrying `end_time`."""
+    event = {
+        "event": event_type,
+        "reservation_id": str(uuid.uuid4()),
+        "user_id": _user(),
+        "device_ids": [str(uuid.uuid4())],
+        "end_time": end_time,
+    }
+    if event_type == "reservation.updated":
+        event.update(added_device_ids=[], removed_device_ids=[], end_time_changed=True)
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "body"),
+    [
+        (
+            "reservation.created",
+            "Reservation for 1 device is active until 2026-11-25 18:00 UTC.",
+        ),
+        ("reservation.updated", "Reservation updated: ends 2026-11-25 18:00 UTC"),
+        (
+            "reservation.expiring_soon",
+            "Reservation for 1 device ends at 2026-11-25 18:00 UTC.",
+        ),
+    ],
+)
+@pytest.mark.parametrize("end_time", ["2026-11-25T10:00:00-08:00", "2026-11-26T03:00:00+09:00"])
+async def test_every_end_time_message_states_the_utc_instant(event_type, body, end_time):
+    """Issue #1564: each renderer that prints the end time prints the UTC instant."""
+    messages = await event_router.build_messages(_end_time_event(event_type, end_time))
+    assert len(messages) == 1
+    assert messages[0].body == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type", ["reservation.created", "reservation.updated", "reservation.expiring_soon"]
+)
+@pytest.mark.parametrize("end_time", ["0001-01-01T00:00:00+05:00", 1764093600])
+async def test_unusable_end_time_still_notifies(event_type, end_time):
+    """A value the formatter cannot convert never raises out of build_messages."""
+    messages = await event_router.build_messages(_end_time_event(event_type, end_time))
+    assert len(messages) == 1
+    expected = end_time if isinstance(end_time, str) else "unknown end"
+    assert expected in messages[0].body

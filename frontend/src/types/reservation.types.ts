@@ -306,9 +306,12 @@ export interface ForkPortConflict {
 }
 
 // The structured detail of a cross-reservation port-claim 409 (ADR 0006
-// Decision 4), relayed verbatim through reservations from cabling.
+// Decision 4), relayed verbatim through reservations from cabling. Cabling
+// always sends `message`; `forkConflictDetail` also accepts a body without it
+// (the dialog then shows its own sentence) and refuses one where it is not a
+// string (issue #1406).
 export interface ForkConflictDetail {
-  message: string;
+  message?: string;
   conflicts: ForkPortConflict[];
 }
 

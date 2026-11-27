@@ -142,9 +142,24 @@ function renderPage() {
   );
 }
 
+// Issue #1566: the editor ignores a drop, a connection, and an AI proposal
+// until its own canvas load has landed (`canvasReady`, issue #1315). That flag
+// flips in a promise callback AFTER the render that first shows the topology's
+// name and the canvas, so a test that acts as soon as either appears races the
+// flip: on a slow runner the event reaches the handler while it still reads
+// false and is dropped, and a later wait for its effect times out. The
+// "Loading canvas..." cover is rendered exactly while the flag is false, so its
+// removal is the condition to wait for.
+async function waitForCanvasReady() {
+  await waitFor(() => expect(screen.queryByText("Loading canvas...")).not.toBeInTheDocument());
+}
+
 async function renderPageWithCanvas(nodes: Node<CanvasNodeData>[]) {
   const view = renderPage();
   await screen.findByText("Parent topology");
+  // Seeding the store before the load lands would also race the load's own
+  // clear of the store.
+  await waitForCanvasReady();
   act(() => {
     useTopologyStore.setState({ nodes, edges: [], selectedEdgeLayer: "L2" });
   });
@@ -157,6 +172,21 @@ function dropDevice(payload: string) {
       getData: (type: string) => (type === "application/herd-device" ? payload : ""),
     },
   });
+}
+
+// A device dropped after a drop that must add nothing: its node is the sign
+// that the earlier drop has been handled.
+const SENTINEL_DEVICE = JSON.stringify({
+  id: "d-sentinel",
+  name: "sentinel",
+  topology_type: "PHYSICAL",
+  status: "AVAILABLE",
+});
+
+function nodeDeviceIds(): string[] {
+  return useTopologyStore
+    .getState()
+    .nodes.map((n) => (n.data as { device?: { id?: string } }).device?.id ?? "");
 }
 
 beforeAll(() => {
@@ -185,6 +215,7 @@ describe("TopologyEditorPage plain device drag-drop", () => {
     server.use(...baseHandlers());
     renderPage();
     await screen.findByTestId("react-flow");
+    await waitForCanvasReady();
 
     const payload = JSON.stringify({
       id: "d-new",
@@ -213,23 +244,28 @@ describe("TopologyEditorPage plain device drag-drop", () => {
       status: "AVAILABLE",
     });
     dropDevice(payload);
+    // A drop is handled synchronously and in order, so once a later drop of
+    // another device has landed, the duplicate drop above has been handled
+    // too; waiting for it replaces a fixed delay that proved nothing.
+    dropDevice(SENTINEL_DEVICE);
+    await waitFor(() => expect(nodeDeviceIds()).toContain("d-sentinel"));
 
-    // Give any (incorrect) async add a tick to land, then assert nothing changed.
-    await new Promise((r) => setTimeout(r, 0));
-    expect(useTopologyStore.getState().nodes).toHaveLength(1);
+    expect(nodeDeviceIds()).toEqual(["d-existing", "d-sentinel"]);
   });
 
   it("a drop with no device/template/element payload is a no-op", async () => {
     server.use(...baseHandlers());
     renderPage();
     await screen.findByTestId("react-flow");
+    await waitForCanvasReady();
 
     fireEvent.drop(screen.getByTestId("react-flow"), {
       dataTransfer: { getData: () => "" },
     });
+    dropDevice(SENTINEL_DEVICE);
+    await waitFor(() => expect(nodeDeviceIds()).toContain("d-sentinel"));
 
-    await new Promise((r) => setTimeout(r, 0));
-    expect(useTopologyStore.getState().nodes).toHaveLength(0);
+    expect(nodeDeviceIds()).toEqual(["d-sentinel"]);
   });
 });
 
