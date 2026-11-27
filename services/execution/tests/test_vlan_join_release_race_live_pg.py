@@ -1320,3 +1320,106 @@ async def test_a_stale_build_park_waiting_on_a_release_never_rewrites_the_releas
     finally:
         await pending.settle()
         await _cleanup(session_factory, h)
+
+
+async def test_a_join_waiting_on_a_release_of_a_frozen_holders_row_never_rewrites_it(
+    session_factory, pg_engine, tagged, pending
+):
+    """Two sessions, staged (issue #1413, the frozen-holder park of #479). R, the release
+    after a removal of a frozen holder reservation's ACTIVE membership on the port,
+    holds that row FOR UPDATE and is stopped before its commit. J, this reservation's
+    join on the same port, reads the other reservations' ACTIVE rows on the port FOR
+    UPDATE and is seen waiting. R commits the row RELEASED; J's read then re-checks
+    `status = ACTIVE` on the row as committed and skips it: the RELEASED row is not
+    rewritten FAILED, and J records its own membership ACTIVE. Every other foreign row
+    is unchanged."""
+    from app.models.reservation_wiring_state import ReservationWiringState
+    from app.services.l2_membership_service import release_l2_membership
+
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    holder = uuid.uuid4()
+    vlan_id, holder_vlan = await _free_vlan_numbers(session_factory, 2)
+    try:
+        alloc = await _seed(session_factory, h, vlan_id, scope=[switch], defined=[switch])
+        async with session_factory() as s:
+            holder_alloc = VlanAssignment(
+                reservation_id=holder,
+                fabric_id=uuid.uuid4(),
+                vlan_id=holder_vlan,
+                switch_device_ids=[switch],
+                defined_switch_ids=[],
+                status="ACTIVE",
+            )
+            s.add(holder_alloc)
+            await s.flush()
+            holder_row = L2PortAssignment(
+                reservation_id=holder,
+                vlan_assignment_id=holder_alloc.id,
+                switch_device_id=uuid.UUID(switch),
+                port="0/0/1",
+                intended="ACTIVE",
+                status="ACTIVE",
+            )
+            s.add(holder_row)
+            s.add(ReservationWiringState(reservation_id=holder, frozen=True))
+            await s.commit()
+            holder_alloc_id, holder_row_id = holder_alloc.id, holder_row.id
+
+        def _others(snapshot):
+            allocations, memberships = snapshot
+            return (
+                [row for row in allocations if row[1] != holder],
+                [row for row in memberships if row[1] != holder],
+            )
+
+        before = _others(await _foreign_snapshot(session_factory, h))
+        gate = pending.gate(flush_first=False)
+        release_engine, _ = tagged("holderrelease")
+        join_engine, join_app = tagged("join")
+        joined: list = []
+
+        async def _release():
+            async with _gated_maker(release_engine, gate)() as s:
+                await release_l2_membership(
+                    s, holder, switch, "0/0/1", expected_vlan_assignment_id=holder_alloc_id
+                )
+
+        async def _join():
+            async with async_sessionmaker(join_engine, expire_on_commit=False)() as s:
+                joined.append(
+                    await record_l2_membership_active(s, h.reservation, alloc, switch, "0/0/1")
+                )
+
+        release = pending.task(_release())
+        await asyncio.wait_for(gate.inside.wait(), COORDINATION_TIMEOUT)
+        join = pending.task(_join())
+        waited = await _seen_waiting(pg_engine, join_app, join)
+        release_was_holding = not gate.returned
+        gate.proceed.set()
+        await asyncio.wait_for(asyncio.gather(release, join), COORDINATION_TIMEOUT)
+        assert waited and release_was_holding
+
+        async with session_factory() as s:
+            held = await s.get(L2PortAssignment, holder_row_id)
+        assert (held.status, held.intended, held.last_error, held.attempts) == (
+            "RELEASED",
+            "RELEASED",
+            None,
+            0,
+        )
+        assert held.released_at is not None
+        assert joined and joined[0] is not None
+        assert (joined[0].status, joined[0].vlan_assignment_id) == ("ACTIVE", alloc)
+        assert _others(await _foreign_snapshot(session_factory, h)) == before
+        allocations = await _own_allocations(session_factory, h)
+        for m in await _own_memberships(session_factory, h):
+            if m.status == "ACTIVE":
+                assert allocations[m.vlan_assignment_id].status == "ACTIVE"
+    finally:
+        await pending.settle()
+        async with session_factory() as s:
+            for model in (L2PortAssignment, VlanAssignment, ReservationWiringState):
+                await s.execute(delete(model).where(model.reservation_id == holder))
+            await s.commit()
+        await _cleanup(session_factory, h)

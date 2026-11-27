@@ -264,6 +264,33 @@ async def _find_reusable_failed(
     return result.scalars().first()
 
 
+def _log_frozen_join_undo_failed(
+    res_uuid: uuid.UUID,
+    switch_uuid: uuid.UUID,
+    port: str,
+    vlan_uuid: uuid.UUID,
+    error_class: str | None,
+) -> None:
+    """One ERROR line for a frozen join's undo that did not remove its add (issue
+    #1413): it answered False (`error_class` None) or ended by an exception, named by
+    its class only."""
+    logger.error(
+        "Undo of the frozen join of reservation %s on switch %s port %s failed%s; "
+        "the port stays in allocation %s's number with no row naming it",
+        res_uuid,
+        switch_uuid,
+        port,
+        f" ({error_class})" if error_class else "",
+        vlan_uuid,
+        extra={
+            "action": "l2_frozen_join_undo_failed",
+            "error_class": error_class,
+            "reservation_id": str(res_uuid),
+            "vlan_assignment_id": str(vlan_uuid),
+        },
+    )
+
+
 async def record_l2_membership_active(
     db: AsyncSession,
     reservation_id: uuid.UUID | str,
@@ -312,22 +339,25 @@ async def record_l2_membership_active(
     retry channel's, used only for that failure write (the row-identity
     compare-and-swap of WIRE-LEDGER-8); the reconcile passes neither and the write is
     the key-based upsert. The returned row is that failure write's. The existing-ACTIVE
-    short-circuit and the frozen park above take no lock: neither writes an ACTIVE row.
+    short-circuit and the frozen park above take no allocation lock: neither writes an
+    ACTIVE row. The frozen-holder park of issue #479 reads the other reservations'
+    ACTIVE rows on the port FOR UPDATE, before any allocation lock.
 
     The FAILED flip never takes a row that owes a lost join's undo
     (JOIN_UNDO_PENDING_REMOVAL): moving it to this join's allocation would leave the old
     number untracked. Such a flip is refused like a lost compare-and-swap and the
     row is returned as it is; the apply does not drive an add for such a port at all
-    (membership_owes_undo). The frozen park leaves such a row as it is too: its one
-    UPDATE matches the row only while it is FAILED and owes nothing, since the owed
-    number is a RELEASED one, while this join's number is the reservation's own
-    allocation, which is not handed out before its release. On a miss the row is read
-    again: gone (released since it was read), a fresh FROZEN_JOIN_PENDING_REMOVAL row
-    records this join; still there (it owes a removal, or another pass recorded it
-    ACTIVE), it is left as it is, one line is logged (`l2_frozen_join_left_owed_row` or
+    (membership_owes_undo). The frozen park leaves such a row as it is too, and also a
+    row an earlier frozen join parked (FROZEN_JOIN_PENDING_REMOVAL): its one UPDATE
+    matches the row only while it is FAILED and is not parked for an add known to have
+    landed on its own number. On a miss the row is read again, refreshed: gone
+    (released since it was read), a fresh FROZEN_JOIN_PENDING_REMOVAL row records this
+    join; still there (parked for a landed add, or recorded ACTIVE by another pass), it
+    is left as it is, one line is logged (`l2_frozen_join_left_owed_row` or
     `l2_frozen_join_left_live_row`), and, after the commit, `undo_lost_join` removes
-    this join's add at once, its live-holder check first; a failed undo logs
-    `l2_frozen_join_undo_failed`, and an exception from it goes on, the row unchanged.
+    this join's add at once, its live-holder check first. An undo that answers False,
+    or ends by any exception (a BaseException, the class name only), logs
+    `l2_frozen_join_undo_failed`; the exception goes on, and the row is unchanged.
     """
     res_uuid = _as_uuid(reservation_id)
     vlan_uuid = _as_uuid(vlan_assignment_id)
@@ -358,13 +388,22 @@ async def record_l2_membership_active(
     # deliberately for soundness).
     # Own-reservation rows are also out of scope: the owning reconcile's remove
     # pass converges those.
+    #
+    # Issue #1413: read under the row lock (nothing on SQLite), so a holder's row that a
+    # release holds is re-read as committed once that release commits, and a row
+    # released meanwhile is not loaded and rewritten by the ORM park below. The lock is
+    # taken before the allocation's share lock (hold_active_allocation), and is released
+    # by this call's commit or by the rollback before a lost join's undo, never held
+    # across a driver call.
     stale_result = await db.execute(
-        select(L2PortAssignment).where(
+        select(L2PortAssignment)
+        .where(
             L2PortAssignment.switch_device_id == switch_uuid,
             L2PortAssignment.port == port,
             L2PortAssignment.reservation_id != res_uuid,
             L2PortAssignment.status == "ACTIVE",
         )
+        .with_for_update()
     )
     for stale in stale_result.scalars().all():
         stale_state = await get_wiring_state(db, stale.reservation_id)
@@ -408,15 +447,16 @@ async def record_l2_membership_active(
         if row is not None:
             # Overwrite the allocation with the one the successful join actually used,
             # so the pending remove drives the real fabric VLAN. Issue #1413: one UPDATE
-            # matching the row only while it is FAILED and does not owe the removal of
-            # a lost join's add (a RELEASED number nothing else would clean the port
-            # out of, so that row is left as it is, the FAILED flip's rule).
+            # matching the row only while it is FAILED and is not parked for an add
+            # known to have landed on its own number (a lost join's owed removal, or an
+            # earlier frozen join): that number has no other row to clean the port out
+            # of it, so that row is left as it is.
             result = await db.execute(
                 update(L2PortAssignment)
                 .where(
                     L2PortAssignment.id == row.id,
                     L2PortAssignment.status == "FAILED",
-                    ~_owes_undo(),
+                    ~_landed_add_pending_removal(),
                 )
                 .values(
                     intended="RELEASED",
@@ -428,20 +468,24 @@ async def record_l2_membership_active(
                 .execution_options(synchronize_session=False)
             )
             if (result.rowcount or 0) == 0:
-                # The row moved since it was read: re-read this reservation's row for
-                # the port (no write follows on it). None left (released meanwhile): a fresh row
-                # records this join below. Otherwise it owes a removal, or another
-                # pass recorded it ACTIVE: it is left as it is, never a second live row
-                # for the key, and this join's add is undone after the commit.
+                # The row is parked for a landed add, or moved since it was read:
+                # re-read this reservation's row for the port (no write follows on
+                # it), refreshing the copy the session already holds. None left
+                # (released meanwhile): a fresh row records this join below. Otherwise
+                # it is parked for a landed add, or another pass recorded it ACTIVE: it
+                # is left as it is, never a second live row for the key, and this
+                # join's add is undone after the commit.
                 row = (
                     (
                         await db.execute(
-                            select(L2PortAssignment).where(
+                            select(L2PortAssignment)
+                            .where(
                                 L2PortAssignment.reservation_id == res_uuid,
                                 L2PortAssignment.switch_device_id == switch_uuid,
                                 L2PortAssignment.port == port,
                                 L2PortAssignment.status != "RELEASED",
                             )
+                            .execution_options(populate_existing=True)
                         )
                     )
                     .scalars()
@@ -451,7 +495,7 @@ async def record_l2_membership_active(
                     owes = (
                         row.status == "FAILED"
                         and row.intended == "RELEASED"
-                        and row.last_error == JOIN_UNDO_PENDING_REMOVAL
+                        and row.last_error in _LANDED_ADD_REASONS
                     )
                     left_action = (
                         "l2_frozen_join_left_owed_row" if owes else "l2_frozen_join_left_live_row"
@@ -480,9 +524,9 @@ async def record_l2_membership_active(
             )
             return row
         logger.warning(
-            "Join for frozen reservation %s landed on switch %s port %s, whose row "
-            "already names another number; the row is left as it is and this join's "
-            "allocation %s is undone, not recorded",
+            "Join for frozen reservation %s landed on switch %s port %s, whose row is "
+            "already parked for a removal or recorded ACTIVE; the row is left as it is "
+            "and this join's allocation %s is undone, not recorded",
             res_uuid,
             switch_uuid,
             port,
@@ -495,21 +539,19 @@ async def record_l2_membership_active(
         )
         # Issue #1413: no row can name this join's number, so its add is undone now,
         # in the caller's switch session with no lock held (the same check for a live
-        # holder of the number on the port comes first, inside the undo).
-        if undo_lost_join is not None and not await undo_lost_join():
-            logger.error(
-                "Undo of the frozen join of reservation %s on switch %s port %s failed; "
-                "the port stays in allocation %s's number with no row naming it",
-                res_uuid,
-                switch_uuid,
-                port,
-                vlan_uuid,
-                extra={
-                    "action": "l2_frozen_join_undo_failed",
-                    "reservation_id": str(res_uuid),
-                    "vlan_assignment_id": str(vlan_uuid),
-                },
-            )
+        # holder of the number on the port comes first, inside the undo). An undo that
+        # answers False, or ends by any exception, is logged with the action
+        # l2_frozen_join_undo_failed (the class name only); the exception goes on and
+        # the row stays as it is.
+        if undo_lost_join is None:
+            return row
+        try:
+            undone = await undo_lost_join()
+        except BaseException as exc:
+            _log_frozen_join_undo_failed(res_uuid, switch_uuid, port, vlan_uuid, type(exc).__name__)
+            raise
+        if not undone:
+            _log_frozen_join_undo_failed(res_uuid, switch_uuid, port, vlan_uuid, None)
         return row
 
     from app.services.vlan_service import hold_active_allocation
@@ -677,13 +719,16 @@ async def release_l2_membership(
     the one whose number a successful remove_from_vlan drove (`removal_driven` True),
     or, for a settlement with no driver call (`removal_driven` False), the allocation
     of the row the caller read, the nil placeholder included. None means not given, and
-    nothing below applies. A FAILED row on any other allocation is not released (None
-    comes back and nothing is written): another writer moved the row after the caller
-    planned, so its own removal or join is still pending, and a removal is idempotent.
-    With no driver call an ACTIVE row on another allocation is not released either:
-    nothing was removed. After a removal an ACTIVE row on another allocation is still
-    released, as before (whether the removal took the port out of that row's number
-    depends on the device and on the order of the two calls; the spec's Open defects).
+    nothing is compared. Given, a row on any other allocation, FAILED or ACTIVE, is not
+    released (None comes back and nothing is written): another writer moved the row
+    after the caller planned, so a FAILED row's own removal or join is still pending (a
+    removal is idempotent), and an ACTIVE row records a membership in another number,
+    which on a device that keeps one membership per number the removal did not touch.
+
+    `removal_driven` False (a settlement with no driver call) also requires the row to
+    be FAILED: nothing was removed, so a row another pass recorded ACTIVE since is a
+    live membership and is not released. After a removal (`removal_driven` True) an
+    ACTIVE row on the expected allocation is released, the ordinary leave.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -695,10 +740,11 @@ async def release_l2_membership(
         L2PortAssignment.status != "RELEASED",
     )
     if expected_vlan_assignment_id is not None:
-        elsewhere = L2PortAssignment.vlan_assignment_id != _as_uuid(expected_vlan_assignment_id)
-        if removal_driven:
-            elsewhere = elsewhere & (L2PortAssignment.status == "FAILED")
-        stmt = stmt.where(~elsewhere)
+        stmt = stmt.where(
+            L2PortAssignment.vlan_assignment_id == _as_uuid(expected_vlan_assignment_id)
+        )
+    if not removal_driven:
+        stmt = stmt.where(L2PortAssignment.status == "FAILED")
     result = await db.execute(stmt.with_for_update())
     row = result.scalars().first()
     if row is None:
@@ -764,10 +810,14 @@ async def _record_l2_failed_for_row(
         # The drive this failure records is over, so release the claim (issue #817).
         "claimed_until": None,
     }
-    if intended == "RELEASED":
+    from app.services.wiring_retry_service import is_retryable_failure
+
+    if intended == "RELEASED" and is_retryable_failure(last_error):
         # Issue #1413: a failed removal of a row parked for a landed add keeps its
         # reason (JOIN_UNDO_PENDING_REMOVAL or FROZEN_JOIN_PENDING_REMOVAL), so the
         # own-number supersession rule and the owed undo's settle still apply to it.
+        # A pinned non-retryable failure is recorded instead, as on any row, so the
+        # tick stops selecting a row it cannot drive.
         values["last_error"] = case(
             (_landed_add_pending_removal(), L2PortAssignment.last_error),
             else_=literal(last_error),
@@ -821,13 +871,13 @@ async def _record_l2_failed_for_row(
 
 def _log_landed_add_reason_kept(row: L2PortAssignment, last_error: str) -> None:
     """One WARNING line when a failed removal kept a landed add's reason on the row
-    (issue #1413): the row carries the fixed reason, this line says a removal of its
-    number failed, and the failure itself is on that removal's execution run."""
+    (issue #1413): the row carries the fixed reason, and this line says a removal of
+    its number failed. The failure's own text is not logged here."""
     if row.last_error not in _LANDED_ADD_REASONS or row.last_error == last_error:
         return
     logger.warning(
         "Removal of the port of reservation %s on switch %s port %s from allocation %s "
-        "failed; the row keeps its pending-removal reason (see the removal's execution run)",
+        "failed; the row keeps its pending-removal reason",
         row.reservation_id,
         row.switch_device_id,
         row.port,
@@ -902,10 +952,15 @@ async def record_l2_failed(
     allocation, a pinned-reason failure, a release failure, and every write on a
     reservation that is not frozen are unchanged; the row-id path is unchanged.
 
-    Issue #1413: a row that owes the removal of a lost join's add
-    (JOIN_UNDO_PENDING_REMOVAL) keeps naming its released allocation. A key-based BUILD
-    failure leaves such a row as it is (it is returned unchanged), and a RELEASE failure,
-    by key or by row id, keeps that reason instead of `last_error`.
+    Issue #1413: a row parked for the removal of an add known to have landed on its
+    number (JOIN_UNDO_PENDING_REMOVAL, FROZEN_JOIN_PENDING_REMOVAL) keeps naming that
+    number. A key-based BUILD failure leaves such a row as it is (it is returned
+    unchanged), and a RELEASE failure, by key or by row id, keeps that reason instead
+    of `last_error` when `last_error` is retryable; a pinned non-retryable failure
+    (NON_RETRYABLE_REASON_PREFIXES) replaces it, as on any row, so the tick stops
+    selecting the row. The key path reads the row FOR UPDATE, and its two returns that
+    write nothing (an ACTIVE row under a build failure, and the parked row above)
+    commit, so the lock is not held past this call.
     """
     res_uuid = _as_uuid(reservation_id)
     switch_uuid = _as_uuid(switch_device_id)
@@ -959,30 +1014,33 @@ async def record_l2_failed(
                 port,
                 res_uuid,
             )
+            # Nothing is written: end the transaction so the row lock is not held.
+            await db.commit()
             return row
-        owes_undo = (
-            row.status == "FAILED"
-            and row.intended == "RELEASED"
-            and row.last_error == JOIN_UNDO_PENDING_REMOVAL
-        )
         # Issue #1413: judged on the row as read, before the writes below.
-        keeps_reason = (
-            intended == "RELEASED"
-            and row.status == "FAILED"
+        landed_add = (
+            row.status == "FAILED"
             and row.intended == "RELEASED"
             and row.last_error in _LANDED_ADD_REASONS
         )
-        if owes_undo and intended == "ACTIVE":
-            # Issue #1413: a build failure never moves a row off the number it still
-            # owes a removal from; the row is left as it is.
+        if landed_add and intended == "ACTIVE":
+            # Issue #1413: a build failure never moves a row off the number an add is
+            # known to have landed on (a lost join's owed removal, or a frozen join);
+            # the row is left as it is.
             logger.warning(
                 "Ignoring L2 build failure for switch %s port %s, reservation %s: the "
-                "row still owes the removal of a lost join's add",
+                "row is parked for the removal of an add that landed on its number",
                 switch_uuid,
                 port,
                 res_uuid,
             )
+            await db.commit()
             return row
+        # A failed removal of such a row keeps its reason, so the own-number rules still
+        # apply to it, unless the failure is a pinned non-retryable one (a deleted
+        # switch, a broken driver package): that reason is recorded, so the tick stops
+        # selecting a row it cannot drive.
+        keeps_reason = landed_add and is_retryable_failure(last_error)
         frozen_parks = build_parks and (vlan_uuid or row.vlan_assignment_id) not in (None, _NIL)
         row.status = "FAILED"
         if frozen_parks:
@@ -995,8 +1053,7 @@ async def record_l2_failed(
         else:
             row.intended = intended
             row.attempts = (row.attempts or 0) + attempts
-        # Issue #1413: a failed removal of a row parked for a landed add keeps its reason
-        # (the owed undo's build-direction case returned above).
+        # Issue #1413: keeps_reason above (the build-direction case returned there).
         row.last_error = row.last_error if keeps_reason else last_error
         # The drive this failure records is over, so release the claim (issue #817).
         row.claimed_until = None
@@ -1175,9 +1232,11 @@ async def supersede_l2_release_if_reclaimed(
     Which rule applies, and the row's number, are read from the row as it stands in
     `db` (the caller's write_guard holds its lock), not from `row`. A row of the second
     kind whose allocation no longer resolves to a number is never settled here. An
-    ordinary row is released only if it is still on the allocation the caller read
-    (release_l2_membership with that allocation and no driver call); otherwise nothing
-    is written and False sends the caller on to its planned removal.
+    ordinary row is released only if it is still FAILED and on the allocation the caller
+    read (release_l2_membership with that allocation and no driver call); otherwise
+    (moved onto another allocation, or recorded ACTIVE by another pass's join) nothing
+    is written and False sends the caller on to its planned removal, which the claim
+    then refuses for a row that is no longer FAILED.
     """
     from app.models.vlan_assignment import VlanAssignment
 
