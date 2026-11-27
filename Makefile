@@ -1143,7 +1143,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty-one today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty-two today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1219,6 +1219,11 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # row-lock test commits one reservation of its own under a random id, holds its
 # row lock for about one second, writes no other row, and deletes it in a
 # finally.
+# The reservations suite added for issue #1543 (migration 0019's reset of
+# stored purpose suggestions that are not usable) needs the migrated
+# reservations schema. It commits nothing: it inserts its rows, runs the
+# upgrade inside one REPEATABLE READ transaction, and rolls it back; the
+# upgrade row-locks any foreign row holding an unusable suggestion until then.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1269,6 +1274,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_sweep_claim_cancel_race_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_pending_fork_prune_live_pg.py -v) && \
+	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_purpose_suggestion_reset_live_pg.py -v) && \
 	(cd services/inventory && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_config_apply_races_live_pg.py -v)
 

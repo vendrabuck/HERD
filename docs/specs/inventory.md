@@ -606,7 +606,8 @@ size per user. Admins can also copy and bulk-delete devices.
 connection reads for an expanded row). Import and export controls and Copy render for
 admins only. Copy names the new device `Copy of <name>` and sends the source's template,
 topology type, and `field_data`, leaving the status to the default; the Template
-filter reads the first 500 device templates.
+filter pages through the device templates instead of stopping at the first 500
+(issue #1336).
 
 **Rules.**
 
@@ -1198,9 +1199,16 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_csv`, `parse_import`); `services/common/herd_common/csv_safety.py` (`csv_unsafe_cell`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_csv_strips_neutralizing_quote_from_named_text_columns`, `test_parse_csv_leaves_apostrophe_led_value_alone`); `services/inventory/tests/test_bulk.py` (`test_device_csv_roundtrip_with_formula_trigger_name`, `test_template_csv_roundtrip_with_formula_trigger_name`)
 - **INV-BULK-17.** The import dialog can run a dry run and lists each rejected row with
-  its reason, and it infers the format from the file extension. \
-  Enforced in: `frontend/src/components/ui/BulkImportExport.tsx` (`BulkImportExport`) \
-  Pinned by: `frontend/src/test/components/BulkImportExport.test.tsx` (`runs a dry-run and shows the per-row reject report`, `infers csv format from the file extension`)
+  its reason, and it infers the format from the file extension. A refused import shows
+  its reason inside the dialog, under the file input as an alert, never in a toast: a
+  413 or 422 shows the server's detail through `errorDetail` (a body with no usable
+  detail shows `Failed to import <label>`), and any other failure, a 403, a 503, a 5xx,
+  or no answer, shows `Failed to import <label>` whatever its body says (issue #1575).
+  The detail is rendered as text. Choosing another file, starting another run, or
+  closing the dialog clears it. The dialog is shared with the devices, templates, and
+  topologies pages. \
+  Enforced in: `frontend/src/components/ui/BulkImportExport.tsx` (`BulkImportExport`); `frontend/src/lib/errors.ts` (`importErrorText`) \
+  Pinned by: `frontend/src/test/components/BulkImportExport.test.tsx` (`runs a dry-run and shows the per-row reject report`, `infers csv format from the file extension`, `BulkImportExport refused import (issue #1575)`, `renders markup in a detail as text, never as HTML`, `clears the reason when another file is chosen`, `clears the reason when a later run succeeds`, `clears the reason when the dialog is closed`)
 - **INV-BULK-18.** A dry run is a full rehearsal: every row goes through the same create
   and update functions as a committed import (INV-BULK-10, INV-BULK-13), a later row
   sees an earlier row's create (a name repeated in one file reports `create` then

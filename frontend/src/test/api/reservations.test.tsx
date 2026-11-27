@@ -14,7 +14,8 @@ vi.mock("react-hot-toast", () => ({
 
 import { server } from "../mocks/server";
 import {
-  useReservations,
+  useReservation,
+  useUpdateReservation,
   usePaginatedReservations,
   useCalendarReservations,
   useCreateReservation,
@@ -42,15 +43,69 @@ const RESV = {
 };
 
 describe("reservations api hooks", () => {
-  it("useReservations unwraps paginated items", async () => {
+  // Issue #1319: the one reservation is read by id, never found by scanning a
+  // page of the caller's list.
+  it("useReservation reads exactly the reservation named and never the list", async () => {
+    let listHit = false;
+    const requested: string[] = [];
     server.use(
-      http.get("/api/reservations/", () =>
-        HttpResponse.json({ items: [RESV], total: 1, skip: 0, limit: 500 }),
+      http.get("/api/reservations/", () => {
+        listHit = true;
+        return HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 });
+      }),
+      http.get("/api/reservations/:id", ({ params }) => {
+        requested.push(String(params.id));
+        return HttpResponse.json(RESV);
+      }),
+    );
+    const { result } = renderHook(() => useReservation(RESV.id), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual(RESV);
+    expect(requested).toEqual([RESV.id]);
+    expect(listHit).toBe(false);
+  });
+
+  it("useReservation is disabled without an id and sends nothing", () => {
+    for (const id of [null, undefined, ""]) {
+      const { result } = renderHook(() => useReservation(id), { wrapper });
+      expect(result.current.fetchStatus).toBe("idle");
+      expect(result.current.data).toBeUndefined();
+    }
+  });
+
+  it("useReservation is an error, not empty data, when the read is refused", async () => {
+    // RES-VIEW-1 and RES-VIEW-2: anyone but the owner, an admin included, gets 404.
+    server.use(
+      http.get("/api/reservations/:id", () =>
+        HttpResponse.json({ detail: "Reservation not found" }, { status: 404 }),
       ),
     );
-    const { result } = renderHook(() => useReservations(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual([RESV]);
+    const { result } = renderHook(() => useReservation(RESV.id), { wrapper });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+  });
+
+  it("a mutation that invalidates ['reservations'] refetches useReservation", async () => {
+    let reads = 0;
+    server.use(
+      http.get("/api/reservations/:id", () => {
+        reads += 1;
+        return HttpResponse.json({ ...RESV, device_ids: reads === 1 ? ["a"] : ["a", "b"] });
+      }),
+      http.patch("/api/reservations/:id", () => HttpResponse.json(RESV)),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const shared = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    const { result } = renderHook(
+      () => ({ one: useReservation(RESV.id), update: useUpdateReservation() }),
+      { wrapper: shared },
+    );
+    await waitFor(() => expect(result.current.one.data?.device_ids).toEqual(["a"]));
+    await result.current.update.mutateAsync({ id: RESV.id, data: { device_ids: ["a", "b"] } });
+    await waitFor(() => expect(result.current.one.data?.device_ids).toEqual(["a", "b"]));
+    expect(reads).toBe(2);
   });
 
   it("usePaginatedReservations forwards skip/limit", async () => {

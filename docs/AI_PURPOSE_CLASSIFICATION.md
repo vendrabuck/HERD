@@ -155,7 +155,13 @@ The reconciler's outcome taxonomy, all documented in
 - `forbidden`: 403 without the disabled marker. Ends the tick; no attempt
   counted, but logged at WARNING (not `feature_off`'s INFO) since this is a
   problem an operator needs to see and fix, not an expected state.
-- `failed`: any other non-200 status, or a 200 with an unparseable body.
+- `failed`: any other non-200 status, or a 200 whose body is not a usable
+  suggestion: one that does not parse (not JSON, not UTF-8, or nested past the
+  decoder's recursion limit), or anything but a JSON object with a string
+  `top_category` (nested no deeper than 32 levels, with no number that is not
+  finite, and no string or key holding a NUL or an unpaired surrogate), a JSON
+  `null` included (issues #1543 and #1577; RES-PURPOSE-7 in
+  `docs/specs/reservations.md`). Nothing is stored and the tick continues.
   Increments `purpose_classify_attempts`; this and `timeout` are the only
   outcomes that affect the row's attempt cap.
 

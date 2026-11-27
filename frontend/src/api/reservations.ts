@@ -28,7 +28,16 @@ import type {
 import type { CanvasData } from "@/types/topology.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
-import { errorDetail, structuredDetail } from "@/lib/errors";
+import {
+  errorDetail,
+  hasFields,
+  isInvalidRoute,
+  isListOf,
+  isOptionalString,
+  isString,
+  isStringList,
+  structuredDetail,
+} from "@/lib/errors";
 import { appendReservationListFilters } from "@/lib/reservationFilters";
 import type { ReservationListFilters } from "@/lib/reservationFilters";
 
@@ -62,9 +71,11 @@ async function fetchPaginatedReservations(
   return resp.data;
 }
 
-async function fetchReservations(): Promise<Reservation[]> {
-  const resp = await fetchPaginatedReservations(0, 500);
-  return resp.items;
+// One reservation by id (`GET /reservations/{id}`, owner only: anyone else,
+// an admin included, gets 404 per RES-VIEW-1 and RES-VIEW-2).
+async function fetchReservation(id: string): Promise<Reservation> {
+  const resp = await apiClient.get<Reservation>(`/reservations/${id}`);
+  return resp.data;
 }
 
 async function createReservation(data: ReservationCreate): Promise<Reservation> {
@@ -123,10 +134,17 @@ export function useCalendarReservations(params: CalendarQueryParams) {
   });
 }
 
-export function useReservations() {
+/**
+ * Exactly the reservation named, read by id (issue #1319), never found by
+ * scanning a page of the caller's list. Keyed `["reservations", id]`, so every
+ * mutation that invalidates `["reservations"]` refreshes it. Disabled (no
+ * request) without an id.
+ */
+export function useReservation(id: string | null | undefined) {
   return useQuery({
-    queryKey: ["reservations"],
-    queryFn: fetchReservations,
+    queryKey: ["reservations", id ?? ""],
+    queryFn: () => fetchReservation(id!),
+    enabled: !!id,
   });
 }
 
@@ -583,9 +601,24 @@ export function useRetryReservationWiring() {
 // branch the conflict dialog from the plain error toast. This body has no
 // `error` discriminant key of its own (only `message` + `conflicts`), unlike
 // every ADR 0014 shape below, so its `structuredDetail` match checks the
-// `conflicts` array directly instead.
+// `conflicts` array directly instead. Issue #1406: the conflict dialog renders
+// `message` and each conflict's three ids, so a body passes only when
+// `message` is a string or absent and every conflict is an object whose
+// `reservation_id`, `device_id`, and `port` are strings; any other body (an
+// object or list `message`, a null or numeric id, a null entry) answers null
+// and the caller shows its fixed fallback instead of throwing mid-render and
+// losing the drawing. Every narrower below checks the fields it hands to a
+// renderer the same way.
 export function forkConflictDetail(err: unknown): ForkConflictDetail | null {
-  return structuredDetail<ForkConflictDetail>(err, 409, (d) => Array.isArray(d.conflicts));
+  return structuredDetail<ForkConflictDetail>(
+    err,
+    409,
+    (d) =>
+      isOptionalString(d.message) &&
+      isListOf(d.conflicts, (conflict) =>
+        hasFields(conflict, { reservation_id: isString, device_id: isString, port: isString }),
+      ),
+  );
 }
 
 // Narrow an axios error's response detail to the structured fork
@@ -596,7 +629,7 @@ export function forkDeviceNotMemberDetail(err: unknown): ForkDeviceNotMemberDeta
   return structuredDetail<ForkDeviceNotMemberDetail>(
     err,
     409,
-    (d) => d.error === "fork_device_not_member" && Array.isArray(d.device_ids),
+    (d) => d.error === "fork_device_not_member" && isStringList(d.device_ids),
   );
 }
 
@@ -608,7 +641,7 @@ export function forkL3IntentInvalidDetail(err: unknown): ForkL3IntentInvalidDeta
   return structuredDetail<ForkL3IntentInvalidDetail>(
     err,
     409,
-    (d) => d.error === "l3_intent_invalid" && Array.isArray(d.invalid_routes),
+    (d) => d.error === "l3_intent_invalid" && isListOf(d.invalid_routes, isInvalidRoute),
   );
 }
 
@@ -621,7 +654,7 @@ export function forkL3IntentMalformedDetail(err: unknown): ForkL3IntentMalformed
   return structuredDetail<ForkL3IntentMalformedDetail>(
     err,
     422,
-    (d) => d.error === "l3_intent_malformed",
+    (d) => d.error === "l3_intent_malformed" && isString(d.node_id) && isString(d.message),
   );
 }
 
@@ -635,7 +668,10 @@ export function topologyRoutingIntentInvalidDetail(
   return structuredDetail<TopologyRoutingIntentInvalidDetail>(
     err,
     422,
-    (d) => d.error === "topology_routing_intent_invalid" && Array.isArray(d.invalid_routes),
+    (d) =>
+      d.error === "topology_routing_intent_invalid" &&
+      isString(d.message) &&
+      isListOf(d.invalid_routes, isInvalidRoute),
   );
 }
 

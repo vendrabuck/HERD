@@ -1179,7 +1179,9 @@ their own by name. A dry run reports what would happen without writing.
 **Surfaces.** User interface `frontend/src/components/ui/BulkImportExport.tsx` on the
 topologies page; routes `GET /topologies/export` and `POST /topologies/import`; inventory
 `POST /devices/resolve-by-name` (section 10). [BULK_IMPORT_EXPORT.md](../BULK_IMPORT_EXPORT.md)
-is the user guide.
+is the user guide. The dialog is shared with inventory, so how it shows a refused import
+(the server's detail for a 413 or 422, `Failed to import topologies` for anything else,
+inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
 
 **Rules.**
 
@@ -1584,8 +1586,8 @@ reservation's fork opens read-only.
 `frontend/src/components/topology-editor/LiveEditBar.tsx`,
 `frontend/src/components/topology-editor/ForkHistoryPanel.tsx`,
 `frontend/src/hooks/useForkAutosave.ts`, `frontend/src/hooks/useForkVersionPreview.ts`,
-`frontend/src/lib/forkDiff.ts`; the reservations fork routes (`reservations.md`, section
-5).
+`frontend/src/lib/forkDiff.ts`; the reservations fork routes and `GET /{id}`
+(`reservations.md`, section 5).
 
 **Rules.**
 
@@ -1602,9 +1604,17 @@ reservation's fork opens read-only.
   Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`disables the Commit button with the invalid-edge count when an edge has no physical path, and never calls the fork save`, `PATCH-adds a newly drawn device to the reservation BEFORE saving the fork (issue #701)`, `a failed device-set PATCH blocks the fork save entirely (issue #701)`, `PATCH-removes a device from the reservation only AFTER the fork save succeeds (issue #701)`, `commit calls the fork save and the device PATCH, never the parent topology PUT`)
 - **TOPO-UIFORK-3.** A port-claim 409 opens the conflict dialog and keeps the drawing; a
   membership 409 names the devices; routing refusals toast their count, the parser's
-  message, or the inventory outage; any other string detail is shown as sent. \
-  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
-  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`)
+  message, or the inventory outage; any other string detail is shown as sent. Each of
+  those structured bodies is used only when every field the dialog or toast reads has
+  its type: a string or absent port-claim `message`, string `reservation_id`,
+  `device_id`, and `port` in every conflict, string membership ids, well-formed
+  `invalid_routes` entries, a string parser `message`. Any other body, an HTML page
+  included, never opens the dialog: it toasts its `message` when that is a non-blank string,
+  else the plain detail or `Failed to save the reservation fork`, and the editor and
+  the drawing stay as they were (issue #1406). A blank parser message toasts
+  `Routing intent malformed: no reason given`. \
+  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`); `frontend/src/api/reservations.ts` (`forkConflictDetail`, `forkDeviceNotMemberDetail`, `forkL3IntentInvalidDetail`, `forkL3IntentMalformedDetail`); `frontend/src/lib/errors.ts` (`hasFields`, `isListOf`, `isInvalidRoute`); `frontend/src/components/topology-editor/ForkConflictDialog.tsx` (`ForkConflictDialog`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`, `a port-claim 409 whose fields are not in shape keeps the editor and its drawing (issue #1406)`, `an l3_intent_malformed 422 whose message is not usable text toasts fixed text (issue #1406)`); `frontend/src/test/api/reservationFork.test.tsx` (`forkConflictDetail checks every field the dialog renders (issue #1406)`, `the other fork narrowers check what they hand on (issue #1406)`); `frontend/src/test/components/ForkConflictDialog.test.tsx` (`cuts a very long message to the shared detail bound`, `renders markup in the message as text, never as HTML`)
 - **TOPO-UIFORK-4.** The draft is sent as a canvas PUT 2000 ms after the last edit, never
   for the canvas as loaded, and flushed when the page closes; a read-only fork never
   autosaves. \
@@ -1652,6 +1662,21 @@ reservation's fork opens read-only.
   save wires the other lines (issue #1066). \
   Enforced in: `frontend/src/lib/edgeProblems.ts` (`serverEdgeProblemsFrom`, `applySkippedConstrainedEdges`, `withServerEdgeProblems`, `stripServerEdgeProblem`); `frontend/src/hooks/useForkAutosave.ts` (`onDraftValidated`); `frontend/src/pages/TopologyEditorPage.tsx` (`loadCanvasAndClearRouteProblems`, `handleDraftValidated`, `serverOnlyInvalidEdgeCount`); `frontend/src/components/topology-editor/edges/edgeStatus.ts` (`resolveEdgeStroke`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`serverInvalidEdgeCount`) \
   Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a replace on a real edge strips the render-only server reason before the store sees it (issue #1066)`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+- **TOPO-UIFORK-11.** Live edit reads its reservation by id (`GET /reservations/{id}`,
+  owner only, RES-VIEW-1), never by scanning a page of the owner's list; that read
+  supplies the header's purpose, the `ACTIVE` status that shows Restore, and the current
+  device set the pre-save add unions with the canvas (TOPO-UIFORK-2). Commit stays
+  disabled, reading `Loading reservation...`, until the read lands. A failed read keeps
+  it disabled under a red line: the 404 anyone but the owner gets reads
+  `Only the reservation's owner can commit from this editor`, and any other failure
+  says the reservation could not be loaded and to reload the page. A commit triggered anyway
+  sends neither the device-set PATCH nor the fork save, so the union is never computed
+  without the reservation's own set (issue #1319). A copy already read stays in force
+  when a later background refetch fails: Commit stays enabled and unions with that
+  copy, and the server still refuses a save or PATCH for a reservation that has left
+  `ACTIVE` (RES-FORK-6). \
+  Enforced in: `frontend/src/api/reservations.ts` (`useReservation`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`, `reservationStatus`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`LiveEditReservationStatus`, `reservationStatus`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkReservationLookup.test.tsx` (`a reservation past the owner's first 500 still drives the header, Restore, and the device-set union`, `a failed read keeps Commit closed and sends neither the PATCH nor the fork save`, `a reservation the caller may not read (404 for anyone but the owner) fails closed and says only the owner can commit`, `a cached reservation stays loaded when a background refetch fails, and Commit unions with the cached set`, `while the read is in flight Commit waits for it, then commits with the full set`); `frontend/src/test/components/LiveEditBar.test.tsx` (`disables commit and reads 'Loading reservation...' while the reservation is loading`, `a failed reservation read disables commit and says so`, `a read refused as not the owner's says only the owner can commit, with no reload advice`); `frontend/src/test/api/reservations.test.tsx` (`useReservation reads exactly the reservation named and never the list`, `useReservation is an error, not empty data, when the read is refused`, `a mutation that invalidates ['reservations'] refetches useReservation`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is
