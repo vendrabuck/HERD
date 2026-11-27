@@ -1647,10 +1647,12 @@ named in each rule.
   Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`AIDialog`) \
   Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`disables Generate when the prompt is empty`, `surfaces the server detail on a 503 and never names ANTHROPIC_API_KEY`, `falls back to a provider-agnostic 503 message when the body has no detail`, `names each unwireable connection on the structured 422`, `keeps the plain-string fallback for a 422 that is not structured`, `toasts the 502 upstream detail`)
 - **AI-UI-3.** `topologyUnconnectableDetail` narrows only a 422 whose detail has
-  `error: topology_unconnectable` and an array `pairs`; anything else is null and keeps
-  the caller's plain fallback. \
+  `error: topology_unconnectable`, a string `message`, and a `pairs` array whose every
+  entry is an object with string `source_role`, `target_role`, `source_template`, and
+  `target_template` (issue #1406); anything else is null and keeps the caller's plain
+  fallback. \
   Enforced in: `frontend/src/lib/errors.ts` (`topologyUnconnectableDetail`, `formatUnconnectableDetail`) \
-  Pinned by: `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for a different status carrying the same body`, `returns null for a plain-string detail`, `returns null when pairs is not an array`, `renders one 'source to target' line per pair under the message`)
+  Pinned by: `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for a different status carrying the same body`, `returns null for a plain-string detail`, `returns null when pairs is not an array`, `renders one 'source to target' line per pair under the message`, `the AI narrowers check every entry they format (issue #1406)`)
 - **AI-UI-4.** A new proposal first removes any earlier ghost nodes, and is discarded with a
   toast when a role has no resolved device or a resolved device is already on the canvas;
   otherwise devices and elements are drawn as ghost nodes and edges marked `isProposal`. \
@@ -1667,11 +1669,13 @@ named in each rule.
   Enforced in: `frontend/src/components/topology-editor/AICommitDialog.tsx` (`CommitForm`) \
   Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`renders the commit form with a default topology name and device summary`, `toasts an error when end time is not after start time`, `forwards elements and their attachment edges in the commit body`)
 - **AI-UI-7.** `aiCommitTopologyUnwireableDetail` narrows only a 422 with
-  `error: topology_unwireable` and an array `invalid_edges`; the dialog then lists each
+  `error: topology_unwireable`, a string `message`, and an `invalid_edges` array whose
+  every entry is an object with string `edge_id`, `source_role`, `target_role`, and
+  `reason` (issue #1406); the dialog then lists each
   edge as `<role> to <role>: <reason in plain words>`, and otherwise shows
   `Commit failed: <detail>`. \
   Enforced in: `frontend/src/lib/errors.ts` (`aiCommitTopologyUnwireableDetail`); `frontend/src/components/topology-editor/AICommitDialog.tsx` (`invalidEdgeReasonText`); `frontend/src/lib/edgeProblems.ts` (`invalidEdgeReasonText`, `INVALID_EDGE_REASON_TEXT`) \
-  Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`toasts a plain-words per-edge list for a structured topology_unwireable 422`, `falls back to the generic detail toast for a non-topology_unwireable 422`, `toasts the backend detail when commit fails`)
+  Pinned by: `frontend/src/test/components/AICommitDialog.test.tsx` (`toasts a plain-words per-edge list for a structured topology_unwireable 422`, `falls back to the generic detail toast for a non-topology_unwireable 422`, `toasts the backend detail when commit fails`); `frontend/src/test/lib/errors.test.ts` (`the AI narrowers check every entry they format (issue #1406)`)
 - **AI-UI-8.** The reservation detail modal shows the AI Assistant tab only when the status
   reports `enabled`. \
   Enforced in: `frontend/src/components/reservations/ReservationDetailModal.tsx` (`ReservationDetailModal`) \
@@ -1726,9 +1730,11 @@ named in each rule.
   Pinned by: `frontend/src/test/components/AIAssistantTabLegacy.test.tsx` (`never sends a conversation_id, so each question starts a new conversation`)
 - **AI-UI-19.** On a `topology_mixed_types` 422 the generate dialog shows the server's
   message and one `TYPE: template, template` line per type; `topologyMixedTypesDetail`
-  narrows only a 422 whose detail has `error: topology_mixed_types` and an array `groups`. \
+  narrows only a 422 whose detail has `error: topology_mixed_types`, a string `message`,
+  and a `groups` array whose every entry is an object with a string `topology_type` and
+  string lists `roles` and `templates` (issue #1406). \
   Enforced in: `frontend/src/components/topology-editor/AIDialog.tsx` (`AIDialog`); `frontend/src/lib/errors.ts` (`topologyMixedTypesDetail`, `formatMixedTypesDetail`) \
-  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`names the templates per type on the mixed-types 422 (#1038)`); `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for the unconnectable 422 and a plain string`, `renders the message then one line per type`)
+  Pinned by: `frontend/src/test/components/AIDialog.test.tsx` (`names the templates per type on the mixed-types 422 (#1038)`); `frontend/src/test/lib/errors.test.ts` (`narrows the structured 422 body`, `returns null for the unconnectable 422 and a plain string`, `renders the message then one line per type`, `the AI narrowers check every entry they format (issue #1406)`)
 
 **Out of scope.** The Purpose Review page and the Classify now button are reservations
 callers (`reservations.md`, RES-PURPOSE-9 to RES-PURPOSE-15).
