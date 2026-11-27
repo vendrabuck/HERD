@@ -11,11 +11,13 @@ through only when it has exactly that shape.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import socket
 import sys
 import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,6 +44,7 @@ class FakeRestarter:
         self.hang = threading.Event()  # set: answer; clear and `hold`: never answer
         self.hold = False
         self.requests: list[dict] = []
+        self.arrived = threading.Event()  # set once a request has been read
 
 
 @pytest.fixture
@@ -62,6 +65,7 @@ def restarter(monkeypatch):
                     "headers": {k.lower(): v for k, v in self.headers.items()},
                 }
             )
+            fake.arrived.set()
             if fake.hold:
                 fake.hang.wait(10)
                 return
@@ -277,6 +281,212 @@ async def test_apply_without_a_session_makes_no_call(async_client, restarter):
 
     assert response.status_code == 401
     assert restarter.requests == []
+
+
+# -- The last restart, read back (issue #1433) --
+
+NO_RUN = {"id": None, "state": "none", "result": None, "finished_at": None}
+# The record's clock in these tests (the record itself is pinned in test_restart_record.py).
+FINISHED = datetime(2026, 11, 27, 16, 51, 23, tzinfo=timezone.utc)
+FINISHED_TEXT = "2026-11-27T16:51:23+00:00"
+
+
+@pytest.fixture(autouse=True)
+def fixed_record_clock(monkeypatch):
+    import app.restart_record as restart_record
+
+    monkeypatch.setattr(
+        restart_record, "RECORD", restart_record.RestartRecord(clock=lambda: FINISHED)
+    )
+
+
+async def _last(client, headers) -> dict:
+    response = await client.get("/apply/last", headers=headers)
+    assert response.status_code == 200
+    return response.json()
+
+
+def _is_run_id(value) -> bool:
+    return (
+        isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+async def test_last_is_no_run_before_any_restart(async_client, restarter):
+    headers = await _configured_session(async_client)
+
+    assert await _last(async_client, headers) == NO_RUN
+    assert restarter.requests == []
+
+
+@pytest.mark.parametrize("auth", [None, "Bearer not-a-token"], ids=["no-session", "bad-token"])
+async def test_last_needs_a_session(async_client, restarter, auth):
+    headers = await _configured_session(async_client)
+    await async_client.post("/apply", headers=headers)
+    sent = {} if auth is None else {"Authorization": auth}
+
+    response = await async_client.get("/apply/last", headers=sent)
+
+    assert response.status_code == 401
+    assert "restarted" not in response.text
+
+
+async def test_last_holds_the_finished_result_and_each_run_has_a_new_id(async_client, restarter):
+    headers = await _configured_session(async_client)
+
+    first = await async_client.post("/apply", headers=headers)
+    last = await _last(async_client, headers)
+    assert first.json() == GOOD
+    assert (last["state"], last["result"], last["finished_at"]) == ("done", GOOD, FINISHED_TEXT)
+    assert _is_run_id(last["id"])
+
+    restarter.body = json.dumps({"restarted": ["auth"], "errors": []}).encode()
+    await async_client.post("/apply", headers=headers)
+    again = await _last(async_client, headers)
+    assert (again["state"], again["result"]) == ("done", {"restarted": ["auth"], "errors": []})
+    assert _is_run_id(again["id"]) and again["id"] != last["id"]
+
+
+async def test_last_records_an_error_result_as_answered(async_client, restarter):
+    restarter.status = 500
+    headers = await _configured_session(async_client)
+
+    answered = (await async_client.post("/apply", headers=headers)).json()
+
+    assert answered == {"restarted": [], "errors": ["The restart service answered HTTP 500"]}
+    assert (await _last(async_client, headers))["result"] == answered
+
+
+@pytest.mark.parametrize("refusal", ["no-session", "unrotated", "unconfigured"])
+async def test_a_refused_apply_leaves_the_record(async_client, restarter, monkeypatch, refusal):
+    import app.main as main
+    from app.config_store import CONFIG_FILE
+
+    headers = await _configured_session(async_client)
+    await async_client.post("/apply", headers=headers)
+    before = await _last(async_client, headers)
+    sent = dict(headers)
+    if refusal == "no-session":
+        sent = {}
+    elif refusal == "unrotated":
+        monkeypatch.setattr(main, "is_password_changed", lambda: False)
+    else:
+        Path(CONFIG_FILE).unlink()
+
+    refused = await async_client.post("/apply", headers=sent)
+
+    assert (
+        refused.status_code == {"no-session": 401, "unrotated": 403, "unconfigured": 400}[refusal]
+    )
+    assert len(restarter.requests) == 1
+    assert await _last(async_client, headers) == before
+
+
+async def test_last_is_running_during_the_restart_and_a_second_apply_is_refused(
+    async_client, restarter
+):
+    restarter.hold = True
+    headers = await _configured_session(async_client)
+
+    pending = asyncio.create_task(async_client.post("/apply", headers=headers))
+    assert await asyncio.to_thread(restarter.arrived.wait, 10)
+    running = await _last(async_client, headers)
+    assert (running["state"], running["result"], running["finished_at"]) == (
+        "running",
+        None,
+        None,
+    )
+    assert _is_run_id(running["id"])
+
+    # A second click while the first restart runs: the in-progress entry, no second
+    # call to the restarter, and the first run's record untouched.
+    second = await async_client.post("/apply", headers=headers)
+    assert (second.status_code, second.json()) == (
+        200,
+        {"restarted": [], "errors": [IN_PROGRESS_ERROR]},
+    )
+    assert len(restarter.requests) == 1
+    assert await _last(async_client, headers) == running
+
+    restarter.hang.set()  # the fake restarter hangs up without an answer
+    first = (await pending).json()
+    assert first == {
+        "restarted": [],
+        "errors": ["Cannot reach the restart service: RemoteDisconnected"],
+    }
+    assert await _last(async_client, headers) == {
+        "id": running["id"],
+        "state": "done",
+        "result": first,
+        "finished_at": FINISHED_TEXT,
+    }
+
+
+async def test_the_result_is_recorded_when_the_request_is_cut_off(
+    async_client, restarter, monkeypatch
+):
+    """The browser's request dies mid-restart (ERR_NETWORK_CHANGED): the route's await
+    is cancelled, the restart goes on, and the worker thread still records its result."""
+    import app.restart_record as restart_record
+
+    finished = threading.Event()
+
+    class SignallingRecord(restart_record.RestartRecord):
+        def finish(self, run_id, result):
+            super().finish(run_id, result)
+            finished.set()
+
+    monkeypatch.setattr(restart_record, "RECORD", SignallingRecord(clock=lambda: FINISHED))
+    restarter.hold = True
+    headers = await _configured_session(async_client)
+
+    pending = asyncio.create_task(async_client.post("/apply", headers=headers))
+    assert await asyncio.to_thread(restarter.arrived.wait, 10)
+    run_id = (await _last(async_client, headers))["id"]
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert (await _last(async_client, headers))["state"] == "running"
+
+    restarter.hang.set()  # the restart ends after the request is gone
+    assert await asyncio.to_thread(finished.wait, 10)
+    last = await _last(async_client, headers)
+    assert last == {
+        "id": run_id,
+        "state": "done",
+        "result": {
+            "restarted": [],
+            "errors": ["Cannot reach the restart service: RemoteDisconnected"],
+        },
+        "finished_at": FINISHED_TEXT,
+    }
+
+
+async def test_a_restart_that_raises_is_recorded_as_lost_and_frees_the_next(
+    async_client, restarter, monkeypatch
+):
+    import app.main as main
+
+    def boom():
+        raise RuntimeError("unexpected")
+
+    headers = await _configured_session(async_client)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(main, "restart_services", boom)
+        with pytest.raises(RuntimeError):
+            await async_client.post("/apply", headers=headers)
+    lost = await _last(async_client, headers)
+    assert (lost["state"], lost["result"], lost["finished_at"]) == (
+        "done",
+        {"restarted": [], "errors": ["The restart ended without a result; check service health"]},
+        FINISHED_TEXT,
+    )
+
+    # The run is over, so the next apply reaches the restarter again.
+    answered = await async_client.post("/apply", headers=headers)
+    assert answered.json() == GOOD
+    assert len(restarter.requests) == 1
 
 
 # -- The config service holds no Docker client --

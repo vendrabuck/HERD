@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app import login_limits
+from app import login_limits, restart_record
 from app.auth import create_session_token, require_config_session
 from app.config_schema import CONFIG_SCHEMA, SCHEMA_KEYS
 from app.config_store import (
@@ -26,7 +26,7 @@ from app.config_store import (
     save_config,
     verify_password,
 )
-from app.docker_ctl import restart_services
+from app.docker_ctl import IN_PROGRESS_ERROR, restart_services
 from app.request_limits import max_request_body_bytes
 from app.validation_errors import holds_lone_surrogate, install_validation_errors
 from app.version import add_version_route, service_version
@@ -279,10 +279,38 @@ async def update_settings(
     return {"message": "Configuration saved"}
 
 
+def _restart_and_record(run_id: str) -> dict:
+    """Run the restart and record its result, in the worker thread itself.
+
+    Recording here, not in the route after the await, means the result is kept even
+    when the browser's request is cut off mid-restart (issue #1433), and the finally
+    means a run never stays `running`, so a later apply is never refused for good.
+    """
+    result = {"restarted": [], "errors": [restart_record.RESULT_LOST_ERROR]}
+    try:
+        result = restart_services()
+    finally:
+        restart_record.RECORD.finish(run_id, result)
+    return result
+
+
 @app.post("/apply")
 async def apply_config(_rotated: None = Depends(require_password_rotated)):
     if not is_configured():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No configuration to apply")
+    # One restart at a time per config process: while the recorded run is still
+    # going, a second apply is answered as the restarter's own 409 would be, and
+    # leaves the record (and the restarter) alone.
+    run_id = restart_record.RECORD.begin()
+    if run_id is None:
+        return {"restarted": [], "errors": [IN_PROGRESS_ERROR]}
     # One parameterless call to the restarter (ADR 0017); nothing from this request
     # is passed on. It blocks for the whole restart, so it runs in a worker thread.
-    return await run_in_threadpool(restart_services)
+    return await run_in_threadpool(_restart_and_record, run_id)
+
+
+@app.get("/apply/last")
+async def last_apply(_session: dict = Depends(require_config_session)):
+    # The last restart this process started, for a page whose POST /apply was cut
+    # off by the restart itself, or that was reloaded meanwhile (issue #1433).
+    return restart_record.RECORD.snapshot()

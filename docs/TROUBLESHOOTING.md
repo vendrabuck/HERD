@@ -21,6 +21,14 @@ The config service runs as a non-root user since issue #1326, and the `herd-conf
 
 The config service could not get an answer from the `restarter` container. Check it is up and healthy with `docker compose ps restarter` and read `docker compose logs restarter`. A stack upgraded with `make restart` instead of `make up` or `make prod` has no restarter yet (and still runs the old config image): run `make up` (`make prod` on a production host). `A restart is already in progress` means another Save and Restart is still running; wait for its result.
 
+### Save and Restart says the connection dropped, or that the restart did not start
+
+A browser on the Docker host itself (Linux, IPv6 on, for example the quick start at `https://localhost`) loses its requests in flight whenever a container restarts, so the restart can cut off the page's own `POST /api/config/apply`. Before issue #1433 the page then said `Failed to save or restart` although the restart went fine. The page now keeps waiting, reads the result the config service kept (`GET /api/config/apply/last`), and shows it under Restart Result as usual. Reloading the config page shows the last result too, under `Last restart, finished <date and time>` in your browser's timezone, so it is never mistaken for the result of a new click. The messages that remain:
+
+- `The restart did not start; try Save and Restart again`: the config service holds no run from this click (or the page could not read the config service's record before sending the restart, and then sent none). Check `docker compose ps` before trying again: another restart may still be running, or the config service itself may have been replaced while a restart ran, which forgets its record.
+- `The connection dropped during the restart and no result arrived in time; check service health`: no result within about 12 minutes. Check `docker compose ps` and `docker compose logs config restarter`.
+- `The connection dropped during the restart and its result could not be read; check service health` (or, after a reload, `The restart that was running did not report a result; check service health`): the config service refused the read. The usual cause is that the config session expired during the wait: a config session lasts 30 minutes from sign-in, so one that began long before the click can end while the page waits. Sign in to the config page again: the result is still there and shows under `Last restart, finished ...`. Then check `docker compose ps`.
+
 ### Sign-in says `Too many sign-in attempts`, or a script gets `429 Too many attempts; try again later`
 
 Auth counts every password attempt, successful or not, against the source address it

@@ -25,6 +25,11 @@ def tmp_config_dir(monkeypatch):
 
     monkeypatch.setattr(login_limits, "LIMITER", login_limits.LoginLimiter())
 
+    # A fresh last-restart record per test (issue #1433), for the same reason.
+    import app.restart_record as restart_record
+
+    monkeypatch.setattr(restart_record, "RECORD", restart_record.RestartRecord())
+
     with tempfile.TemporaryDirectory() as tmpdir:
         monkeypatch.setenv("HERD_CONFIG_DATA_DIR", tmpdir)
         # Patch the module-level variables in config_store

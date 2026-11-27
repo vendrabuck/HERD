@@ -197,22 +197,19 @@ jobs:
       # diagnostics on a failure and stop the three labs, LDAP, OIDC, and NOS).
       # It needs no Selenium: the test drives Playwright's own Chromium.
       #
-      # IPv6 is switched off on the runner first, and that is load-bearing. The
-      # browser runs on the Docker host. Restarting a container removes and
-      # recreates its veth interface, whose only address is an IPv6 link-local
-      # one, and Chromium aborts every in-flight request with
-      # ERR_NETWORK_CHANGED when a host address appears or disappears. The
-      # first run of this step (2026-11-14) lost the POST /api/config/apply
-      # answer that way 306 ms in: the restarter restarted all eleven services
-      # and answered 200, and the page never saw it. With IPv6 off the veth
-      # carries no address, so the restart changes none. A browser on another
-      # machine than the Docker host is not affected.
+      # IPv6 stays on, so this step also covers the lost-answer path. The browser
+      # runs on the Docker host. Restarting a container removes and recreates its
+      # veth interface, whose only address is an IPv6 link-local one, and
+      # Chromium aborts every in-flight request with ERR_NETWORK_CHANGED when a
+      # host address appears or disappears. The first run of this step
+      # (2026-11-14) lost the POST /api/config/apply answer that way 306 ms in.
+      # Since issue #1433 the config service keeps its last restart and the page
+      # reads it from GET /api/config/apply/last when the answer is lost, so the
+      # Restart Result panel appears either way (OPS-CONFIG-32, OPS-CONFIG-33).
       - name: Config Save and Restart (real restart path, runs last)
         env:
           HERD_E2E_RESTART: "1"
-        run: |
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
-          uv run pytest tests/e2e/test_config_playwright.py::test_config_save_and_restart_gated -v --tb=short
+        run: uv run pytest tests/e2e/test_config_playwright.py::test_config_save_and_restart_gated -v --tb=short
 
       # Issue #648: this ordering is an invariant in both directions. It must
       # come AFTER every test phase it is meant to cover (an `if: failure()`
