@@ -90,9 +90,14 @@ Every import returns a `BulkImportReport`:
   processed. Import is per-row transactional: a rejected row is rolled back and
   leaves no partial write. In a JSON import, an item that is not an object is
   rejected with `row is not an object`, and one whose `name` is not a string with
-  `name: must be a string`. A topology item whose canvas has a part of the wrong
-  type is rejected with the part's path, for example `canvas.nodes.2: must be an
-  object` or `canvas.nodes.0.data.device.name: must be a string`.
+  `name: must be a string`. A topology item is also checked along one chain of its
+  canvas: `canvas` must be an object, `canvas.nodes` a list, each node an object,
+  each node's `data` and `data.device` objects, and the device `name` a string. A
+  part of that chain with the wrong type is rejected with its path, for example
+  `canvas.nodes.2: must be an object` or `canvas.nodes.0.data.device.name: must be a
+  string`, even when the value is empty, zero, or false; a null or absent part passes,
+  except a null node. Other parts of the canvas, such as `edges`, are judged with the
+  row.
 
 With `dry_run=true`, nothing is written and the same report shape is returned.
 For all three importers, a dry run is a full rehearsal (issue #1017 for devices

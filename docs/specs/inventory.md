@@ -1262,10 +1262,13 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   boolean, or null) is rejected with the reason `row is not an object`, and an object
   whose `name` is present, not null, and not a string is rejected with `name: must be a
   string`; both rows carry no identity, and every other row is judged on its own
-  (INV-BULK-7). A null, empty, or blank name keeps the reason `missing required field:
-  name` (INV-BULK-9). The check runs before anything reads the item. Before issue #1573
-  such an item answered 500, after a committing import had already written the rows
-  before it. \
+  (INV-BULK-7). An absent or null name, or a string name that is empty or blank, keeps
+  the reason `missing required field: name` (INV-BULK-9). The check runs before
+  anything reads the item. Before issue #1573 an item that is not an object, or a
+  `name` that is a nonzero number, `true`, or a non-empty list or object, answered 500,
+  and on a committing import the rows before it had already been written; a `name` of
+  `0`, `false`, `[]`, or `{}` was rejected `missing required field: name` and is now
+  rejected `name: must be a string`. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_shape_reason`, `_import_device_rows`, `_import_template_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_null_or_empty_name_is_still_the_missing_name_reason`, `test_the_items_wrapper_rejects_a_non_object_item_the_same_way`, `test_a_committing_import_reports_the_rows_before_a_bad_item`); `services/inventory/tests/test_bulk_service_unit.py` (`test_row_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_device_import_item_that_is_not_an_object_is_a_rejected_row`)
 - **INV-BULK-23.** An import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB) answers

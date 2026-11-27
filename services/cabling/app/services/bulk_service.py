@@ -85,8 +85,8 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
 
 # A JSON import item the importer cannot read (issue #1573): an item that is not an
 # object, a `name` that is not a string, or a canvas whose parts the device-name pass
-# reads are the wrong type. Each answered 500 (the pass over every record's device
-# names runs before any row); such an item is now a rejected row with a fixed reason,
+# reads are the wrong type (TOPO-BULK-21 lists which of these answered 500 before and
+# which were read as absent). Such an item is a rejected row with a fixed reason,
 # `<field>: <message>` naming the path and never a value, and the other rows are
 # judged on their own. A CSV import builds every record itself, so it never meets one.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"

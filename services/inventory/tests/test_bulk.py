@@ -1706,11 +1706,12 @@ async def test_a_json_string_cell_the_parser_refuses_rejects_that_row_only(
 
 # A JSON import item the row loop cannot read (issue #1573) ---------------------------
 #
-# An item that is not an object, or an object whose `name` is not a string, raised
-# AttributeError on its first `.get` or `.strip`, outside the per-row handling: the
-# route answered 500, and on a committing import the rows before it were already
-# written with no report saying so. Such an item is now a rejected row with a fixed
-# reason, and every other row is judged on its own (INV-BULK-7 and INV-BULK-9).
+# An item that is not an object, or an object whose `name` is a nonzero number, true,
+# or a non-empty list or object, raised AttributeError on its first `.get` or `.strip`,
+# outside the per-row handling: the route answered 500, and on a committing import the
+# rows before it were already written with no report saying so. A name of 0, false,
+# [], or {} was read as missing. Each is now a rejected row with a fixed reason, and
+# every other row is judged on its own (INV-BULK-7, INV-BULK-26).
 
 _ROW_NOT_AN_OBJECT = "row is not an object"
 _NAME_NOT_A_STRING = "name: must be a string"

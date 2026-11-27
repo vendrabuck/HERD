@@ -107,9 +107,11 @@ JSON_CELL_UNREADABLE_REASON = "a JSON cell is nested too deeply or holds a numbe
 
 # A JSON import item the row loop cannot read (issue #1573): an item that is not an
 # object (a list, string, number, boolean, or null), or an object whose `name` is not
-# a string. Each answered 500 before the first `.get` or `.strip`; the item is now a
-# rejected row with one of these fixed reasons and the other rows are judged on their
-# own. A CSV row is always an object of strings, so it never meets either.
+# a string. A non-object item, or a name that is a nonzero number, true, or a non-empty
+# list or object, answered 500 at the first `.get` or `.strip`; a name that is 0,
+# false, [], or {} was read as missing. The item is now a rejected row with one of
+# these fixed reasons and the other rows are judged on their own. A CSV row is always
+# an object of strings, so it never meets either.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
 

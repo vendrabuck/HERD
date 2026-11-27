@@ -1320,14 +1320,26 @@ is the user guide.
   `canvas.nodes.<i>.data: must be an object`, `canvas.nodes.<i>.data.device: must be an
   object`, and `canvas.nodes.<i>.data.device.name: must be a string`, where `<i>` is the
   node's index. A null or absent `canvas`, `canvas.nodes`, node `data`, `data.device`,
-  or device name passes; a null node does not. The row carries the trimmed name as its
-  identity when the name is a string that is not blank, else none. Such a record is checked before the
-  one pass that collects every record's device names for TOPO-BULK-9, and that pass
-  leaves it out, so none of its names is sent to inventory. Edges and every other part
-  of the canvas are read only inside the row's own handling and are not checked here.
-  Before issue #1573 each of these answered 500 to any signed-in user, after a
-  committing import had already written the rows before it. The same reasons for an
-  item and its name are inventory's (INV-BULK-26 in `inventory.md`). \
+  or device name passes; a null node does not. A value of the wrong type is rejected
+  even when it is empty, zero, or false (`0`, `false`, `""`, `[]`, or `{}`, whichever
+  is the wrong type for that part). The row carries the trimmed name as its identity
+  when the name is a string that is not blank, else none. Such a record is checked
+  before the one pass that collects every record's device names for TOPO-BULK-9, and
+  that pass leaves it out, so none of its names is sent to inventory. Edges and every
+  other part of the canvas are read only inside the row's own handling and are not
+  checked here. The same reasons for an item and its name are inventory's (INV-BULK-26
+  in `inventory.md`). Before issue #1573, to any signed-in user: an item that is not an
+  object, a node that is not an object, a device name that is a non-empty list or
+  object, or a `canvas`, `canvas.nodes`, node `data`, or `data.device` of the wrong
+  type that is not empty, zero, or false answered 500 from the device-name pass, before
+  any row ran, so nothing was written; a `name` that is a nonzero number, `true`, or a
+  non-empty list or object answered 500 after the rows before it had committed. A device
+  name that is a number or `true` was not refused by type: beside a string device name
+  in the same file it stopped the request with the TOPO-BULK-9 503, and otherwise it was
+  passed to the name lookup. A wrong-typed `canvas`, `canvas.nodes`, `data`,
+  `data.device`, or device name that is empty, zero, or false was read as absent and the
+  topology imported, and a `name` of `0`, `false`, `[]`, or `{}` was rejected `missing
+  required field: name`; each of those is now rejected with the reason above. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`_record_shape_reason`, `import_topologies`, `_import_topology_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row`, `test_a_rejected_record_is_left_out_of_the_name_resolution`, `test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row`, `test_a_null_or_absent_part_passes_the_shape_check`, `test_an_odd_edge_list_is_judged_by_the_row_not_a_500`, `test_a_committing_import_reports_the_topology_before_a_bad_item`); `services/cabling/tests/test_route_handlers_direct.py` (`test_record_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin`)
 - **TOPO-BULK-22.** A CSV import is read through the shared reader `read_csv_rows`, the

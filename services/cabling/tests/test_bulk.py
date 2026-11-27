@@ -1409,12 +1409,12 @@ async def test_a_json_import_just_under_the_parser_bounds_imports(user_client, f
 # A JSON import item the importer cannot read (issue #1573) --------------------------
 #
 # An item that is not an object, a `name` that is not a string, or a canvas whose
-# parts the device-name pass reads are the wrong type raised AttributeError or
-# TypeError outside the per-row handling: the pass over every record's device names
-# runs before any row, and the name is read before the row's `try`. The route answered
-# 500 to any signed-in user, and a committing import kept the rows before the bad one
-# with no report. Such an item is now a rejected row with a fixed reason and the rest
-# of the batch runs (TOPO-BULK-10, TOPO-BULK-18).
+# parts the device-name pass reads are the wrong type. The pass over every record's
+# device names runs before any row, and the name is read before the row's `try`, so
+# most of these answered 500 to any signed-in user (a bad name after the rows before
+# it had committed), and the ones that are empty, zero, or false were read as absent;
+# TOPO-BULK-21 lists which. Each is now a rejected row with a fixed reason and the
+# rest of the batch runs (TOPO-BULK-18, TOPO-BULK-21).
 
 _ROW_NOT_AN_OBJECT = "row is not an object"
 _NAME_NOT_A_STRING = "name: must be a string"
@@ -1578,6 +1578,92 @@ _BAD_CANVASES = {
     ),
     "second_device_name_int": (
         {"nodes": [_device_node(), _device_node(name=2, id="n2")]},
+        "canvas.nodes.1.data.device.name: must be a string",
+    ),
+    # Wrong-typed values that are falsy: each `is None` test must not become a
+    # truthiness test, which would read them as absent.
+    "canvas_false": (False, "canvas: must be an object"),
+    "nodes_zero": ({"nodes": 0}, "canvas.nodes: must be a list"),
+    "nodes_false": ({"nodes": False}, "canvas.nodes: must be a list"),
+    "nodes_empty_string": ({"nodes": ""}, "canvas.nodes: must be a list"),
+    "node_zero": ({"nodes": [0]}, "canvas.nodes.0: must be an object"),
+    "node_false": ({"nodes": [False]}, "canvas.nodes.0: must be an object"),
+    "node_empty_string": ({"nodes": [""]}, "canvas.nodes.0: must be an object"),
+    "data_zero": ({"nodes": [{"data": 0}]}, "canvas.nodes.0.data: must be an object"),
+    "data_empty_string": ({"nodes": [{"data": ""}]}, "canvas.nodes.0.data: must be an object"),
+    "data_empty_list": ({"nodes": [{"data": []}]}, "canvas.nodes.0.data: must be an object"),
+    "device_zero": (
+        {"nodes": [{"data": {"device": 0}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_false": (
+        {"nodes": [{"data": {"device": False}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_empty_list": (
+        {"nodes": [{"data": {"device": []}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_name_zero": (
+        {"nodes": [_device_node(name=0)]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_zero_float": (
+        {"nodes": [_device_node(name=0.0)]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_false": (
+        {"nodes": [_device_node(name=False)]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_empty_list": (
+        {"nodes": [_device_node(name=[])]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_empty_object": (
+        {"nodes": [_device_node(name={})]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    # A null or absent part early in the canvas, then a bad part in a later node:
+    # passing the null part must move on to the next node, never end the check.
+    "absent_data_then_bad_node": (
+        {"nodes": [{"id": "n1"}, 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "null_data_then_bad_node": (
+        {"nodes": [{"id": "n1", "data": None}, 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "absent_device_then_bad_node": (
+        {"nodes": [{"id": "n1", "data": {"label": "x"}}, 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "null_device_then_bad_node": (
+        {"nodes": [{"data": {"device": None}}, 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "null_device_name_then_bad_node": (
+        {"nodes": [_device_node(name=None), 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "absent_device_name_then_bad_node": (
+        {"nodes": [{"id": "n1", "data": {"device": {"role": "dut"}}}, 1]},
+        "canvas.nodes.1: must be an object",
+    ),
+    "null_data_then_bad_data": (
+        {"nodes": [{"id": "n1", "data": None}, {"id": "n2", "data": 1}]},
+        "canvas.nodes.1.data: must be an object",
+    ),
+    "null_device_then_bad_device": (
+        {"nodes": [{"data": {"device": None}}, {"data": {"device": "x"}}]},
+        "canvas.nodes.1.data.device: must be an object",
+    ),
+    "null_device_then_bad_device_name": (
+        {"nodes": [{"data": {"device": None}}, _device_node(name=0, id="n2")]},
+        "canvas.nodes.1.data.device.name: must be a string",
+    ),
+    "null_device_name_then_bad_device_name": (
+        {"nodes": [_device_node(name=None), _device_node(name=1, id="n2")]},
         "canvas.nodes.1.data.device.name: must be a string",
     ),
 }

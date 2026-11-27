@@ -370,9 +370,9 @@ async def _delete_topologies_named(client, name: str, failure: BaseException | N
 async def test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin(
     user_client, dry_run
 ):
-    """Issue #1573: an item that is not an object answered 500 through the gateway to
-    any signed-in user, after the rows before it were written. It is a rejected row
-    with a fixed reason, and the good row is judged on its own."""
+    """Issue #1573: an item that is not an object, or a `name` of 1, answered 500
+    through the gateway to any signed-in user. Each is a rejected row with a fixed
+    reason, and the good row is judged on its own."""
     name = f"int-bulk-shape-{uuid.uuid4().hex[:8]}"
     items = [1, {"name": name, "canvas": {"nodes": [], "edges": []}}, {"name": 1}]
     failure: BaseException | None = None
