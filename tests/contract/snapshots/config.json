@@ -5,6 +5,10 @@
       "/apply"
     ],
     [
+      "GET",
+      "/apply/last"
+    ],
+    [
       "POST",
       "/change-password"
     ],
