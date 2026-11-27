@@ -543,6 +543,51 @@ describe("Retry inside a form submits nothing (issue #1320)", () => {
   });
 });
 
+describe("a connections page walk that fails part way (issues #1320 and #1336)", () => {
+  it("shows the connections load error, never the first page's ports as uncabled", async () => {
+    // useDeviceConnections walks every page; a failed second page rejects the
+    // whole walk, so the panel shows the failure rather than a partial list.
+    const firstPage = Array.from({ length: 500 }, (_, i) => ({
+      id: `c${i}`,
+      device_a_id: "dev-1",
+      port_a: `p${i}`,
+      device_b_id: "dev-x",
+      port_b: `q${i}`,
+      connection_type: "ethernet",
+      notes: null,
+      created_by: "admin",
+      created_at: STAMP,
+      modified_by: null,
+      updated_at: null,
+    }));
+    const skips: string[] = [];
+    server.use(
+      ok("/api/inventory/templates", page([])),
+      ok("/api/inventory/devices", page([])),
+      ok("/api/inventory/devices/dev-1/ports", [PORT]),
+      http.get("/api/cabling/connections", ({ request }) => {
+        const skip = new URL(request.url).searchParams.get("skip") ?? "0";
+        skips.push(skip);
+        if (skip === "0") {
+          return HttpResponse.json({ items: firstPage, total: 600, skip: 0, limit: 500 });
+        }
+        return HttpResponse.json({ detail: "cabling is restarting" }, { status: 500 });
+      }),
+    );
+    renderSpec({
+      name: "PortsSection",
+      element: () => <PortsSection deviceId="dev-1" isAdmin />,
+      handlers: () => [],
+      alertText: "",
+      retryName: "",
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load this device's connections. cabling is restarting",
+    );
+    expect(skips).toEqual(["0", "500"]);
+  });
+});
+
 describe("where a failed connections read shows (issue #1320)", () => {
   it("PortsSection shows only the ports failure when both reads fail", async () => {
     server.use(
