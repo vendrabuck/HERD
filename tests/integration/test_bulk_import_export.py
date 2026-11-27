@@ -349,3 +349,89 @@ async def test_topology_import_the_parser_refuses_is_a_fixed_422_for_a_non_admin
             if failure is None:
                 raise
             failure.add_note(f"cleanup after this failure also failed: {cleanup_exc!r}")
+
+
+async def _delete_topologies_named(client, name: str, failure: BaseException | None) -> None:
+    """Delete every topology called `name`; a cleanup failure after a test failure is
+    added to that failure as a note instead of replacing it."""
+    try:
+        listing = await client.get("/cabling/topologies", params={"limit": 500})
+        assert listing.status_code == 200, listing.text
+        for leaked in [t for t in listing.json()["items"] if t["name"] == name]:
+            await delete_topology_checked(client, leaked["id"])
+    except Exception as cleanup_exc:
+        if failure is None:
+            raise
+        failure.add_note(f"cleanup after this failure also failed: {cleanup_exc!r}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", ["true", "false"])
+async def test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin(
+    user_client, dry_run
+):
+    """Issue #1573: an item that is not an object answered 500 through the gateway to
+    any signed-in user, after the rows before it were written. It is a rejected row
+    with a fixed reason, and the good row is judged on its own."""
+    name = f"int-bulk-shape-{uuid.uuid4().hex[:8]}"
+    items = [1, {"name": name, "canvas": {"nodes": [], "edges": []}}, {"name": 1}]
+    failure: BaseException | None = None
+    try:
+        resp = await user_client.post(
+            "/cabling/topologies/import",
+            params={"format": "json", "dry_run": dry_run},
+            files={"file": ("t.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+        )
+        assert resp.status_code == 200, resp.text
+        assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+            ("reject", None, "row is not an object"),
+            ("create", name, None),
+            ("reject", None, "name: must be a string"),
+        ]
+        listing = await user_client.get("/cabling/topologies", params={"limit": 500})
+        assert listing.status_code == 200, listing.text
+        landed = [t["name"] for t in listing.json()["items"] if t["name"] == name]
+        assert landed == ([] if dry_run == "true" else [name])
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        await _delete_topologies_named(user_client, name, failure)
+
+
+@pytest.mark.asyncio
+async def test_device_import_item_that_is_not_an_object_is_a_rejected_row(admin_client):
+    """Issue #1573 on inventory: a dry run, so nothing needs cleaning up."""
+    resp = await admin_client.post(
+        "/inventory/devices/import",
+        params={"format": "json", "dry_run": "true"},
+        files={"file": ("d.json", io.BytesIO(b'[1, null, {"name": 1}]'), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "row is not an object"),
+        ("reject", "row is not an object"),
+        ("reject", "name: must be a string"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin(user_client):
+    """Issue #1574: a CSV with classic Mac line endings (bare carriage returns)
+    answered 500 through the gateway. Every line is now read as a row."""
+    name = f"int-bulk-cr-{uuid.uuid4().hex[:8]}"
+    body = f"topology_name,source_device,source_port,target_device,target_port,layer\r{name},,,,,\r"
+    failure: BaseException | None = None
+    try:
+        resp = await user_client.post(
+            "/cabling/topologies/import",
+            params={"format": "csv"},
+            files={"file": ("t.csv", io.BytesIO(body.encode()), "text/csv")},
+        )
+        assert resp.status_code == 200, resp.text
+        assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", name)]
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        await _delete_topologies_named(user_client, name, failure)

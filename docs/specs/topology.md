@@ -191,7 +191,7 @@ writer's row lock.
 | GET | `/topologies/{id}/versions/{vid}` | any signed-in user | 200 | TOPO-VER-2, TOPO-STRIP-3 |
 | POST | `/topologies/{id}/versions/{vid}/restore` | creator, or any admin | 200 | TOPO-VER-4, TOPO-VER-5, TOPO-TVER-3 |
 | GET | `/topologies/export?format` | any signed-in user | 200 | TOPO-BULK-1 to TOPO-BULK-5 |
-| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19 |
+| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19, TOPO-BULK-21, TOPO-BULK-22 |
 | GET | `/templates` | any signed-in user | 200 | TOPO-TMPL-1 |
 | POST | `/templates` | any signed-in user | 201 | TOPO-TMPL-2, TOPO-TMPL-3 |
 | POST | `/templates/from-topology/{topology_id}` | any signed-in user | 201 | TOPO-TMPL-5, TOPO-TMPL-6, TOPO-TMPL-7 |
@@ -1311,6 +1311,35 @@ is the user guide.
   and parsed on the event loop. The same rule on inventory is INV-BULK-23. \
   Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
+- **TOPO-BULK-21.** A JSON import item the importer cannot read is a rejected row with
+  a fixed reason, `<field>: <message>` naming a path and never a value, and the rest of
+  the batch runs (TOPO-BULK-18): an item that is not an object (a list, string, number,
+  boolean, or null) is `row is not an object`; a `name` present, not null, and not a
+  string is `name: must be a string`; then `canvas: must be an object`,
+  `canvas.nodes: must be a list`, `canvas.nodes.<i>: must be an object`,
+  `canvas.nodes.<i>.data: must be an object`, `canvas.nodes.<i>.data.device: must be an
+  object`, and `canvas.nodes.<i>.data.device.name: must be a string`, where `<i>` is the
+  node's index. A null or absent `canvas`, `canvas.nodes`, node `data`, `data.device`,
+  or device name passes; a null node does not. The row carries the trimmed name as its
+  identity when the name is a string that is not blank, else none. Such a record is checked before the
+  one pass that collects every record's device names for TOPO-BULK-9, and that pass
+  leaves it out, so none of its names is sent to inventory. Edges and every other part
+  of the canvas are read only inside the row's own handling and are not checked here.
+  Before issue #1573 each of these answered 500 to any signed-in user, after a
+  committing import had already written the rows before it. The same reasons for an
+  item and its name are inventory's (INV-BULK-26 in `inventory.md`). \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`_record_shape_reason`, `import_topologies`, `_import_topology_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row`, `test_a_rejected_record_is_left_out_of_the_name_resolution`, `test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row`, `test_a_null_or_absent_part_passes_the_shape_check`, `test_an_odd_edge_list_is_judged_by_the_row_not_a_500`, `test_a_committing_import_reports_the_topology_before_a_bad_item`); `services/cabling/tests/test_route_handlers_direct.py` (`test_record_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin`)
+- **TOPO-BULK-22.** A CSV import is read through the shared reader `read_csv_rows`, the
+  one inventory's importers use (INV-BULK-25 in `inventory.md`), before any row is
+  grouped: `\n`, `\r\n`, and bare `\r` line endings are all read, a bare `\r` in an
+  unquoted cell ends the line, a cell may be as long as the file, and anything the csv
+  module still refuses answers 422 `Invalid CSV: line <n> could not be read; fix it and
+  retry` for the whole request with nothing written, dry run included. Before issue
+  #1574 a cell over 131,072 characters or a bare `\r` outside quotes answered 500 to any
+  signed-in user. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_device_cell_past_the_field_limit_is_judged_not_a_500`, `test_a_topology_name_past_the_field_limit_is_read`, `test_every_line_ending_imports_the_same_topologies`, `test_a_cr_only_csv_with_edges_imports_its_wiring`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_reads_a_cr_only_file`, `test_parse_csv_a_csv_error_is_the_fixed_422`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1733,6 +1762,7 @@ other error carries `detail` as a string or the object shown.
 | 422 | `Invalid JSON: <error>`, `JSON import must be a list of topologies or an object with an 'items' list`, `'items' must be a list` | an unparseable or misshapen JSON import | TOPO-BULK-7 |
 | 422 | `Invalid JSON: the document is nested too deeply or holds a number too long to read` | a JSON import nested past the parser's depth bound or holding an integer longer than 4,300 digits | TOPO-BULK-7 |
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry`, `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | an import file that is not UTF-8, or a JSON import holding a lone surrogate | TOPO-BULK-19 |
+| 422 | `Invalid CSV: line <n> could not be read; fix it and retry` | a CSV import the csv module refuses | TOPO-BULK-22 |
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |

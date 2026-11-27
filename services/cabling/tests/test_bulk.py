@@ -1404,3 +1404,473 @@ async def test_a_json_import_just_under_the_parser_bounds_imports(user_client, f
     assert resp.status_code == 200, resp.text
     assert resp.json()["created"] == 1, resp.text
     assert await _topology_names(user_client) == ["lab"]
+
+
+# A JSON import item the importer cannot read (issue #1573) --------------------------
+#
+# An item that is not an object, a `name` that is not a string, or a canvas whose
+# parts the device-name pass reads are the wrong type raised AttributeError or
+# TypeError outside the per-row handling: the pass over every record's device names
+# runs before any row, and the name is read before the row's `try`. The route answered
+# 500 to any signed-in user, and a committing import kept the rows before the bad one
+# with no report. Such an item is now a rejected row with a fixed reason and the rest
+# of the batch runs (TOPO-BULK-10, TOPO-BULK-18).
+
+_ROW_NOT_AN_OBJECT = "row is not an object"
+_NAME_NOT_A_STRING = "name: must be a string"
+
+_TOPO_NON_OBJECTS = {
+    "empty_list": [],
+    "list": ["lab"],
+    "string": "lab",
+    "empty_string": "",
+    "int": 1,
+    "zero": 0,
+    "float": 1.5,
+    "true": True,
+    "false": False,
+    "null": None,
+}
+
+_TOPO_NON_STRING_NAMES = {
+    "int": 1,
+    "zero": 0,
+    "float": 1.5,
+    "true": True,
+    "false": False,
+    "empty_list": [],
+    "list": ["lab"],
+    "empty_object": {},
+    "object": {"name": "lab"},
+}
+
+_GOOD_TOPOLOGIES = [
+    {"name": "lab-a", "canvas": {"nodes": [], "edges": []}},
+    {"name": "lab-b", "canvas": {"nodes": [], "edges": []}},
+]
+
+
+def _placed(bad, position: str) -> tuple[list, int]:
+    index = {"first": 0, "middle": 1, "last": 2}[position]
+    items = list(_GOOD_TOPOLOGIES)
+    items.insert(index, bad)
+    return items, index
+
+
+def _rows_with_reject(bad_index: int, reason: str, identity: str | None = None) -> list[dict]:
+    names = iter(t["name"] for t in _GOOD_TOPOLOGIES)
+    return [
+        {"row": i, "action": "reject", "identity": identity, "reason": reason}
+        if i == bad_index
+        else {"row": i, "action": "create", "identity": next(names), "reason": None}
+        for i in range(len(_GOOD_TOPOLOGIES) + 1)
+    ]
+
+
+async def _assert_good_rows_landed(client, dry_run: bool) -> None:
+    expected = [] if dry_run else sorted(t["name"] for t in _GOOD_TOPOLOGIES)
+    assert await _topology_names(client) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("kind", list(_TOPO_NON_OBJECTS))
+@pytest.mark.parametrize("position", ["first", "middle", "last"])
+async def test_an_item_that_is_not_an_object_is_a_rejected_row(
+    user_client, dry_run, kind, position
+):
+    items, bad_index = _placed(_TOPO_NON_OBJECTS[kind], position)
+    resp = await _import_json(user_client, items, dry_run=str(dry_run).lower())
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["rows"] == _rows_with_reject(bad_index, _ROW_NOT_AN_OBJECT)
+    assert (report["total"], report["created"], report["rejected"]) == (3, 2, 1)
+    await _assert_good_rows_landed(user_client, dry_run)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("kind", list(_TOPO_NON_STRING_NAMES))
+async def test_an_item_whose_name_is_not_a_string_is_a_rejected_row(user_client, dry_run, kind):
+    bad = {"name": _TOPO_NON_STRING_NAMES[kind], "canvas": {"nodes": [], "edges": []}}
+    items, bad_index = _placed(bad, "middle")
+    resp = await _import_json(user_client, items, dry_run=str(dry_run).lower())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == _rows_with_reject(bad_index, _NAME_NOT_A_STRING)
+    await _assert_good_rows_landed(user_client, dry_run)
+
+
+def _device_node(name="switch-a", **overrides) -> dict:
+    node = {"id": "n1", "data": {"device": {"name": name}, "label": "x"}}
+    node.update(overrides)
+    return node
+
+
+# Each canvas a record may carry that the device-name pass could not read, and the
+# fixed reason it is rejected with: `<path>: <message>`, the path naming the node by
+# its index and never a value from the file.
+_BAD_CANVASES = {
+    "canvas_int": (1, "canvas: must be an object"),
+    "canvas_zero": (0, "canvas: must be an object"),
+    "canvas_string": ("x", "canvas: must be an object"),
+    "canvas_empty_string": ("", "canvas: must be an object"),
+    "canvas_list": ([{"nodes": []}], "canvas: must be an object"),
+    "canvas_empty_list": ([], "canvas: must be an object"),
+    "canvas_true": (True, "canvas: must be an object"),
+    "nodes_string": ({"nodes": "n1"}, "canvas.nodes: must be a list"),
+    "nodes_int": ({"nodes": 1}, "canvas.nodes: must be a list"),
+    "nodes_object": ({"nodes": {"n1": {}}}, "canvas.nodes: must be a list"),
+    "nodes_empty_object": ({"nodes": {}}, "canvas.nodes: must be a list"),
+    "nodes_true": ({"nodes": True}, "canvas.nodes: must be a list"),
+    "node_int": ({"nodes": [1]}, "canvas.nodes.0: must be an object"),
+    "node_null": ({"nodes": [None]}, "canvas.nodes.0: must be an object"),
+    "node_string": ({"nodes": ["n1"]}, "canvas.nodes.0: must be an object"),
+    "node_list": ({"nodes": [[]]}, "canvas.nodes.0: must be an object"),
+    "second_node_int": ({"nodes": [_device_node(), 1]}, "canvas.nodes.1: must be an object"),
+    "last_of_three_nodes": (
+        {"nodes": [_device_node(), {"id": "n2"}, "n3"]},
+        "canvas.nodes.2: must be an object",
+    ),
+    "data_int": ({"nodes": [{"id": "n1", "data": 1}]}, "canvas.nodes.0.data: must be an object"),
+    "data_string": (
+        {"nodes": [{"id": "n1", "data": "x"}]},
+        "canvas.nodes.0.data: must be an object",
+    ),
+    "data_list": (
+        {"nodes": [{"id": "n1", "data": [{"device": {}}]}]},
+        "canvas.nodes.0.data: must be an object",
+    ),
+    "data_false": (
+        {"nodes": [{"id": "n1", "data": False}]},
+        "canvas.nodes.0.data: must be an object",
+    ),
+    "device_int": (
+        {"nodes": [{"id": "n1", "data": {"device": 1}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_string": (
+        {"nodes": [{"id": "n1", "data": {"device": "switch-a"}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_list": (
+        {"nodes": [{"id": "n1", "data": {"device": ["switch-a"]}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_empty_string": (
+        {"nodes": [{"id": "n1", "data": {"device": ""}}]},
+        "canvas.nodes.0.data.device: must be an object",
+    ),
+    "device_name_int": (
+        {"nodes": [_device_node(name=1)]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_list": (
+        {"nodes": [_device_node(name=["switch-a"])]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_object": (
+        {"nodes": [_device_node(name={"a": "b"})]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "device_name_true": (
+        {"nodes": [_device_node(name=True)]},
+        "canvas.nodes.0.data.device.name: must be a string",
+    ),
+    "second_device_name_int": (
+        {"nodes": [_device_node(), _device_node(name=2, id="n2")]},
+        "canvas.nodes.1.data.device.name: must be a string",
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("kind", list(_BAD_CANVASES))
+async def test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row(user_client, dry_run, kind):
+    canvas, reason = _BAD_CANVASES[kind]
+    items, bad_index = _placed({"name": "  bad-lab  ", "canvas": canvas}, "middle")
+    # Every device name in the good rows (none) and in the rejected record must stay
+    # out of the one resolve call: the bad record is skipped by the name pass.
+    with _resolver({}) as resolver:
+        resp = await _import_json(user_client, items, dry_run=str(dry_run).lower())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == _rows_with_reject(bad_index, reason, identity="bad-lab")
+    resolver.assert_not_called()
+    await _assert_good_rows_landed(user_client, dry_run)
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_record_is_left_out_of_the_name_resolution(admin_client):
+    """The bad record names a device in a readable node; the name pass skips the whole
+    record, so only the good record's names are sent to inventory."""
+    bad = {"name": "bad-lab", "canvas": {"nodes": [_device_node(name="sw-hidden"), 1]}}
+    good = {"name": "good-lab", "canvas": {"nodes": [_device_node()], "edges": []}}
+    with _resolver({"switch-a": DEV_A}) as resolver:
+        resp = await _import_json(admin_client, [bad, good])
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "bad-lab", "canvas.nodes.1: must be an object"),
+        ("create", "good-lab", None),
+    ]
+    resolver.assert_awaited_once_with(["switch-a"])
+
+
+@pytest.mark.asyncio
+async def test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row(user_client):
+    """The non-admin path with a real filter (an empty visible set) reaches the same
+    shape check; the visibility read itself is unchanged."""
+    with (
+        patch(
+            "app.services.bulk_service.resolve_caller_visibility",
+            new=AsyncMock(return_value=set()),
+        ),
+        _resolver({}),
+    ):
+        resp = await _import_json(user_client, [1, {"name": "lab-a"}, {"name": 1}])
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", None, _ROW_NOT_AN_OBJECT),
+        ("create", "lab-a", None),
+        ("reject", None, _NAME_NOT_A_STRING),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canvas",
+    [
+        None,
+        {},
+        {"nodes": None, "edges": []},
+        {"nodes": [{"id": "n1"}], "edges": []},
+        {"nodes": [{"id": "n1", "data": None}], "edges": []},
+        {"nodes": [{"id": "n1", "data": {"device": None}}], "edges": []},
+        {"nodes": [{"id": "n1", "data": {"device": {"name": None}}}], "edges": []},
+        {"nodes": [{"id": "n1", "data": {"device": {}}}], "edges": []},
+    ],
+    ids=[
+        "canvas_null",
+        "canvas_empty",
+        "nodes_null",
+        "node_without_data",
+        "data_null",
+        "device_null",
+        "device_name_null",
+        "device_empty",
+    ],
+)
+async def test_a_null_or_absent_part_passes_the_shape_check(user_client, canvas):
+    resp = await _import_json(user_client, [{"name": "lab", "canvas": canvas}])
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", "lab")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edges",
+    ["e1", 1, {"e1": {}}, [1], [None], ["e1"], [{"id": "e1", "source": 1, "target": []}]],
+    ids=[
+        "string",
+        "int",
+        "object",
+        "edge_int",
+        "edge_null",
+        "edge_string",
+        "edge_ends_not_strings",
+    ],
+)
+async def test_an_odd_edge_list_is_judged_by_the_row_not_a_500(user_client, edges):
+    """Edges are read only inside the row's own error handling, so the shape check
+    leaves them to it: the answer is a report, whatever the row's outcome."""
+    resp = await _import_json(
+        user_client, [{"name": "lab", "canvas": {"nodes": [], "edges": edges}}]
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["rows"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_committing_import_reports_the_topology_before_a_bad_item(user_client):
+    """The issue's partial-write case: `[{"name": "T-ok"}, {"name": 1}]` wrote `T-ok`
+    and answered 500 with no report. The report now says so."""
+    resp = await _import_json(user_client, [{"name": "T-ok"}, {"name": 1}])
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [
+        ("create", "T-ok"),
+        ("reject", None),
+    ]
+    assert await _topology_names(user_client) == ["T-ok"]
+
+
+_NOT_TOPOLOGIES = "JSON import must be a list of topologies or an object with an 'items' list"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (1, _NOT_TOPOLOGIES),
+        (1.5, _NOT_TOPOLOGIES),
+        ("lab", _NOT_TOPOLOGIES),
+        (True, _NOT_TOPOLOGIES),
+        (None, _NOT_TOPOLOGIES),
+        ({}, _NOT_TOPOLOGIES),
+        ({"topologies": []}, _NOT_TOPOLOGIES),
+        ({"items": 1}, "'items' must be a list"),
+        ({"items": "lab"}, "'items' must be a list"),
+        ({"items": None}, "'items' must be a list"),
+        ({"items": {"name": "lab"}}, "'items' must be a list"),
+    ],
+    ids=[
+        "int",
+        "float",
+        "string",
+        "bool",
+        "null",
+        "empty_object",
+        "object_without_items",
+        "items_int",
+        "items_string",
+        "items_null",
+        "items_object",
+    ],
+)
+async def test_a_document_that_is_not_the_expected_container_is_a_422(
+    user_client, dry_run, body, detail
+):
+    resp = await _import_json(user_client, body, dry_run=str(dry_run).lower())
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": detail}
+    assert await _topology_names(user_client) == []
+
+
+# A CSV import the csv module cannot read (issue #1574) ------------------------------
+
+_DEFAULT_FIELD_LIMIT = 131_072
+_CSV_HEADER = "topology_name,source_device,source_port,target_device,target_port,layer"
+
+
+async def _import_csv(client, text: str, *, dry_run: bool = False):
+    return await client.post(
+        "/topologies/import",
+        params={"format": "csv", "dry_run": str(dry_run).lower()},
+        files={"file": ("t.csv", io.BytesIO(text.encode()), "text/csv")},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [_DEFAULT_FIELD_LIMIT, _DEFAULT_FIELD_LIMIT + 1])
+async def test_a_device_cell_past_the_field_limit_is_judged_not_a_500(user_client, length):
+    device = "d" * length
+    with _resolver({}):
+        resp = await _import_csv(user_client, f"{_CSV_HEADER}\nlab,{device},,switch-b,,\n")
+    assert resp.status_code == 200, resp.text
+    [row] = resp.json()["rows"]
+    assert (row["action"], row["identity"]) == ("reject", "lab")
+    assert row["reason"] == f"unresolved device names: {device}, switch-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_a_topology_name_past_the_field_limit_is_read(user_client, dry_run):
+    name = "t" * (_DEFAULT_FIELD_LIMIT + 1)
+    resp = await _import_csv(user_client, f"{_CSV_HEADER}\n{name},,,,,\n", dry_run=dry_run)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", name)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_every_line_ending_imports_the_same_topologies(user_client, ending, dry_run):
+    text = ending.join([_CSV_HEADER, "lab-a,,,,,", "lab-b,,,,,"]) + ending
+    resp = await _import_csv(user_client, text, dry_run=dry_run)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [
+        ("create", "lab-a"),
+        ("create", "lab-b"),
+    ]
+    assert await _topology_names(user_client) == ([] if dry_run else ["lab-a", "lab-b"])
+
+
+@pytest.mark.asyncio
+async def test_a_cr_only_csv_with_edges_imports_its_wiring(admin_client):
+    """A whole file with classic Mac line endings: each line is an edge row."""
+    await _seed_connection()
+    text = "\r".join([_CSV_HEADER, "lab,switch-a,eth0,switch-b,eth0,L1"]) + "\r"
+    with _resolver({"switch-a": DEV_A, "switch-b": DEV_B}):
+        resp = await _import_csv(admin_client, text)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", "lab")]
+    exported = await admin_client.get("/topologies/export", params={"format": "csv"})
+    assert exported.text.splitlines()[1] == "lab,switch-a,eth0,switch-b,eth0,L1"
+
+
+@pytest.mark.asyncio
+async def test_a_bare_cr_in_an_unquoted_cell_ends_the_line(user_client):
+    resp = await _import_csv(user_client, f"{_CSV_HEADER}\r\nlab-a\rlab-b,,,,,\r\n")
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [
+        ("create", "lab-a"),
+        ("create", "lab-b"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "rows"),
+    [
+        (f"{_CSV_HEADER}\nla\x00b,,,,,\n", 1),
+        (f'{_CSV_HEADER}\n"lab,,,,,\n', 1),
+        (f'{_CSV_HEADER}\nla"b,,,,,\n', 1),
+        (f'{_CSV_HEADER}\n"la"b,,,,,\n', 1),
+        (f"{_CSV_HEADER}\nlab,,,,,,extra\n", 1),
+        ("", 0),
+        (f"{_CSV_HEADER}\n", 0),
+    ],
+    ids=[
+        "nul",
+        "unterminated_quote",
+        "quote_inside_unquoted_cell",
+        "text_after_a_closing_quote",
+        "extra_cells",
+        "empty_file",
+        "header_only",
+    ],
+)
+async def test_csv_the_module_reads_leniently_is_judged_not_a_500(user_client, text, rows):
+    resp = await _import_csv(user_client, text)
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["total"] == len(report["rows"]) == rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        (f"{_CSV_HEADER},a_very_long_extra_column\nlab,,,,,\n", 1),
+        (f"{_CSV_HEADER}\nlab-a,,,,,\nlab-b,,,,,\nlab-c-is-too-long,,,,,\n", 4),
+        (f'{_CSV_HEADER}\n"lab\r\nx",,,,,\nlab-c-is-too-long,,,,,\n', 4),
+        (f"{_CSV_HEADER}\rlab-a,,,,,\rlab-c-is-too-long,,,,,\r", 3),
+    ],
+    ids=["header", "fourth_line", "after_a_multiline_cell", "cr_lines"],
+)
+async def test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing(
+    user_client, monkeypatch, dry_run, text, line
+):
+    """The csv module is made to refuse a real cell by holding its field limit at 13
+    characters (the longest header cell, `topology_name`); its own `csv.Error` then
+    reaches the route. The rows before the refused line are not written either."""
+    from herd_common import csv_import
+
+    monkeypatch.setattr(csv_import, "_field_limit_for", lambda text: 13)
+    resp = await _import_csv(user_client, text, dry_run=dry_run)
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": f"Invalid CSV: line {line} could not be read; fix it and retry"
+    }
+    assert await _topology_names(user_client) == []
+    assert await _count_versions() == 0

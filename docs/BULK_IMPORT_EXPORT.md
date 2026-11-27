@@ -88,7 +88,11 @@ Every import returns a `BulkImportReport`:
 - `reject`: the row failed validation or reference resolution. The `reason`
   explains why. A reject never aborts the batch; every other row is still
   processed. Import is per-row transactional: a rejected row is rolled back and
-  leaves no partial write.
+  leaves no partial write. In a JSON import, an item that is not an object is
+  rejected with `row is not an object`, and one whose `name` is not a string with
+  `name: must be a string`. A topology item whose canvas has a part of the wrong
+  type is rejected with the part's path, for example `canvas.nodes.2: must be an
+  object` or `canvas.nodes.0.data.device.name: must be a string`.
 
 With `dry_run=true`, nothing is written and the same report shape is returned.
 For all three importers, a dry run is a full rehearsal (issue #1017 for devices
@@ -120,6 +124,15 @@ Python 3.12), or one holding an integer longer than 4,300 digits. A device or
 template `field_data` or `sections` written as JSON text like that, a CSV cell or a
 JSON string in a JSON import, rejects only its row, with the reason `a JSON cell is
 nested too deeply or holds a number too long to read`.
+
+A CSV import file, for devices, templates, or topologies, may end its lines with
+`\n`, `\r\n`, or a bare `\r` (the classic Mac format some spreadsheet tools still
+write). A bare `\r` inside an unquoted cell ends the line, the way a spreadsheet
+reads it; quote a cell to keep a line break in it. A cell may be as long as the file,
+so a template whose `icon` is a large data URL exports to CSV and imports back. A CSV
+the reader still cannot read is refused as a whole with HTTP 422 `Invalid CSV: line
+<n> could not be read; fix it and retry`, naming the line where reading stopped (the
+header is line 1).
 
 ### Devices
 
