@@ -49,11 +49,6 @@ async function fetchPaginatedTopologies(
   return resp.data;
 }
 
-async function fetchTopologies(): Promise<Topology[]> {
-  const resp = await fetchPaginatedTopologies(0, 500);
-  return resp.items;
-}
-
 async function fetchTopology(id: string): Promise<Topology> {
   const resp = await apiClient.get<Topology>(`/cabling/topologies/${id}`);
   return resp.data;
@@ -91,13 +86,6 @@ export async function validateTopology(id: string): Promise<TopologyValidationRe
     `/cabling/topologies/${id}/validate`,
   );
   return resp.data;
-}
-
-export function useTopologies() {
-  return useQuery({
-    queryKey: ["topologies"],
-    queryFn: fetchTopologies,
-  });
 }
 
 export function usePaginatedTopologies(

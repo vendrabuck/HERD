@@ -118,9 +118,6 @@ function placeholderNode(id: string, templateId: string, count: number): Node<Ca
 function baseHandlers() {
   return [
     http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
-    http.get("/api/reservations/", () =>
-      HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
-    ),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
     http.get("/api/inventory/templates", () =>
       HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 }),
