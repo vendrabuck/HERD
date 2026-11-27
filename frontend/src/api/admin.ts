@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tansta
 import type { ProfileUpdate, User } from "@/types/auth.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedUsers(skip = 0, limit = 50): Promise<PaginatedResponse<User>> {
   const resp = await apiClient.get<PaginatedResponse<User>>("/auth/users", {
@@ -10,9 +11,10 @@ async function fetchPaginatedUsers(skip = 0, limit = 50): Promise<PaginatedRespo
   return resp.data;
 }
 
+// Every user, across all pages (issue #1336): the group member picker and the
+// purpose review's user names must not stop at the 500-row page cap.
 async function fetchAllUsers(): Promise<User[]> {
-  const resp = await fetchPaginatedUsers(0, 500);
-  return resp.items;
+  return fetchAllPages(fetchPaginatedUsers);
 }
 
 async function setUserRole({ userId, role }: { userId: string; role: string }): Promise<User> {

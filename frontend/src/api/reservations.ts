@@ -71,9 +71,11 @@ async function fetchPaginatedReservations(
   return resp.data;
 }
 
-async function fetchReservations(): Promise<Reservation[]> {
-  const resp = await fetchPaginatedReservations(0, 500);
-  return resp.items;
+// One reservation by id (`GET /reservations/{id}`, owner only: anyone else,
+// an admin included, gets 404 per RES-VIEW-1 and RES-VIEW-2).
+async function fetchReservation(id: string): Promise<Reservation> {
+  const resp = await apiClient.get<Reservation>(`/reservations/${id}`);
+  return resp.data;
 }
 
 async function createReservation(data: ReservationCreate): Promise<Reservation> {
@@ -132,10 +134,17 @@ export function useCalendarReservations(params: CalendarQueryParams) {
   });
 }
 
-export function useReservations() {
+/**
+ * Exactly the reservation named, read by id (issue #1319), never found by
+ * scanning a page of the caller's list. Keyed `["reservations", id]`, so every
+ * mutation that invalidates `["reservations"]` refreshes it. Disabled (no
+ * request) without an id.
+ */
+export function useReservation(id: string | null | undefined) {
   return useQuery({
-    queryKey: ["reservations"],
-    queryFn: fetchReservations,
+    queryKey: ["reservations", id ?? ""],
+    queryFn: () => fetchReservation(id!),
+    enabled: !!id,
   });
 }
 

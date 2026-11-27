@@ -1142,11 +1142,10 @@ def pw_click_for_response(page, target, method, url_end, *, status=200, timeout=
     control that is still loading does not spend the response timeout. That
     timeout still covers more than the request: the click's own actionability
     wait, and anything the page does between the click and the request (in the
-    fork editor, a Commit made before the reservation has loaded sends a
-    device-set PATCH ahead of the save POST, TopologyEditorPage.tsx
-    handleCommitToReservation). Matches on the request method and on the URL
-    without its query string ending in `url_end`. Fails with the response body
-    when the status is not `status`.
+    fork editor, a Commit that adds devices sends a device-set PATCH ahead of
+    the save POST, TopologyEditorPage.tsx handleCommitToReservation). Matches
+    on the request method and on the URL without its query string ending in
+    `url_end`. Fails with the response body when the status is not `status`.
 
     It returns the FIRST response the predicate matches. The main axios client
     replays a request once after a 401 and a token refresh

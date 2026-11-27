@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tansta
 import type { Group, GroupDetail, GroupCreate, GroupUpdate, GroupMember } from "@/types/group.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedGroups(skip = 0, limit = 50): Promise<PaginatedResponse<Group>> {
   const resp = await apiClient.get<PaginatedResponse<Group>>("/auth/groups", {
@@ -10,9 +11,9 @@ async function fetchPaginatedGroups(skip = 0, limit = 50): Promise<PaginatedResp
   return resp.data;
 }
 
+// Every user group, across all pages (issue #1336).
 async function fetchGroups(): Promise<Group[]> {
-  const resp = await fetchPaginatedGroups(0, 500);
-  return resp.items;
+  return fetchAllPages(fetchPaginatedGroups);
 }
 
 async function fetchGroup(id: string): Promise<GroupDetail> {
