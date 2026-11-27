@@ -681,6 +681,155 @@ describe("TopologyEditorPage handleCommitToReservation error branches", () => {
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("Fork is not ACTIVE"));
   });
 
+  // Issue #1406: the conflict dialog renders the 409's message and each
+  // conflict's ids. A body whose fields are not in that shape used to reach it
+  // anyway and throw mid-render, which replaced the editor with the error page
+  // and lost the unsaved drawing. Now such a body never opens the dialog: the
+  // save shows a plain toast, and the editor and its canvas stay as they were.
+  const GOOD_CONFLICT = { reservation_id: "res-x", device_id: "d-x", port: "eth1" };
+  const SAVE_FAILED = "Failed to save the reservation fork";
+  const malformedConflictBodies: Array<{
+    name: string;
+    respond: () => Response;
+    toast: string;
+  }> = [
+    {
+      name: "an object message",
+      respond: () =>
+        HttpResponse.json(
+          { detail: { message: { text: "claimed" }, conflicts: [GOOD_CONFLICT] } },
+          { status: 409 },
+        ),
+      toast: SAVE_FAILED,
+    },
+    {
+      name: "a list message",
+      respond: () =>
+        HttpResponse.json(
+          { detail: { message: ["a"], conflicts: [GOOD_CONFLICT] } },
+          { status: 409 },
+        ),
+      toast: SAVE_FAILED,
+    },
+    {
+      name: "a numeric device id",
+      respond: () =>
+        HttpResponse.json(
+          { detail: { message: "Ports claimed", conflicts: [{ ...GOOD_CONFLICT, device_id: 7 }] } },
+          { status: 409 },
+        ),
+      toast: "Ports claimed",
+    },
+    {
+      name: "a null reservation id",
+      respond: () =>
+        HttpResponse.json(
+          {
+            detail: {
+              message: "Ports claimed",
+              conflicts: [{ ...GOOD_CONFLICT, reservation_id: null }],
+            },
+          },
+          { status: 409 },
+        ),
+      toast: "Ports claimed",
+    },
+    {
+      name: "an object port",
+      respond: () =>
+        HttpResponse.json(
+          {
+            detail: {
+              message: "Ports claimed",
+              conflicts: [{ ...GOOD_CONFLICT, port: { name: "eth1" } }],
+            },
+          },
+          { status: 409 },
+        ),
+      toast: "Ports claimed",
+    },
+    {
+      name: "a null conflict entry",
+      respond: () =>
+        HttpResponse.json(
+          { detail: { message: "Ports claimed", conflicts: [GOOD_CONFLICT, null] } },
+          { status: 409 },
+        ),
+      toast: "Ports claimed",
+    },
+    {
+      name: "a very long message and a bad entry",
+      respond: () =>
+        HttpResponse.json(
+          { detail: { message: "y".repeat(2000), conflicts: [{ ...GOOD_CONFLICT, port: 1 }] } },
+          { status: 409 },
+        ),
+      // Cut to the shared 1000-character detail bound, like any other detail.
+      toast: "y".repeat(997) + "...",
+    },
+    {
+      name: "a detail that is a list",
+      respond: () =>
+        HttpResponse.json({ detail: [{ conflicts: [GOOD_CONFLICT] }] }, { status: 409 }),
+      toast: SAVE_FAILED,
+    },
+    {
+      name: "an HTML page instead of JSON",
+      respond: () =>
+        new HttpResponse("<html><body><h1>409 Conflict</h1></body></html>", {
+          status: 409,
+          headers: { "Content-Type": "text/html" },
+        }),
+      toast: SAVE_FAILED,
+    },
+  ];
+
+  describe("a port-claim 409 whose fields are not in shape keeps the editor and its drawing (issue #1406)", () => {
+    it.each(malformedConflictBodies)(
+      "a 409 with $name shows a plain toast and keeps the editor and its drawing",
+      async ({ respond, toast }) => {
+        const fork = makeFork({
+          canvas_data: {
+            nodes: [forkNode("fork-node", "d-fork"), forkNode("other-node", "d-other")],
+            edges: [
+              {
+                id: "e-kept",
+                source: "fork-node",
+                target: "other-node",
+                type: "layerEdge",
+                data: { layer: "L2" },
+              },
+            ],
+            selectedEdgeLayer: "L2",
+          },
+        });
+        server.use(
+          ...baseHandlers(fork, { ...RESERVATION, device_ids: ["d-fork", "d-other"] }),
+          http.post(`/api/reservations/${RES_ID}/fork/save`, respond),
+        );
+        renderPage();
+        const commit = await screen.findByRole("button", { name: "Commit to reservation" });
+        await waitFor(() => expect(commit).toBeEnabled());
+
+        fireEvent.click(commit);
+
+        await waitFor(() => expect(toastError).toHaveBeenCalledWith(toast));
+        expect(toastError).toHaveBeenCalledTimes(1);
+        // The editor is still mounted, not replaced by an error page.
+        expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
+        expect(screen.getByTestId("react-flow")).toBeInTheDocument();
+        // The conflict dialog lists nothing: it was never handed the body.
+        expect(screen.queryByText(/port eth1/)).not.toBeInTheDocument();
+        // The drawing is exactly as it was.
+        expect(useTopologyStore.getState().nodes.map((n) => n.id)).toEqual([
+          "fork-node",
+          "other-node",
+        ]);
+        expect(useTopologyStore.getState().edges.map((e) => e.id)).toEqual(["e-kept"]);
+      },
+    );
+  });
+
   it("a fork_device_not_member 409 names the offending devices in plain words (issue #701)", async () => {
     // The canvas only names d-fork, already a reservation member, so this
     // pins the save-time refusal (a device the PATCH could not add, or a
@@ -842,6 +991,34 @@ describe("TopologyEditorPage handleCommitToReservation error branches", () => {
         "Routing intent malformed: 'l3' must be an object with exactly one key: 'routes'",
       ),
     );
+  });
+
+  // Issue #1406: the toast reads the parser's message only as text. An
+  // object message no longer matches the narrower (plain fallback); a blank
+  // one keeps the routing wording with a fixed reason.
+  describe("an l3_intent_malformed 422 whose message is not usable text toasts fixed text (issue #1406)", () => {
+    it.each([
+      ["an object message", { text: "bad" }, "Failed to save the reservation fork"],
+      ["a blank message", "  ", "Routing intent malformed: no reason given"],
+    ])("with %s", async (_name, message, expected) => {
+      server.use(
+        ...baseHandlers(makeFork()),
+        http.post(`/api/reservations/${RES_ID}/fork/save`, () =>
+          HttpResponse.json(
+            { detail: { error: "l3_intent_malformed", node_id: "fork-node", message } },
+            { status: 422 },
+          ),
+        ),
+      );
+      renderPage();
+      const commit = await screen.findByRole("button", { name: "Commit to reservation" });
+      await waitFor(() => expect(commit).toBeEnabled());
+
+      fireEvent.click(commit);
+
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(expected));
+      expect(screen.getByText("EDITING LIVE RESERVATION")).toBeInTheDocument();
+  });
   });
 
   // ADR 0014 Decision 5 (issue #34): the L3 pass fails closed on an
