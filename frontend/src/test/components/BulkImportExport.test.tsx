@@ -163,6 +163,16 @@ describe("BulkImportExport refused import (issue #1575)", () => {
       "Failed to import devices",
     ],
     [
+      "a 400 with a string detail",
+      refusal(400, { detail: "Bad request" }),
+      "Failed to import devices",
+    ],
+    [
+      "a 409 with a string detail",
+      refusal(409, { detail: "Conflict" }),
+      "Failed to import devices",
+    ],
+    [
       "a 403 with a string detail",
       refusal(403, { detail: "Admin or superadmin role required" }),
       "Failed to import devices",

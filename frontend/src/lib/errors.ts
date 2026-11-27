@@ -115,7 +115,7 @@ export function errorDetail(err: unknown, fallback: string): string {
 // be, a null list entry) would throw while rendering. So a narrower checks
 // every field its type names, the list entries included, and answers null for
 // a body that does not match, which sends the caller to its plain fallback. A
-// field no caller reads is typed `unknown` rather than checked.
+// field typed `unknown` is left for its caller to check.
 
 /** A field check: true when the value has the type the field declares. */
 export type FieldCheck = (value: unknown) => boolean;
