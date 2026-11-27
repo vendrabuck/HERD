@@ -338,6 +338,7 @@ Behavior is specified in `docs/specs/ai-features.md` and `docs/specs/reservation
 
 - `purpose_category` is validated against `PURPOSE_CATEGORIES`, a plain string list, not a Postgres enum.
 - The single-row classifier lives at `purpose_service.classify_purpose_one` (moved out of `tasks/expiration.py` so the router does not import from tasks); the sweep keeps ADR 0013's oldest-first order.
+- An orchestrator answer's body is parsed only through `_read_classify_body` (it catches `ValueError` and `RecursionError`, the latter not a `ValueError`), and a 200 is stored only when `_suggestion_refusal` returns None (issue #1543). Every per-row failure is caught inside `classify_purpose_one`, which counts the attempt; the sweep loop in `_run_purpose_classify_reconcile` has no per-row catch, so an exception that reaches it ends the tick.
 - Terminal writers stamp through `stamp_purpose_classify_requested` (see Reservations and the state machine).
 - The frontend gate is `canClassifyPurpose` beside `canCancel` and `canRelease` in `src/lib/reservationStatus.ts`; the admin-only Classify now button lives in `ReservationDetailModal.tsx`, not on the Purpose Review page (`/admin/purpose-review`).
 - Contract: `docs/AI_PURPOSE_CLASSIFICATION.md` has the endpoint contract; ADR 0013 is `docs/design/0013-lab-purpose-classification.md`.
