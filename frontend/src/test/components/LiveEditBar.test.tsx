@@ -12,6 +12,7 @@ function makeBar(overrides: Partial<Parameters<typeof LiveEditBar>[0]> = {}) {
       invalidEdgeCount={0}
       isCommitting={false}
       forkLoaded={true}
+      reservationStatus="loaded"
       onCommit={onCommit}
       onCancel={onCancel}
       {...overrides}
@@ -75,6 +76,35 @@ describe("LiveEditBar", () => {
   it("committing takes priority over the loading label if both were somehow true", () => {
     makeBar({ forkLoaded: false, isCommitting: true });
     expect(screen.getByRole("button", { name: "Committing..." })).toBeDisabled();
+  });
+
+  // Issue #1319: Commit needs the reservation's own device set, so it waits
+  // for the reservation read and stays closed if that read failed.
+  it("disables commit and reads 'Loading reservation...' while the reservation is loading", () => {
+    const { onCommit } = makeBar({ reservationStatus: "loading" });
+    const commit = screen.getByRole("button", { name: "Loading reservation..." });
+    expect(commit).toBeDisabled();
+    fireEvent.click(commit);
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("a failed reservation read disables commit and says so", () => {
+    const { onCommit } = makeBar({ reservationStatus: "failed" });
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this reservation, so committing is disabled. Reload the page to try again.",
+    );
+    const commit = screen.getByRole("button", { name: "Commit to reservation" });
+    expect(commit).toBeDisabled();
+    fireEvent.click(commit);
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("the fork's loading label comes before the reservation's", () => {
+    makeBar({ forkLoaded: false, reservationStatus: "loading" });
+    expect(screen.getByRole("button", { name: "Loading fork..." })).toBeDisabled();
   });
 
   // Issue #1066: lines only the server's draft check flags are stated, never a

@@ -10,6 +10,7 @@ import type {
 } from "@/types/deviceGroup.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedDeviceGroups(skip = 0, limit = 50): Promise<PaginatedResponse<DeviceGroup>> {
   const resp = await apiClient.get<PaginatedResponse<DeviceGroup>>("/inventory/device-groups", {
@@ -18,9 +19,9 @@ async function fetchPaginatedDeviceGroups(skip = 0, limit = 50): Promise<Paginat
   return resp.data;
 }
 
+// Every device group, across all pages (issue #1336).
 async function fetchDeviceGroups(): Promise<DeviceGroup[]> {
-  const resp = await fetchPaginatedDeviceGroups(0, 500);
-  return resp.items;
+  return fetchAllPages(fetchPaginatedDeviceGroups);
 }
 
 async function fetchDeviceGroup(id: string): Promise<DeviceGroupDetail> {

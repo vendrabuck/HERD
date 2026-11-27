@@ -6,6 +6,7 @@ import type {
 } from "@/types/template.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedTemplates(
   templateType?: string,
@@ -20,11 +21,12 @@ async function fetchPaginatedTemplates(
   return resp.data;
 }
 
+// Every template of `templateType` (every type when unset), across all pages
+// (issue #1336).
 async function fetchTemplates(
   templateType?: string,
 ): Promise<DeviceTemplate[]> {
-  const resp = await fetchPaginatedTemplates(templateType, 0, 500);
-  return resp.items;
+  return fetchAllPages((skip, limit) => fetchPaginatedTemplates(templateType, skip, limit));
 }
 
 async function fetchTemplate(id: string): Promise<DeviceTemplate> {

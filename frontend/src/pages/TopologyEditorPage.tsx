@@ -21,7 +21,7 @@ import toast from "react-hot-toast";
 
 import { useTopology, useUpdateTopology, useRestoreVersion, validateTopology } from "@/api/topologies";
 import {
-  useReservations,
+  useReservation,
   useUpdateReservation,
   useReservationFork,
   useSaveReservationFork,
@@ -202,11 +202,13 @@ function TopologyEditorInner() {
   // fork version (never touching the parent's TopologyVersion history), and the
   // device-set PATCH still drives incremental provisioning.
   const reservationId = searchParams.get("reservationId");
-  const { data: reservations } = useReservations();
-  const liveReservation = useMemo(
-    () => reservations?.find((r) => r.id === reservationId) ?? null,
-    [reservations, reservationId],
-  );
+  // Read by id (issue #1319), never found by scanning a page of the owner's
+  // list: a reservation past that page left this null, and Commit then
+  // computed the device-set union from an empty set. Null while the read is
+  // in flight or after it failed (a 404 for anyone but the owner); Commit
+  // refuses in both cases (handleCommitToReservation, LiveEditBar).
+  const { data: reservationData, isError: reservationLookupFailed } = useReservation(reservationId);
+  const liveReservation = reservationData ?? null;
   const isLiveEdit = !!reservationId;
   const updateReservation = useUpdateReservation();
   const { data: fork } = useReservationFork(isLiveEdit ? reservationId : null);
@@ -1346,7 +1348,20 @@ function TopologyEditorInner() {
       toast.error("Fix unreachable edges before committing");
       return;
     }
-    const currentDeviceIds = liveReservation?.device_ids ?? [];
+    // Issue #1319: the device-set union below needs the reservation's own
+    // current set. Without it (still loading, or the read failed) the union
+    // would start from nothing, every canvas device would count as added, and
+    // the pre-save PATCH would drop the devices not yet removed from the
+    // canvas. Fail closed: no PATCH, no fork save.
+    if (!liveReservation) {
+      toast.error(
+        reservationLookupFailed
+          ? "Could not load this reservation, so nothing was committed; reload the page to try again"
+          : "The reservation is still loading; try again in a moment",
+      );
+      return;
+    }
+    const currentDeviceIds = liveReservation.device_ids;
     const addedDeviceIds = allDeviceIds.filter((deviceId) => !currentDeviceIds.includes(deviceId));
     const removedDeviceIds = currentDeviceIds.filter(
       (deviceId) => !allDeviceIds.includes(deviceId),
@@ -1481,6 +1496,7 @@ function TopologyEditorInner() {
     forkLoaded,
     hasInvalidEdges,
     liveReservation,
+    reservationLookupFailed,
     saveFork,
     autosave,
     persistableCanvas,
@@ -1818,6 +1834,9 @@ function TopologyEditorInner() {
               serverInvalidEdgeCount={serverOnlyInvalidEdgeCount}
               isCommitting={isCommitting}
               forkLoaded={forkLoaded}
+              reservationStatus={
+                liveReservation ? "loaded" : reservationLookupFailed ? "failed" : "loading"
+              }
               autosaveStatus={autosave.status}
               onCommit={handleCommitToReservation}
               onCancel={handleCancelLiveEdit}

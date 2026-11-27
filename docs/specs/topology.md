@@ -1584,8 +1584,8 @@ reservation's fork opens read-only.
 `frontend/src/components/topology-editor/LiveEditBar.tsx`,
 `frontend/src/components/topology-editor/ForkHistoryPanel.tsx`,
 `frontend/src/hooks/useForkAutosave.ts`, `frontend/src/hooks/useForkVersionPreview.ts`,
-`frontend/src/lib/forkDiff.ts`; the reservations fork routes (`reservations.md`, section
-5).
+`frontend/src/lib/forkDiff.ts`; the reservations fork routes and `GET /{id}`
+(`reservations.md`, section 5).
 
 **Rules.**
 
@@ -1652,6 +1652,16 @@ reservation's fork opens read-only.
   save wires the other lines (issue #1066). \
   Enforced in: `frontend/src/lib/edgeProblems.ts` (`serverEdgeProblemsFrom`, `applySkippedConstrainedEdges`, `withServerEdgeProblems`, `stripServerEdgeProblem`); `frontend/src/hooks/useForkAutosave.ts` (`onDraftValidated`); `frontend/src/pages/TopologyEditorPage.tsx` (`loadCanvasAndClearRouteProblems`, `handleDraftValidated`, `serverOnlyInvalidEdgeCount`); `frontend/src/components/topology-editor/edges/edgeStatus.ts` (`resolveEdgeStroke`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`serverInvalidEdgeCount`) \
   Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a replace on a real edge strips the render-only server reason before the store sees it (issue #1066)`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+- **TOPO-UIFORK-11.** Live edit reads its reservation by id (`GET /reservations/{id}`,
+  owner only, RES-VIEW-1), never by scanning a page of the owner's list; that read
+  supplies the header's purpose, the `ACTIVE` status that shows Restore, and the current
+  device set the pre-save add unions with the canvas (TOPO-UIFORK-2). Commit stays
+  disabled, reading `Loading reservation...`, until the read lands; a failed read,
+  including the 404 anyone but the owner gets, keeps it disabled under a red line, and a
+  commit triggered anyway sends neither the device-set PATCH nor the fork save, so the
+  union is never computed without the reservation's own set (issue #1319). \
+  Enforced in: `frontend/src/api/reservations.ts` (`useReservation`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`, `reservationLookupFailed`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`reservationStatus`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkReservationLookup.test.tsx` (`a reservation past the owner's first 500 still drives the header, Restore, and the device-set union`, `a failed read keeps Commit closed and sends neither the PATCH nor the fork save`, `a reservation the caller may not read (404 for anyone but the owner) fails closed the same way`, `while the read is in flight Commit waits for it, then commits with the full set`); `frontend/src/test/components/LiveEditBar.test.tsx` (`disables commit and reads 'Loading reservation...' while the reservation is loading`, `a failed reservation read disables commit and says so`); `frontend/src/test/api/reservations.test.tsx` (`useReservation reads exactly the reservation named and never the list`, `useReservation is an error, not empty data, when the read is refused`, `a mutation that invalidates ['reservations'] refetches useReservation`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is

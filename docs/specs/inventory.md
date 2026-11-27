@@ -606,7 +606,7 @@ size per user. Admins can also copy and bulk-delete devices.
 connection reads for an expanded row). Import and export controls and Copy render for
 admins only. Copy names the new device `Copy of <name>` and sends the source's template,
 topology type, and `field_data`, leaving the status to the default; the Template
-filter reads the first 500 device templates.
+filter reads every device template, page by page (issue #1336).
 
 **Rules.**
 

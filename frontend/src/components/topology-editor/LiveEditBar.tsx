@@ -15,6 +15,10 @@ interface LiveEditBarProps {
   // device-set PATCH would send an empty device_ids, which the reservations
   // schema rejects with 422. The button stays disabled until this is true.
   forkLoaded: boolean;
+  // The editor's read of the reservation itself (issue #1319). Commit needs
+  // its current device set to compute the pre-save union, so the button stays
+  // disabled until it is "loaded", and a "failed" read says so in red.
+  reservationStatus: "loading" | "loaded" | "failed";
   autosaveStatus?: ForkAutosaveStatus;
   onCommit: () => void;
   onCancel: () => void;
@@ -33,23 +37,28 @@ const AUTOSAVE_LABEL: Record<ForkAutosaveStatus, string> = {
 // the fork (POST /reservations/{id}/fork/save, which appends a fork version and
 // leaves the parent topology's history untouched) and PATCHes the reservation's
 // device set to drive incremental provisioning. Commit is blocked while any edge
-// has no physical path, matching the server-side validation.
+// has no physical path, matching the server-side validation, and until both the
+// fork and the reservation itself have loaded.
 export function LiveEditBar({
   deviceCount,
   invalidEdgeCount,
   serverInvalidEdgeCount = 0,
   isCommitting,
   forkLoaded,
+  reservationStatus,
   autosaveStatus,
   onCommit,
   onCancel,
 }: LiveEditBarProps) {
   const blocked = invalidEdgeCount > 0;
+  const reservationLoaded = reservationStatus === "loaded";
   const commitLabel = isCommitting
     ? "Committing..."
     : !forkLoaded
       ? "Loading fork..."
-      : "Commit to reservation";
+      : reservationStatus === "loading"
+        ? "Loading reservation..."
+        : "Commit to reservation";
   return (
     <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 bg-white border-2 border-blue-400 rounded-lg shadow-lg px-4 py-3 max-w-2xl">
       <div className="flex items-start gap-4">
@@ -83,6 +92,12 @@ export function LiveEditBar({
               physical path; fix or remove them before committing.
             </p>
           )}
+          {reservationStatus === "failed" && (
+            <p className="text-xs text-red-600 mt-1" role="alert">
+              Could not load this reservation, so committing is disabled. Reload the page to try
+              again.
+            </p>
+          )}
           {serverInvalidEdgeCount > 0 && (
             <p className="text-xs text-red-600 mt-1">
               {serverInvalidEdgeCount === 1
@@ -101,7 +116,7 @@ export function LiveEditBar({
           </button>
           <button
             onClick={onCommit}
-            disabled={blocked || isCommitting || !forkLoaded}
+            disabled={blocked || isCommitting || !forkLoaded || !reservationLoaded}
             title={
               blocked
                 ? `Cannot commit: ${invalidEdgeCount} edge${invalidEdgeCount !== 1 ? "s" : ""} have no physical path`

@@ -8,6 +8,7 @@ import type {
 } from "@/types/connection.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedConnections(
   skip = 0,
@@ -46,10 +47,13 @@ export function usePaginatedConnections(skip = 0, limit = 50, deviceId?: string)
   });
 }
 
+// Every connection with this device on either side, across all pages (issue
+// #1336): port availability and the cabled-to column must see every cable.
 export function useDeviceConnections(deviceId: string | undefined) {
   return useQuery({
     queryKey: ["connections", "device", deviceId],
-    queryFn: () => fetchPaginatedConnections(0, 500, deviceId!).then((r) => r.items),
+    queryFn: () =>
+      fetchAllPages((skip, limit) => fetchPaginatedConnections(skip, limit, deviceId!)),
     enabled: !!deviceId,
   });
 }
