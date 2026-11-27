@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tansta
 import type { DriverPackageInfo, DriverUpdate } from "@/types/driver.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedDrivers(skip = 0, limit = 50): Promise<PaginatedResponse<DriverPackageInfo>> {
   const resp = await apiClient.get<PaginatedResponse<DriverPackageInfo>>("/inventory/drivers", {
@@ -10,9 +11,9 @@ async function fetchPaginatedDrivers(skip = 0, limit = 50): Promise<PaginatedRes
   return resp.data;
 }
 
+// Every driver package, across all pages (issue #1336).
 async function fetchDrivers(): Promise<DriverPackageInfo[]> {
-  const resp = await fetchPaginatedDrivers(0, 500);
-  return resp.items;
+  return fetchAllPages(fetchPaginatedDrivers);
 }
 
 async function fetchDriver(id: string): Promise<DriverPackageInfo> {

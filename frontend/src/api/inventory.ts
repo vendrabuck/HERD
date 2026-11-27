@@ -4,18 +4,17 @@ import type { Device, DeviceCreate, DeviceUpdate, DeviceFilters } from "@/types/
 import type { PaginatedResponse } from "@/types/pagination.types";
 import type { CanvasData, DeviceNodeData } from "@/types/topology.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 import { detailText, responseDetail } from "@/lib/errors";
 
 // Query-key factory. Splits the "devices" namespace into list queries (paginated,
-// all-names, simple filtered) and detail queries (per-id). Mutations invalidate
+// all-names, all filtered, by ids) and detail queries (per-id). Mutations invalidate
 // lists as a group while patching the detail cache surgically.
 const deviceKeys = {
   all: ["devices"] as const,
   lists: () => [...deviceKeys.all, "list"] as const,
   paginated: (filters: DeviceFilters | undefined, skip: number, limit: number) =>
     [...deviceKeys.lists(), "paginated", filters, skip, limit] as const,
-  simpleList: (filters: DeviceFilters | undefined) =>
-    [...deviceKeys.lists(), "simple", filters] as const,
   allList: (filters: DeviceFilters | undefined) =>
     [...deviceKeys.lists(), "all", filters] as const,
   allNames: () => [...deviceKeys.lists(), "all-names"] as const,
@@ -39,17 +38,6 @@ async function fetchPaginatedDevices(
   if (filters?.search) params.search = filters.search;
   const resp = await apiClient.get<PaginatedResponse<Device>>("/inventory/devices", { params });
   return resp.data;
-}
-
-// Page 0 of the server's 500-row cap, `total` dropped. This is the repo-wide
-// "simple list" convention (admin.ts, groups.ts, templates.ts, and others use
-// the same shape) and it is only correct while the collection fits in one
-// page. Anything that must see EVERY device goes through fetchAllDevices (the
-// page walker below) or fetchDevicesByIds (the batch endpoint); issue #703
-// moved the device consumers there and left the other modules to a follow-up.
-async function fetchDevices(filters?: DeviceFilters): Promise<Device[]> {
-  const resp = await fetchPaginatedDevices(filters, 0, 500);
-  return resp.items;
 }
 
 export async function fetchDevice(id: string): Promise<Device> {
@@ -157,26 +145,11 @@ async function createDevice(data: DeviceCreate): Promise<Device> {
   return resp.data;
 }
 
-// Walk every page of /inventory/devices (server-side filters honored) and
-// return the full row set, so a consumer that must see the whole collection
-// is not silently cut at the 500-row page cap (issue #703). Exit conditions
-// (in order): short page from the server, or skip meeting/exceeding the
-// reported total. A MAX_PAGES cap prevents an infinite loop if the server
-// ever returns overlapping pages (e.g., from a mid-fetch write).
+// Every device matching `filters`, across all pages, through the shared
+// page walker (issue #703, generalized by #1336), so a consumer that must see
+// the whole collection is never silently cut at the 500-row page cap.
 export async function fetchAllDevices(filters?: DeviceFilters): Promise<Device[]> {
-  const all: Device[] = [];
-  const limit = 500;
-  const MAX_PAGES = 200;
-  let skip = 0;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const resp = await fetchPaginatedDevices(filters, skip, limit);
-    all.push(...resp.items);
-    if (resp.items.length === 0) break;
-    skip += resp.items.length;
-    if (resp.items.length < limit) break;
-    if (skip >= resp.total) break;
-  }
-  return all;
+  return fetchAllPages((skip, limit) => fetchPaginatedDevices(filters, skip, limit));
 }
 
 // Id to name map over the whole (unfiltered) collection.
@@ -194,8 +167,9 @@ export function useAllDeviceNames() {
   });
 }
 
-// Every device matching `filters`, across all pages. Use this (not useDevices)
-// wherever the list feeds a picker or an index that must be complete.
+// Every device matching `filters`, across all pages. Use this wherever the
+// list feeds a picker or an index that must be complete; usePaginatedDevices
+// is for a page the user steps through.
 export function useAllDevices(filters?: DeviceFilters) {
   return useQuery({
     queryKey: deviceKeys.allList(filters),
@@ -232,13 +206,6 @@ export function useUpdateDevice() {
       // Lists (paginated, simple, all-names) may reflect name/status changes.
       queryClient.invalidateQueries({ queryKey: deviceKeys.lists() });
     },
-  });
-}
-
-export function useDevices(filters?: DeviceFilters) {
-  return useQuery({
-    queryKey: deviceKeys.simpleList(filters),
-    queryFn: () => fetchDevices(filters),
   });
 }
 

@@ -1239,6 +1239,66 @@ def test_parse_json_items_not_a_list_raises_422():
     assert exc.value.detail == "'items' must be a list"
 
 
+@pytest.mark.parametrize(
+    ("rec", "reason"),
+    [
+        (1, "row is not an object"),
+        (None, "row is not an object"),
+        ([], "row is not an object"),
+        ("Lab", "row is not an object"),
+        ({"name": 1}, "name: must be a string"),
+        ({"name": ["Lab"]}, "name: must be a string"),
+        ({"name": "Lab", "canvas": 1}, "canvas: must be an object"),
+        ({"name": "Lab", "canvas": {"nodes": "x"}}, "canvas.nodes: must be a list"),
+        ({"name": "Lab", "canvas": {"nodes": [{}, 1]}}, "canvas.nodes.1: must be an object"),
+        (
+            {"name": "Lab", "canvas": {"nodes": [{"data": 1}]}},
+            "canvas.nodes.0.data: must be an object",
+        ),
+        (
+            {"name": "Lab", "canvas": {"nodes": [{"data": {"device": 1}}]}},
+            "canvas.nodes.0.data.device: must be an object",
+        ),
+        (
+            {"name": "Lab", "canvas": {"nodes": [{"data": {"device": {"name": 1}}}]}},
+            "canvas.nodes.0.data.device.name: must be a string",
+        ),
+        ({}, None),
+        ({"name": None, "canvas": None}, None),
+        ({"name": "Lab", "canvas": {"nodes": None, "edges": "not read here"}}, None),
+        ({"name": "Lab", "canvas": {"nodes": [{"data": {"device": {"name": "sw"}}}]}}, None),
+    ],
+)
+def test_record_shape_reason(rec, reason):
+    from app.services.bulk_service import _record_shape_reason
+
+    assert _record_shape_reason(rec) == reason
+
+
+def test_parse_csv_reads_a_cr_only_file():
+    from app.services.bulk_service import parse_csv_topologies
+
+    raw = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\r"
+        "Lab,sw-a,eth0,sw-b,eth1,L1\r"
+    ).encode()
+    [rec] = parse_csv_topologies(raw)
+    assert rec["name"] == "Lab"
+    assert [e["source"] for e in rec["canvas"]["edges"]] == ["node-sw-a"]
+
+
+def test_parse_csv_a_csv_error_is_the_fixed_422(monkeypatch):
+    from app.services.bulk_service import parse_csv_topologies
+    from fastapi import HTTPException
+    from herd_common import csv_import
+
+    monkeypatch.setattr(csv_import, "_field_limit_for", lambda text: 13)
+    with pytest.raises(HTTPException) as exc:
+        parse_csv_topologies(b"topology_name\nLab\nLab-is-too-long\n")
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Invalid CSV: line 3 could not be read; fix it and retry"
+
+
 def test_parse_csv_groups_rows_into_topologies():
     from app.services.bulk_service import parse_csv_topologies
 

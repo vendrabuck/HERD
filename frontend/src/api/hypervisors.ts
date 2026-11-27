@@ -6,6 +6,7 @@ import type {
 } from "@/types/hypervisor.types";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 
 async function fetchPaginatedHypervisors(
   skip = 0,
@@ -17,9 +18,9 @@ async function fetchPaginatedHypervisors(
   return resp.data;
 }
 
+// Every hypervisor, across all pages (issue #1336).
 async function fetchHypervisors(): Promise<Hypervisor[]> {
-  const resp = await fetchPaginatedHypervisors(0, 500);
-  return resp.items;
+  return fetchAllPages(fetchPaginatedHypervisors);
 }
 
 async function createHypervisor(data: HypervisorCreate): Promise<Hypervisor> {

@@ -118,9 +118,7 @@ function baseHandlers(fork: Record<string, unknown>, reservation: Record<string,
   return [
     http.get(`/api/reservations/${RES_ID}/fork`, () => HttpResponse.json(fork)),
     http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
-    http.get("/api/reservations/", () =>
-      HttpResponse.json({ items: [reservation], total: 1, skip: 0, limit: 500 }),
-    ),
+    http.get(`/api/reservations/${RES_ID}`, () => HttpResponse.json(reservation)),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
   ];
 }
@@ -191,9 +189,7 @@ describe("TopologyEditorPage live-edit fork mode", () => {
         return HttpResponse.json(makeFork());
       }),
       http.get(`/api/cabling/topologies/${TOPO_ID}`, () => HttpResponse.json(PARENT_TOPOLOGY)),
-      http.get("/api/reservations/", () =>
-        HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
-      ),
+      http.get(`/api/reservations/${RES_ID}`, () => HttpResponse.json(RESERVATION)),
       http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
       http.post(`/api/reservations/${RES_ID}/fork/save`, () => {
         forkSaveHit = true;
