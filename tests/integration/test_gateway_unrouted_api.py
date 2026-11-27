@@ -34,6 +34,7 @@ async def test_an_unrouted_api_path_ending_like_a_static_asset_is_still_the_json
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         resp = await client.get(f"{base_url}/no-such-service-1320/logo.svg")
     assert resp.status_code == 503
+    assert resp.headers["content-type"].startswith("application/json")
     assert resp.json() == {"detail": UNROUTED_DETAIL}
 
 

@@ -253,7 +253,7 @@ def _free_port_pairs(dialog, ports_a, ports_b, count):
     lists (never empty) on every path that reaches this function.
 
     MultiConnectDialog gates EVERY row's aria-disabled on one shared
-    `interactionDisabled = connectionsLoading || submitting` flag (both
+    `interactionDisabled = connectionsUnknown || submitting` flag (both
     columns read the same value), and that flag is still true for a moment
     right after the dialog opens and both devices' ports/connections queries
     are freshly kicked off, so a same-tick DOM read can catch every row

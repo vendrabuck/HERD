@@ -10,8 +10,7 @@ change to it fails without a stack.
 Limits: a text scan of `frontend/nginx.conf`, not nginx's own parser. It finds
 the `location ^~ /api/ { ... }` block by a regular expression over the file,
 checks the directives inside it, and parses the quoted `return` body as JSON.
-It does not prove the file loads in nginx (`nginx -t`); the image build and
-the stack test do.
+It does not prove the file loads in nginx (`nginx -t`); the stack test does.
 """
 
 import json
@@ -34,6 +33,9 @@ def _api_block() -> str:
 def test_api_block_answers_503_json_with_the_fixed_detail():
     body = _api_block()
     assert re.search(r"^\s*default_type\s+application/json;", body, re.M)
+    # nginx types a `return` body by the URI's extension before default_type,
+    # so the block empties the types map: every /api path answers JSON.
+    assert re.search(r"^\s*types\s*\{\s*\}\s*$", body, re.M)
     ret = re.search(r"^\s*return\s+(\d+)\s+'(?P<payload>[^']*)';", body, re.M)
     assert ret, "the /api/ block must `return <status> '<json>';`"
     assert ret.group(1) == "503"
