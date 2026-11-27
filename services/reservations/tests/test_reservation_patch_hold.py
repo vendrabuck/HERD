@@ -16,6 +16,7 @@ Uses app.database's own engine (like test_expiration_hold_invariant.py) so the o
 test that runs the sweep's activation sees the same rows.
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ from app.schemas.reservation import ReservationUpdate
 from app.services import reservation_service as svc
 from app.services.reservation_service import ReservationStatusChanged, update_reservation
 from app.tasks.expiration import _run_expiration_cycle
-from sqlalchemy import select, update
+from sqlalchemy import Text, literal, select, type_coerce, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 Session = async_sessionmaker(engine, expire_on_commit=False)
@@ -318,6 +319,61 @@ async def test_patch_losing_its_status_guard_keeps_nothing(seams, caplog, observ
     prune.assert_not_called()
     assert await _subjects() == []
     assert _actions(caplog, "reservation_update_lost_race")
+
+
+async def _store_raw_marker(rid, raw: str) -> None:
+    async with Session() as s:
+        await s.execute(
+            update(Reservation)
+            .where(Reservation.id == rid)
+            .values(pending_fork_prune_device_ids=literal(raw, Text))
+        )
+        await s.commit()
+
+
+async def _raw_marker(rid) -> str | None:
+    col = Reservation.pending_fork_prune_device_ids
+    async with Session() as s:
+        return (
+            await s.execute(select(type_coerce(col, Text)).where(Reservation.id == rid))
+        ).scalar_one()
+
+
+@pytest.mark.parametrize("race", [False, True], ids=["guard-holds", "guard-lost"])
+async def test_a_corrupt_marker_discard_is_logged_only_when_the_edit_commits(seams, caplog, race):
+    """RES-PATCH-11 (issue #1554): a device-set PATCH over a corrupt stored prune
+    marker logs `pending_prune_corrupt_marker_discarded` after its commit. When the
+    status guard loses (a cancel commits while the PATCH fetches devices), the edit
+    keeps nothing, the corrupt marker is still stored as it was, and no discard is
+    logged; when the guard holds, the marker is replaced and the discard is logged
+    once."""
+    rid = await _insert(ACTIVE, [HELD, OTHER])
+    await _store_raw_marker(rid, "5")
+
+    async def fetch(ids, token):
+        if race:
+            await _set_status_on_second_session(rid, CANCELLED)
+        return [_device(d) for d in ids]
+
+    with (
+        patch(f"{SVC}._update_device_statuses", new=Inventory()),
+        patch(f"{SVC}._fetch_devices", new=fetch),
+        caplog.at_level(logging.INFO),
+    ):
+        if race:
+            with pytest.raises(ReservationStatusChanged):
+                await _patch(rid, device_ids=[HELD])
+        else:
+            await _patch(rid, device_ids=[HELD])
+
+    discarded = _actions(caplog, "pending_prune_corrupt_marker_discarded")
+    if race:
+        assert discarded == []
+        assert json.loads(str(await _raw_marker(rid))) == 5, "the lost edit rewrote the marker"
+        assert _actions(caplog, "reservation_update_lost_race")
+    else:
+        assert [(r.levelname, r.marker_type) for r in discarded] == [("ERROR", "int")]
+        assert json.loads(await _raw_marker(rid)) == [str(OTHER)]
 
 
 async def test_cancel_committing_after_the_edit_reverts_the_added_hold(seams, caplog):

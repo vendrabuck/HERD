@@ -191,7 +191,7 @@ writer's row lock.
 | GET | `/topologies/{id}/versions/{vid}` | any signed-in user | 200 | TOPO-VER-2, TOPO-STRIP-3 |
 | POST | `/topologies/{id}/versions/{vid}/restore` | creator, or any admin | 200 | TOPO-VER-4, TOPO-VER-5, TOPO-TVER-3 |
 | GET | `/topologies/export?format` | any signed-in user | 200 | TOPO-BULK-1 to TOPO-BULK-5 |
-| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19 |
+| POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19, TOPO-BULK-21, TOPO-BULK-22 |
 | GET | `/templates` | any signed-in user | 200 | TOPO-TMPL-1 |
 | POST | `/templates` | any signed-in user | 201 | TOPO-TMPL-2, TOPO-TMPL-3 |
 | POST | `/templates/from-topology/{topology_id}` | any signed-in user | 201 | TOPO-TMPL-5, TOPO-TMPL-6, TOPO-TMPL-7 |
@@ -1179,7 +1179,9 @@ their own by name. A dry run reports what would happen without writing.
 **Surfaces.** User interface `frontend/src/components/ui/BulkImportExport.tsx` on the
 topologies page; routes `GET /topologies/export` and `POST /topologies/import`; inventory
 `POST /devices/resolve-by-name` (section 10). [BULK_IMPORT_EXPORT.md](../BULK_IMPORT_EXPORT.md)
-is the user guide.
+is the user guide. The dialog is shared with inventory, so how it shows a refused import
+(the server's detail for a 413 or 422, `Failed to import topologies` for anything else,
+inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
 
 **Rules.**
 
@@ -1219,9 +1221,19 @@ is the user guide.
   Enforced in: `services/cabling/app/routes/bulk.py` (`import_topologies_endpoint`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`); `services/common/herd_common/rehearsal.py` (`rehearsal_session`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_import_json_creates_topology`, `test_dry_run_writes_nothing`, `test_dry_run_update_writes_nothing`, `test_dry_run_duplicate_new_name_matches_commit_row_for_row`, `test_dry_run_csv_matches_commit_row_for_row`); `services/common/tests/test_rehearsal.py` (`test_commits_are_visible_inside_and_discarded_after`, `test_rollback_returns_to_the_last_commit_only`, `test_an_exception_inside_still_rolls_everything_back`)
 - **TOPO-BULK-7.** JSON import takes an object with an `items` list or a bare list;
-  invalid JSON, another shape, or a non-list `items` is 422 for the whole request. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_json_topologies`) \
-  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_json_invalid_json_raises_422`, `test_parse_json_bare_list_accepted`, `test_parse_json_wrong_shape_raises_422`, `test_parse_json_items_not_a_list_raises_422`)
+  invalid JSON, another shape, or a non-list `items` is 422 for the whole request, and
+  nothing is written, dry run included. A syntax error answers `Invalid JSON: `
+  followed by the decoder's message, which names a line, column, and character offset
+  and no content. A document the parser refuses for its shape answers the fixed
+  `Invalid JSON: the document is nested too deeply or holds a number too long to read`,
+  which names no part of the file or the exception: one nested deeper than the parser's
+  C recursion budget (the interpreter's bound, not a HERD setting; just under 10,000
+  levels on the service image's Python 3.12), or one holding an integer literal longer
+  than Python's integer string conversion limit (4,300 digits, sign not counted). Both
+  were 500s before issue #1511, reachable by any signed-in user; inventory's importers give the same answer
+  (INV-BULK-4 in `inventory.md`). \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_json_topologies`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
+  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_json_invalid_json_raises_422`, `test_parse_json_bare_list_accepted`, `test_parse_json_wrong_shape_raises_422`, `test_parse_json_items_not_a_list_raises_422`); `services/cabling/tests/test_bulk.py` (`test_the_bounds_these_tests_rest_on`, `test_parse_json_topologies_refuses_an_unreadable_document_with_the_fixed_detail`, `test_parse_json_topologies_reads_a_document_just_under_the_depth_bound`, `test_parse_json_topologies_reads_an_integer_at_the_digit_limit`, `test_parse_json_topologies_keeps_the_decoder_position_for_a_syntax_error`, `test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing`, `test_a_json_import_just_under_the_parser_bounds_imports`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_the_parser_refuses_is_a_fixed_422_for_a_non_admin`)
 - **TOPO-BULK-8.** CSV import groups rows by topology name (rows without one are
   skipped), makes one node per distinct device name with id `node-<name>`, and one edge
   per row carrying `layer`, `sourcePort`, and `targetPort`. \
@@ -1301,6 +1313,47 @@ is the user guide.
   and parsed on the event loop. The same rule on inventory is INV-BULK-23. \
   Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
+- **TOPO-BULK-21.** A JSON import item the importer cannot read is a rejected row with
+  a fixed reason, `<field>: <message>` naming a path and never a value, and the rest of
+  the batch runs (TOPO-BULK-18): an item that is not an object (a list, string, number,
+  boolean, or null) is `row is not an object`; a `name` present, not null, and not a
+  string is `name: must be a string`; then `canvas: must be an object`,
+  `canvas.nodes: must be a list`, `canvas.nodes.<i>: must be an object`,
+  `canvas.nodes.<i>.data: must be an object`, `canvas.nodes.<i>.data.device: must be an
+  object`, and `canvas.nodes.<i>.data.device.name: must be a string`, where `<i>` is the
+  node's index. A null or absent `canvas`, `canvas.nodes`, node `data`, `data.device`,
+  or device name passes; a null node does not. A value of the wrong type is rejected
+  even when it is empty, zero, or false (`0`, `false`, `""`, `[]`, or `{}`, whichever
+  is the wrong type for that part). The row carries the trimmed name as its identity
+  when the name is a string that is not blank, else none. Such a record is checked
+  before the one pass that collects every record's device names for TOPO-BULK-9, and
+  that pass leaves it out, so none of its names is sent to inventory. Edges and every
+  other part of the canvas are read only inside the row's own handling and are not
+  checked here. The same reasons for an item and its name are inventory's (INV-BULK-26
+  in `inventory.md`). Before issue #1573, to any signed-in user: an item that is not an
+  object, a node that is not an object, a device name that is a non-empty list or
+  object, or a `canvas`, `canvas.nodes`, node `data`, or `data.device` of the wrong
+  type that is not empty, zero, or false answered 500 from the device-name pass, before
+  any row ran, so nothing was written; a `name` that is a nonzero number, `true`, or a
+  non-empty list or object answered 500 after the rows before it had committed. A device
+  name that is a number or `true` was not refused by type: beside a string device name
+  in the same file it stopped the request with the TOPO-BULK-9 503, and otherwise it was
+  passed to the name lookup. A wrong-typed `canvas`, `canvas.nodes`, `data`,
+  `data.device`, or device name that is empty, zero, or false was read as absent and the
+  topology imported, and a `name` of `0`, `false`, `[]`, or `{}` was rejected `missing
+  required field: name`; each of those is now rejected with the reason above. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`_record_shape_reason`, `import_topologies`, `_import_topology_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row`, `test_a_rejected_record_is_left_out_of_the_name_resolution`, `test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row`, `test_a_null_or_absent_part_passes_the_shape_check`, `test_an_odd_edge_list_is_judged_by_the_row_not_a_500`, `test_a_committing_import_reports_the_topology_before_a_bad_item`); `services/cabling/tests/test_route_handlers_direct.py` (`test_record_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin`)
+- **TOPO-BULK-22.** A CSV import is read through the shared reader `read_csv_rows`, the
+  one inventory's importers use (INV-BULK-25 in `inventory.md`), before any row is
+  grouped: `\n`, `\r\n`, and bare `\r` line endings are all read, a bare `\r` in an
+  unquoted cell ends the line, a cell may be as long as the file, and anything the csv
+  module still refuses answers 422 `Invalid CSV: line <n> could not be read; fix it and
+  retry` for the whole request with nothing written, dry run included. Before issue
+  #1574 a cell over 131,072 characters or a bare `\r` outside quotes answered 500 to any
+  signed-in user. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_device_cell_past_the_field_limit_is_judged_not_a_500`, `test_a_topology_name_past_the_field_limit_is_read`, `test_every_line_ending_imports_the_same_topologies`, `test_a_cr_only_csv_with_edges_imports_its_wiring`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_reads_a_cr_only_file`, `test_parse_csv_a_csv_error_is_the_fixed_422`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1574,8 +1627,8 @@ reservation's fork opens read-only.
 `frontend/src/components/topology-editor/LiveEditBar.tsx`,
 `frontend/src/components/topology-editor/ForkHistoryPanel.tsx`,
 `frontend/src/hooks/useForkAutosave.ts`, `frontend/src/hooks/useForkVersionPreview.ts`,
-`frontend/src/lib/forkDiff.ts`; the reservations fork routes (`reservations.md`, section
-5).
+`frontend/src/lib/forkDiff.ts`; the reservations fork routes and `GET /{id}`
+(`reservations.md`, section 5).
 
 **Rules.**
 
@@ -1592,9 +1645,17 @@ reservation's fork opens read-only.
   Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`disables the Commit button with the invalid-edge count when an edge has no physical path, and never calls the fork save`, `PATCH-adds a newly drawn device to the reservation BEFORE saving the fork (issue #701)`, `a failed device-set PATCH blocks the fork save entirely (issue #701)`, `PATCH-removes a device from the reservation only AFTER the fork save succeeds (issue #701)`, `commit calls the fork save and the device PATCH, never the parent topology PUT`)
 - **TOPO-UIFORK-3.** A port-claim 409 opens the conflict dialog and keeps the drawing; a
   membership 409 names the devices; routing refusals toast their count, the parser's
-  message, or the inventory outage; any other string detail is shown as sent. \
-  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`) \
-  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`)
+  message, or the inventory outage; any other string detail is shown as sent. Each of
+  those structured bodies is used only when every field the dialog or toast reads has
+  its type: a string or absent port-claim `message`, string `reservation_id`,
+  `device_id`, and `port` in every conflict, string membership ids, well-formed
+  `invalid_routes` entries, a string parser `message`. Any other body, an HTML page
+  included, never opens the dialog: it toasts its `message` when that is a non-blank string,
+  else the plain detail or `Failed to save the reservation fork`, and the editor and
+  the drawing stay as they were (issue #1406). A blank parser message toasts
+  `Routing intent malformed: no reason given`. \
+  Enforced in: `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`); `frontend/src/api/reservations.ts` (`forkConflictDetail`, `forkDeviceNotMemberDetail`, `forkL3IntentInvalidDetail`, `forkL3IntentMalformedDetail`); `frontend/src/lib/errors.ts` (`hasFields`, `isListOf`, `isInvalidRoute`); `frontend/src/components/topology-editor/ForkConflictDialog.tsx` (`ForkConflictDialog`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkMode.test.tsx` (`a structured 409 port-claim conflict opens the conflict dialog and keeps the drawing`, `a fork_device_not_member 409 names the offending devices in plain words (issue #701)`, `an l3_intent_invalid 409 toasts the problem count`, `an l3_intent_malformed 422 toasts the parser's message`, `an l3_config_unavailable 503 toasts that inventory could not be reached`, `a plain 409 with a string detail toasts that string verbatim`, `a port-claim 409 whose fields are not in shape keeps the editor and its drawing (issue #1406)`, `an l3_intent_malformed 422 whose message is not usable text toasts fixed text (issue #1406)`); `frontend/src/test/api/reservationFork.test.tsx` (`forkConflictDetail checks every field the dialog renders (issue #1406)`, `the other fork narrowers check what they hand on (issue #1406)`); `frontend/src/test/components/ForkConflictDialog.test.tsx` (`cuts a very long message to the shared detail bound`, `renders markup in the message as text, never as HTML`)
 - **TOPO-UIFORK-4.** The draft is sent as a canvas PUT 2000 ms after the last edit, never
   for the canvas as loaded, and flushed when the page closes; a read-only fork never
   autosaves. \
@@ -1642,6 +1703,21 @@ reservation's fork opens read-only.
   save wires the other lines (issue #1066). \
   Enforced in: `frontend/src/lib/edgeProblems.ts` (`serverEdgeProblemsFrom`, `applySkippedConstrainedEdges`, `withServerEdgeProblems`, `stripServerEdgeProblem`); `frontend/src/hooks/useForkAutosave.ts` (`onDraftValidated`); `frontend/src/pages/TopologyEditorPage.tsx` (`loadCanvasAndClearRouteProblems`, `handleDraftValidated`, `serverOnlyInvalidEdgeCount`); `frontend/src/components/topology-editor/edges/edgeStatus.ts` (`resolveEdgeStroke`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`serverInvalidEdgeCount`) \
   Pinned by: `frontend/src/test/lib/edgeProblems.test.ts` (`maps each reported edge id to its reason`, `replaces every no_port_path verdict with the save's skipped list and keeps other reasons`, `overlays the reason on copies of the matched edges only, never mutating the input`); `frontend/src/test/hooks/useForkAutosave.test.tsx` (`drops an older PUT's answer that settles after a newer PUT was sent`, `drops an answer for a canvas that changed while the PUT was in flight`, `never calls back after unmount`); `frontend/src/test/pages/TopologyEditorForkServerEdges.test.tsx` (`paints a line the draft PUT reported, inside its bundle, without touching the store`, `stays red until the next PUT answer says otherwise`, `clears the verdicts when a fork-history preview replaces the canvas, and they do not return on exit`, `a fork save refreshes the no_port_path verdicts from its skipped list and keeps the others`); `frontend/src/test/pages/TopologyEditorWiring.test.tsx` (`a replace on a real edge strips the render-only server reason before the store sees it (issue #1066)`); `frontend/src/test/components/LayerEdge.test.tsx` (`renders red with the server's reason, above a reachable device pair`); `frontend/src/test/components/LiveEditBar.test.tsx` (`states server-reported lines without blocking commit`); `tests/e2e/test_fork_save_skipped_edge_playwright.py` (`test_fork_save_toast_names_a_line_on_unjoined_ports`)
+- **TOPO-UIFORK-11.** Live edit reads its reservation by id (`GET /reservations/{id}`,
+  owner only, RES-VIEW-1), never by scanning a page of the owner's list; that read
+  supplies the header's purpose, the `ACTIVE` status that shows Restore, and the current
+  device set the pre-save add unions with the canvas (TOPO-UIFORK-2). Commit stays
+  disabled, reading `Loading reservation...`, until the read lands. A failed read keeps
+  it disabled under a red line: the 404 anyone but the owner gets reads
+  `Only the reservation's owner can commit from this editor`, and any other failure
+  says the reservation could not be loaded and to reload the page. A commit triggered anyway
+  sends neither the device-set PATCH nor the fork save, so the union is never computed
+  without the reservation's own set (issue #1319). A copy already read stays in force
+  when a later background refetch fails: Commit stays enabled and unions with that
+  copy, and the server still refuses a save or PATCH for a reservation that has left
+  `ACTIVE` (RES-FORK-6). \
+  Enforced in: `frontend/src/api/reservations.ts` (`useReservation`); `frontend/src/pages/TopologyEditorPage.tsx` (`handleCommitToReservation`, `reservationStatus`); `frontend/src/components/topology-editor/LiveEditBar.tsx` (`LiveEditReservationStatus`, `reservationStatus`) \
+  Pinned by: `frontend/src/test/pages/TopologyEditorForkReservationLookup.test.tsx` (`a reservation past the owner's first 500 still drives the header, Restore, and the device-set union`, `a failed read keeps Commit closed and sends neither the PATCH nor the fork save`, `a reservation the caller may not read (404 for anyone but the owner) fails closed and says only the owner can commit`, `a cached reservation stays loaded when a background refetch fails, and Commit unions with the cached set`, `while the read is in flight Commit waits for it, then commits with the full set`); `frontend/src/test/components/LiveEditBar.test.tsx` (`disables commit and reads 'Loading reservation...' while the reservation is loading`, `a failed reservation read disables commit and says so`, `a read refused as not the owner's says only the owner can commit, with no reload advice`); `frontend/src/test/api/reservations.test.tsx` (`useReservation reads exactly the reservation named and never the list`, `useReservation is an error, not empty data, when the read is refused`, `a mutation that invalidates ['reservations'] refetches useReservation`)
 
 **Out of scope.** Who may open the fork, and the Edit topology entry point, are
 `reservations.md` (RES-FORK-4, RES-FORK-19). The Wiring tab is
@@ -1721,7 +1797,9 @@ other error carries `detail` as a string or the object shown.
 | 422 | `Devices belong to different device groups and share none; cross-group cabling is disabled.` | cabling across disjoint device groups; per row in bulk | TOPO-BOUND-1 |
 | 422 | `missing assignment for role '<role>'` | instantiate without a device for a role | TOPO-TMPL-8 |
 | 422 | `Invalid JSON: <error>`, `JSON import must be a list of topologies or an object with an 'items' list`, `'items' must be a list` | an unparseable or misshapen JSON import | TOPO-BULK-7 |
+| 422 | `Invalid JSON: the document is nested too deeply or holds a number too long to read` | a JSON import nested past the parser's depth bound or holding an integer longer than 4,300 digits | TOPO-BULK-7 |
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry`, `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | an import file that is not UTF-8, or a JSON import holding a lone surrogate | TOPO-BULK-19 |
+| 422 | `Invalid CSV: line <n> could not be read; fix it and retry` | a CSV import the csv module refuses | TOPO-BULK-22 |
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |

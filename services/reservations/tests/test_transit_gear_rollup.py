@@ -531,3 +531,199 @@ async def test_a_failure_from_any_chunk_raises_transit_gear_unavailable(
                 db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
             )
     assert failing_size in asked
+
+
+# --- A 200 of the wrong type (#1553) --------------------------------------------------
+#
+# These call the real `_fetch_transit_devices` directly with the transport patched to
+# answer a built `httpx.Response(200)`, so only the body's shape is under test.
+
+_BODY_TEXT = "body-text-that-must-stay-out-of-the-log"
+
+# Bodies that are not an object holding a `devices` object: each fails the read closed.
+WRONG_BODIES = {
+    "list": [1, 2],
+    "string": "x",
+    "true": True,
+    "int": 7,
+    "null": None,
+    "object_without_devices": {"other": {}},
+    "empty_object": {},
+    "devices_list": {"devices": ["rid"]},
+    "devices_string": {"devices": "abc"},
+    "devices_int": {"devices": 7},
+    "devices_true": {"devices": True},
+    "devices_null": {"devices": None},
+}
+# Nesting depth for bodies the decoder refuses with RecursionError (a RuntimeError, not a
+# ValueError). It is chosen far above any plausible limit, not near one: CPython's
+# default recursion limit is 1,000 and the C decoder's stack guard trips long before
+# 200,000 levels on 3.12 and 3.14, so these never parse on a host that raised its limit.
+_DEEP = 200_000
+DEEP_BODIES = {
+    "deep_list": b"[" * _DEEP + b"]" * _DEEP,
+    "deep_list_in_devices": b'{"devices": ' + b"[" * _DEEP + b"]" * _DEEP + b"}",
+    "deep_object": b'{"a":' * _DEEP + b"1" + b"}" * _DEEP,
+}
+# Bodies that do not parse: also closed, and the decoder's text never travels.
+NOT_JSON_BODIES = {
+    "plain_text": _BODY_TEXT.encode(),
+    "empty": b"",
+    "truncated_object": b'{"devices": {',
+    "not_utf8": b"\xff\xfe\xfa",
+    **DEEP_BODIES,
+}
+
+
+async def _fetch_with_answers(reservation_ids, answers):
+    """Run the real fetch; the transport hands out `answers` one per chunk, in order."""
+    queue = list(answers)
+
+    async def _batch(chunk):
+        return queue.pop(0)
+
+    with patch(
+        "app.services.reporting_service._cabling_fork_devices_batch",
+        new=AsyncMock(side_effect=_batch),
+    ):
+        return await _real_fetch_transit_devices(reservation_ids)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", list(WRONG_BODIES.values()), ids=list(WRONG_BODIES))
+async def test_a_200_that_is_not_an_object_with_a_devices_object_is_unavailable(body):
+    """OPS-REPORT-8 (issue #1553): the whole-body shapes of the issue's table, which
+    answered 500 before (or, for `{}`, `null`, and `{"devices": null}`, silently
+    reported no transit gear), raise TransitGearUnavailable. The body is encoded by
+    hand: `httpx.Response(json=None)` would send no body at all, not `null`."""
+    answer = httpx.Response(200, content=json.dumps(body).encode())
+    assert answer.json() == body
+    with pytest.raises(TransitGearUnavailable):
+        await _fetch_with_answers([uuid.uuid4()], [answer])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", list(NOT_JSON_BODIES.values()), ids=list(NOT_JSON_BODIES))
+async def test_a_200_that_is_not_json_is_unavailable_without_its_text(content):
+    """OPS-REPORT-8 (issue #1553): a 200 whose body does not parse raises
+    TransitGearUnavailable, not the decoder's ValueError (which the report routes turn
+    into a 422 quoting the decoder's text) or its RecursionError for a body nested
+    too deep (a 500), and nothing about the body is chained."""
+    with pytest.raises(TransitGearUnavailable) as raised:
+        await _fetch_with_answers([uuid.uuid4()], [httpx.Response(200, content=content)])
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    assert _BODY_TEXT not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_chunk", [0, 1], ids=["the-500-chunk", "the-1-chunk"])
+async def test_a_wrongly_shaped_body_in_any_chunk_is_unavailable(failing_chunk):
+    """Every chunk's body is checked: a good first chunk does not excuse a bad second."""
+    answers = [httpx.Response(200, json={"devices": {}}) for _ in range(2)]
+    answers[failing_chunk] = httpx.Response(200, json=[1, 2])
+    with pytest.raises(TransitGearUnavailable):
+        await _fetch_with_answers([uuid.uuid4() for _ in range(501)], answers)
+
+
+def _skip_records(caplog):
+    return [
+        r for r in caplog.records if getattr(r, "action", None) == "transit_gear_entries_skipped"
+    ]
+
+
+# A device list that is not a list (null is the pinned "adds nothing", not wrong).
+WRONG_DEVICE_LISTS = {
+    "int": 7,
+    "string": "abc",
+    "true": True,
+    "float": 1.5,
+    "object": {"k": _BODY_TEXT},
+}
+# A device id that is not a string.
+WRONG_DEVICE_IDS = {
+    "int": 7,
+    "true": True,
+    "null": None,
+    "float": 1.5,
+    "object": {"k": _BODY_TEXT},
+    "list": [_BODY_TEXT],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrong_list", list(WRONG_DEVICE_LISTS.values()), ids=list(WRONG_DEVICE_LISTS)
+)
+async def test_a_device_list_of_the_wrong_type_is_skipped_and_logged_once(caplog, wrong_list):
+    """OPS-REPORT-7 (issue #1553, owner decision): inside a well-formed map, a device
+    list that is not a list is skipped (its reservation gets no transit devices, as a
+    null list), the other reservation's devices still count, and ONE warning with a
+    fixed `action` and the counts, and no body text, is logged. Before the fix a
+    number answered 500 and a string was read character by character."""
+    bad_rid, good_rid, switch = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    body = {"devices": {str(bad_rid): wrong_list, str(good_rid): [str(switch)]}}
+    with caplog.at_level("DEBUG", logger="app.services.reporting_service"):
+        devices = await _fetch_with_answers([bad_rid, good_rid], [httpx.Response(200, json=body)])
+    assert devices == {good_rid: [switch]}
+    records = _skip_records(caplog)
+    assert [(r.levelname, r.skipped_device_lists, r.skipped_device_ids) for r in records] == [
+        ("WARNING", 1, 0)
+    ]
+    assert _BODY_TEXT not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_device_ids_of_the_wrong_type_are_skipped_and_the_rest_count(caplog):
+    """OPS-REPORT-7 (issue #1553): every wrongly typed device id is skipped while the
+    entry's UUID strings still count, on either side of each one; the report logs ONE
+    warning counting all of them. Before the fix `uuid.UUID(7)` raised AttributeError
+    and the report answered 500."""
+    rid, first, second = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    entry = [str(first), *WRONG_DEVICE_IDS.values(), "not-a-uuid", str(second)]
+    with caplog.at_level("DEBUG", logger="app.services.reporting_service"):
+        devices = await _fetch_with_answers(
+            [rid], [httpx.Response(200, json={"devices": {str(rid): entry}})]
+        )
+    assert devices == {rid: [first, second]}
+    records = _skip_records(caplog)
+    assert [(r.skipped_device_lists, r.skipped_device_ids) for r in records] == [
+        (0, len(WRONG_DEVICE_IDS))
+    ]
+    assert _BODY_TEXT not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_wrongly_typed_entries_across_chunks_log_one_line_per_report(caplog):
+    """The skip is logged once per report, not once per chunk or entry: two chunks each
+    with wrongly typed entries give one warning with the sums."""
+    ids = [uuid.uuid4() for _ in range(501)]
+    switch = uuid.uuid4()
+    first = {"devices": {str(ids[0]): 7, str(ids[1]): [True, str(switch)]}}
+    second = {"devices": {str(ids[500]): "abc"}}
+    with caplog.at_level("DEBUG", logger="app.services.reporting_service"):
+        devices = await _fetch_with_answers(
+            ids, [httpx.Response(200, json=first), httpx.Response(200, json=second)]
+        )
+    assert devices == {ids[1]: [switch]}
+    records = _skip_records(caplog)
+    assert [(r.skipped_device_lists, r.skipped_device_ids) for r in records] == [(2, 1)]
+
+
+@pytest.mark.asyncio
+async def test_the_pinned_leniency_logs_nothing(caplog):
+    """The leniency PR #1547 pinned is unchanged and is not a wrong type: a key that is
+    not a UUID, a device id string that is not a UUID, and a null device list are
+    ignored without a log line."""
+    rid, null_rid, switch = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    body = {
+        "devices": {
+            "not-a-reservation-id": [str(uuid.uuid4())],
+            str(rid): ["not-a-uuid", str(switch), ""],
+            str(null_rid): None,
+        }
+    }
+    with caplog.at_level("DEBUG", logger="app.services.reporting_service"):
+        devices = await _fetch_with_answers([rid, null_rid], [httpx.Response(200, json=body)])
+    assert devices == {rid: [switch], null_rid: []}
+    assert _skip_records(caplog) == []

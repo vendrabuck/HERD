@@ -1,4 +1,12 @@
 import {
+  aiCommitTopologyUnwireableDetail,
+  hasFields,
+  isInvalidRoute,
+  isListOf,
+  isOptionalString,
+  isString,
+  isStringList,
+  isStringOrNull,
   configApplyErrorText,
   configRestoreErrorText,
   deletePortErrorText,
@@ -243,6 +251,121 @@ describe("topologyMixedTypesDetail (#1038)", () => {
     expect(formatMixedTypesDetail(MIXED)).toBe(
       "The proposal mixes CLOUD and PHYSICAL devices.\nCLOUD: CloudVM\nPHYSICAL: EX3400, QFX",
     );
+  });
+});
+
+// Issue #1406: a structured narrower checks every field its type names, list
+// entries included, so a renderer can never be handed an object where it
+// expects text.
+describe("the shared field checks (issue #1406)", () => {
+  it("hasFields wants a plain object whose named fields pass", () => {
+    const fields = { a: isString, b: isOptionalString };
+    expect(hasFields({ a: "x", b: "y" }, fields)).toBe(true);
+    expect(hasFields({ a: "x" }, fields)).toBe(true);
+    expect(hasFields({ a: "x", b: "y", c: {} }, fields)).toBe(true);
+    expect(hasFields({ a: 1 }, fields)).toBe(false);
+    expect(hasFields({ a: "x", b: null }, fields)).toBe(false);
+    expect(hasFields({}, fields)).toBe(false);
+    for (const value of [null, undefined, "x", 1, ["x"], true]) {
+      expect(hasFields(value, fields)).toBe(false);
+    }
+  });
+
+  it("hasFields reads only a field's own value, never one inherited from Object", () => {
+    // `toString` is inherited by every object; it must read as absent.
+    expect(hasFields({}, { toString: isOptionalString })).toBe(true);
+    expect(hasFields({}, { constructor: (v: unknown) => v === undefined })).toBe(true);
+  });
+
+  it("isListOf wants an array whose every entry passes; an empty one passes", () => {
+    expect(isListOf([], isString)).toBe(true);
+    expect(isListOf(["a", "b"], isString)).toBe(true);
+    expect(isListOf(["a", 1], isString)).toBe(false);
+    expect(isListOf([null], isString)).toBe(false);
+    for (const value of [null, undefined, "ab", { 0: "a", length: 1 }]) {
+      expect(isListOf(value, isString)).toBe(false);
+    }
+    expect(isStringList(["a"])).toBe(true);
+    expect(isStringList([["a"]])).toBe(false);
+  });
+
+  it("isStringOrNull and isOptionalString differ only on null and absence", () => {
+    expect(isStringOrNull(null)).toBe(true);
+    expect(isStringOrNull(undefined)).toBe(false);
+    expect(isOptionalString(undefined)).toBe(true);
+    expect(isOptionalString(null)).toBe(false);
+    for (const check of [isString, isStringOrNull, isOptionalString]) {
+      expect(check("")).toBe(true);
+      expect(check({})).toBe(false);
+      expect(check(1)).toBe(false);
+    }
+  });
+
+  it("isInvalidRoute matches cabling's InvalidRoute and nothing looser", () => {
+    const route = { node_id: "n", device_id: "d", index: 2, reason: "l3_bad_next_hop", detail: null };
+    expect(isInvalidRoute(route)).toBe(true);
+    expect(isInvalidRoute({ ...route, device_id: null, index: null, detail: "why" })).toBe(true);
+    for (const broken of [
+      { ...route, node_id: undefined },
+      { ...route, device_id: undefined },
+      { ...route, index: undefined },
+      { ...route, index: 1.5 },
+      { ...route, index: "2" },
+      { ...route, reason: { code: 1 } },
+      { ...route, detail: ["x"] },
+      null,
+      [route],
+    ]) {
+      expect(isInvalidRoute(broken)).toBe(false);
+    }
+  });
+});
+
+describe("the AI narrowers check every entry they format (issue #1406)", () => {
+  it("topologyUnconnectableDetail refuses a non-string message or a malformed pair", () => {
+    const pair = DETAIL.pairs[0];
+    for (const detail of [
+      { ...DETAIL, message: { text: "x" } },
+      { ...DETAIL, message: undefined },
+      { ...DETAIL, pairs: [pair, null] },
+      { ...DETAIL, pairs: [{ ...pair, source_role: 1 }] },
+      { ...DETAIL, pairs: [{ ...pair, target_role: {} }] },
+      { ...DETAIL, pairs: [{ ...pair, source_template: null }] },
+      { ...DETAIL, pairs: [{ ...pair, target_template: ["t"] }] },
+    ]) {
+      expect(topologyUnconnectableDetail(axiosLike(422, detail))).toBeNull();
+    }
+  });
+
+  it("topologyMixedTypesDetail refuses a non-string message or a malformed group", () => {
+    const group = { topology_type: "CLOUD", roles: ["vm"], templates: ["CloudVM"] };
+    const mixed = { error: "topology_mixed_types", groups: [group], message: "m" };
+    expect(topologyMixedTypesDetail(axiosLike(422, mixed))).toEqual(mixed);
+    for (const detail of [
+      { ...mixed, message: ["m"] },
+      { ...mixed, groups: [null] },
+      { ...mixed, groups: [{ ...group, topology_type: 1 }] },
+      { ...mixed, groups: [{ ...group, roles: "vm" }] },
+      { ...mixed, groups: [{ ...group, templates: [null] }] },
+    ]) {
+      expect(topologyMixedTypesDetail(axiosLike(422, detail))).toBeNull();
+    }
+  });
+
+  it("aiCommitTopologyUnwireableDetail refuses a non-string message or a malformed edge", () => {
+    const edge = { edge_id: "e1", source_role: "fw-a", target_role: "sw-a", reason: "no_path" };
+    const body = { error: "topology_unwireable", invalid_edges: [edge], message: "m" };
+    expect(aiCommitTopologyUnwireableDetail(axiosLike(422, body))).toEqual(body);
+    for (const detail of [
+      { ...body, message: {} },
+      { ...body, invalid_edges: [null] },
+      { ...body, invalid_edges: [{ ...edge, edge_id: null }] },
+      { ...body, invalid_edges: [{ ...edge, source_role: 1 }] },
+      { ...body, invalid_edges: [{ ...edge, target_role: {} }] },
+      { ...body, invalid_edges: [{ ...edge, reason: ["no_path"] }] },
+    ]) {
+      expect(aiCommitTopologyUnwireableDetail(axiosLike(422, detail))).toBeNull();
+    }
   });
 });
 

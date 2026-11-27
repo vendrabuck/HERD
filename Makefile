@@ -11,11 +11,12 @@ DB_SERVICES := auth inventory reservations cabling acl execution user-profile no
 # explicitly. Add new repo-root packages or scripts here so they are linted and
 # format-checked locally and in CI. Today this is the seedtools seeding package
 # (issue #791), the CI image-vs-lock guard script (issue #593), the manual search
-# index generator (issue #1298), the AI generate evaluation harness
-# (tests/ai_eval/), the repo-root unit tests (tests/unit/), and the restarter with
-# its tests (infra/restarter/, issue #1326); the rest of tests/ is not covered by
-# make lint or CI's ruff steps.
-ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ai_eval/ tests/unit/ infra/restarter/
+# index generator (issue #1298), all of tests/ (the e2e, integration, contract,
+# load, NOS lab, AI eval, and repo-root unit suites; issue #1557), the driver
+# packages under drivers/ (issue #1557), and the restarter with its tests
+# (infra/restarter/, issue #1326). The same list is spelled out in CI's two ruff
+# steps (.github/workflows/ci.yml); keep them identical.
+ROOT_PY := seedtools/ scripts/check_image_matches_lock.py scripts/build_manual_search_index.py tests/ drivers/ infra/restarter/
 
 # The ephemeral master/everything gate stack runs in its OWN compose project so
 # its volumes never collide with the dev stack's: the gate is always born fresh
@@ -1142,7 +1143,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty-three today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1187,6 +1188,14 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # l2_port_assignments row it does not own unchanged and no execution_runs row
 # written for its foreign reservation, and deletes its own and its seeded rows
 # in a finally.
+# The execution suite added for issue #1413 (the join and define side of that
+# release) works the same way on the migrated execution schema: random
+# reservation ids, seeded foreign rows asserted unchanged, its own rows deleted
+# in a finally. Each FAILED row it leaves has at least 1,000,000 attempts, so the
+# stack's own retry tick does not select it at any cap below that (the default is
+# 10); it runs no tick itself. The test stops one party inside its transaction
+# with a gate, holding its row lock, and the other party waits on that lock for
+# well under a second before the gate lets the first go.
 # The auth suite added for ADR 0016 phase 2 (the OIDC flow store and JIT
 # provisioning races) needs the migrated auth schema with migration 0010's two
 # tables. It commits its own users, identities, and flows under random tags,
@@ -1210,6 +1219,11 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # row-lock test commits one reservation of its own under a random id, holds its
 # row lock for about one second, writes no other row, and deletes it in a
 # finally.
+# The reservations suite added for issue #1543 (migration 0019's reset of
+# stored purpose suggestions that are not usable) needs the migrated
+# reservations schema. It commits nothing: it inserts its rows, runs the
+# upgrade inside one REPEATABLE READ transaction, and rolls it back; the
+# upgrade row-locks any foreign row holding an unusable suggestion until then.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1245,6 +1259,8 @@ _gate-pg-live-tests:
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_vlan_release_cas_live_pg.py -v) && \
 	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_vlan_join_release_race_live_pg.py -v) && \
+	(cd services/execution && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_wide_allocation_check_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_reservation_status_cas_live_pg.py -v) && \
@@ -1260,6 +1276,8 @@ _gate-pg-live-tests:
 		uv run pytest tests/test_sweep_claim_cancel_race_live_pg.py -v) && \
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_pending_fork_prune_live_pg.py -v) && \
+	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_purpose_suggestion_reset_live_pg.py -v) && \
 	(cd services/inventory && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_config_apply_races_live_pg.py -v)
 

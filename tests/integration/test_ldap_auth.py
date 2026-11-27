@@ -54,9 +54,7 @@ LDAP_HOST = os.getenv("HERD_TEST_LDAP_HOST", "127.0.0.1")
 LDAP_PORT = int(os.getenv("HERD_TEST_LDAP_PORT", "389"))
 LDAP_USER = os.getenv("HERD_TEST_LDAP_USER", "ldapit-eng1")
 LDAP_PASSWORD = os.getenv("HERD_TEST_LDAP_PASSWORD", "Password1")
-LDAP_EXPECTED_EMAIL = os.getenv(
-    "HERD_TEST_LDAP_EMAIL", f"{LDAP_USER}@company.local"
-)
+LDAP_EXPECTED_EMAIL = os.getenv("HERD_TEST_LDAP_EMAIL", f"{LDAP_USER}@company.local")
 
 
 def _ldap_reachable() -> bool:
@@ -156,9 +154,7 @@ async def test_ldap_login_provisions_ldap_user(base_url):
         login.raise_for_status()
         token = login.json()["access_token"]
 
-        me = await client.get(
-            f"{base_url}/auth/me", headers={"Authorization": f"Bearer {token}"}
-        )
+        me = await client.get(f"{base_url}/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert me.status_code == 200
     user = me.json()
     assert user.get("email") == LDAP_EXPECTED_EMAIL

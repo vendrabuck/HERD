@@ -187,9 +187,7 @@ function handlers() {
       if (forkHold) await forkHold;
       return HttpResponse.json(FORK);
     }),
-    http.get("/api/reservations/", () =>
-      HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
-    ),
+    http.get(`/api/reservations/${RES_ID}`, () => HttpResponse.json(RESERVATION)),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
     http.get("/api/cabling/topologies/:id/versions", ({ params }) =>
       HttpResponse.json(

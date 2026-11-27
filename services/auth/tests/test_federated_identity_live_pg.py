@@ -26,9 +26,11 @@ write, no read) or the account row `FOR UPDATE` while the tasks start, the test
 waits until they are all blocked in `pg_stat_activity`, and only then releases.
 
 Env contract identical to test_oidc_flow_service_live_pg.py:
-    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns an unreachable
-                            server into a hard failure instead of the normal skip.
+    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
+                            empty, the suite is skipped and connects to nothing; a
+                            named database that does not answer skips it too.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either skip
+                            into an error at setup (herd_common.pg_live_suite).
 
 Gate-ledger scoping (TESTING.md, issue #819): the gate runs this against its
 ALREADY-USED auth schema. Every test owns its accounts under
@@ -45,7 +47,6 @@ The table lock is held for well under a second per race.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -71,15 +72,12 @@ from app.services.federated_identity_service import (
     relink_identity,
     rewrite_issuer,
 )
+from herd_common.pg_live_suite import pg_live_target
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
-PG_DSN = os.getenv(
-    "HERD_TEST_PG_DSN",
-    f"postgresql+asyncpg://herd:herd@127.0.0.1:{DEFAULT_PG_PORT}/herd",
-)
-_PG_REQUIRED = os.getenv("HERD_TEST_PG_REQUIRED", "") not in ("", "0")
+_PG = pg_live_target()
+PG_DSN = _PG.dsn
 
 _CONNECT_ARGS = {
     "server_settings": {
@@ -96,36 +94,13 @@ def _make_engine():
     return create_async_engine(PG_DSN, connect_args=_CONNECT_ARGS, pool_size=N + 4)
 
 
-async def _pg_reachable() -> bool:
-    engine = _make_engine()
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
-
-
-_PG_REACHABLE = asyncio.run(_pg_reachable())
-
-pytestmark = pytest.mark.skipif(
-    not _PG_REQUIRED and not _PG_REACHABLE,
-    reason=(
-        f"No Postgres reachable at {PG_DSN!r}; set HERD_TEST_PG_DSN to point at one "
-        "(e.g. the gate stack's published postgres port, 5433) to run this suite."
-    ),
-)
+pytestmark = pytest.mark.skipif(_PG.skip_reason is not None, reason=_PG.skip_reason or "")
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unreachable():
-    if _PG_REQUIRED and not _PG_REACHABLE:
-        pytest.fail(
-            f"HERD_TEST_PG_REQUIRED is set but no Postgres is reachable at {PG_DSN!r}; "
-            "start one or unset HERD_TEST_PG_REQUIRED."
-        )
+def _fail_when_pg_live_cannot_run():
+    if _PG.failure is not None:
+        pytest.fail(_PG.failure)
 
 
 @pytest.fixture

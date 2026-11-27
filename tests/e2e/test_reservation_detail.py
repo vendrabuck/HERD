@@ -43,9 +43,7 @@ def test_reservation_detail_modal_opens(admin_browser, base_url, transient_reser
     )
     # Five tab buttons: Details, Inventory, Routes, Wiring, Schedule.
     for label in ("Details", "Inventory", "Routes", "Wiring", "Schedule"):
-        admin_browser.find_element(
-            By.XPATH, f"//button[normalize-space()='{label}']"
-        )
+        admin_browser.find_element(By.XPATH, f"//button[normalize-space()='{label}']")
 
 
 def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reservation):
@@ -61,9 +59,7 @@ def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reser
     wait = WebDriverWait(admin_browser, WAIT)
     short_id = transient_reservation["id"][:8]
     row_cell = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH, f"//tbody/tr/td[normalize-space()='{short_id}']")
-        )
+        EC.element_to_be_clickable((By.XPATH, f"//tbody/tr/td[normalize-space()='{short_id}']"))
     )
     row_cell.click()
     wait.until(
@@ -79,10 +75,12 @@ def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reser
             By.XPATH, f"//dialog[@open]//button[normalize-space()='{label}']"
         ).click()
         wait.until(
-            lambda d, label=label: "bg-gray-900"
-            in d.find_element(
-                By.XPATH, f"//dialog[@open]//button[normalize-space()='{label}']"
-            ).get_attribute("class")
+            lambda d, label=label: (
+                "bg-gray-900"
+                in d.find_element(
+                    By.XPATH, f"//dialog[@open]//button[normalize-space()='{label}']"
+                ).get_attribute("class")
+            )
         )
         active = [
             other
@@ -100,9 +98,7 @@ def test_reservation_detail_tabs_switch(admin_browser, base_url, transient_reser
         )
 
 
-def test_reservation_edit_resources_button_visible(
-    admin_browser, base_url, transient_reservation
-):
+def test_reservation_edit_resources_button_visible(admin_browser, base_url, transient_reservation):
     """Edit Resources button shows for the reservation owner on ACTIVE/PENDING."""
     _open_reservations(admin_browser, base_url)
     admin_browser.refresh()
@@ -111,7 +107,5 @@ def test_reservation_edit_resources_button_visible(
 
     _click_reservation_row(admin_browser)
     wait.until(
-        EC.visibility_of_element_located(
-            (By.XPATH, "//button[contains(., 'Edit Resources')]")
-        )
+        EC.visibility_of_element_located((By.XPATH, "//button[contains(., 'Edit Resources')]"))
     )

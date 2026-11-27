@@ -14,6 +14,9 @@ from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
+    log_consumer_connect_failure,
+    log_consumer_setup_failure,
+    log_consumer_stream_check_failure,
     nak_delay,
     parse_nak_backoff_schedule,
     process_batch_with_heartbeat,
@@ -113,6 +116,11 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 # inspection and replay (see docs/OPERATIONS.md). The _publish_to_dlq publish stays
 # best-effort and swallows errors so a DLQ outage cannot wedge the consumer.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
+
+# The stream and durable this service's one consumer reads; the startup warnings
+# name them (issue #1418).
+EXECUTION_STREAM = "HERD_RESERVATIONS"
+EXECUTION_DURABLE = "execution-consumer"
 
 # Event name for the connection-driven L1 reconcile (ADR 0007, issue #345 P3b).
 WIRING_CHANGED_EVENT = "reservation.wiring_changed"
@@ -2868,6 +2876,67 @@ async def _run_vlan_definition_op(
     return ok, attempts, err
 
 
+async def _undo_unrecorded_definition(
+    row,
+    switch_id: str,
+    ctx: "_FetchContext",
+    get_db_session,
+) -> None:
+    """Drive delete_vlan for a create_vlan the define pre-pass could not record because
+    the allocation `row` was released meanwhile (issue #1413).
+
+    The release winner deletes only the switches it read in defined_switch_ids, and this
+    switch was never added there, so this is the one delete it gets. It is judged by the
+    rule the release's own deletes use (WIRE-VLAN-11): when another ACTIVE allocation now
+    holds the number in the switch's current component, no delete runs. When that cannot
+    be judged (TransientUpstreamError from the fabric lookup) no delete runs and one line
+    is logged with the action `vlan_define_undo_unjudged`. A failed delete is logged and
+    the definition lingers, as with a release's failed delete. Anything else raised
+    propagates, as from the create before it.
+    """
+    from app.services.vlan_service import FabricResolver, find_superseding_allocation
+
+    try:
+        async with get_db_session() as db:
+            winner = await find_superseding_allocation(db, row, [switch_id], FabricResolver())
+    except TransientUpstreamError as exc:
+        logger.error(
+            "Not undoing create_vlan for VLAN %d on switch %s (allocation %s released "
+            "meanwhile): supersession could not be judged (%s); the definition lingers",
+            row.vlan_id,
+            switch_id,
+            row.id,
+            type(exc).__name__,
+            extra={
+                "action": "vlan_define_undo_unjudged",
+                "error_class": type(exc).__name__,
+                "vlan_assignment_id": str(row.id),
+            },
+        )
+        return
+    if winner is not None:
+        logger.warning(
+            "Not undoing create_vlan for VLAN %d on switch %s: allocation %s now holds "
+            "the number in the switch's component",
+            row.vlan_id,
+            switch_id,
+            winner,
+        )
+        return
+    ok, _attempts, err = await _run_vlan_definition_op(
+        switch_id, "delete_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
+    )
+    if not ok:
+        logger.error(
+            "delete_vlan undoing VLAN %d on switch %s (allocation %s released meanwhile) "
+            "failed: %s; the empty VLAN definition lingers on the switch",
+            row.vlan_id,
+            switch_id,
+            row.id,
+            err,
+        )
+
+
 async def _define_pending_for_allocations(
     allocation_ids: set,
     ctx: "_FetchContext",
@@ -2886,8 +2955,21 @@ async def _define_pending_for_allocations(
     the failures; the caller parks that switch's dependent membership builds (no new
     row type, per the #442 decision) and a transit-only failure is only loudly logged
     here (there is no membership row to park; the pending set keeps it retried).
+
+    Issue #1413: the success is recorded through vlan_service.record_allocation_defined,
+    under the allocation's row lock and only while it is ACTIVE. When the allocation was
+    released after this pass read it, the switch is not recorded; the create just made
+    is undone by _undo_unrecorded_definition, the rest of that allocation's pending
+    switches are not defined, and each of them, the undone one included, is returned as
+    a failure with attempts 0 and JOIN_LOST_ALLOCATION_RELEASED, so the caller parks
+    the joins on those switches instead of driving them on the released number. Joins
+    on the allocation's switches that were already defined are not failures here: they
+    are still driven on that number, and each loses at the join's guard and is undone
+    like any lost join (_undo_lost_join).
     """
     from app.models.vlan_assignment import VlanAssignment
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+    from app.services.vlan_service import record_allocation_defined
 
     failures: dict[str, tuple[int, str]] = {}
     nil = uuid.UUID(int=0)
@@ -2911,20 +2993,42 @@ async def _define_pending_for_allocations(
             for s in (row.switch_device_ids or [])
             if str(s) not in {str(d) for d in (row.defined_switch_ids or [])}
         ]
-        for switch_id in pending:
+        for index, switch_id in enumerate(pending):
             ok, attempts, err = await _run_vlan_definition_op(
                 switch_id, "create_vlan", row.vlan_id, row.reservation_id, ctx, get_db_session
             )
             if ok:
                 async with get_db_session() as db:
-                    fresh = (
-                        await db.execute(select(VlanAssignment).where(VlanAssignment.id == va_uuid))
-                    ).scalar_one_or_none()
-                    if fresh is not None:
-                        defined = {str(d) for d in (fresh.defined_switch_ids or [])}
-                        defined.add(switch_id)
-                        fresh.defined_switch_ids = sorted(defined)
-                        await db.commit()
+                    recorded = await record_allocation_defined(db, va_uuid, switch_id)
+                if recorded:
+                    continue
+                # Issue #1413: the allocation was released after this pass read it, so
+                # the switch is not added to a RELEASED row (whose release winner has
+                # already chosen the switches it deletes from). Undo this create, and
+                # park the joins of this switch and of every switch of the allocation
+                # not yet defined, rather than drive them on the released number (joins
+                # on switches already defined are still driven, lose at the join's
+                # guard, and are undone).
+                not_defined = pending[index:]
+                for parked in not_defined:
+                    failures[parked] = (0, JOIN_LOST_ALLOCATION_RELEASED)
+                logger.warning(
+                    "create_vlan for VLAN %d on switch %s lost to the release of "
+                    "allocation %s (reservation %s); undoing it and parking the joins "
+                    "of switches %s",
+                    row.vlan_id,
+                    switch_id,
+                    va_uuid,
+                    row.reservation_id,
+                    not_defined,
+                    extra={
+                        "action": "vlan_define_lost_to_release",
+                        "vlan_assignment_id": str(va_uuid),
+                        "switch_ids": not_defined,
+                    },
+                )
+                await _undo_unrecorded_definition(row, switch_id, ctx, get_db_session)
+                break
             else:
                 failures[switch_id] = (attempts, err or "create_vlan failed")
                 logger.error(
@@ -3149,6 +3253,7 @@ async def _release_orphaned_allocations(
         FabricResolver,
         find_superseding_allocation,
         release_allocation_if_orphaned,
+        trim_allocation_definitions,
     )
 
     resolver = FabricResolver()
@@ -3272,13 +3377,12 @@ async def _release_orphaned_allocations(
                 err,
             )
         if remaining != defined:
+            # Issue #1413: remove what was deleted from the list as it stands now, under
+            # the row lock, never overwrite it with this pass's copy.
             async with get_db_session() as db:
-                fresh = (
-                    await db.execute(select(VlanAssignment).where(VlanAssignment.id == row.id))
-                ).scalar_one_or_none()
-                if fresh is not None:
-                    fresh.defined_switch_ids = remaining
-                    await db.commit()
+                await trim_allocation_definitions(
+                    db, row.id, [s for s in defined if s not in remaining]
+                )
 
 
 async def _release_reservation_orphaned_allocations(
@@ -3352,7 +3456,9 @@ async def _apply_l2_memberships(
         switch. A create failure parks that switch's adds FAILED intended ACTIVE with
         the create error (the membership ledger row is the parking spot, no new row
         type) and their driver calls are skipped; removes are unaffected (a switch
-        with a live membership was necessarily already defined).
+        with a live membership was necessarily already defined). A switch whose
+        definition lost to a release of its allocation (issue #1413) parks its adds
+        the same way, under JOIN_LOST_ALLOCATION_RELEASED with no prefix.
       - Undefine: _release_orphaned_allocations drives delete_vlan on last-free.
 
     `retry_row_ids` (issue #814) is passed ONLY by the retry channels, which call this
@@ -3381,8 +3487,10 @@ async def _apply_l2_memberships(
         update_execution_run,
     )
     from app.services.l2_membership_service import (
+        JOIN_LOST_ALLOCATION_RELEASED,
         is_membership_active,
         membership_needs_remove,
+        membership_owes_undo,
         record_l2_failed,
     )
 
@@ -3393,6 +3501,29 @@ async def _apply_l2_memberships(
         return retry_ids.get((str(switch_id), port))
 
     touched_allocations: set[uuid.UUID] = {uuid.UUID(str(r["vlan_assignment_id"])) for r in removes}
+
+    # Issue #1413: a port whose row still owes the removal of a lost join's add from a
+    # released number gets no add, no define, and no build write here: its row cannot
+    # move to a new allocation until that removal succeeds (the release-direction retry
+    # drives it, and the build retry then re-allocates the row).
+    if adds:
+        async with get_db_session() as db:
+            owed = [
+                a
+                for a in adds
+                if await membership_owes_undo(
+                    db, res_uuid, uuid.UUID(str(a["switch_device_id"])), a["port"]
+                )
+            ]
+        if owed:
+            logger.info(
+                "Deferring %d L2 join(s) of reservation %s: each row still owes the "
+                "removal of a lost join's add",
+                len(owed),
+                reservation_id,
+                extra={"action": "l2_join_deferred_for_owed_undo"},
+            )
+            adds = [a for a in adds if a not in owed]
 
     define_ids = {uuid.UUID(str(a["vlan_assignment_id"])) for a in adds}
     define_ids.update(uuid.UUID(str(v)) for v in (define_allocation_ids or ()) if v is not None)
@@ -3408,6 +3539,7 @@ async def _apply_l2_memberships(
                 park_error = (
                     err
                     if err.startswith(WIRING_UNRESOLVABLE_REASON)
+                    or err == JOIN_LOST_ALLOCATION_RELEASED
                     else f"create_vlan failed: {err}"
                 )
                 await record_l2_failed(
@@ -3632,6 +3764,92 @@ async def _apply_l2_memberships(
     await _release_orphaned_allocations(touched_allocations, get_db_session, ctx)
 
 
+async def _undo_lost_join(
+    db,
+    driver_path: str,
+    context: dict,
+    password_keys: set,
+    switch_uuid: uuid.UUID,
+    driver_id: uuid.UUID,
+    driver_sha256: str,
+    res_uuid: uuid.UUID,
+    port: str,
+    vlan_id: int,
+) -> bool:
+    """Remove the port of a join that lost to the release of its allocation from the
+    number its add_to_vlan used (issue #1413); True when the port is known not to be left
+    in that number by this join.
+
+    Runs in the caller's logged-in switch session, after the join's session was rolled
+    back, so no row lock is held across the driver call. Superseded first: when an
+    ACTIVE membership on this (switch, port), of any reservation, sits on an ACTIVE
+    allocation holding the same number (l2_membership_service.port_holds_number_live),
+    the port belongs in that number, no driver call is made, and the answer is True.
+    Otherwise one remove_from_vlan is driven, with its own execution run, result-gated
+    like every other call (Decision 3); the answer is whether it succeeded. A failure is
+    logged with the action `l2_join_undo_failed` and no driver text; the caller records
+    the removal as owed.
+    """
+    from datetime import datetime, timezone
+
+    from app.services.execution_service import (
+        create_execution_run,
+        redact_context_for_logging,
+        update_execution_run,
+    )
+    from app.services.l2_membership_service import port_holds_number_live
+
+    if await port_holds_number_live(db, switch_uuid, port, vlan_id):
+        logger.info(
+            "Not undoing the lost join of reservation %s on switch %s port %s: a live "
+            "membership holds VLAN %d on that port",
+            res_uuid,
+            switch_uuid,
+            port,
+            vlan_id,
+            extra={"action": "l2_join_undo_superseded"},
+        )
+        return True
+    action = "remove_from_vlan"
+    method_kwargs = {"port": port, "vlan_id": vlan_id}
+    run = await create_execution_run(
+        db,
+        switch_uuid,
+        driver_id,
+        driver_sha256,
+        action,
+        WIRING_SYSTEM_USER,
+        redact_context_for_logging(context, password_keys),
+        res_uuid,
+        port,
+        method_kwargs=method_kwargs,
+    )
+    started = datetime.now(timezone.utc)
+    ok, _attempts, err, result = await _run_driver_with_retry(
+        driver_path, action, context, password_keys, method_kwargs=method_kwargs
+    )
+    await update_execution_run(
+        db,
+        run,
+        "SUCCESS" if ok else "FAILED",
+        output=json.dumps(result["output"], default=str) if ok and result else None,
+        error=None if ok else err,
+        started_at=started,
+        completed_at=datetime.now(timezone.utc),
+    )
+    if not ok:
+        logger.error(
+            "Undo of the lost join of reservation %s on switch %s port %s failed; the "
+            "removal from VLAN %d is owed and stays tracked on the row",
+            res_uuid,
+            switch_uuid,
+            port,
+            vlan_id,
+            extra={"action": "l2_join_undo_failed", "reservation_id": str(res_uuid)},
+        )
+    return ok
+
+
 async def _apply_one_vlan_action(
     db,
     action: str,
@@ -3664,7 +3882,13 @@ async def _apply_one_vlan_action(
     row the other retry channel already holds returns without an execution_run, a
     driver call, or a ledger write, and so does a row that no longer intends this
     action's direction (issue #1496). Taken here rather than at selection because a
-    selected batch is driven sequentially behind a per-switch login.
+    selected batch is driven sequentially behind a per-switch login. An add's claim is
+    sized for one more driver action (issue #1413).
+
+    Issue #1413: an add whose join lost to the release of its allocation is undone in
+    this same session by _undo_lost_join (record_l2_membership_active then records the
+    outcome), and a successful remove of a row that owed such an undo turns it back
+    into a pending join (settle_undone_join) instead of releasing it.
     """
     from datetime import datetime, timezone
 
@@ -3677,13 +3901,19 @@ async def _apply_one_vlan_action(
         record_l2_failed,
         record_l2_membership_active,
         release_l2_membership,
+        settle_undone_join,
     )
+    from app.services.wiring_claim import ROW_DRIVER_ACTIONS, claim_budget
 
     # The direction this call drives (issue #1496): the claim requires the row to
     # intend it, and a failure write records it (WIRE-LEDGER-5).
     intended = "ACTIVE" if action == "add_to_vlan" else "RELEASED"
+    # Issue #1413: an add may be followed by one more driver action on the same row, the
+    # undo of a join that lost to the release of its allocation, so its claim is sized
+    # for that action too.
+    budget = claim_budget(ROW_DRIVER_ACTIONS + 1) if action == "add_to_vlan" else None
     if claims is not None and not await claims.claim(
-        db, L2PortAssignment, retry_row_id, intended=intended
+        db, L2PortAssignment, retry_row_id, intended=intended, budget=budget
     ):
         return
 
@@ -3719,9 +3949,46 @@ async def _apply_one_vlan_action(
             completed_at=datetime.now(timezone.utc),
         )
         if action == "add_to_vlan":
-            await record_l2_membership_active(db, res_uuid, vlan_assignment_id, switch_uuid, port)
-        else:
-            await release_l2_membership(db, res_uuid, switch_uuid, port)
+
+            async def _undo() -> bool:
+                return await _undo_lost_join(
+                    db,
+                    driver_path,
+                    context,
+                    password_keys,
+                    switch_uuid,
+                    driver_id,
+                    driver_sha256,
+                    res_uuid,
+                    port,
+                    vlan_id,
+                )
+
+            await record_l2_membership_active(
+                db,
+                res_uuid,
+                vlan_assignment_id,
+                switch_uuid,
+                port,
+                row_id=retry_row_id,
+                claims=claims,
+                undo_lost_join=_undo,
+            )
+        elif not await settle_undone_join(
+            db, res_uuid, switch_uuid, port, vlan_assignment_id=vlan_assignment_id
+        ):
+            # Issue #1413: a row that owed a lost join's undo on the allocation this
+            # removal drove becomes a pending join again (settle_undone_join); every
+            # other removal is released as before, except a row now on ANOTHER
+            # allocation (moved there after this removal was planned, FAILED or
+            # ACTIVE), which is left as it is.
+            await release_l2_membership(
+                db,
+                res_uuid,
+                switch_uuid,
+                port,
+                expected_vlan_assignment_id=vlan_assignment_id,
+            )
     else:
         await update_execution_run(
             db,
@@ -3894,7 +4161,16 @@ async def _reconcile_l2_memberships(
         va_id = row.vlan_assignment_id
         if va_id is None or va_id == _nil or va_id not in vlan_by_alloc:
             async with get_db_session() as db:
-                await release_l2_membership(db, row.reservation_id, row.switch_device_id, row.port)
+                # Issue #1413: only the row this pass read, on its nil or dangling
+                # allocation, never one moved since.
+                await release_l2_membership(
+                    db,
+                    row.reservation_id,
+                    row.switch_device_id,
+                    row.port,
+                    expected_vlan_assignment_id=va_id,
+                    removal_driven=False,
+                )
             logger.warning(
                 "Stale L2 build for reservation %s switch %s port %s has no resolvable "
                 "VLAN allocation (%s); released directly with no driver call (issue #491)",
@@ -5283,6 +5559,7 @@ async def _teardown_from_ledgers(
         park_stale_l1_build,
     )
     from app.services.l2_membership_service import (
+        JOIN_UNDO_PENDING_REMOVAL,
         TEARDOWN_PENDING_VLAN_REMOVAL,
         active_memberships_for_reservation,
         failed_memberships_for_reservation,
@@ -5363,14 +5640,20 @@ async def _teardown_from_ledgers(
     # delete-failure is log-and-continue with accepted bounded lingering).
     async with get_db_session() as db:
         l2_rows = await active_memberships_for_reservation(db, res_str)
-        l2_failed = [
+        all_failed = await failed_memberships_for_reservation(db, res_str)
+        l2_failed = [row for row in all_failed if row.intended == "ACTIVE"]
+        # Issue #1413: a row that owes the removal of a lost join's add is removed here
+        # too, from the released number it names (the frozen reservation's success then
+        # releases it, settle_undone_join refusing a frozen row).
+        l2_owed = [
             row
-            for row in await failed_memberships_for_reservation(db, res_str)
-            if row.intended == "ACTIVE"
+            for row in all_failed
+            if row.intended == "RELEASED" and row.last_error == JOIN_UNDO_PENDING_REMOVAL
         ]
-    if l2_rows or l2_failed:
+    if l2_rows or l2_failed or l2_owed:
         _nil = uuid.UUID(int=0)
         remove_alloc_ids = {row.vlan_assignment_id for row in l2_rows}
+        remove_alloc_ids.update(row.vlan_assignment_id for row in l2_owed)
         remove_alloc_ids.update(
             row.vlan_assignment_id
             for row in l2_failed
@@ -5384,7 +5667,7 @@ async def _teardown_from_ledgers(
                 "vlan_assignment_id": row.vlan_assignment_id,
                 "vlan_id": vlan_by_alloc.get(row.vlan_assignment_id, 0),
             }
-            for row in l2_rows
+            for row in [*l2_rows, *l2_owed]
         ]
         # Issue #1501, the L1 park above for L2, in the reconcile's stale-settlement
         # form (WIRE-STALE-2): a FAILED intended-ACTIVE membership with a resolvable
@@ -5417,7 +5700,16 @@ async def _teardown_from_ledgers(
                     write_guard(db, L2PortAssignment, row.id, WiringRowClaims()) as unclaimed_now,
                 ):
                     if unclaimed_now:
-                        await release_l2_membership(db, res_str, row.switch_device_id, row.port)
+                        # Issue #1413: only the row this teardown read, on its nil
+                        # or dangling allocation, never one moved since.
+                        await release_l2_membership(
+                            db,
+                            res_str,
+                            row.switch_device_id,
+                            row.port,
+                            expected_vlan_assignment_id=row.vlan_assignment_id,
+                            removal_driven=False,
+                        )
                 continue
             if (row.last_error or "").startswith(NON_RETRYABLE_REASON_PREFIXES):
                 continue
@@ -5811,6 +6103,13 @@ async def start_nats_consumer(app) -> None:
     to whatever config the server already has, so on a persistent NATS volume
     (`make prod`) a durable provisioned before this fix would silently keep its
     old `backoff` forever without the explicit update.
+
+    Never raises an `Exception`: a failed connect, or a failed setup after a
+    good connect, is logged through herd_common.jetstream's consumer warnings
+    (issue #1418, WIRE-CONSUME-4) and the service keeps running; nothing
+    retries either in this process. Only a failed connect leaves
+    `app.state.nats` unset; after a failed setup the connection is kept, so
+    the outbox relay and the stream ensures in `app.main` still use it.
     """
     import nats
     from nats.js.api import ConsumerConfig
@@ -5821,7 +6120,12 @@ async def start_nats_consumer(app) -> None:
         # warning below is reachable and the service runs without the consumer;
         # an established connection still retries forever.
         nc = await connect_nats(settings.nats_url)
-        app.state.nats = nc
+    except Exception as exc:
+        log_consumer_connect_failure(logger, exc, not_running=[EXECUTION_DURABLE])
+        return
+    app.state.nats = nc
+
+    try:
         js = nc.jetstream()
 
         # Confirm stream exists; this consumer does not own its config (reservations
@@ -5830,11 +6134,11 @@ async def start_nats_consumer(app) -> None:
         try:
             await ensure_stream_exists(
                 js,
-                name="HERD_RESERVATIONS",
+                name=EXECUTION_STREAM,
                 subjects=["herd.reservations.*"],
             )
-        except Exception:
-            logger.warning("Could not create/update NATS stream", exc_info=True)
+        except Exception as exc:
+            log_consumer_stream_check_failure(logger, exc, stream=EXECUTION_STREAM)
 
         # Durable consumer with explicit retry policy: bounded redelivery, a real
         # 30s ack_wait, no `backoff` (issue #895: `backoff` on ConsumerConfig
@@ -5856,14 +6160,14 @@ async def start_nats_consumer(app) -> None:
         # config change to an already-existing durable).
         await ensure_consumer(
             js,
-            stream="HERD_RESERVATIONS",
+            stream=EXECUTION_STREAM,
             subject="herd.reservations.*",
-            durable="execution-consumer",
+            durable=EXECUTION_DURABLE,
             config=consumer_config,
         )
         psub = await js.pull_subscribe(
             "herd.reservations.*",
-            durable="execution-consumer",
+            durable=EXECUTION_DURABLE,
             config=consumer_config,
         )
 
@@ -5908,13 +6212,17 @@ async def start_nats_consumer(app) -> None:
                 await process_batch(msgs, js, _get_db_session)
 
         app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
-        logger.info("NATS consumer started")
-
-    except Exception:
-        logger.warning(
-            "Failed to connect to NATS; operating without event-driven execution",
-            exc_info=True,
+    except Exception as exc:
+        log_consumer_setup_failure(
+            logger,
+            exc,
+            durable=EXECUTION_DURABLE,
+            stream=EXECUTION_STREAM,
+            not_running=[EXECUTION_DURABLE],
+            running=[],
         )
+        return
+    logger.info("NATS consumer started")
 
 
 async def stop_nats_consumer(app) -> None:

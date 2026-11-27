@@ -5,13 +5,23 @@ handling (one bad row does not abort the batch), cross-instance reference
 resolution by template name / driver name, and RBAC (admin-only).
 """
 
+import csv
+import functools
 import io
 import json
+import sys
 
 import pytest
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
+from app.services.bulk_service import (
+    IMPORT_JSON_UNREADABLE_DETAIL,
+    JSON_CELL_UNREADABLE_REASON,
+    _coerce_json_cell,
+    parse_import,
+)
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -1393,3 +1403,716 @@ async def test_the_read_asks_for_exactly_one_byte_past_the_bound(monkeypatch):
     await bulk_router._read_capped(_File(), 4096)
 
     assert asked == [4097]
+
+
+# A JSON import the parser refuses for its shape, not its syntax (issue #1511) ------
+#
+# `json.loads` raises RecursionError for a document nested past CPython's C recursion
+# budget and a plain ValueError (not a JSONDecodeError) for an integer literal longer
+# than `sys.get_int_max_str_digits()`, 4,300 digits by default; both were 500s. The
+# depth bound is the interpreter's, not HERD's: on 3.12 and 3.13 it is the C recursion
+# limit, on 3.14 a C stack budget, and `sys.setrecursionlimit` moves neither. Measured
+# from a script's top level, bare `json.loads` refused at about 10,000 levels on 3.12
+# and 3.13 and at about 43,000 to 52,000 on the 3.14 builds tried; each figure moves a
+# few levels, or a few dozen on 3.14, with the depth of the call stack it runs on. So
+# no test pins a depth: `_parser_depth_bound` measures where `json.loads` first refuses
+# on the running interpreter, and the boundary cases sit `_DEPTH_MARGIN` levels either
+# side of it, which covers the difference between the measuring call stack and the
+# route's. `_DEEP` is past every bound measured (3.12 to 3.14) and, as arrays, 200,000
+# bytes.
+
+_UNREADABLE = "Invalid JSON: the document is nested too deeply or holds a number too long to read"
+_CELL_UNREADABLE = "a JSON cell is nested too deeply or holds a number too long to read"
+_DEPTH_MARGIN = 500
+_DEEP = 100_000
+_DIGITS_AT_LIMIT = "1" * 4300
+_DIGITS_OVER_LIMIT = "1" * 4301
+
+
+def _nest(depth: int, inner: str = "") -> str:
+    return "[" * depth + inner + "]" * depth
+
+
+@functools.cache
+def _parser_depth_bound() -> int:
+    """The fewest nested arrays `json.loads` refuses with RecursionError here."""
+    lo, hi = 1, _DEEP
+    while lo < hi:
+        mid = (lo + hi) // 2
+        try:
+            json.loads(_nest(mid))
+        except RecursionError:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def test_the_bounds_these_tests_rest_on():
+    """The preconditions, stated so a changed interpreter fails here, not obscurely."""
+    assert IMPORT_JSON_UNREADABLE_DETAIL == _UNREADABLE
+    assert JSON_CELL_UNREADABLE_REASON == _CELL_UNREADABLE
+    assert sys.get_int_max_str_digits() == 4300
+    bound = _parser_depth_bound()
+    # Past the bound on this interpreter, so _DEEP is a refusal, not a parse.
+    assert bound + _DEPTH_MARGIN < _DEEP
+    # A CSV cell this deep (two characters a level) fits the csv module's field limit,
+    # so the cell reaches json.loads rather than stopping in the CSV reader.
+    assert 2 * (bound + _DEPTH_MARGIN) < csv.field_size_limit()
+
+
+# Whole documents the parser refuses; each answers the one fixed detail.
+_UNREADABLE_DOCS = {
+    "deep_arrays": lambda bound: _nest(_DEEP),
+    "deep_just_over_the_bound": lambda bound: _nest(bound + _DEPTH_MARGIN),
+    "deep_objects": lambda bound: '{"a": ' * _DEEP + "1" + "}" * _DEEP,
+    "deep_beside_items": lambda bound: '{"items": [], "x": ' + _nest(_DEEP) + "}",
+    "long_int": lambda bound: _DIGITS_OVER_LIMIT,
+    "negative_long_int": lambda bound: "-" + _DIGITS_OVER_LIMIT,
+    "long_int_nested_in_a_row": lambda bound: (
+        '[{"name": "d1", "field_data": {"a": [0, {"b": ' + _DIGITS_OVER_LIMIT + "}]}}]"
+    ),
+    "long_int_then_deep": lambda bound: "[" + _DIGITS_OVER_LIMIT + ", " + _nest(_DEEP) + "]",
+    "deep_then_long_int": lambda bound: "[" + _nest(_DEEP, _DIGITS_OVER_LIMIT) + ", 1]",
+}
+
+
+@pytest.mark.parametrize("kind", list(_UNREADABLE_DOCS))
+def test_parse_import_refuses_an_unreadable_document_with_the_fixed_detail(kind):
+    doc = _UNREADABLE_DOCS[kind](_parser_depth_bound())
+    with pytest.raises(HTTPException) as exc:
+        parse_import(doc.encode(), "json", [])
+    assert exc.value.status_code == 422
+    assert exc.value.detail == _UNREADABLE
+
+
+def test_parse_import_reads_a_document_just_under_the_depth_bound():
+    depth = _parser_depth_bound() - _DEPTH_MARGIN
+    items = parse_import(_nest(depth).encode(), "json", [])
+    # Never compare the nested value itself: the comparison recurses as deep.
+    assert isinstance(items, list)
+    assert len(items) == 1
+
+
+@pytest.mark.parametrize("sign", ["", "-"])
+def test_parse_import_reads_an_integer_at_the_digit_limit(sign):
+    items = parse_import(f"[{sign}{_DIGITS_AT_LIMIT}]".encode(), "json", [])
+    assert items == [int(sign + _DIGITS_AT_LIMIT)]
+
+
+def test_parse_import_keeps_the_decoder_position_for_a_syntax_error():
+    with pytest.raises(HTTPException) as exc:
+        parse_import(b"[", "json", [])
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Invalid JSON: Expecting value: line 1 column 2 (char 1)"
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        lambda bound: _nest(_DEEP),
+        lambda bound: _nest(bound + _DEPTH_MARGIN),
+        lambda bound: '{"model": ' + _DIGITS_OVER_LIMIT + "}",
+        lambda bound: "[-" + _DIGITS_OVER_LIMIT + "]",
+    ],
+    ids=["deep", "deep_just_over_the_bound", "long_int", "negative_long_int"],
+)
+def test_a_json_cell_the_parser_refuses_raises_the_fixed_reason(cell):
+    with pytest.raises(ValueError) as exc:
+        _coerce_json_cell(cell(_parser_depth_bound()), {})
+    assert type(exc.value) is ValueError
+    assert str(exc.value) == _CELL_UNREADABLE
+
+
+def test_a_json_cell_just_under_the_bounds_still_parses():
+    depth = _parser_depth_bound() - _DEPTH_MARGIN
+    nested = _coerce_json_cell(_nest(depth), [])
+    assert isinstance(nested, list)
+    assert len(nested) == 1
+    assert _coerce_json_cell("[-" + _DIGITS_AT_LIMIT + "]", []) == [-int(_DIGITS_AT_LIMIT)]
+
+
+def test_a_json_cell_syntax_error_keeps_the_decoder_error():
+    with pytest.raises(json.JSONDecodeError):
+        _coerce_json_cell("{", {})
+
+
+async def _bulk_import_row(client, path: str) -> dict:
+    """One valid row for the importer at `path`, so a refusal provably wrote nothing."""
+    if path == "/devices/import":
+        return {
+            "name": "d1",
+            "template_name": "Firewall",
+            "topology_type": "PHYSICAL",
+            "status": "AVAILABLE",
+            "field_data": {"model": "EX3300"},
+        }
+    driver_name = (await client.get("/drivers")).json()["items"][0]["name"]
+    return {
+        "name": "T2",
+        "template_type": "device",
+        "driver_name": driver_name,
+        "vendor": "Acme",
+        "model": "M1",
+        "sections": TEMPLATE_PAYLOAD["sections"],
+    }
+
+
+async def _bulk_state(client) -> tuple[list[str], list[str]]:
+    devices = sorted(d["name"] for d in (await client.get("/devices")).json()["items"])
+    templates = sorted(t["name"] for t in (await client.get("/templates")).json()["items"])
+    return devices, templates
+
+
+# Fragments the parser refuses, placed beside the items or inside the valid row.
+_UNREADABLE_FRAGMENTS = {
+    "deep": lambda bound: _nest(_DEEP),
+    "deep_just_over_the_bound": lambda bound: _nest(bound + _DEPTH_MARGIN),
+    "long_int": lambda bound: _DIGITS_OVER_LIMIT,
+    "negative_long_int": lambda bound: '[0, {"b": -' + _DIGITS_OVER_LIMIT + "}]",
+    "long_int_then_deep": lambda bound: "[" + _DIGITS_OVER_LIMIT + ", " + _nest(_DEEP) + "]",
+    "deep_then_long_int": lambda bound: _nest(_DEEP, _DIGITS_OVER_LIMIT),
+}
+
+
+def _with_fragment(row: dict, fragment: str, placement: str) -> bytes:
+    row_json = json.dumps(row)
+    if placement == "beside_items":
+        return ('{"items": [' + row_json + '], "x": ' + fragment + "}").encode()
+    return ('{"items": [' + row_json[:-1] + ', "extra": ' + fragment + "}]}").encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("fragment", list(_UNREADABLE_FRAGMENTS))
+@pytest.mark.parametrize("placement", ["beside_items", "inside_a_row"])
+async def test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing(
+    client, path, dry_run, fragment, placement
+):
+    """Issue #1511: each of these answered 500 through the route."""
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    row = await _bulk_import_row(client, path)
+    body = _with_fragment(row, _UNREADABLE_FRAGMENTS[fragment](_parser_depth_bound()), placement)
+    resp = await client.post(
+        path,
+        params={"format": "json", "dry_run": dry_run},
+        files={"file": ("d.json", io.BytesIO(body), "application/json")},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": _UNREADABLE}
+    assert await _bulk_state(client) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        lambda bound: _nest(bound - _DEPTH_MARGIN),
+        lambda bound: "[" + _DIGITS_AT_LIMIT + ", -" + _DIGITS_AT_LIMIT + "]",
+    ],
+    ids=["deep_just_under_the_bound", "ints_at_the_digit_limit"],
+)
+async def test_a_json_import_just_under_the_parser_bounds_imports(client, path, fragment):
+    """The other side of each boundary: the same file shape parses and its row lands."""
+    await _create_template(client, name="Firewall")
+    row = await _bulk_import_row(client, path)
+    body = _with_fragment(row, fragment(_parser_depth_bound()), "beside_items")
+    resp = await client.post(
+        path,
+        params={"format": "json"},
+        files={"file": ("d.json", io.BytesIO(body), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] == 1, resp.text
+    devices, templates = await _bulk_state(client)
+    assert row["name"] in devices + templates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cell",
+    [
+        lambda bound: _nest(bound + _DEPTH_MARGIN),
+        lambda bound: '{""model"": ' + _DIGITS_OVER_LIMIT + "}",
+        lambda bound: '{""model"": [0, -' + _DIGITS_OVER_LIMIT + "]}",
+    ],
+    ids=["deep_just_over_the_bound", "long_int", "negative_long_int"],
+)
+async def test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only(client, cell):
+    """Before issue #1511 the row was rejected with Python's own exception text."""
+    await _create_template(client, name="Firewall")
+    body = (
+        "name,template_name,topology_type,field_data\n"
+        f'd1,Firewall,PHYSICAL,"{cell(_parser_depth_bound())}"\n'
+        'd2,Firewall,PHYSICAL,"{""model"": ""EX3300""}"\n'
+    ).encode()
+    report = await _import(client, body, "csv")
+    assert [(r["identity"], r["action"]) for r in report["rows"]] == [
+        ("d1", "reject"),
+        ("d2", "create"),
+    ]
+    assert report["rows"][0]["reason"] == _CELL_UNREADABLE
+    assert (await _bulk_state(client))[0] == ["d2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    "text",
+    [
+        lambda bound: _nest(_DEEP),
+        lambda bound: _nest(bound + _DEPTH_MARGIN),
+        lambda bound: '{"model": ' + _DIGITS_OVER_LIMIT + "}",
+        lambda bound: '[{"b": [0, -' + _DIGITS_OVER_LIMIT + "]}]",
+    ],
+    ids=["deep", "deep_just_over_the_bound", "long_int", "negative_long_int"],
+)
+async def test_a_json_string_cell_the_parser_refuses_rejects_that_row_only(
+    client, path, dry_run, text
+):
+    """A JSON import may carry `field_data` or `sections` as a JSON string; it goes
+    through the same cell parse as a CSV cell and gets the same fixed reason. The
+    file itself parses, so only that row is rejected and the next is judged alone."""
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    good = await _bulk_import_row(client, path)
+    key = "field_data" if path == "/devices/import" else "sections"
+    bad = {**good, "name": "bad-row", key: text(_parser_depth_bound())}
+    resp = await client.post(
+        path,
+        params={"format": "json", "dry_run": dry_run},
+        files={
+            "file": ("d.json", io.BytesIO(json.dumps([bad, good]).encode()), "application/json")
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert [(r["identity"], r["action"]) for r in report["rows"]] == [
+        ("bad-row", "reject"),
+        (good["name"], "create"),
+    ]
+    assert report["rows"][0]["reason"] == _CELL_UNREADABLE
+    devices, templates = await _bulk_state(client)
+    if dry_run:
+        assert (devices, templates) == before
+    else:
+        assert "bad-row" not in devices + templates
+        assert good["name"] in devices + templates
+
+
+# A JSON import item the row loop cannot read (issue #1573) ---------------------------
+#
+# An item that is not an object, or an object whose `name` is a nonzero number, true,
+# or a non-empty list or object, raised AttributeError on its first `.get` or `.strip`,
+# outside the per-row handling: the route answered 500, and on a committing import the
+# rows before it were already written with no report saying so. A name of 0, false,
+# [], or {} was read as missing. Each is now a rejected row with a fixed reason, and
+# every other row is judged on its own (INV-BULK-7, INV-BULK-26).
+
+_ROW_NOT_AN_OBJECT = "row is not an object"
+_NAME_NOT_A_STRING = "name: must be a string"
+
+_NON_OBJECTS = {
+    "empty_list": [],
+    "list": ["d1"],
+    "string": "d1",
+    "empty_string": "",
+    "int": 1,
+    "zero": 0,
+    "float": 1.5,
+    "true": True,
+    "false": False,
+    "null": None,
+}
+
+_NON_STRING_NAMES = {
+    "int": 1,
+    "zero": 0,
+    "float": 1.5,
+    "true": True,
+    "false": False,
+    "empty_list": [],
+    "list": ["d1"],
+    "empty_object": {},
+    "object": {"name": "d1"},
+}
+
+
+async def _two_good_rows(client, path: str) -> list[dict]:
+    row = await _bulk_import_row(client, path)
+    return [{**row, "name": f"{row['name']}-a"}, {**row, "name": f"{row['name']}-b"}]
+
+
+def _place(bad, good: list[dict], position: str) -> tuple[list, int]:
+    """The bad item put first, between the two good rows, or last; and its index."""
+    index = {"first": 0, "middle": 1, "last": 2}[position]
+    items = list(good)
+    items.insert(index, bad)
+    return items, index
+
+
+async def _post_items(client, path: str, body, *, dry_run: bool):
+    return await client.post(
+        path,
+        params={"format": "json", "dry_run": "true" if dry_run else "false"},
+        files={"file": ("x.json", io.BytesIO(json.dumps(body).encode()), "application/json")},
+    )
+
+
+def _expected_rows(good: list[dict], bad_index: int, reason: str) -> list[dict]:
+    names = iter(g["name"] for g in good)
+    return [
+        {"row": i, "action": "reject", "identity": None, "reason": reason}
+        if i == bad_index
+        else {"row": i, "action": "create", "identity": next(names), "reason": None}
+        for i in range(len(good) + 1)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("kind", list(_NON_OBJECTS))
+@pytest.mark.parametrize("position", ["first", "middle", "last"])
+async def test_an_item_that_is_not_an_object_is_a_rejected_row(
+    client, path, dry_run, kind, position
+):
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    good = await _two_good_rows(client, path)
+    items, bad_index = _place(_NON_OBJECTS[kind], good, position)
+
+    resp = await _post_items(client, path, items, dry_run=dry_run)
+
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["rows"] == _expected_rows(good, bad_index, _ROW_NOT_AN_OBJECT)
+    assert (report["total"], report["created"], report["rejected"]) == (3, 2, 1)
+    assert report["dry_run"] is dry_run
+    devices, templates = await _bulk_state(client)
+    if dry_run:
+        assert (devices, templates) == before
+    else:
+        assert all(g["name"] in devices + templates for g in good)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("kind", list(_NON_STRING_NAMES))
+async def test_an_item_whose_name_is_not_a_string_is_a_rejected_row(client, path, dry_run, kind):
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    good = await _two_good_rows(client, path)
+    bad = {**good[0], "name": _NON_STRING_NAMES[kind]}
+    items, bad_index = _place(bad, good, "middle")
+
+    resp = await _post_items(client, path, items, dry_run=dry_run)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == _expected_rows(good, bad_index, _NAME_NOT_A_STRING)
+    devices, templates = await _bulk_state(client)
+    if dry_run:
+        assert (devices, templates) == before
+    else:
+        assert all(g["name"] in devices + templates for g in good)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("name", [None, "", "   "], ids=["null", "empty", "blank"])
+async def test_a_null_or_empty_name_is_still_the_missing_name_reason(client, path, name):
+    """The shape check passes a null name through: its reason stays the existing one."""
+    await _create_template(client, name="Firewall")
+    resp = await _post_items(client, path, [{"name": name}], dry_run=False)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rows"] == [
+        {"row": 0, "action": "reject", "identity": None, "reason": "missing required field: name"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+async def test_the_items_wrapper_rejects_a_non_object_item_the_same_way(client, path):
+    await _create_template(client, name="Firewall")
+    good = await _two_good_rows(client, path)
+    body = {"resource": "devices", "version": 1, "items": [good[0], 1, None, good[1]]}
+    resp = await _post_items(client, path, body, dry_run=False)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("create", good[0]["name"], None),
+        ("reject", None, _ROW_NOT_AN_OBJECT),
+        ("reject", None, _ROW_NOT_AN_OBJECT),
+        ("create", good[1]["name"], None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_committing_import_reports_the_rows_before_a_bad_item(client):
+    """The issue's partial-write case: `[<valid row>, 1]` wrote the device and then
+    answered 500, so the caller could not tell what was written. The report now says
+    so, and a retry of the same file reports `update` for the row that landed."""
+    await _create_template(client, name="Firewall")
+    good = (await _two_good_rows(client, "/devices/import"))[0]
+    first = await _post_items(client, "/devices/import", [good, 1], dry_run=False)
+    assert first.status_code == 200, first.text
+    assert [(r["action"], r["reason"]) for r in first.json()["rows"]] == [
+        ("create", None),
+        ("reject", _ROW_NOT_AN_OBJECT),
+    ]
+    assert (await _bulk_state(client))[0] == [good["name"]]
+    again = await _post_items(client, "/devices/import", [good, 1], dry_run=False)
+    assert [r["action"] for r in again.json()["rows"]] == ["update", "reject"]
+
+
+_NOT_A_LIST_OF_RECORDS = "JSON import must be a list of records or an object with an 'items' list"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (1, _NOT_A_LIST_OF_RECORDS),
+        (1.5, _NOT_A_LIST_OF_RECORDS),
+        ("d1", _NOT_A_LIST_OF_RECORDS),
+        (True, _NOT_A_LIST_OF_RECORDS),
+        (None, _NOT_A_LIST_OF_RECORDS),
+        ({}, _NOT_A_LIST_OF_RECORDS),
+        ({"records": []}, _NOT_A_LIST_OF_RECORDS),
+        ({"items": 1}, "'items' must be a list"),
+        ({"items": "d1"}, "'items' must be a list"),
+        ({"items": None}, "'items' must be a list"),
+        ({"items": {"name": "d1"}}, "'items' must be a list"),
+    ],
+    ids=[
+        "int",
+        "float",
+        "string",
+        "bool",
+        "null",
+        "empty_object",
+        "object_without_items",
+        "items_int",
+        "items_string",
+        "items_null",
+        "items_object",
+    ],
+)
+async def test_a_document_that_is_not_the_expected_container_is_a_422(
+    client, path, dry_run, body, detail
+):
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    resp = await _post_items(client, path, body, dry_run=dry_run)
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {"detail": detail}
+    assert await _bulk_state(client) == before
+
+
+# A CSV import the csv module cannot read (issue #1574) -----------------------------
+#
+# The importers iterated `csv.DictReader(io.StringIO(text))` with no handler: a cell
+# longer than the module's field limit (131,072 characters) or a bare carriage return
+# outside quotes (a whole file with classic Mac line endings included) raised
+# `csv.Error`, a 500. The shared reader `herd_common.csv_import.read_csv_rows` now
+# reads every line ending, lifts the field limit for the read, and answers a fixed 422
+# for anything the module still refuses.
+
+_DEFAULT_FIELD_LIMIT = 131_072
+# The template's required `model` field, as a quoted CSV cell.
+_MODEL_CELL = '"{""model"": ""EX3300""}"'
+
+
+async def _import_csv(client, path: str, text: str, *, dry_run: bool = False):
+    return await client.post(
+        path,
+        params={"format": "csv", "dry_run": "true" if dry_run else "false"},
+        files={"file": ("x.csv", io.BytesIO(text.encode()), "text/csv")},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [_DEFAULT_FIELD_LIMIT, _DEFAULT_FIELD_LIMIT + 1])
+async def test_a_device_name_past_the_field_limit_is_judged_not_a_500(client, length):
+    """The row reaches the schema, which bounds a name at 255 characters."""
+    await _create_template(client, name="Firewall")
+    long_name = "d" * length
+    text = f"name,template_name,topology_type\n{long_name},Firewall,PHYSICAL\n"
+    resp = await _import_csv(client, "/devices/import", text)
+    assert resp.status_code == 200, resp.text
+    [row] = resp.json()["rows"]
+    assert (row["action"], row["identity"]) == ("reject", long_name)
+    assert row["reason"] == "name: String should have at most 255 characters"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_a_field_data_cell_past_the_field_limit_is_read(client, dry_run):
+    await _create_template(client, name="Firewall")
+    rack = "r" * (_DEFAULT_FIELD_LIMIT + 1)
+    cell = json.dumps({"model": "EX3300", "rack": rack}).replace('"', '""')
+    resp = await _import_csv(
+        client,
+        "/devices/import",
+        f'name,template_name,topology_type,field_data\nd1,Firewall,PHYSICAL,"{cell}"\n',
+        dry_run=dry_run,
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", "d1")]
+    devices = (await client.get("/devices")).json()["items"]
+    if dry_run:
+        assert devices == []
+    else:
+        assert devices[0]["field_data"]["rack"] == rack
+
+
+@pytest.mark.asyncio
+async def test_a_template_description_past_the_field_limit_is_read(client):
+    await _create_template(client, name="Firewall")
+    driver_name = (await client.get("/drivers")).json()["items"][0]["name"]
+    description = "v" * (_DEFAULT_FIELD_LIMIT + 1)
+    sections = json.dumps(TEMPLATE_PAYLOAD["sections"]).replace('"', '""')
+    text = (
+        "name,template_type,driver_name,vendor,model,sections,description\n"
+        f'T2,device,{driver_name},Acme,M1,"{sections}",{description}\n'
+    )
+    resp = await _import_csv(client, "/templates/import", text)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", "T2")]
+    stored = next(t for t in (await client.get("/templates")).json()["items"] if t["name"] == "T2")
+    assert stored["description"] == description
+
+
+@pytest.mark.asyncio
+async def test_a_template_with_a_large_icon_round_trips_through_csv(client):
+    """The issue's round trip: a template whose icon is a data URL longer than the
+    csv module's default field limit exported to CSV and could not be imported back."""
+    await _create_template(client, name="Firewall")
+    icon = "data:image/png;base64," + "A" * 140_000
+    template = (await client.get("/templates")).json()["items"][0]
+    put = await client.put(f"/templates/{template['id']}", json={"icon": icon})
+    assert put.status_code == 200, put.text
+    exported = await client.get("/templates/export", params={"format": "csv"})
+    assert exported.status_code == 200
+    assert len(exported.text) > _DEFAULT_FIELD_LIMIT
+
+    for dry_run in (True, False):
+        resp = await _import_csv(client, "/templates/import", exported.text, dry_run=dry_run)
+        assert resp.status_code == 200, resp.text
+        assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [
+            ("update", "Firewall")
+        ]
+    stored = (await client.get(f"/templates/{template['id']}")).json()
+    assert stored["icon"] == icon
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+@pytest.mark.parametrize("dry_run", [True, False])
+async def test_every_line_ending_imports_the_same_devices(client, ending, dry_run):
+    await _create_template(client, name="Firewall")
+    lines = [
+        "name,template_name,topology_type,field_data",
+        f"d1,Firewall,PHYSICAL,{_MODEL_CELL}",
+        f"d2,Firewall,PHYSICAL,{_MODEL_CELL}",
+    ]
+    resp = await _import_csv(
+        client, "/devices/import", ending.join(lines) + ending, dry_run=dry_run
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [
+        ("create", "d1"),
+        ("create", "d2"),
+    ]
+    assert (await _bulk_state(client))[0] == ([] if dry_run else ["d1", "d2"])
+
+
+@pytest.mark.asyncio
+async def test_a_bare_cr_in_an_unquoted_cell_ends_the_line(client):
+    """Read the way a spreadsheet reads it: the text after the CR is a new row, and
+    each part is judged on its own."""
+    await _create_template(client, name="Firewall")
+    resp = await _import_csv(
+        client,
+        "/devices/import",
+        "name,template_name,topology_type,field_data\r\n"
+        "d1,Fire\rwall,PHYSICAL\r\n"
+        f"d2,Firewall,PHYSICAL,{_MODEL_CELL}\r\n",
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "d1", "template not found by name: 'Fire'"),
+        ("reject", "wall", "template not found by name: 'PHYSICAL'"),
+        ("create", "d2", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize(
+    ("text", "rows"),
+    [
+        ("name,template_name\na\x00b,Firewall\n", 1),
+        ('name,template_name\n"d1,Firewall\n', 1),
+        ('name,template_name\nd"1,Firewall\n', 1),
+        ('name,template_name\n"d"1,Firewall\n', 1),
+        ("name,template_name\nd1,Firewall,extra,cells\n", 1),
+        ("", 0),
+        ("name,template_name\n", 0),
+    ],
+    ids=[
+        "nul",
+        "unterminated_quote",
+        "quote_inside_unquoted_cell",
+        "text_after_a_closing_quote",
+        "extra_cells",
+        "empty_file",
+        "header_only",
+    ],
+)
+async def test_csv_the_module_reads_leniently_is_judged_not_a_500(client, path, text, rows):
+    await _create_template(client, name="Firewall")
+    resp = await _import_csv(client, path, text)
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["total"] == len(report["rows"]) == rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize(
+    ("text", "line"),
+    [
+        ("name,template_name_is_long\nd1,Firewall\n", 1),
+        ("name,template_name\nd1,Firewall\nd2,Firewall\nlong-name-1234,Firewall\n", 4),
+        ('name,template_name\n"d\r\n1",Firewall\nlong-name-1234,Firewall\n', 4),
+        ("name,template_name\rd1,Firewall\rlong-name-1234,Firewall\r", 3),
+    ],
+    ids=["header", "fourth_line", "after_a_multiline_cell", "cr_lines"],
+)
+async def test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing(
+    client, monkeypatch, path, dry_run, text, line
+):
+    """No input the reader is given today makes the csv module refuse it (its field
+    limit is lifted to the length of the text), so the refusal is made real by
+    holding the limit at 13 characters (the longest header cell, `template_name`):
+    the module's own `csv.Error` then reaches the route. The good rows before the
+    refused line are not written either."""
+    from herd_common import csv_import
+
+    monkeypatch.setattr(csv_import, "_field_limit_for", lambda text: 13)
+    await _create_template(client, name="Firewall")
+    before = await _bulk_state(client)
+    resp = await _import_csv(client, path, text, dry_run=dry_run)
+    assert resp.status_code == 422, resp.text
+    assert resp.json() == {
+        "detail": f"Invalid CSV: line {line} could not be read; fix it and retry"
+    }
+    assert await _bulk_state(client) == before

@@ -180,3 +180,52 @@ async def test_full_fanout_then_redelivery_is_idempotent():
     notif_count, channels = await _counts(user_id)
     assert notif_count == 1
     assert channels == {"email", "chat", "webhook"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("end_time", "body"),
+    [
+        (
+            "2026-11-25T10:00:00-08:00",
+            "Reservation for 1 device is active until 2026-11-25 18:00 UTC.",
+        ),
+        (
+            "0001-01-01T00:00:00+05:00",
+            "Reservation for 1 device is active until 0001-01-01T00:00:00+05:00.",
+        ),
+        (1764093600, "Reservation for 1 device is active until unknown end."),
+    ],
+)
+async def test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack(end_time, body):
+    """Issue #1564 through the real consumer path: the stored in-app body states the
+    UTC instant of an offset end_time, and a value with no UTC equivalent or a number
+    (which the old formatter raised on) is acked and delivered, not naked toward the
+    DLQ."""
+    set_preferences_client(
+        _StubPrefs(NotificationPreferences(channels={"in_app": True}, events={}))
+    )
+    user_id = uuid.uuid4()
+    payload = json.dumps(
+        {
+            "event": "reservation.created",
+            "user_id": str(user_id),
+            "device_ids": [str(uuid.uuid4())],
+            "end_time": end_time,
+        }
+    ).encode()
+    msg = _FakeMsg(payload, num_delivered=1, stream_seq=21)
+
+    result = await nats_consumer.process_message(
+        msg, AsyncMock(), nats_consumer.handle_event, _session_factory
+    )
+
+    assert result == "ack"
+    msg.nak.assert_not_awaited()
+    async with _SessionLocal() as session:
+        rows = (
+            (await session.execute(select(Notification).where(Notification.user_id == user_id)))
+            .scalars()
+            .all()
+        )
+    assert [row.body for row in rows] == [body]

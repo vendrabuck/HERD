@@ -112,9 +112,7 @@ def test_wiring_dialog_two_pairs_persist_as_distinct_edges(pw_page):
         pw_page.mouse.up()
 
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog).to_have_accessible_name(
-            f"Wire {device_a['name']} to {device_b['name']}"
-        )
+        expect(dialog).to_have_accessible_name(f"Wire {device_a['name']} to {device_b['name']}")
 
         # --- Escape closes the dialog without emitting an edge.
         pw_page.keyboard.press("Escape")
@@ -130,9 +128,7 @@ def test_wiring_dialog_two_pairs_persist_as_distinct_edges(pw_page):
         pw_page.mouse.move(tx, ty, steps=5)
         pw_page.mouse.up()
         dialog = pw_page.locator("dialog[open]")
-        expect(dialog).to_have_accessible_name(
-            f"Wire {device_a['name']} to {device_b['name']}"
-        )
+        expect(dialog).to_have_accessible_name(f"Wire {device_a['name']} to {device_b['name']}")
 
         # Port clicks are scoped to each side's own column (review item 8a):
         # two similarly-named/numbered seeded devices could otherwise put the

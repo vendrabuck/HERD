@@ -126,7 +126,8 @@ while it is still due, so concurrent schedulers and replicas poll disjoint rows
 | GET | `/schema` (config) | anyone | 200 | OPS-CONFIG-10 |
 | GET | `/settings` (config) | config session | 200 | OPS-CONFIG-10 |
 | PUT | `/settings` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-11, OPS-CONFIG-12, OPS-CONFIG-23, OPS-CONFIG-31 |
-| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24 |
+| POST | `/apply` (config) | config session, password rotated | 200 | OPS-CONFIG-9, OPS-CONFIG-13 to OPS-CONFIG-16, OPS-CONFIG-24, OPS-CONFIG-32 |
+| GET | `/apply/last` (config) | config session | 200 | OPS-CONFIG-32 |
 | POST | `/secrets` (secrets) | admin | 201 | OPS-SECRET-1, OPS-SECRET-2 |
 | GET | `/secrets` (secrets) | any signed-in user | 200 | OPS-SECRET-5 |
 | GET | `/secrets/{secret_id}` (secrets) | admin, or a `view` or `manage` grant | 200 | OPS-SECRET-6 |
@@ -487,10 +488,10 @@ config service cannot be reached, the form stays enabled and a sign-in goes to a
 usual (IAM-UI-9 in `identity-and-access.md`).
 
 **Surfaces.** `services/config/app/` (`main.py`, `config_store.py`, `auth.py`,
-`docker_ctl.py`, `config_schema.py`, `auth_rules.py`, `validation_errors.py`); the restarter,
+`docker_ctl.py`, `restart_record.py`, `config_schema.py`, `auth_rules.py`, `validation_errors.py`); the restarter,
 `infra/restarter/restarter.py`, the one HERD container that holds the Docker socket
 ([ADR 0017](../design/0017-config-restart-without-the-docker-socket.md));
-`frontend/src/pages/ConfigPage.tsx` and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
+`frontend/src/pages/ConfigPage.tsx`, `frontend/src/lib/configRestart.ts`, and `frontend/src/stores/configStore.ts`. The login page's use of `GET /status` is
 `identity-and-access.md` (IAM-UI-9).
 
 **Rules.**
@@ -670,13 +671,18 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   Enforced in: `frontend/src/stores/configStore.ts` (`setConfigToken`, `clearConfigToken`); `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
   Pinned by: `frontend/src/test/stores/configStore.test.ts` (`setConfigToken updates the state and persists to sessionStorage`, `clearConfigToken nulls the state and removes the sessionStorage entry`); `frontend/src/test/pages/ConfigPage.test.tsx` (`renders the config login form when no token is present`, `posts the password and stores the token on success`, `toasts an error when the config login is rejected`)
 - **OPS-CONFIG-19.** Save and Restart saves, then applies, and shows the restarted
-  services and each error under "Restart Result". The browser test runs only with
-  `HERD_E2E_RESTART=1`; nightly.yml sets it in its last test step, where the test
-  asserts the panel lists exactly `RESTART_SERVICES` and no error, then that every
-  container of those services has a later start time than before the click and is
-  running and healthy within 300 seconds (issue #1326). \
-  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`); `.github/workflows/nightly.yml` (`HERD_E2E_RESTART`) \
-  Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`)
+  services and each error under "Restart Result", from the answer to `POST /apply` or,
+  when that answer is lost, from the config service's record of the run
+  (OPS-CONFIG-33). The browser test runs only with `HERD_E2E_RESTART=1`; nightly.yml
+  sets it in its last test step, with IPv6 on, where the test asserts no "Restart
+  Result" panel before the click, then that the panel lists exactly `RESTART_SERVICES`
+  and no error, then that every container of those services has a later start time
+  than before the click and is running and healthy within 300 seconds (issue #1326),
+  then that `GET /apply/last` answers that same result with a UTC `finished_at`, and
+  that after a page reload the result shows again under a `Last restart, finished ...`
+  heading (issue #1433). \
+  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`, `showRestartResult`); `.github/workflows/nightly.yml` (`HERD_E2E_RESTART`) \
+  Pinned by: `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`); `frontend/src/test/pages/ConfigPage.test.tsx` (`shows the answered result directly when POST /apply answers`, `shows an answered result with errors as a partial failure`)
 - **OPS-CONFIG-20.** Against a running stack, a value saved in the config page reads back
   through `GET /settings`. \
   Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigPage`) \
@@ -810,6 +816,62 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   unencodable (a 500). Other non-ASCII text and a character outside the BMP are saved. \
   Enforced in: `services/config/app/main.py` (`update_settings`, `SETTINGS_NOT_UTF8_DETAIL`); `services/config/app/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/config/tests/test_config.py` (`test_a_lone_surrogate_is_the_fixed_422_and_writes_nothing`, `test_a_surrogate_pair_and_other_non_ascii_text_are_saved`)
+- **OPS-CONFIG-32.** The config service keeps its last restart in memory, and
+  `GET /apply/last` (a config session) answers it as `{id, state, result, finished_at}`.
+  `state` is `none`, with `id`, `result`, and `finished_at` null, until the first
+  restart this process starts; `running`, with a new random 32-character lowercase hex
+  `id` and `result` and `finished_at` null, from the moment a `POST /apply` has passed
+  its session, rotation, and configured checks; and `done` once the restart call
+  returns, with `result` exactly what that `POST /apply` answers (OPS-CONFIG-24) and
+  `finished_at` the UTC time the worker recorded it, ISO 8601 to the second with its
+  `+00:00` offset (`2026-11-27T16:51:23+00:00`). The worker thread that runs the restart
+  records the result itself, so it is kept when the apply request is cut off
+  mid-restart; a restart call that raises is recorded as `The restart ended without a
+  result; check service health` and the apply answers 500. A refused apply (401, 403,
+  or 400) leaves the record unchanged. While a run is `running`, another `POST /apply`
+  answers 200 `{"restarted": [], "errors": ["A restart is already in progress"]}`,
+  makes no call to the restarter, and leaves the record unchanged. The record is per
+  process: a restart of the config container itself forgets it. Before issue #1433
+  the result existed only in the answer to the one `POST /apply`. \
+  Enforced in: `services/config/app/restart_record.py` (`RestartRecord`, `RECORD`, `RESULT_LOST_ERROR`, `STATE_NONE`, `STATE_RUNNING`, `STATE_DONE`, `utc_now`); `services/config/app/main.py` (`apply_config`, `_restart_and_record`, `last_apply`) \
+  Pinned by: `services/config/tests/test_restart_record.py` (`test_a_new_record_holds_no_run`, `test_begin_records_a_running_run_with_a_random_hex_id`, `test_begin_while_a_run_is_running_is_refused_and_keeps_that_run`, `test_finish_records_the_result_and_its_time_and_frees_the_next_run`, `test_finished_at_is_the_clock_at_finish_in_utc_with_its_offset`, `test_the_default_clock_is_utc_and_parses_back`, `test_every_run_gets_a_distinct_id`, `test_finish_with_a_stale_id_changes_nothing`, `test_a_second_finish_of_the_same_run_changes_nothing`, `test_the_snapshot_and_the_stored_result_are_copies`, `test_the_lost_result_wording`, `test_restart_record_imports_only_the_standard_library`); `services/config/tests/test_docker_ctl.py` (`test_last_is_no_run_before_any_restart`, `test_last_needs_a_session`, `test_last_holds_the_finished_result_and_each_run_has_a_new_id`, `test_last_records_an_error_result_as_answered`, `test_a_refused_apply_leaves_the_record`, `test_last_is_running_during_the_restart_and_a_second_apply_is_refused`, `test_the_result_is_recorded_when_the_request_is_cut_off`, `test_a_restart_that_raises_is_recorded_as_lost_and_frees_the_next`)
+- **OPS-CONFIG-33.** The config page judges Save and Restart by whether the restart
+  finished, not by whether its one `POST /apply` got an answer. Once the save succeeds
+  it removes any result panel from the page, so an earlier run's result never stands as
+  this click's; a refused save leaves the page as it was. It then reads
+  `GET /apply/last` for the current `id` (when that read fails it sends no apply and
+  says `The restart did not start; try Save and Restart again`) and sends
+  `POST /apply`. An answer from the config service decides: a 200 is shown as
+  OPS-CONFIG-19 says, any other status is `Failed to save or restart`. A lost answer is
+  not a failure: no response at all (a restart on a Linux Docker host aborts the
+  requests of a browser on that host with `ERR_NETWORK_CHANGED`), or a 502, 503, or 504
+  whose body has no string `detail` (every 503 the config service itself sends carries
+  one). The page then reads `GET /apply/last` every 2 seconds and shows the result of
+  the first run whose `id` differs from the one read before, once it is `done`, exactly
+  as an answered result. Each read of `GET /apply/last` is given up and aborted after 10
+  seconds; a read given up that way, or otherwise lost, is retried. The wait ends with
+  `The restart did not start; try Save and Restart again` when a read that answered
+  still shows no new run 10 seconds or more after the wait began, with `The connection
+  dropped during the restart and its result could not be read; check service health`
+  when the config service refuses a read, and with `The connection dropped during the
+  restart and no result arrived in time; check service health` once 750 seconds have
+  passed, at the end of the first read that ends after that (so within 762 seconds:
+  at most one more 2 second pause and one 10 second read), above the
+  config service's own 720 second wait (OPS-CONFIG-28). Save and Restart stays
+  disabled, reading `Restarting...`, while the page waits, and a wait ends with no
+  further read and no message when the editor goes away. When the editor opens it reads
+  `GET /apply/last` once: a `done` run's result is shown with no toast under the
+  heading `Last restart, finished <local YYYY-MM-DD HH:MM>`, its `finished_at` in the
+  viewer's timezone, never under "Restart Result", which only this click's own run
+  gets; a `running` one is waited for the same way and shown under the same kind of
+  heading (ending with `The restart that was running did not report a result; check
+  service health` when no result comes); nothing is shown for `none`, a failed read, or
+  a read that answers after the editor went away; and once a Save and Restart has been
+  clicked, the read on open neither shows nor follows anything, so one run is never
+  reported twice. Before issue #1433 any failure of the one request was `Failed to save
+  or restart` and nothing could show the result afterward. \
+  Enforced in: `frontend/src/lib/configRestart.ts` (`answerWasLost`, `waitForRestart`, `readWithin`, `readOnOpen`, `LastRestartReadTimedOut`, `formatFinishedAt`, `lastRestartHeading`, `RESTART_RESULT_HEADING`, `RESTART_POLL_INTERVAL_MS`, `RESTART_NOT_STARTED_GRACE_MS`, `RESTART_WAIT_MS`, `RESTART_READ_TIMEOUT_MS`, `RESTART_NOT_STARTED_TEXT`, `RESTART_TIMED_OUT_TEXT`, `RESTART_UNREADABLE_TEXT`, `RESTART_FOLLOW_LOST_TEXT`); `frontend/src/api/config.ts` (`fetchLastRestart`); `frontend/src/pages/ConfigPage.tsx` (`handleSaveAndRestart`, `reportLostAnswer`, `awaitingRestart`, `clickStarted`, `setRestartPanel`) \
+  Pinned by: `frontend/src/test/lib/configRestart.test.ts` (`answerWasLost (issue #1433)`, `waitForRestart (issue #1433)`, `readWithin and readOnOpen (issue #1433)`, `formatFinishedAt and lastRestartHeading (issue #1433)`); `frontend/src/test/pages/ConfigPage.test.tsx` (`ConfigPage Save and Restart outcome (issue #1433)`, `ConfigPage last restart on open (issue #1433)`); `frontend/src/test/api/config.test.tsx` (`fetchLastRestart reads GET /apply/last with the bearer token (issue #1433)`); `tests/e2e/test_config_playwright.py` (`test_config_save_and_restart_gated`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).
@@ -941,17 +1003,45 @@ relay task (reservations, started in `services/reservations/app/main.py`; execut
 - **OPS-OUTBOX-11.** The listener retries a failed connect or a lost connection after one
   tick, closes the connection it opened on every exit, sets the wake once per successful
   registration (catching up rows committed while it was away), and connects with the
-  engine's own driver arguments. \
-  Enforced in: `services/common/herd_common/outbox.py` (`_listen_for_wakeups`) \
-  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`)
+  engine's own driver arguments. A failure to build those arguments (or to import the
+  driver) is not retried: it is logged once at ERROR with `action`
+  `outbox_listener_setup_failed` and the exception class name only, and the listener
+  returns, leaving the relay on its tick. A listener task that ends with an `Exception`,
+  or a `BaseException` subclass that asyncio does not treat as a process-exit signal, is
+  logged when it ends (OPS-OUTBOX-13) and again, by class name, when the relay's shutdown
+  awaits it through `await_stopped_task` (a `KeyboardInterrupt` or `SystemExit` leaves the
+  event loop as the listener dies, OPS-OUTBOX-13); the relay, when cancelled, still ends with `CancelledError`, never
+  the listener's exception. A `GeneratorExit` thrown into the relay while it awaits the
+  listener (the relay coroutine closed there) is not the listener's and propagates at once
+  (issue #1549). \
+  Enforced in: `services/common/herd_common/outbox.py` (`_listen_for_wakeups`, `run_outbox_relay`); `services/common/herd_common/background_tasks.py` (`await_stopped_task`) \
+  Pinned by: `services/common/tests/test_outbox.py` (`test_listen_for_wakeups_retries_then_wakes_on_connect_and_notify`, `test_listen_for_wakeups_termination_closes_conn_then_backs_off_before_reconnect`, `test_listen_for_wakeups_registration_failure_closes_conn_and_leaks_none`, `test_listen_for_wakeups_dsn_from_dialect_connect_args`, `test_listen_for_wakeups_setup_failure_is_logged_once_and_returns`, `test_relay_with_a_listener_whose_setup_fails_ends_cancelled`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`, `test_closing_the_relay_while_it_awaits_its_listener_lets_generator_exit_through`, `test_a_relay_that_ends_with_its_own_exception_keeps_it_after_cancelling_its_listener`)
 - **OPS-OUTBOX-12.** A consumer's deduplication key is the payload `event_id`, else the
   JetStream `<stream>:<sequence>`, else none. \
   Enforced in: `services/common/herd_common/outbox.py` (`event_dedupe_key`) \
   Pinned by: `services/common/tests/test_outbox.py` (`test_dedupe_key_prefers_payload_event_id`, `test_dedupe_key_falls_back_to_stream_sequence`, `test_dedupe_key_none_when_no_id_and_no_metadata`, `test_dedupe_key_stable_across_resequence`)
-- **OPS-OUTBOX-13.** The relay task is cancelled at shutdown and a crash of it is logged.
-  Against a running stack, an event staged by reservations reaches its consumers. \
-  Enforced in: `services/execution/app/main.py` (`start_outbox_relay`, `stop_outbox_relay`) \
-  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
+- **OPS-OUTBOX-13.** The relay task is cancelled at shutdown and a crash of it is logged
+  when it happens. Reservations logs a crash of any of its three lifespan tasks (the
+  expiration loop, the purpose-classify loop, and the relay), and every relay logs a
+  crash of its wake-up listener, through the ONE shared done callback `log_task_crash`:
+  at ERROR, with `action` `background_task_crashed`, the task's name, and the exception
+  class name only. At shutdown reservations cancels all three tasks before it awaits any,
+  then awaits each in that order through `await_stopped_task`, which returns, never
+  raises, what a task ended with: an `Exception`, or a `BaseException` subclass that
+  asyncio does not treat as a process-exit signal, is logged (`action`
+  `background_task_failed_at_shutdown`, class name only) and does not stop the rest, and
+  the NATS connection, when there is one, is closed after; the lifespan raises none of
+  them. A `KeyboardInterrupt` or `SystemExit` never reaches these steps: asyncio raises it
+  out of the event loop as the task dies, `asyncio.run` then cancels the lifespan at its
+  `yield`, so in that case none of the shutdown steps run (the NATS close included), and
+  the signal leaves `asyncio.run`. A `GeneratorExit` thrown into the shutdown while it
+  awaits a task (the lifespan closed while suspended there) propagates at once. When the
+  lifespan itself is cancelled while it awaits a task, the remaining steps still run and
+  the lifespan then ends cancelled. Execution's relay task keeps its own callback (issue #1549 leaves
+  moving it to the shared one for later). Against a running stack, an event staged by
+  reservations reaches its consumers. \
+  Enforced in: `services/execution/app/main.py` (`start_outbox_relay`, `stop_outbox_relay`); `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/background_tasks.py` (`log_task_crash`, `await_stopped_task`, `TASK_CRASHED_ACTION`, `TASK_FAILED_AT_SHUTDOWN_ACTION`) \
+  Pinned by: `services/execution/tests/test_main.py` (`test_start_outbox_relay_starts_task_and_stop_cancels`, `test_stop_outbox_relay_noop_when_never_started`); `services/common/tests/test_outbox.py` (`test_relay_cancelled_error_during_sleep_propagates`, `test_relay_logs_a_listener_that_dies_and_still_ends_cancelled`); `services/common/tests/test_background_tasks.py` (`test_a_task_that_raises_is_logged_when_it_ends_by_class_name_only`, `test_a_task_that_is_cancelled_or_returns_is_not_logged`, `test_await_stopped_task_returns_none_for_a_cancelled_or_returned_task`, `test_await_stopped_task_returns_a_dead_tasks_exception_and_logs_it_once`, `test_an_exception_thrown_into_the_caller_propagates_even_after_the_task_died`); `services/reservations/tests/test_main_task_lifecycle.py` (`test_a_task_that_dies_is_logged_at_once_and_shutdown_still_runs_every_step`, `test_shutdown_cancels_and_awaits_every_task_the_lifespan_starts`, `test_a_process_exit_signal_in_a_task_cancels_the_lifespan_at_its_yield`, `test_closing_the_lifespan_while_it_awaits_a_task_lets_generator_exit_through`, `test_a_lifespan_cancelled_during_shutdown_finishes_the_steps_then_ends_cancelled`); `tests/integration/test_outbox_durability.py` (`test_outbox_delivers_reservation_event_end_to_end`)
 - **OPS-OUTBOX-14.** A row is marked published when JetStream acknowledges it, and is not
   republished; an event the broker loses afterwards (an ephemeral store recreated before a
   consumer pulled it) is not recovered by the relay. By decision; recorded in
@@ -995,10 +1085,14 @@ reaches a stack that keeps its broker state and no consumer drifts from the othe
   Enforced in: `services/common/herd_common/jetstream.py` (`ensure_stream`) \
   Pinned by: `services/common/tests/test_jetstream.py` (`test_max_age_seconds_none_yields_config_with_no_max_age`, `test_max_age_seconds_zero_yields_config_with_no_max_age`)
 - **OPS-NATS-4.** Execution owns `HERD_HEALTH` (`herd.health.*`) and declares it with
-  `ensure_stream` once its consumer has connected; a failed declaration is logged and the
-  service keeps running. \
+  `ensure_stream` once its consumer has connected (also when the consumer's durable
+  setup then failed, since the connection is kept); a failed declaration is logged with
+  the exception class name only and the service keeps running (issue #1418): `JetStream
+  stream HERD_HEALTH could not be created or updated (<class>); the connection is kept,
+  so health events publish if the stream exists, and while it is missing they wait in
+  the outbox and the relay retries them every tick`. \
   Enforced in: `services/execution/app/main.py` (`_ensure_health_stream`, `_start_consumer_and_streams`) \
-  Pinned by: `services/execution/tests/test_main.py` (`test_lifespan_starts_consumer_immediately_when_schema_ready`)
+  Pinned by: `services/execution/tests/test_main.py` (`test_lifespan_starts_consumer_immediately_when_schema_ready`, `test_ensure_health_stream_failure_says_health_events_wait_in_the_outbox`); `services/execution/tests/test_nats_consumer_full.py` (`test_setup_failure_keeps_the_connection_for_the_stream_ensures`)
 - **OPS-NATS-15.** Reservations owns `HERD_RESERVATIONS` (`herd.reservations.*`) and
   declares it with `ensure_stream` right after connecting; a failed declaration is logged
   and the service keeps running with the connection it has. \
@@ -1520,19 +1614,29 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   as reserved, and a suggestion-only reservation adds transit hours but no transit
   purpose rows. In a 200 answer from cabling, an entry whose reservation id is not a UUID
   string is ignored, a device id string that is not a UUID is ignored while the entry's
-  other device ids still count, and a null device list adds no transit devices. \
+  other device ids still count, and a null device list adds no transit devices. A device
+  list that is not a list (a number, a string, a boolean, an object) adds no transit
+  devices either, and a device id that is not a string (a number, a boolean, null, an
+  object, a list) is ignored while the entry's other device ids still count; these
+  wrongly typed values are logged once per report at WARNING with `action`
+  `transit_gear_entries_skipped` and the two counts, never the body (issue #1553). The
+  report is still produced. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`build_utilization_report`, `_fetch_transit_devices`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_transit_device_inherits_category_and_hours`, `test_reserved_and_transit_dedupes_to_reserved_only`, `test_duplicate_device_ids_in_fork_response_count_once`, `test_mixed_reserved_in_one_transit_in_another`, `test_reservation_absent_from_cabling_map_has_no_transit`, `test_ai_suggested_only_reservation_contributes_no_device_purpose_transit`, `test_transit_devices_of_every_chunk_are_merged`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_valid_fork_devices_count_around_entries_that_are_not_uuids`, `test_wrongly_typed_entries_are_skipped_and_the_report_is_still_produced`); `services/reservations/tests/test_transit_gear_rollup.py` (`test_a_device_list_of_the_wrong_type_is_skipped_and_logged_once`, `test_device_ids_of_the_wrong_type_are_skipped_and_the_rest_count`, `test_wrongly_typed_entries_across_chunks_log_one_line_per_report`, `test_the_pinned_leniency_logs_nothing`)
 - **OPS-REPORT-8.** Transit devices are read from cabling in chunks of 500 reservations;
-  a transport error or non-200 from any chunk fails the report closed with 503
-  `{"error": "transit_gear_unavailable"}`, and `include_transit=false` makes no cabling
-  call. \
+  a transport error, a non-200, or a 200 whose body is not the declared shape (a body
+  that does not parse: not JSON, not UTF-8, or nested deeper than the decoder's recursion
+  limit; or one that is not an object holding a `devices` object: a list, a string, a
+  boolean, a number, null, an object without `devices`, or `devices` that is not an
+  object) from any chunk
+  fails the report closed with 503 `{"error": "transit_gear_unavailable"}`, and
+  `include_transit=false` makes no cabling call. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`_fetch_transit_devices`, `_TRANSIT_BATCH_CHUNK_SIZE`, `TransitGearUnavailable`) \
-  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
+  Pinned by: `services/reservations/tests/test_transit_gear_rollup.py` (`test_chunking_splits_into_500_and_1`, `test_transport_failure_raises_transit_gear_unavailable`, `test_non_200_raises_transit_gear_unavailable`, `test_include_transit_false_skips_the_cabling_call`, `test_transit_devices_of_every_chunk_are_merged`, `test_a_failure_from_any_chunk_raises_transit_gear_unavailable`, `test_a_200_that_is_not_an_object_with_a_devices_object_is_unavailable`, `test_a_200_that_is_not_json_is_unavailable_without_its_text`, `test_a_wrongly_shaped_body_in_any_chunk_is_unavailable`); `services/reservations/tests/test_utilization_report_routes.py` (`test_transit_devices_come_from_one_internal_cabling_call_for_the_counted_rows`, `test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`, `test_include_transit_false_makes_no_cabling_call_on_both_routes`)
 - **OPS-REPORT-9.** The routes map that failure to 503 `{"error":
   "transit_gear_unavailable"}`. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report`, `get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
+  Pinned by: `services/reservations/tests/test_reservations.py` (`test_utilization_report_cabling_unreachable_is_503`, `test_utilization_report_cabling_non_200_is_503`, `test_utilization_report_csv_cabling_unreachable_is_503`, `test_utilization_report_csv_cabling_non_200_is_503`); `services/reservations/tests/test_utilization_report_routes.py` (`test_a_cabling_failure_is_503_transit_gear_unavailable_on_both_routes`, `test_a_200_of_the_wrong_shape_is_503_transit_gear_unavailable_on_both_routes`, `test_a_cabling_outage_fails_every_csv_section_closed`)
 - **OPS-REPORT-10.** The fleet section lists every device inventory returns (paged by 500,
   with the caller's token, stopping at 100,000), each with its hours over the whole
   window as `utilization_pct`, unclamped; devices with no hours are the idle count, and a
@@ -1549,12 +1653,12 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fleet_devices_are_listed_busiest_first_then_by_name`, `test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total`, `test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total`, `test_fetch_fleet_devices_stops_at_100_000_devices`, `test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total`, `test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with
-  `fleet` null. \
+  `fleet` null. Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fetch_fleet_devices_none_on_non_200`, `test_fetch_fleet_devices_none_on_unreachable`, `test_report_route_fleet_null_when_inventory_unreachable`)
 - **OPS-REPORT-12.** `execution_run_count` is the number of driver runs started in the
   window, read from execution with the caller's token, and null when execution cannot
-  answer. \
+  answer. Known gap, see #1577. \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_execution_run_count`) \
   Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_fetch_execution_run_count_returns_total`, `test_fetch_execution_run_count_swallows_http_errors`, `test_fetch_execution_run_count_returns_none_on_non_200`)
 - **OPS-REPORT-13.** The CSV route serves one `section` (`user`, `device`, `fleet`,
@@ -1564,7 +1668,7 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`); `services/reservations/app/services/reporting_service.py` (`report_to_csv`) \
   Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `services/reservations/tests/test_report_utc_days.py` (`test_csv_route_reproduction_matches_json_and_names_utc_dates`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
 - **OPS-REPORT-14.** The `fleet` CSV is 503 `Inventory service is unreachable` when
-  inventory cannot answer; the other sections make no inventory call. \
+  inventory cannot answer; the other sections make no inventory call. Known gap, see #1577. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_csv_route_fleet_503_when_inventory_unreachable`, `test_csv_route_other_sections_skip_inventory_fetch`, `test_csv_route_fleet_section`)
 - **OPS-REPORT-15.** Free-text CSV cells (owner names, device names, and the browser's
@@ -2167,7 +2271,7 @@ IAM-REG-2, IAM-LOGIN-5 (`identity-and-access.md`), and OPS-CONFIG-8.
 | 422 | validation list, or `merged <reason>` | a preferences body or merged result over a cap | OPS-PREF-4, OPS-PREF-5 |
 | 401 | `Invalid internal token` | the internal preferences read without the right token | OPS-PREF-7 |
 | 422 | `window_end must be after window_start`, `Utilization window cannot exceed <N> days (...)`, `<start or end> must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, a validation list | a bad report window, a bound with no UTC equivalent, or an unknown CSV section | OPS-REPORT-1, OPS-REPORT-13 |
-| 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices | OPS-REPORT-8, OPS-REPORT-9 |
+| 503 | `{"error": "transit_gear_unavailable"}` | cabling cannot list transit devices, or answers 200 with a body that is not an object holding a `devices` object | OPS-REPORT-8, OPS-REPORT-9 |
 | 503 | `Inventory service is unreachable` | the fleet CSV when inventory cannot answer | OPS-REPORT-14 |
 
 Startup refusals (no HTTP answer; the container exits or waits):
@@ -2194,7 +2298,7 @@ Startup refusals (no HTTP answer; the container exits or waits):
 | Out (execution, device check) | the device's driver | `login`, then `status` and `logout` in the sandbox | the device check | Answered 200 with the failed run's status and error (OPS-HEALTH-8, OPS-HEALTH-9) |
 | Out (secrets) | acl | `GET /resources` with the caller's token (5 s); the shared grant check | which secrets a user may see or reveal | Fail closed: nothing listed, 404 or 403 (OPS-SECRET-5) |
 | Out (secrets) | inventory | `GET /hypervisors/by-secret/{id}/internal` (internal token, 5 s) | delete guard | Fail closed: 503, a malformed 200 included (OPS-SECRET-14) |
-| Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed: 503 (OPS-REPORT-8) |
+| Out (reservations, report) | cabling | `POST /internal/forks/devices/batch` (internal token, 10 s, chunks of 500) | transit devices | Fail closed, a 200 of the wrong shape included: 503 (OPS-REPORT-8); a wrongly typed entry is skipped and logged (OPS-REPORT-7) |
 | Out (reservations, report) | inventory | `GET /devices` with the caller's token (10 s, paged by 500) | fleet section | Fail open: `fleet` null, or 503 for the fleet CSV (OPS-REPORT-11, OPS-REPORT-14) |
 | Out (reservations, report) | auth | `POST /groups/users/groups` with the caller's token (5 s) | group section | Fail open: every user `Ungrouped` (OPS-REPORT-5) |
 | Out (reservations, report) | execution | `GET /runs` with the caller's token (5 s) | run count | Fail open: null (OPS-REPORT-12) |
@@ -2281,7 +2385,16 @@ run against a stack; so were the large canvas save and the 1 MiB fork canvas sav
 
 ### Open defects
 
-None at present.
+- #1577 (OPS-REPORT-11, OPS-REPORT-12, OPS-REPORT-14): the utilization report reads
+  inventory's `GET /devices` and execution's `GET /runs` without a guarded parse, so a
+  200 whose body does not parse (not JSON, not UTF-8, or nested deeper than the
+  decoder's recursion limit), or is a list or a string, answers 500 on the JSON report
+  and, from inventory, on the `fleet` CSV, instead of `fleet` null,
+  `execution_run_count` null, or the CSV's 503; from execution a `null` answers 500
+  too, while from inventory a `null` or an `items` string gives a fleet of 0 devices
+  instead (issue #1577's run). A real
+  upstream cannot send these bodies while its response model holds. The reservations
+  sites of the same issue are listed in `reservations.md`.
 
 ### Limits by decision
 

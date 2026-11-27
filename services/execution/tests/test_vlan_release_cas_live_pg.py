@@ -13,8 +13,9 @@ behavior, but one SQLite connection cannot make two writers contend for a row. H
 each releaser is a real asyncio task on its own Postgres connection:
 
   - two releases of one allocation are held at the row lock together (a third
-    connection holds the row FOR UPDATE until both UPDATEs are seen waiting in
-    pg_stat_activity), then let go: exactly one releases it, one set of delete_vlan
+    connection holds the row FOR UPDATE until both releasers are seen waiting on it
+    in pg_stat_activity, in the row lock each takes before its guarded UPDATE since
+    issue #1413), then let go: exactly one releases it, one set of delete_vlan
     calls is driven, the other logs the lost race;
   - a membership committed after a releaser's orphan check keeps the allocation
     ACTIVE and drives nothing;
@@ -44,16 +45,17 @@ Connections set search_path to the execution schema rather than flipping
 5 s lock_timeout, so a releaser that waits on a lock nobody releases fails in seconds.
 
 Env contract identical to the other execution live-pg suites:
-    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN.
-    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns an unreachable
-                            server into a hard failure instead of the normal skip.
+    HERD_TEST_PG_DSN        SQLAlchemy asyncpg DSN of the database to use. Unset or
+                            empty, the suite is skipped and connects to nothing; a
+                            named database that does not answer skips it too.
+    HERD_TEST_PG_REQUIRED   "1" (or any value not in ("", "0")) turns either skip
+                            into an error at setup (herd_common.pg_live_suite).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from collections import defaultdict
 from contextlib import ExitStack
@@ -65,47 +67,21 @@ from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services import vlan_service
 from app.services.nats_consumer import _FetchContext, _release_orphaned_allocations
+from herd_common.pg_live_suite import pg_live_target
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
-PG_DSN = os.getenv(
-    "HERD_TEST_PG_DSN",
-    f"postgresql+asyncpg://herd:herd@127.0.0.1:{DEFAULT_PG_PORT}/herd",
-)
-_PG_REQUIRED = os.getenv("HERD_TEST_PG_REQUIRED", "") not in ("", "0")
+_PG = pg_live_target()
+PG_DSN = _PG.dsn
 
 
-async def _pg_reachable() -> bool:
-    engine = create_async_engine(PG_DSN)
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
-
-
-_PG_REACHABLE = asyncio.run(_pg_reachable())
-
-pytestmark = pytest.mark.skipif(
-    not _PG_REQUIRED and not _PG_REACHABLE,
-    reason=(
-        f"No Postgres reachable at {PG_DSN!r}; set HERD_TEST_PG_DSN to point at one "
-        "(e.g. the gate stack's published postgres port, 5433) to run this suite."
-    ),
-)
+pytestmark = pytest.mark.skipif(_PG.skip_reason is not None, reason=_PG.skip_reason or "")
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unreachable():
-    if _PG_REQUIRED and not _PG_REACHABLE:
-        pytest.fail(
-            f"HERD_TEST_PG_REQUIRED is set but no Postgres is reachable at {PG_DSN!r}; "
-            "start one or unset HERD_TEST_PG_REQUIRED."
-        )
+def _fail_when_pg_live_cannot_run():
+    if _PG.failure is not None:
+        pytest.fail(_PG.failure)
 
 
 EXECUTION_SCHEMA = "execution"
@@ -383,15 +359,16 @@ async def _cleanup(session_factory, h: _Harness):
 
 async def _waiting_on_lock(pg_engine, application_name: str) -> int:
     """How many of THIS test's releaser backends (tagged with `application_name`) wait
-    on a lock in their guarded UPDATE. Other sessions on the database, such as a live
-    gate stack's own, are never counted."""
+    on a lock in a statement naming vlan_assignments (since issue #1413 that is the row
+    lock the release takes before its guarded UPDATE). Other sessions on the database,
+    such as a live gate stack's own, are never counted."""
     async with pg_engine.connect() as conn:
         return (
             await conn.execute(
                 text(
                     "SELECT count(*) FROM pg_stat_activity "
                     "WHERE wait_event_type = 'Lock' AND datname = current_database() "
-                    "AND application_name = :app AND query ILIKE 'UPDATE vlan_assignments%'"
+                    "AND application_name = :app AND query ILIKE '%vlan_assignments%'"
                 ),
                 {"app": application_name},
             )
@@ -435,7 +412,7 @@ async def test_two_concurrent_releases_of_one_allocation_have_exactly_one_winner
         get_db = _session_ctx(async_sessionmaker(releaser_engine, expire_on_commit=False))
         with h.patches(release=_recorded), caplog.at_level(logging.INFO):
             async with pg_engine.connect() as holder:
-                # Hold the row so both guarded UPDATEs queue on its lock together.
+                # Hold the row so both releasers queue on its lock together.
                 await holder.execute(
                     select(VlanAssignment.id).where(VlanAssignment.id == alloc).with_for_update()
                 )

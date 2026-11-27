@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import type { BulkFormat, BulkImportReport } from "@/api/bulk";
+import { importErrorText } from "@/lib/errors";
 
 interface BulkImportExportProps {
   // Human label for the resource, e.g. "devices", "templates", "topologies".
@@ -27,6 +28,9 @@ export function BulkImportExport({
   const [format, setFormat] = useState<BulkFormat>("json");
   const [report, setReport] = useState<BulkImportReport | null>(null);
   const [busy, setBusy] = useState(false);
+  // Why the last import run failed (issue #1575), shown inside the dialog
+  // beside the file input; cleared by a new file, a new run, and closing.
+  const [importError, setImportError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   // Per-instance title id (issue #1318), like Modal and ConfirmDialog.
   const titleId = useId();
@@ -42,6 +46,7 @@ export function BulkImportExport({
     setFile(null);
     setReport(null);
     setBusy(false);
+    setImportError(null);
   };
 
   const close = () => {
@@ -60,12 +65,14 @@ export function BulkImportExport({
   const handleFile = (selected: File | null) => {
     setFile(selected);
     setReport(null);
+    setImportError(null);
     if (selected) setFormat(inferFormat(selected.name));
   };
 
   const runImport = async (dryRun: boolean) => {
     if (!file) return;
     setBusy(true);
+    setImportError(null);
     try {
       const result = await onImport(file, format, dryRun);
       setReport(result);
@@ -76,8 +83,11 @@ export function BulkImportExport({
         );
         onImported?.();
       }
-    } catch {
-      toast.error(`Failed to import ${resourceLabel}`);
+    } catch (err) {
+      // Issue #1575: a refusal of the file itself (413, 422) names its reason;
+      // every other failure is the fixed sentence. Shown in the dialog, where
+      // the user is fixing the file, not in a toast that fades.
+      setImportError(importErrorText(err, `Failed to import ${resourceLabel}`));
     } finally {
       setBusy(false);
     }
@@ -134,6 +144,11 @@ export function BulkImportExport({
                 onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
                 className="block w-full text-sm text-gray-700"
               />
+              {importError && (
+                <p role="alert" className="mt-2 text-sm text-red-600 break-words">
+                  {importError}
+                </p>
+              )}
             </div>
 
             <div>

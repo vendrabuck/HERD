@@ -174,7 +174,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8, INV-VIS-9 |
 | GET | `/device-groups/device/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-GRP-10 to INV-GRP-13, INV-VIS-6 |
 | GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-BULK-21, INV-CSV-1, INV-CSV-2 |
-| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-CSV-3 |
+| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-BULK-25, INV-BULK-26, INV-CSV-3 |
 | `/devices/{id}/config-versions...`, `/devices/{id}/apply-jobs`, `/apply-jobs/...` | | see `device-configuration.md` | | none here |
 
 `GET /devices` takes `template_id`, `topology_type`, `status`, `dut_only`, `search`,
@@ -606,7 +606,8 @@ size per user. Admins can also copy and bulk-delete devices.
 connection reads for an expanded row). Import and export controls and Copy render for
 admins only. Copy names the new device `Copy of <name>` and sends the source's template,
 topology type, and `field_data`, leaving the status to the default; the Template
-filter reads the first 500 device templates.
+filter pages through the device templates instead of stopping at the first 500
+(issue #1336).
 
 **Rules.**
 
@@ -1106,9 +1107,18 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`device_to_record`) \
   Pinned by: none
 - **INV-BULK-4.** Import accepts a JSON list or an object with an `items` list; invalid
-  JSON, any other shape, or a non-list `items` answers 422 for the whole file. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`) \
-  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_json_invalid_document_raises_422`, `test_parse_json_accepts_bare_list`, `test_parse_json_accepts_items_wrapper`, `test_parse_json_scalar_document_rejected`, `test_parse_json_items_not_a_list_rejected`)
+  JSON, any other shape, or a non-list `items` answers 422 for the whole file, and
+  nothing is written, dry run included. A syntax error answers `Invalid JSON: ` followed
+  by the decoder's message, which names a line, column, and character offset and no
+  content. A document the parser refuses for its shape answers the fixed `Invalid JSON:
+  the document is nested too deeply or holds a number too long to read`, which names no
+  part of the file or the exception: one nested deeper than the parser's C recursion
+  budget (the interpreter's bound, not a HERD setting; just under 10,000 levels on
+  the service image's Python 3.12), or one holding an integer literal longer than
+  Python's integer string conversion limit (4,300 digits, sign not counted). Both were
+  500s before issue #1511. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `IMPORT_JSON_UNREADABLE_DETAIL`) \
+  Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_json_invalid_document_raises_422`, `test_parse_json_accepts_bare_list`, `test_parse_json_accepts_items_wrapper`, `test_parse_json_scalar_document_rejected`, `test_parse_json_items_not_a_list_rejected`); `services/inventory/tests/test_bulk.py` (`test_the_bounds_these_tests_rest_on`, `test_parse_import_refuses_an_unreadable_document_with_the_fixed_detail`, `test_parse_import_reads_a_document_just_under_the_depth_bound`, `test_parse_import_reads_an_integer_at_the_digit_limit`, `test_parse_import_keeps_the_decoder_position_for_a_syntax_error`, `test_an_unreadable_json_import_is_a_fixed_422_and_writes_nothing`, `test_a_json_import_just_under_the_parser_bounds_imports`)
 - **INV-BULK-5.** The file is decoded as UTF-8, and a leading byte order mark is
   dropped. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`parse_import`) \
@@ -1189,9 +1199,16 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_csv`, `parse_import`); `services/common/herd_common/csv_safety.py` (`csv_unsafe_cell`) \
   Pinned by: `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_csv_strips_neutralizing_quote_from_named_text_columns`, `test_parse_csv_leaves_apostrophe_led_value_alone`); `services/inventory/tests/test_bulk.py` (`test_device_csv_roundtrip_with_formula_trigger_name`, `test_template_csv_roundtrip_with_formula_trigger_name`)
 - **INV-BULK-17.** The import dialog can run a dry run and lists each rejected row with
-  its reason, and it infers the format from the file extension. \
-  Enforced in: `frontend/src/components/ui/BulkImportExport.tsx` (`BulkImportExport`) \
-  Pinned by: `frontend/src/test/components/BulkImportExport.test.tsx` (`runs a dry-run and shows the per-row reject report`, `infers csv format from the file extension`)
+  its reason, and it infers the format from the file extension. A refused import shows
+  its reason inside the dialog, under the file input as an alert, never in a toast: a
+  413 or 422 shows the server's detail through `errorDetail` (a body with no usable
+  detail shows `Failed to import <label>`), and any other failure, a 403, a 503, a 5xx,
+  or no answer, shows `Failed to import <label>` whatever its body says (issue #1575).
+  The detail is rendered as text. Choosing another file, starting another run, or
+  closing the dialog clears it. The dialog is shared with the devices, templates, and
+  topologies pages. \
+  Enforced in: `frontend/src/components/ui/BulkImportExport.tsx` (`BulkImportExport`); `frontend/src/lib/errors.ts` (`importErrorText`) \
+  Pinned by: `frontend/src/test/components/BulkImportExport.test.tsx` (`runs a dry-run and shows the per-row reject report`, `infers csv format from the file extension`, `BulkImportExport refused import (issue #1575)`, `renders markup in a detail as text, never as HTML`, `clears the reason when another file is chosen`, `clears the reason when a later run succeeds`, `clears the reason when the dialog is closed`)
 - **INV-BULK-18.** A dry run is a full rehearsal: every row goes through the same create
   and update functions as a committed import (INV-BULK-10, INV-BULK-13), a later row
   sees an earlier row's create (a name repeated in one file reports `create` then
@@ -1212,14 +1229,56 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   `Import file holds a lone surrogate escape, which is not valid text; fix it and retry`
   for the whole file, and nothing is written. A CSV row whose JSON cell (`field_data`,
   `sections`) holds one is rejected with the reason `a JSON cell holds a lone surrogate
-  escape, which is not valid text`; the other rows are imported. The file is a
-  multipart upload, which the shared body check (OPS-VALID-6) passes through, so the
-  importer checks the JSON it parses itself. Before issue #1456's sweep a device or
+  escape, which is not valid text`, and the other rows are judged on their own. The
+  file is a multipart upload, which the shared body check (OPS-VALID-6) passes through,
+  so the importer checks the JSON it parses itself. Before issue #1456's sweep a device or
   template name holding one made the report unencodable (a 500), and one in
   `field_data` was stored, so every later read of the device could not encode it. A
   character outside the BMP written as an escaped pair is imported. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_json`, `_coerce_json_cell`, `IMPORT_NOT_TEXT_DETAIL`, `JSON_CELL_NOT_TEXT_REASON`); `services/common/herd_common/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_import_holding_a_lone_surrogate_is_a_fixed_422`, `test_a_csv_json_cell_holding_a_lone_surrogate_rejects_that_row_only`)
+- **INV-BULK-24.** A row whose `field_data` (device) or `sections` (template) is JSON
+  text, a CSV cell or a JSON string in a JSON import, that the parser refuses for its
+  shape, nested deeper than its C recursion budget or holding an integer literal longer
+  than 4,300 digits (the bounds of INV-BULK-4), is rejected with the fixed reason `a
+  JSON cell is nested too deeply or holds a number too long to read`, and the other rows
+  are judged on their own. Such text with a syntax error is still rejected with the
+  decoder's message, which names a position and no content. Before issue #1511 the row
+  was rejected with Python's own exception text. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_coerce_json_cell`, `JSON_CELL_UNREADABLE_REASON`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_json_cell_the_parser_refuses_raises_the_fixed_reason`, `test_a_json_cell_just_under_the_bounds_still_parses`, `test_a_json_cell_syntax_error_keeps_the_decoder_error`, `test_a_csv_json_cell_the_parser_refuses_rejects_that_row_only`, `test_a_json_string_cell_the_parser_refuses_rejects_that_row_only`)
+- **INV-BULK-25.** A CSV import is read through the shared reader `read_csv_rows`:
+  `\n`, `\r\n`, and bare `\r` line endings are all read as line ends (a file saved with
+  classic Mac line endings imports), a bare `\r` in an unquoted cell ends the line and
+  the rest of the cell starts the next row, a line break inside a quoted cell is kept,
+  and a cell may be as long as the file, since the csv module's process-wide field
+  limit (131,072 characters by default) is raised to the length of the text, when that
+  is longer, for the read and put back after it. Anything the csv module still refuses answers 422
+  `Invalid CSV: line <n> could not be read; fix it and retry` for the whole file, where
+  `<n>` is the number of physical lines the reader had read (the header is line 1), and
+  nothing is written, dry run included; the detail carries no cell and none of the
+  module's own text. With the line endings and the field limit handled, no input tried
+  on Python 3.12 or 3.14 reaches that answer; it covers any refusal the module still
+  has or adds later. A NUL character, an unterminated quote, or a quote inside an
+  unquoted cell is read, not refused, and the row is judged by the row rules. Before
+  issue #1574 a cell over 131,072 characters or a bare `\r` outside quotes answered
+  500, so a template whose icon is a data URL over that length exported to CSV and
+  could not be imported back. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_csv`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`, `_field_limit_for`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_device_name_past_the_field_limit_is_judged_not_a_500`, `test_a_field_data_cell_past_the_field_limit_is_read`, `test_a_template_description_past_the_field_limit_is_read`, `test_a_template_with_a_large_icon_round_trips_through_csv`, `test_every_line_ending_imports_the_same_devices`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_csv_reads_every_line_ending`, `test_parse_csv_reads_a_cell_past_the_default_field_limit`, `test_parse_import_answers_the_fixed_422_for_a_csv_error`); `services/common/tests/test_csv_import.py` (`test_every_line_ending_reads_the_same_rows`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_a_line_break_inside_a_quoted_cell_is_kept`, `test_a_cell_past_the_default_field_limit_reads`, `test_the_limit_is_raised_only_during_the_read`, `test_a_csv_error_answers_the_fixed_422_naming_the_line`, `test_a_csv_error_puts_the_previous_limit_back`, `test_input_the_csv_module_reads_leniently`)
+- **INV-BULK-26.** A JSON import item that is not an object (a list, string, number,
+  boolean, or null) is rejected with the reason `row is not an object`, and an object
+  whose `name` is present, not null, and not a string is rejected with `name: must be a
+  string`; both rows carry no identity, and every other row is judged on its own
+  (INV-BULK-7). An absent or null name, or a string name that is empty or blank, keeps
+  the reason `missing required field: name` (INV-BULK-9). The check runs before
+  anything reads the item. Before issue #1573 an item that is not an object, or a
+  `name` that is a nonzero number, `true`, or a non-empty list or object, answered 500,
+  and on a committing import the rows before it had already been written; a `name` of
+  `0`, `false`, `[]`, or `{}` was rejected `missing required field: name` and is now
+  rejected `name: must be a string`. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_shape_reason`, `_import_device_rows`, `_import_template_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_null_or_empty_name_is_still_the_missing_name_reason`, `test_the_items_wrapper_rejects_a_non_object_item_the_same_way`, `test_a_committing_import_reports_the_rows_before_a_bad_item`); `services/inventory/tests/test_bulk_service_unit.py` (`test_row_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_device_import_item_that_is_not_an_object_is_a_rejected_row`)
 - **INV-BULK-23.** An import upload larger than `IMPORT_UPLOAD_BYTES` (10 MiB) answers
   413 with the body limit's one item, `{"type": "body_too_large", "loc": ["body"], "msg":
   "Request body is larger than <limit> bytes"}`, and nothing is parsed or written. The
@@ -1472,8 +1531,10 @@ other error carries `detail` as a string or as the object shown.
 | 422 | `driver_metadata.json is larger than 1048576 bytes; nothing was stored`, `Driver package has a tar header record over 1048576 bytes (a pax extended header or GNU long name); nothing was stored` | driver upload or file replace whose metadata entry or tar header record is over 1 MiB | INV-DRV-7 |
 | 422 | `Secret does not exist` | hypervisor with an unknown secret | INV-HYP-3, INV-HYP-6 |
 | 422 | `Invalid JSON: ...`, `JSON import must be a list of records or an object with an 'items' list`, `'items' must be a list` | unparseable JSON import | INV-BULK-4 |
+| 422 | `Invalid JSON: the document is nested too deeply or holds a number too long to read` | a JSON import nested past the parser's depth bound or holding an integer longer than 4,300 digits | INV-BULK-4 |
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry` | an import file that is not valid UTF-8 | INV-BULK-20 |
 | 422 | `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | a JSON import file holding a lone surrogate | INV-BULK-22 |
+| 422 | `Invalid CSV: line <n> could not be read; fix it and retry` | a CSV import the csv module refuses | INV-BULK-25 |
 | 422 | `Secret data cannot be read; an admin must replace it in the secrets service` | hypervisor with a secret whose stored data the secrets service cannot return | INV-HYP-4, INV-HYP-6 |
 | 422 | `generated port names would exceed 255 characters; ...` (validation list) | a bulk port create whose last generated name is too long | INV-PORT-6 |
 | 500 | `internal: missing Authorization header while resolving user groups` or `... group names` | a visibility or name lookup with no header to forward | INV-VIS-3 |
@@ -1519,7 +1580,7 @@ The calls other services make to inventory are section 7.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
+| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
 | Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |

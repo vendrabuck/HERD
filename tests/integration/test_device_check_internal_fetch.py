@@ -30,7 +30,7 @@ pytestmark = pytest.mark.asyncio
 # A complete Management driver: all five methods the connection type requires
 # for validation, with login/status/logout succeeding so device-check can
 # reach a SUCCESS verdict.
-_DRIVER_PY = b'''\
+_DRIVER_PY = b"""\
 class Driver:
     def __init__(self, context):
         self.context = context
@@ -49,7 +49,7 @@ class Driver:
 
     def status(self):
         return {"reachable": True}
-'''
+"""
 
 _DRIVER_METADATA = b'{"supports_dry_run": false, "version": "1.0", "vendor": "integration"}'
 

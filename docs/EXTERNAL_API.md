@@ -420,7 +420,7 @@ def verify(raw_body: bytes, header_value: str, secret: str) -> bool:
     """
     if not header_value.startswith("sha256="):
         return False
-    sent = header_value[len("sha256="):]
+    sent = header_value[len("sha256=") :]
     expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sent, expected)
 ```

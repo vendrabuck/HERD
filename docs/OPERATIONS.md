@@ -505,6 +505,42 @@ kept for it, and no route changes that. The person can be given a different emai
 username at the provider, so the first sign-in provisions a new account; carrying the
 old account's groups and ownership over is a manual step.
 
+### A user's first single sign-on login is refused as `email_invalid`
+
+The `login_failure` query under "A user's first single sign-on login is refused as a
+collision" above shows the reason. It is `email_invalid` when the email the provider
+sends (the claim `OIDC_EMAIL_CLAIM` names, default `email`) is not a plain address:
+a space at either end, an invisible format character (a zero width space, a bidi
+control), not exactly one `@` with text on both sides, or, since issue #1400, any
+character outside ASCII, in the part before the `@` or after it. A control character
+is different: a tab, a newline, any other C0 or C1 control (C1, U+0080 to U+009F, is
+outside ASCII too), or a lone surrogate makes HERD treat the claim as absent, so the
+log shows `email_missing` instead. The person sees the same failure page either way.
+
+The ASCII rule keeps a look-alike (a Cyrillic or Greek letter, a fullwidth letter, an
+accented letter) from becoming a second account that reads like someone else's, and
+it also refuses a genuinely internationalized mailbox. HERD does not convert the
+address: give the person an ASCII email at the provider, or point `OIDC_EMAIL_CLAIM`
+at a claim that holds one. A domain written in its ASCII `xn--` form is accepted and
+shown that way. The rule does not catch an all-ASCII look-alike (`rn` for `m`), nor an
+ASCII email that imitates an account already holding a non-ASCII one, which is still
+provisioned as a separate account.
+
+The rule applies only to a first sign-in: an account created with a non-ASCII email
+before it keeps signing in. To find such accounts, in a UTF-8 database (check with
+`SHOW server_encoding;`), run in `docker compose exec postgres psql -U "$POSTGRES_USER"
+-d "$POSTGRES_DB"`:
+
+```sql
+SELECT id, auth_source FROM auth.users WHERE octet_length(email) <> char_length(email);
+```
+
+For an `oidc` account in that list, a sign-in from a second identity carrying the same
+email (for example after the provider reissued the person's `sub`) is now refused as
+`email_invalid`, not `email_taken`, so no relink candidate is kept for it. Recover such
+a person with the typed issuer-and-subject relink in "A user's first single sign-on
+login is refused as a collision", with a `sub` read at the provider.
+
 ### Sessions after a relink or rewrite
 
 Neither route revokes a session. A sign-in already in flight when a relink or rewrite
@@ -632,7 +668,8 @@ There is no built-in Prometheus/Grafana stack; roll your own based on the JSON l
 - Reservations service still accepts writes. Lifecycle events are written to the transactional outbox in the same transaction as the state change (issue #21), so nothing is lost while NATS is unreachable; the relay just cannot publish them yet.
 - Execution service can't consume events during the outage, so L1/L2 driver operations are NOT triggered yet; a reservation goes `ACTIVE` but its devices are not configured on real hardware until events flow again. Health-transition events are likewise buffered in the execution outbox.
 - Recover: bring NATS up. The per-service outbox relays reconnect and drain their unpublished rows on the next tick after NATS is reachable again (at most `OUTBOX_RELAY_TICK_SECONDS` later; the issue #682 wake path is deliberately ignored while the relay is waiting out an outage), so reservation and health events are delivered once (not lost), just delayed. No manual catch-up event is needed for these streams.
-- A service that STARTED while NATS was down is different: its first connect gives up after a few tries (about 10 seconds; issue #1083), it logs `NATS unavailable at ...` (reservations) or `Failed to connect to NATS; ...` (execution, notifications, integration), finishes starting, and stays without NATS until it is restarted. After NATS is back, restart every service that logged one of those lines (`docker compose restart <svc>`); its outbox rows and the durable consumers' unacknowledged messages are kept, so nothing is lost. A connection that was established before the outage reconnects by itself, without limit.
+- A service that STARTED while NATS was down is different: its first connect gives up after a few tries (about 10 seconds; issue #1083), it logs `NATS unavailable at ...` (reservations) or `NATS connect failed (<class>); not running: ...` (execution, notifications, integration, naming each durable consumer that is not running), finishes starting, and stays without NATS until it is restarted. After NATS is back, restart every service that logged one of those lines (`docker compose restart <svc>`); its outbox rows and the durable consumers' unacknowledged messages are kept (a stream keeps a message up to `NATS_STREAM_MAX_AGE_SECONDS`, 7 days by default), so nothing is lost and no event needs a manual replay. A connection that was established before the outage reconnects by itself, without limit.
+- Execution, notifications, or integration can instead log `NATS consumer setup failed for durable <durable> on stream <stream> (<class>); not running: ...; still running: ...` (issue #1418; for a JetStream API error the parentheses also hold its code, as `(NotFoundError, err_code=10059)`): the broker answered but creating or binding a durable consumer failed. The connection is kept and every consumer listed as still running keeps working, but nothing retries the setup: restart the service once the cause is fixed, and the consumers listed as not running pick up every event published meanwhile that is still within the stream's max age. Do not replay those events by hand; that would deliver them twice. A `JetStream stream <stream> could not be checked or created (<class>)` line before it means the stream itself was missing or the broker refused the check.
 - Reservations can instead log `JetStream stream HERD_RESERVATIONS could not be created or updated at ...` (RES-EVENT-5): the broker answered but the stream create or update failed. That service keeps its connection and needs no restart; its relay publishes as soon as the stream exists (execution's consumer also creates it), and until then its events wait in the outbox and are retried every tick.
 
 ### Config volume is wiped

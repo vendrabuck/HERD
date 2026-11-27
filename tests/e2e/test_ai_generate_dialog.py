@@ -74,9 +74,7 @@ def _open_editor(driver, base_url, topology_id):
 def _open_ai_dialog(driver):
     wait = WebDriverWait(driver, WAIT)
     use_ai = wait.until(
-        EC.element_to_be_clickable(
-            (By.XPATH, "//button[normalize-space()='Use AI']")
-        )
+        EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Use AI']"))
     )
     use_ai.click()
     wait.until(EC.element_to_be_clickable((By.ID, "ai-prompt")))
@@ -98,15 +96,11 @@ def test_use_ai_opens_dialog(logged_in_browser, base_url, ai_topology):
     "AI provider is not configured on the gate or nightly stack; an environmental "
     "gate no seed can satisfy"
 )
-def test_ai_generate_button_disabled_when_prompt_empty(
-    logged_in_browser, base_url, ai_topology
-):
+def test_ai_generate_button_disabled_when_prompt_empty(logged_in_browser, base_url, ai_topology):
     """The Generate button is disabled until a prompt is typed."""
     _open_editor(logged_in_browser, base_url, ai_topology["id"])
     _open_ai_dialog(logged_in_browser)
-    generate = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Generate']"
-    )
+    generate = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='Generate']")
     # Empty textarea, button disabled.
     assert generate.get_attribute("disabled") is not None
 
@@ -115,9 +109,7 @@ def test_ai_generate_button_disabled_when_prompt_empty(
     prompt_box.send_keys("Two firewalls behind a client")
 
     # Re-find the button; React may have re-rendered it.
-    generate = logged_in_browser.find_element(
-        By.XPATH, "//button[normalize-space()='Generate']"
-    )
+    generate = logged_in_browser.find_element(By.XPATH, "//button[normalize-space()='Generate']")
     assert generate.get_attribute("disabled") is None
 
 

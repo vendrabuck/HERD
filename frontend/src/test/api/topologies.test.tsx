@@ -15,7 +15,6 @@ vi.mock("react-hot-toast", () => ({
 import { server } from "../mocks/server";
 import {
   useTopology,
-  useTopologies,
   usePaginatedTopologies,
   useCreateTopology,
   useUpdateTopology,
@@ -45,17 +44,6 @@ describe("topologies api hooks", () => {
   it("useTopology is disabled without an id", () => {
     const { result } = renderHook(() => useTopology(undefined), { wrapper });
     expect(result.current.fetchStatus).toBe("idle");
-  });
-
-  it("useTopologies returns items", async () => {
-    server.use(
-      http.get("/api/cabling/topologies", () =>
-        HttpResponse.json({ items: [TOPO], total: 1, skip: 0, limit: 500 }),
-      ),
-    );
-    const { result } = renderHook(() => useTopologies(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toEqual([TOPO]);
   });
 
   it("usePaginatedTopologies returns total", async () => {

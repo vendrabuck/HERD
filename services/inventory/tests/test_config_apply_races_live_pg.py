@@ -27,7 +27,6 @@ deleted in a finally (versions and jobs cascade with the device).
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -42,15 +41,12 @@ from app.routers.apply_jobs import cancel_apply_job
 from app.services.apply_scheduler import fire_job
 from fastapi import HTTPException
 from herd_common.enums import TopologyType
-from sqlalchemy import delete, select, text
+from herd_common.pg_live_suite import pg_live_target
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-DEFAULT_PG_PORT = os.getenv("POSTGRES_PORT", "5433")
-PG_DSN = os.getenv(
-    "HERD_TEST_PG_DSN",
-    f"postgresql+asyncpg://herd:herd@127.0.0.1:{DEFAULT_PG_PORT}/herd",
-)
-_PG_REQUIRED = os.getenv("HERD_TEST_PG_REQUIRED", "") not in ("", "0")
+_PG = pg_live_target()
+PG_DSN = _PG.dsn
 
 # The unit-suite conftest sets DB_SCHEMA="", so the mapped tables carry no schema;
 # the live database keeps them under "inventory".
@@ -68,36 +64,13 @@ def _make_engine():
     return create_async_engine(PG_DSN, connect_args=_CONNECT_ARGS)
 
 
-async def _pg_reachable() -> bool:
-    engine = _make_engine()
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-    finally:
-        await engine.dispose()
-
-
-_PG_REACHABLE = asyncio.run(_pg_reachable())
-
-pytestmark = pytest.mark.skipif(
-    not _PG_REQUIRED and not _PG_REACHABLE,
-    reason=(
-        f"No Postgres reachable at {PG_DSN!r}; set HERD_TEST_PG_DSN to point at one "
-        "(e.g. the gate stack's published postgres port, 5433) to run this suite."
-    ),
-)
+pytestmark = pytest.mark.skipif(_PG.skip_reason is not None, reason=_PG.skip_reason or "")
 
 
 @pytest.fixture(autouse=True)
-def _fail_when_required_but_unreachable():
-    if _PG_REQUIRED and not _PG_REACHABLE:
-        pytest.fail(
-            f"HERD_TEST_PG_REQUIRED is set but no Postgres is reachable at {PG_DSN!r}; "
-            "start one or unset HERD_TEST_PG_REQUIRED."
-        )
+def _fail_when_pg_live_cannot_run():
+    if _PG.failure is not None:
+        pytest.fail(_PG.failure)
 
 
 @pytest.fixture

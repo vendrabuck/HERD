@@ -30,6 +30,7 @@ from app.services.reservation_service import (
     _fetch_active_forks,
     _fetch_devices_best_effort,
     _heal_non_actionable_prune_marker,
+    _parse_prune_marker_entry,
     _provision_requested_event,
     _prune_marker_actionable,
     _prune_removed_devices_from_fork_best_effort,
@@ -988,12 +989,15 @@ async def _run_pending_prune_reconcile() -> None:
         device_ids: list[uuid.UUID] = []
         bad_entries: list = []
         for raw in pending:
-            try:
-                device_ids.append(uuid.UUID(str(raw)))
-            except (ValueError, TypeError):
+            parsed = _parse_prune_marker_entry(raw)
+            if parsed is None:
                 # Defensive: the marker is written from validated UUIDs, so a bad
                 # entry is corruption; clear it rather than wedging the reconciler.
                 bad_entries.append(raw)
+            else:
+                # A non-canonical spelling prunes its canonical id, and the clear
+                # matches it by that id (issue #1554), so it leaves the batch.
+                device_ids.append(parsed)
         if bad_entries:
             await _clear_pending_fork_prune(row.id, bad_entries)
         if not device_ids:
@@ -1049,8 +1053,17 @@ async def _run_purpose_classify_reconcile() -> None:
     bumps that row's own attempt count and the loop continues to the next
     candidate rather than ending the tick. Any other failure (an ordinary
     per-row rejection) also only affects its own row; the loop continues to
-    the next candidate. This function never raises: every per-row failure is
-    caught inside app.services.purpose_service.classify_purpose_one.
+    the next candidate. Every per-row failure is caught inside
+    app.services.purpose_service.classify_purpose_one, a 200 whose body is not a
+    usable suggestion included (issues #1543 and #1577: one nested past the JSON
+    decoder's recursion limit used to raise RecursionError out of it, which ended
+    the tick at purpose_classify_loop's catch with no attempt counted, so the same
+    oldest row was retried first on every tick and the rows behind it were never
+    reached). The catch sits there, not around the call below, because only the
+    classifier knows a failure is the row's own and should count an attempt; an
+    exception that still reaches this loop (a database error, say) is not per-row
+    evidence: it ends the tick at purpose_classify_loop's catch, counts no attempt,
+    and the rows after it wait for the next tick.
     """
     async with AsyncSessionLocal() as db:
         result = await db.execute(

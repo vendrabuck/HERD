@@ -160,9 +160,7 @@ function baseHandlers() {
         canvas_data: CANVAS,
       }),
     ),
-    http.get("/api/reservations/", () =>
-      HttpResponse.json({ items: [RESERVATION], total: 1, skip: 0, limit: 500 }),
-    ),
+    http.get(`/api/reservations/${RES_ID}`, () => HttpResponse.json(RESERVATION)),
     http.get("/api/ai/status", () => HttpResponse.json({ enabled: false })),
     // Every device pair is reachable, so the client checks pass every line.
     http.post("/api/cabling/pathfind/batch", async ({ request }) => {

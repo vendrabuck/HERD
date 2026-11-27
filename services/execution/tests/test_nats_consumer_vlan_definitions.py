@@ -29,7 +29,7 @@ from app.services.nats_consumer import (
     handle_wiring_changed,
 )
 from herd_common.logging import JSONFormatter
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
@@ -1361,3 +1361,275 @@ async def test_scope_grows_with_no_membership_delta_defines_new_transit_switch()
         device_id for a, device_id, _p, _v in calls_result if a == "create_vlan"
     }
     assert SW_MID in create_vlan_switches, "the newly-scoped transit switch must be defined"
+
+
+# --- defined_switch_ids writes are status-guarded and atomic (issue #1413) ---
+
+DEFINE_LOST_ACTION = "vlan_define_lost_to_release"
+
+
+async def _release_now(allocation_id):
+    """Another writer releases the allocation and commits (the release winner)."""
+    async with TestSessionLocal() as s:
+        await _competing_release(s, allocation_id)
+        await s.commit()
+
+
+def _release_before_recording(on_switch: str):
+    """A stand-in for vlan_service.record_allocation_defined that releases the
+    allocation, committed, just before the real guarded append for `on_switch`: the
+    release lands after the define pass read the row ACTIVE and after its create_vlan."""
+    from app.services import vlan_service
+
+    real = vlan_service.record_allocation_defined
+
+    async def _record(db, allocation_id, switch_id):
+        if switch_id == on_switch:
+            await _release_now(allocation_id)
+        return await real(db, allocation_id, switch_id)
+
+    return patch("app.services.vlan_service.record_allocation_defined", new=_record)
+
+
+async def _define(va_ids, *extra_patches, execute_fn=None, calls=None, fetch=None):
+    from app.services.nats_consumer import _define_pending_for_allocations
+
+    if execute_fn is None:
+        execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        if fetch is not None:
+            stack.enter_context(patch("app.services.vlan_service.fetch_fabric_id", new=fetch))
+        for p in extra_patches:
+            stack.enter_context(p)
+        failures = await _define_pending_for_allocations(
+            set(va_ids), _FetchContext(None), _db_session_factory()
+        )
+    return failures, calls
+
+
+async def test_a_define_that_lost_to_a_release_is_undone_and_stops_the_allocation(caplog):
+    """The allocation is released after the define pass read it ACTIVE, while SW_MID's
+    create_vlan ran: SW_MID is not added to the RELEASED row, its create is undone by a
+    delete_vlan, SW_L2_B (not yet defined) gets no create, and both are returned as
+    failures under the lost-join reason with 0 attempts."""
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2, SW_MID, SW_L2_B], [])
+
+    with caplog.at_level(logging.WARNING, logger="app.services.nats_consumer"):
+        failures, calls = await _define([alloc], _release_before_recording(SW_MID))
+
+    assert [(c[0], c[1]) for c in calls] == [
+        ("login", SW_L2),
+        ("create_vlan", SW_L2),
+        ("logout", SW_L2),
+        ("login", SW_MID),
+        ("create_vlan", SW_MID),
+        ("logout", SW_MID),
+        ("login", SW_MID),
+        ("delete_vlan", SW_MID),
+        ("logout", SW_MID),
+    ]
+    assert failures == {
+        SW_MID: (0, JOIN_LOST_ALLOCATION_RELEASED),
+        SW_L2_B: (0, JOIN_LOST_ALLOCATION_RELEASED),
+    }
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [SW_L2]), (
+        "only the create recorded before the release is listed"
+    )
+    (record,) = [r for r in caplog.records if getattr(r, "action", None) == DEFINE_LOST_ACTION]
+    assert record.vlan_assignment_id == str(alloc)
+    assert record.switch_ids == [SW_MID, SW_L2_B]
+
+
+async def test_a_define_undo_is_skipped_when_the_number_was_reallocated_in_reach():
+    """The undo is judged as a release's own delete is (WIRE-VLAN-11): another ACTIVE
+    allocation holding the number in the switch's current component keeps it."""
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_MID], [])
+    rival = await _seed_allocation(OTHER_RES, uuid.uuid4(), 100, [SW_MID], [SW_MID])
+
+    failures, calls = await _define(
+        [alloc],
+        _release_before_recording(SW_MID),
+        fetch=_fabric_map({SW_MID: FABRIC}),
+    )
+
+    assert [c[0] for c in calls if c[0] in ("create_vlan", "delete_vlan")] == ["create_vlan"]
+    assert set(failures) == {SW_MID}
+    rows = await _allocations_by_id([alloc, rival])
+    assert (rows[rival].status, rows[rival].defined_switch_ids) == ("ACTIVE", [SW_MID])
+
+
+async def test_a_define_undo_that_cannot_be_judged_is_skipped_and_logged(caplog):
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_MID], [])
+    await _seed_allocation(OTHER_RES, uuid.uuid4(), 100, [SW_L2_C], [SW_L2_C])
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        failures, calls = await _define(
+            [alloc],
+            _release_before_recording(SW_MID),
+            fetch=AsyncMock(side_effect=TransientUpstreamError("cabling fabric lookup: 503")),
+        )
+
+    assert [c[0] for c in calls if c[0] in ("create_vlan", "delete_vlan")] == ["create_vlan"]
+    assert set(failures) == {SW_MID}
+    (record,) = [
+        r for r in caplog.records if getattr(r, "action", None) == "vlan_define_undo_unjudged"
+    ]
+    assert record.error_class == "TransientUpstreamError"
+    assert "503" not in record.getMessage(), "class name only"
+
+
+async def test_a_failed_define_undo_is_logged_and_the_failures_stand(caplog):
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_MID], [])
+    execute_fn, calls = _recorder(fail={"delete_vlan"})
+
+    with caplog.at_level(logging.ERROR, logger="app.services.nats_consumer"):
+        failures, _ = await _define(
+            [alloc], _release_before_recording(SW_MID), execute_fn=execute_fn, calls=calls
+        )
+
+    assert ("delete_vlan", SW_MID) in [(c[0], c[1]) for c in calls]
+    assert failures == {SW_MID: (0, JOIN_LOST_ALLOCATION_RELEASED)}
+    assert any("lingers" in r.getMessage() for r in caplog.records)
+
+
+async def test_joins_of_a_switch_whose_define_lost_are_parked_not_driven():
+    """Through the shared apply: the add on the switch whose create lost to the release
+    is parked with the lost-join reason (no create_vlan prefix) and no add_to_vlan; the
+    add on the switch recorded before the release is driven and then loses at its own
+    guarded write. No ACTIVE membership ends on the released allocation."""
+    from app.services.l2_membership_service import JOIN_LOST_ALLOCATION_RELEASED
+    from app.services.nats_consumer import _apply_l2_memberships
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2, SW_MID], [])
+    adds = [
+        {"switch_device_id": SW_L2, "port": "0/0/1", "vlan_assignment_id": alloc, "vlan_id": 100},
+        {"switch_device_id": SW_MID, "port": "0/0/1", "vlan_assignment_id": alloc, "vlan_id": 100},
+    ]
+    execute_fn, calls = _recorder()
+    with ExitStack() as stack:
+        for p in _patches(execute_fn, []):
+            stack.enter_context(p)
+        stack.enter_context(_release_before_recording(SW_MID))
+        await _apply_l2_memberships(RES_ID, [], adds, _FetchContext(None), _db_session_factory())
+
+    adds_driven = [(c[1], c[2]) for c in calls if c[0] == "add_to_vlan"]
+    assert adds_driven == [(SW_L2, "0/0/1")]
+    # Issue #1413: the add driven on the already-defined switch is undone in the pass.
+    assert [(c[0], c[1], c[2], c[3]) for c in calls if c[0] == "remove_from_vlan"] == [
+        ("remove_from_vlan", SW_L2, "0/0/1", 100)
+    ]
+    rows = {(str(r.switch_device_id), r.port): r for r in await _membership_rows()}
+    assert set(rows) == {(SW_L2, "0/0/1"), (SW_MID, "0/0/1")}
+    for row in rows.values():
+        assert (row.status, row.intended, row.vlan_assignment_id) == ("FAILED", "ACTIVE", alloc)
+        assert row.last_error == JOIN_LOST_ALLOCATION_RELEASED
+    assert rows[(SW_MID, "0/0/1")].attempts == 0
+    assert rows[(SW_L2, "0/0/1")].attempts == 1
+
+
+async def test_record_allocation_defined_appends_once_in_order_while_active():
+    from app.services.vlan_service import record_allocation_defined
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2, SW_L2_B], [SW_L2_B])
+    async with TestSessionLocal() as s:
+        assert await record_allocation_defined(s, alloc, SW_L2) is True
+    async with TestSessionLocal() as s:
+        assert await record_allocation_defined(s, alloc, SW_L2) is True
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert row.defined_switch_ids == [SW_L2, SW_L2_B]
+
+
+@pytest.mark.parametrize("state", ["RELEASED", "absent"])
+async def test_record_allocation_defined_refuses_an_allocation_that_is_not_active(state):
+    from app.services.vlan_service import record_allocation_defined
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2_B])
+    target = alloc
+    if state == "RELEASED":
+        await _release_now(alloc)
+    else:
+        target = uuid.uuid4()
+    async with TestSessionLocal() as s:
+        assert await record_allocation_defined(s, target, SW_L2) is False
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert row.defined_switch_ids == [SW_L2_B]
+
+
+async def test_record_allocation_defined_appends_to_the_row_as_it_stands_not_a_stale_copy():
+    """A session that already holds a copy of the row from before another define's
+    append still keeps that switch: the locked read refreshes the copy."""
+    from app.services.vlan_service import record_allocation_defined
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2, SW_L2_B], [])
+    async with TestSessionLocal() as stale:
+        # Held, so the session's weak-referencing identity map keeps the copy.
+        copy = await stale.get(VlanAssignment, alloc)
+        async with TestSessionLocal() as other:
+            assert await record_allocation_defined(other, alloc, SW_L2_B) is True
+        assert copy.defined_switch_ids == [], "the session still holds the copy from before"
+        assert await record_allocation_defined(stale, alloc, SW_L2) is True
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert row.defined_switch_ids == [SW_L2, SW_L2_B]
+
+
+async def test_trim_removes_only_the_deleted_switches_from_the_row_as_it_stands():
+    from app.services.vlan_service import trim_allocation_definitions
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2, SW_MID])
+    async with TestSessionLocal() as stale:
+        # Held, so the session's weak-referencing identity map keeps the copy.
+        copy = await stale.get(VlanAssignment, alloc)
+        async with TestSessionLocal() as other:
+            await other.execute(
+                update(VlanAssignment)
+                .where(VlanAssignment.id == alloc)
+                .values(defined_switch_ids=[SW_L2, SW_MID, SW_L2_B])
+            )
+            await other.commit()
+        assert copy.defined_switch_ids == [SW_L2, SW_MID], "the copy from before"
+        await trim_allocation_definitions(stale, alloc, [SW_L2])
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert row.defined_switch_ids == [SW_MID, SW_L2_B]
+
+
+async def test_trim_of_an_absent_allocation_is_a_no_op():
+    from app.services.vlan_service import trim_allocation_definitions
+
+    async with TestSessionLocal() as s:
+        await trim_allocation_definitions(s, uuid.uuid4(), [SW_L2])
+
+
+async def test_release_trim_keeps_a_switch_listed_after_the_winners_re_read():
+    """A switch listed on the released row after the winner re-read it (a writer that
+    is not the guarded define, for example a replica still on the code before #1413
+    during a rolling deploy) survives the winner's trim: only what it deleted leaves."""
+    from app.services import vlan_service
+
+    alloc = await _seed_allocation(RES_ID, FABRIC, 100, [SW_L2], [SW_L2])
+    real = vlan_service.find_superseding_allocation
+
+    async def _then_list(db, row, switch_ids, resolver):
+        found = await real(db, row, switch_ids, resolver)
+        async with TestSessionLocal() as s:
+            await s.execute(
+                update(VlanAssignment)
+                .where(VlanAssignment.id == alloc)
+                .values(defined_switch_ids=[SW_L2, SW_L2_B])
+            )
+            await s.commit()
+        return found
+
+    calls = await _release_with(
+        [alloc], patch("app.services.vlan_service.find_superseding_allocation", new=_then_list)
+    )
+
+    assert [(c[0], c[1]) for c in calls if c[0] == "delete_vlan"] == [("delete_vlan", SW_L2)]
+    row = (await _allocations_by_id([alloc]))[alloc]
+    assert (row.status, row.defined_switch_ids) == ("RELEASED", [SW_L2_B])

@@ -32,6 +32,12 @@ release_allocation_if_orphaned (issue #1357). Nothing else sets its status. The
 reservation-wide check (issue #1497, ADR 0018 D11) selects its candidates with
 reservation_orphaned_allocations and releases them through that same compare-and-swap,
 with the guard held_by_a_pending_join added to its WHERE.
+
+The other side of that release (issue #1413) is here too: hold_active_allocation is
+the share lock a join takes before it writes an ACTIVE membership, and
+record_allocation_defined and trim_allocation_definitions are the only writes of
+defined_switch_ids after the INSERT (which stores it empty), each under the
+allocation's row lock.
 """
 
 import logging
@@ -296,13 +302,19 @@ async def release_allocation_if_orphaned(
 
     The membership predicate is part of the guarded UPDATE, not only of the caller's
     earlier count, so a join that COMMITS after that count and before this statement
-    takes its snapshot keeps the allocation ACTIVE. A join still uncommitted when the
-    statement runs is not seen: the release wins and the join then commits an ACTIVE
-    membership on a RELEASED allocation, because the join side
-    (record_l2_membership_active) does not check that the allocation is still ACTIVE.
-    On Postgres two concurrent releases of one row serialize on its row lock and the
-    second re-checks status = 'ACTIVE' against the committed RELEASED row, so exactly
-    one wins.
+    takes its snapshot keeps the allocation ACTIVE.
+
+    Issue #1413: before the UPDATE the row is locked FOR UPDATE in its own statement.
+    A join holds the row FOR SHARE from its status check to its commit
+    (hold_active_allocation), so the lock waits for a join in flight, and the UPDATE,
+    a later statement, takes a snapshot that sees that join's membership and matches
+    nothing. Without the separate lock the UPDATE would judge the membership predicate
+    on a snapshot taken before the join committed, and a lock wait inside the UPDATE
+    re-checks only the allocation row, never l2_port_assignments. A join that reaches
+    its share lock after this release took the row waits for the release to commit
+    and then finds the row RELEASED. Two concurrent releases of one row serialize on
+    the same lock, and the second UPDATE sees the committed RELEASED row, so exactly
+    one wins. On SQLite (the unit-test database) the lock clause renders nothing.
 
     `reservation_wide` (issue #1497, ADR 0018 D11) is passed only by the
     reservation-wide check. It adds `not held_by_a_pending_join` to the same WHERE, read
@@ -317,6 +329,9 @@ async def release_allocation_if_orphaned(
     left pending is discarded and every object loaded in the session is expired. Call
     it on a session with nothing pending, and re-read any row needed afterwards.
     """
+    await db.execute(
+        select(VlanAssignment.id).where(VlanAssignment.id == allocation_id).with_for_update()
+    )
     live_member = (
         select(L2PortAssignment.id)
         .where(
@@ -339,6 +354,88 @@ async def release_allocation_if_orphaned(
         return False
     await db.commit()
     return True
+
+
+async def hold_active_allocation(db: AsyncSession, allocation_id: uuid.UUID) -> bool:
+    """Lock the allocation row FOR SHARE while it is ACTIVE; True when it is (issue #1413).
+
+    The join side of the release compare-and-swap: record_l2_membership_active calls it
+    before it writes an ACTIVE membership, in the same transaction, and the lock is held
+    until that transaction ends. False when the row is RELEASED or absent; nothing is
+    locked then. On Postgres a release that already took the row FOR UPDATE makes this
+    statement wait and then re-check the status against the released row, so it returns
+    False; a release that arrives later waits for this transaction's commit
+    (release_allocation_if_orphaned). A share lock, not an exclusive one, so joins of
+    one allocation do not wait for each other. On SQLite the lock clause renders nothing.
+    """
+    found = await db.execute(
+        select(VlanAssignment.id)
+        .where(VlanAssignment.id == allocation_id, VlanAssignment.status == "ACTIVE")
+        .with_for_update(read=True)
+    )
+    return found.first() is not None
+
+
+async def record_allocation_defined(
+    db: AsyncSession, allocation_id: uuid.UUID, switch_id: str
+) -> bool:
+    """Add switch_id to an ACTIVE allocation's defined_switch_ids after a gated
+    create_vlan success; True when recorded (issue #1413).
+
+    The row is read FOR UPDATE with its status ACTIVE, so on Postgres the read and the
+    write are one critical section: two defines of one allocation cannot drop each
+    other's switch, and a define cannot add a switch to a RELEASED allocation (the
+    release takes the same lock). On SQLite (the unit-test database) the lock clause
+    renders nothing. False when the row is RELEASED or absent: nothing is written and
+    the session is rolled back. The caller then owns the definition create_vlan left on
+    the switch. The list stays sorted and free of duplicates, as before. Commits on
+    success.
+    """
+    row = (
+        await db.execute(
+            select(VlanAssignment)
+            .where(VlanAssignment.id == allocation_id, VlanAssignment.status == "ACTIVE")
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        await db.rollback()
+        return False
+    defined = {str(d) for d in (row.defined_switch_ids or [])}
+    if switch_id not in defined:
+        defined.add(switch_id)
+        row.defined_switch_ids = sorted(defined)
+    await db.commit()
+    return True
+
+
+async def trim_allocation_definitions(
+    db: AsyncSession, allocation_id: uuid.UUID, deleted: list[str]
+) -> None:
+    """Remove the switches whose delete_vlan succeeded from defined_switch_ids (issue
+    #1413).
+
+    Read FOR UPDATE and rewritten in one critical section, removing only the switches
+    named in `deleted` from the list as it stands now, so a switch listed after the
+    release winner's re-read is kept rather than overwritten away. Only the release
+    winner calls it, on a row that is RELEASED and stays RELEASED, so it takes no status
+    condition. An absent row is a no-op. Commits.
+    """
+    row = (
+        await db.execute(
+            select(VlanAssignment)
+            .where(VlanAssignment.id == allocation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        await db.rollback()
+        return
+    gone = set(deleted)
+    row.defined_switch_ids = [s for s in (row.defined_switch_ids or []) if str(s) not in gone]
+    await db.commit()
 
 
 async def _reachable_active(

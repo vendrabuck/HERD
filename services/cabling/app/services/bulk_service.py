@@ -49,6 +49,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
 from herd_common.validation_errors import holds_lone_surrogate
@@ -72,6 +73,69 @@ IMPORT_NOT_TEXT_DETAIL = (
 # An import file that is not UTF-8 (Latin-1, Windows-1252): a client input error, the
 # same answer inventory's importers give (issue #1022).
 IMPORT_NOT_UTF8_DETAIL = "Import file must be UTF-8 encoded; re-save it as UTF-8 and retry"
+
+# A JSON import file that `json.loads` refuses for its shape rather than its syntax
+# (issue #1511): nested deeper than the C parser's recursion budget (RecursionError),
+# or holding an integer literal longer than Python's integer string conversion limit,
+# 4,300 digits (a ValueError that is not a JSONDecodeError). The answer is fixed and
+# names no part of the file or the exception; inventory's importers give the same one.
+IMPORT_JSON_UNREADABLE_DETAIL = (
+    "Invalid JSON: the document is nested too deeply or holds a number too long to read"
+)
+
+# A JSON import item the importer cannot read (issue #1573): an item that is not an
+# object, a `name` that is not a string, or a canvas whose parts the device-name pass
+# reads are the wrong type (TOPO-BULK-21 lists which of these answered 500 before and
+# which were read as absent). Such an item is a rejected row with a fixed reason,
+# `<field>: <message>` naming the path and never a value, and the other rows are
+# judged on their own. A CSV import builds every record itself, so it never meets one.
+ROW_NOT_AN_OBJECT_REASON = "row is not an object"
+NAME_NOT_A_STRING_REASON = "name: must be a string"
+
+
+def _record_shape_reason(rec: Any) -> str | None:
+    """The fixed reject reason for a record the importer cannot read, else None.
+
+    Checked before anything reads the record. The item must be an object; its `name`
+    a string; its `canvas` an object; `canvas.nodes` a list; each node an object, with
+    an object `data`, an object `data.device`, and a string `data.device.name`. A
+    null or absent `name`, `canvas`, `canvas.nodes`, `data`, `data.device`, or device
+    `name` passes; a null item or node does not. Nothing else in the canvas is read
+    outside the row's own error handling, so nothing else is checked here.
+    """
+    if not isinstance(rec, dict):
+        return ROW_NOT_AN_OBJECT_REASON
+    name = rec.get("name")
+    if name is not None and not isinstance(name, str):
+        return NAME_NOT_A_STRING_REASON
+    canvas = rec.get("canvas")
+    if canvas is None:
+        return None
+    if not isinstance(canvas, dict):
+        return "canvas: must be an object"
+    nodes = canvas.get("nodes")
+    if nodes is None:
+        return None
+    if not isinstance(nodes, list):
+        return "canvas.nodes: must be a list"
+    for index, node in enumerate(nodes):
+        path = f"canvas.nodes.{index}"
+        if not isinstance(node, dict):
+            return f"{path}: must be an object"
+        data = node.get("data")
+        if data is None:
+            continue
+        if not isinstance(data, dict):
+            return f"{path}.data: must be an object"
+        device = data.get("device")
+        if device is None:
+            continue
+        if not isinstance(device, dict):
+            return f"{path}.data.device: must be an object"
+        device_name = device.get("name")
+        if device_name is not None and not isinstance(device_name, str):
+            return f"{path}.data.device.name: must be a string"
+    return None
 
 
 def _decode_import(raw: bytes) -> str:
@@ -234,10 +298,14 @@ def records_to_csv(topologies: list[Topology]) -> str:
 
 
 def parse_json_topologies(raw: bytes) -> list[dict[str, Any]]:
+    text = _decode_import(raw)
     try:
-        doc = json.loads(_decode_import(raw))
+        doc = json.loads(text)
     except json.JSONDecodeError as exc:
+        # The decoder's message names a position, never the file's content.
         raise HTTPException(status_code=422, detail=f"Invalid JSON: {exc}") from exc
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=422, detail=IMPORT_JSON_UNREADABLE_DETAIL) from None
     if holds_lone_surrogate(doc):
         raise HTTPException(status_code=422, detail=IMPORT_NOT_TEXT_DETAIL)
     if isinstance(doc, dict) and "items" in doc:
@@ -261,9 +329,11 @@ def parse_csv_topologies(raw: bytes) -> list[dict[str, Any]]:
     edge. Node ids are synthesized deterministically from the device name so an
     edge can reference its endpoints.
     """
-    reader = csv.DictReader(io.StringIO(_decode_import(raw)))
+    # read_csv_rows (issue #1574) reads every line ending, lifts the field limit for
+    # the read, and answers 422 for anything the csv module still refuses, before any
+    # row is grouped, so a file it cannot read imports nothing.
     by_topology: dict[str, dict[str, Any]] = {}
-    for row in reader:
+    for row in read_csv_rows(_decode_import(raw)):
         # Every cell here may carry a csv_safe_cell neutralization quote
         # added by records_to_csv (issue #910); csv_unsafe_cell strips it
         # back off before the value is stripped/used, so an exported name
@@ -416,7 +486,10 @@ async def import_topologies(
     # below, so a hidden device produces the same outcome as a nonexistent one.
     all_names: set[str] = set()
     for rec in records:
-        all_names |= _collect_device_names(rec.get("canvas"))
+        # A record the row loop will reject for its shape (issue #1573) is skipped
+        # here: this pass reads every record before any row runs.
+        if _record_shape_reason(rec) is None:
+            all_names |= _collect_device_names(rec.get("canvas"))
     try:
         name_to_id = await resolve_device_names(sorted(all_names)) if all_names else {}
     except Exception as exc:
@@ -456,6 +529,18 @@ async def _import_topology_rows(
     report = _empty_report(False)
 
     for index, rec in enumerate(records):
+        shape_reason = _record_shape_reason(rec)
+        if shape_reason is not None:
+            name = rec.get("name") if isinstance(rec, dict) else None
+            report.rows.append(
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=(name.strip() or None) if isinstance(name, str) else None,
+                    reason=shape_reason,
+                )
+            )
+            continue
         name = (rec.get("name") or "").strip()
         try:
             if not name:

@@ -496,12 +496,32 @@ the stream nor causes a duplicate.
   fetches again. \
   Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_consumer_loop_fetches_one_message_at_a_time_on_both_subscriptions`, `test_consumer_loop_continues_after_idle_timeout`, `test_consumer_loop_survives_fetch_exception_and_retries`)
-- **INTEG-CONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no webhook delivery until it is restarted (the first
-  connect is bounded, `operations-and-observability.md` OPS-NATS-1); a failure to ensure
-  a stream is logged and both consumers still start. \
-  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
-  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`)
+- **INTEG-CONSUME-3.** A failed start is logged and the service serves its API; nothing
+  retries the connect or the setup in that process. The durables read every message they
+  have not acked that the stream still holds, and the streams keep a message up to their
+  max age, so an event waits and is processed after a restart that comes while it is
+  still within the stream's max age (issue #1418). Each warning carries the exception
+  class name only (the setup and stream-check lines add a JetStream API error's integer
+  `err_code`, as `NotFoundError, err_code=10059`), never its text, a server description,
+  or the NATS URL. A cancellation raised by the connect or a setup step is not logged and
+  propagates. A failed connect (bounded, `operations-and-observability.md` OPS-NATS-1) starts
+  neither consumer and logs `NATS connect failed (<class>); not running:
+  integration-webhooks-consumer, integration-webhooks-health-consumer. Nothing retries
+  the connect, so these consumers start only when the service is restarted with the
+  broker reachable; events published to their streams meanwhile wait there, kept up to
+  each stream's max age, and are processed after that restart`. A connect that succeeds
+  keeps the connection; the reservations durable is set up first, then the health one,
+  and a setup that raises stops the start there and logs `NATS consumer setup failed for
+  durable <durable> on stream <stream> (<class>[, err_code=<n>]); not running: <durables>; still running:
+  <durables or none>. The connection is kept, but nothing retries the setup, so a
+  consumer that is not running starts only when the service is restarted; events
+  published to its stream meanwhile wait there, kept up to the stream's max age, and are
+  processed after that restart`, so a failed health setup leaves the reservations
+  consumer running. A failure to ensure a stream logs `JetStream stream <stream> could
+  not be checked or created (<class>[, err_code=<n>]); the consumer setup on it goes ahead, and fails if
+  the stream is missing`, and the setup goes on. \
+  Enforced in: `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`, `log_consumer_connect_failure`, `log_consumer_setup_failure`, `log_consumer_stream_check_failure`) \
+  Pinned by: `services/integration/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_connection_failure_is_swallowed`, `test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`, `test_a_cancelled_start_propagates_the_cancellation`); `services/common/tests/test_consumer_startup_logs.py` (`test_connect_failure_wording`, `test_setup_failure_wording_names_the_durable_and_both_lists`, `test_stream_check_failure_wording`, `test_setup_and_stream_check_lines_add_only_an_integer_err_code`)
 - **INTEG-CONSUME-4.** On a migration-managed schema missing a model table, the consumers
   start only once the tables exist, so events wait on the stream. \
   Enforced in: `services/integration/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -605,12 +625,21 @@ event is delivered twice.
   an unexpected error in a loop is logged without stopping it. \
   Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`, `NATS_FETCH_TIMEOUT_SECONDS`) \
   Pinned by: `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_loop_fetches_one_message_at_a_time`, `test_start_nats_consumer_loop_swallows_unexpected_errors`)
-- **INTEG-NCONSUME-3.** When NATS cannot be reached at startup the failure is logged and
-  the service serves its API with no event-driven notifications until it is restarted
-  (the first connect is bounded, `operations-and-observability.md` OPS-NATS-1); a stream
-  failure is tolerated. \
-  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
-  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`)
+- **INTEG-NCONSUME-3.** A failed start is logged in the INTEG-CONSUME-3 wording (the
+  same `herd_common.jetstream` helpers) and the service serves its API; nothing retries
+  the connect or the setup in that process, and the events wait on their streams and are
+  processed after a restart that comes while they are still within the stream's max age
+  (issue #1418). A failed connect lists
+  `notifications-consumer, notifications-health-consumer` as not running. A connect that
+  succeeds keeps the connection; the reservations durable is set up first, then the
+  health one, and a setup that raises stops the start there and names that durable, its
+  stream, the durables not running, and the ones still running, so a failed health setup
+  leaves the reservations consumer running. A failure to ensure a stream is logged and
+  the setup goes on. Each warning carries the exception class name only (plus the
+  integer `err_code` of a JetStream API error on the setup and stream-check lines), and
+  a cancellation propagates unlogged. \
+  Enforced in: `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`); `services/common/herd_common/jetstream.py` (`connect_nats`, `log_consumer_connect_failure`, `log_consumer_setup_failure`, `log_consumer_stream_check_failure`) \
+  Pinned by: `services/notifications/tests/test_nats_connect_real_client.py` (`test_start_nats_consumer_returns_when_broker_is_down`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_swallows_connect_failure`, `test_start_nats_consumer_tolerates_add_stream_failure`, `test_reservations_setup_failure_is_not_called_a_connect_failure`, `test_health_setup_failure_leaves_the_reservations_consumer_running`, `test_a_cancelled_start_propagates_the_cancellation`)
 - **INTEG-NCONSUME-4.** On a migration-managed schema missing a model table, the
   consumers start only once the tables exist. \
   Enforced in: `services/notifications/app/main.py` (`lifespan`); `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`) \
@@ -666,7 +695,8 @@ matters, is cancelled, completes, fails, or is about to end.
   `expiring_soon` each produce one message for the payload's `user_id`, titled
   `Reservation confirmed`, `Reservation cancelled`, `Reservation completed`, and
   `Reservation expiring soon`, with a body naming the device count (`no devices`,
-  `1 device`, `N devices`) and, where the event has one, the end time. \
+  `1 device`, `N devices`) and, where the event has one, the end time in the form
+  INTEG-ROUTE-7 states. \
   Enforced in: `services/notifications/app/services/event_router.py` (`build_messages`, `_RENDERERS`, `_device_summary`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_created_event_produces_single_message`, `test_expiring_soon_event_produces_single_message`, `test_cancelled_and_completed_events_emit`, `test_created_event_zero_devices`); `tests/integration/test_notifications_flow.py` (`test_reservation_created_produces_in_app_notification`); `tests/integration/test_notification_channels_flow.py` (`test_expiring_soon_reminder_produces_single_notification`)
 - **INTEG-ROUTE-2.** Every other event name produces nothing and the message is acked:
@@ -696,6 +726,17 @@ matters, is cancelled, completes, fails, or is about to end.
   for a user whose stored preferences predate the key (INTEG-PREFS-1). \
   Enforced in: `services/notifications/app/services/event_router.py` (`_render_failed`, `_reservation_label`, `_RENDERERS`); `services/notifications/app/schemas/preferences.py` (`DEFAULT_EVENT_TYPES`, `with_defaults`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_failed_event_notifies_the_owner`, `test_failed_event_text_carries_no_upstream_error_text`, `test_failed_event_without_reservation_id_still_notifies`, `test_failed_event_without_user_id_is_skipped`); `services/notifications/tests/test_preferences.py` (`test_stored_preferences_predating_the_key_receive_it_on`, `test_explicit_opt_out_of_failed_is_kept`); `services/notifications/tests/test_preferences_client.py` (`test_preferences_predating_reservation_failed_read_it_as_on`); `services/notifications/tests/test_nats_consumer.py` (`test_handle_event_delivers_failed_under_preferences_predating_the_key`, `test_handle_event_failed_respects_opt_out`); `services/notifications/tests/test_router.py` (`test_put_preferences_predating_failed_writes_it_on`, `test_get_preferences_predating_failed_reads_it_on`); `tests/integration/test_reservation_failed_notification.py` (`test_failed_reservation_notifies_owner_in_app`)
+- **INTEG-ROUTE-7.** The end time in the `reservation.created`, `reservation.updated`,
+  and `reservation.expiring_soon` bodies is the UTC instant the payload's ISO 8601
+  `end_time` names, written `YYYY-MM-DD HH:MM UTC` with seconds and fractions dropped,
+  whatever offset the value carries (#1564); for a year before 1000 the year is written
+  by `strftime("%Y")`, which on Python 3.12 has no leading zeros. A value with no offset
+  is taken as UTC, never as the host's zone. A missing, empty, or non-string `end_time`
+  reads `unknown end`; a non-empty string that does not parse, or whose instant falls
+  outside the years 1 to 9999 in UTC, is written unchanged. None of these raises, so the message is still delivered and
+  acked. \
+  Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`) \
+  Pinned by: `services/notifications/tests/test_event_router.py` (`test_format_end_time_renders_the_utc_instant`, `test_format_end_time_ignores_the_host_zone`, `test_format_end_time_returns_an_unusable_string_unchanged`, `test_format_end_time_missing_or_non_string_is_unknown_end`, `test_every_end_time_message_states_the_utc_instant`, `test_unusable_end_time_still_notifies`); `services/notifications/tests/test_functional_dispatch_path.py` (`test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack`)
 
 **Out of scope.** When reservations stages each event (`reservations.md`, section 6).
 

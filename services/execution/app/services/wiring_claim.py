@@ -456,9 +456,11 @@ class WiringRowClaims:
         (the reconcile, issue #1481) can change it.
 
         `budget`, when given, replaces this pass's `self.budget` for this one claim:
-        the stamp written is now plus `budget`. Only the L3 apply passes it, sized
-        by `l3_pin_claim_budget` from the pin's drive sequence (issue #1482); the L1
-        and L2 applies claim with `self.budget`. A row this pass already holds is
+        the stamp written is now plus `budget`. The L3 apply passes it, sized by
+        `l3_pin_claim_budget` from the pin's drive sequence (issue #1482), and so does
+        the L2 apply for an add_to_vlan, `claim_budget(ROW_DRIVER_ACTIONS + 1)`, for the
+        undo a lost join may drive (issue #1413); the L1 apply and an L2 remove claim
+        with `self.budget`. A row this pass already holds is
         answered without a write, so a later, larger `budget` for it is not
         applied: its stamp stays the one the first claim wrote.
         """

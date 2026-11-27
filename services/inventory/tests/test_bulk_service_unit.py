@@ -15,11 +15,14 @@ from app.database import Base
 from app.models.driver_package import DriverPackage
 from app.models.template import DeviceTemplate
 from app.services.bulk_service import (
+    NAME_NOT_A_STRING_REASON,
+    ROW_NOT_AN_OBJECT_REASON,
     _coerce_bool,
     _coerce_int,
     _coerce_json_cell,
     _parse_csv,
     _parse_json,
+    _row_shape_reason,
     import_devices,
     import_templates,
     parse_import,
@@ -99,6 +102,59 @@ def test_parse_import_strips_utf8_bom_for_csv():
 def test_parse_csv_keeps_only_known_columns():
     rows = _parse_csv("name,extra\nA,drop", ["name"])
     assert rows == [{"name": "A"}]
+
+
+# --- issue #1574: what the csv module could not read ------------------------
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+def test_parse_csv_reads_every_line_ending(ending):
+    rows = _parse_csv(ending.join(["name,model", "A,m1", "B,m2"]), ["name", "model"])
+    assert rows == [{"name": "A", "model": "m1"}, {"name": "B", "model": "m2"}]
+
+
+def test_parse_csv_reads_a_cell_past_the_default_field_limit():
+    rows = _parse_csv("name\n" + "a" * 131_073 + "\n", ["name"])
+    assert rows == [{"name": "a" * 131_073}]
+
+
+def test_parse_import_answers_the_fixed_422_for_a_csv_error(monkeypatch):
+    from herd_common import csv_import
+
+    monkeypatch.setattr(csv_import, "_field_limit_for", lambda text: 4)
+    with pytest.raises(HTTPException) as exc:
+        parse_import(b"name\nA\nlonger\n", "csv", ["name"])
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Invalid CSV: line 3 could not be read; fix it and retry"
+
+
+# --- issue #1573: an item the row loop cannot read --------------------------
+
+
+@pytest.mark.parametrize(
+    ("item", "reason"),
+    [
+        ([], "row is not an object"),
+        (["a"], "row is not an object"),
+        ("a", "row is not an object"),
+        (1, "row is not an object"),
+        (1.5, "row is not an object"),
+        (True, "row is not an object"),
+        (None, "row is not an object"),
+        ({"name": 1}, "name: must be a string"),
+        ({"name": False}, "name: must be a string"),
+        ({"name": []}, "name: must be a string"),
+        ({"name": {"a": "b"}}, "name: must be a string"),
+        ({}, None),
+        ({"name": None}, None),
+        ({"name": ""}, None),
+        ({"name": "A", "template_name": 1}, None),
+    ],
+)
+def test_row_shape_reason(item, reason):
+    assert _row_shape_reason(item) == reason
+    if reason is not None:
+        assert reason in (ROW_NOT_AN_OBJECT_REASON, NAME_NOT_A_STRING_REASON)
 
 
 # --- issue #910: CSV formula-injection neutralization -----------------------

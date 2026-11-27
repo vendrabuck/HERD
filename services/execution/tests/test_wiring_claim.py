@@ -1767,17 +1767,26 @@ async def test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_
     assert holder.held[row_id] == observed["loaded_at"] + expected_budget
 
 
-@pytest.mark.parametrize("layer", ["l1", "l2"])
-async def test_l1_and_l2_rows_still_claim_with_the_one_row_budget(layer):
-    """The L1 and L2 applies pass no per-call budget: the stamp is the claim instant
-    plus the unchanged 5-minute one-row budget, on the virtual clock exactly."""
-    row_id = await _seed_layer(layer)
+@pytest.mark.parametrize(
+    ("layer", "build", "minutes"),
+    [("l1", True, 5), ("l1", False, 5), ("l2", False, 5), ("l2", True, 7)],
+)
+async def test_l1_and_l2_rows_claim_with_their_row_budget(layer, build, minutes):
+    """The L1 apply and an L2 remove pass no per-call budget: the stamp is the claim
+    instant plus the unchanged 5-minute one-row budget. An L2 add is sized for one more
+    driver action, the undo of a join that lost its allocation (issue #1413):
+    `claim_budget(4)`, 7 minutes at the defaults. On the virtual clock exactly."""
+    from app.services.wiring_claim import claim_budget
+
+    row_id = await _seed_layer(layer, intended="ACTIVE" if build else "RELEASED")
     holder = WiringRowClaims()
     clock = _VirtualClock()
     with ExitStack() as stack:
         _virtual_clock_patches(clock, stack)
-        await _drive_one(layer, row_id, holder, FAILURE)
-    assert holder.held[row_id] == clock.started + timedelta(minutes=5)
+        await _drive_one(layer, row_id, holder, FAILURE, build=build)
+    assert holder.held[row_id] == clock.started + timedelta(minutes=minutes)
+    if layer == "l2" and build:
+        assert claim_budget(4) == timedelta(minutes=7)
 
 
 async def test_a_per_call_budget_sets_only_that_claims_stamp(db):

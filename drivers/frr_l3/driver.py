@@ -222,9 +222,7 @@ def _find_not_installed_lines(output):
     every "%"-line rule (the benign remove_route carve-out, the all-or-nothing
     classification) is deliberately unaffected by it.
     """
-    return [
-        line.strip() for line in output.splitlines() if _NOT_INSTALLED_MARKER in line
-    ]
+    return [line.strip() for line in output.splitlines() if _NOT_INSTALLED_MARKER in line]
 
 
 def _find_error_lines(output):
