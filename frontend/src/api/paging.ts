@@ -21,9 +21,17 @@ export class ListPagingLimitError extends Error {
 
 /**
  * Walk every page of a `{items, total, skip, limit}` list endpoint and return
- * the whole row set (issues #703 and #1336), so a list that must be complete
- * (a picker, an index, a lookup) is never silently cut at the server's page
- * cap. `fetchPage(skip, limit)` fetches one page with the caller's filters.
+ * the rows of all of them, concatenated in order (issues #703 and #1336), so a
+ * list that must be complete (a picker, an index, a lookup) is not cut at the
+ * server's page cap. `fetchPage(skip, limit)` fetches one page with the
+ * caller's filters.
+ *
+ * The result is the whole row set, each row once, only when the server's
+ * order is a stable total order and no row is inserted or deleted during the
+ * walk. Offset pages over an order with ties (several routes sort on
+ * `created_at` alone), or over a list that changes mid-walk, can repeat a row
+ * or skip one at a page boundary; this helper neither detects nor removes
+ * that.
  *
  * The walk ends on a short page (fewer rows than asked for, an empty page
  * included) or when `skip` reaches the reported `total`. Pages are fetched

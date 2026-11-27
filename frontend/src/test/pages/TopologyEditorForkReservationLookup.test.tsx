@@ -183,7 +183,7 @@ function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[`/topology/${TOPO_ID}?reservationId=${RES_ID}`]}>
         <Routes>
@@ -193,6 +193,7 @@ function renderPage() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 async function canvasLoaded() {
@@ -247,7 +248,7 @@ describe("live edit reads its reservation by id (issue #1319)", () => {
     renderPage();
     await canvasLoaded();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    expect((await screen.findByRole("alert")).textContent).toBe(
       "Could not load this reservation, so committing is disabled. Reload the page to try again.",
     );
     const commit = screen.getByRole("button", { name: "Commit to reservation" });
@@ -265,7 +266,7 @@ describe("live edit reads its reservation by id (issue #1319)", () => {
     expect(traffic.listReads).toBe(0);
   });
 
-  it("a reservation the caller may not read (404 for anyone but the owner) fails closed the same way", async () => {
+  it("a reservation the caller may not read (404 for anyone but the owner) fails closed and says only the owner can commit", async () => {
     const traffic = newTraffic();
     server.use(
       ...handlers(traffic, () =>
@@ -275,7 +276,10 @@ describe("live edit reads its reservation by id (issue #1319)", () => {
     renderPage();
     await canvasLoaded();
 
-    await screen.findByRole("alert");
+    // Reloading can never help a non-owner, so the line gives no reload advice.
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Only the reservation's owner can commit from this editor",
+    );
     expect(screen.getByRole("button", { name: "Commit to reservation" })).toBeDisabled();
     // No purpose to show, and Restore stays hidden without a known ACTIVE status.
     expect(screen.getByText("Editing reservation")).toBeInTheDocument();
@@ -284,7 +288,40 @@ describe("live edit reads its reservation by id (issue #1319)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "force commit" }));
     await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError.mock.calls).toEqual([
+      ["Only the reservation's owner can commit from this editor"],
+    ]);
     expect(traffic.calls).toEqual([]);
+  });
+
+  it("a cached reservation stays loaded when a background refetch fails, and Commit unions with the cached set", async () => {
+    const traffic = newTraffic();
+    server.use(...handlers(traffic, () => HttpResponse.json(RESERVATION)));
+    const client = renderPage();
+    await canvasLoaded();
+    await screen.findByText("Editing reservation (past the first page)");
+
+    // The next read of the reservation fails; refetch only that query.
+    server.use(
+      http.get(`/api/reservations/${RES_ID}`, () =>
+        HttpResponse.json({ detail: "Reservations service unavailable" }, { status: 503 }),
+      ),
+    );
+    await client.invalidateQueries({ queryKey: ["reservations", RES_ID], exact: true });
+    await waitFor(() =>
+      expect(client.getQueryState(["reservations", RES_ID])?.status).toBe("error"),
+    );
+
+    // Deliberate (issue #1319 review): the cached copy is a complete set, so
+    // the editor keeps it rather than closing Commit; the server still refuses
+    // a reservation that has left ACTIVE.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Editing reservation (past the first page)")).toBeInTheDocument();
+    const commit = screen.getByRole("button", { name: "Commit to reservation" });
+    expect(commit).toBeEnabled();
+    fireEvent.click(commit);
+    await waitFor(() => expect(traffic.calls).toEqual(["patch", "save", "patch"]));
+    expect(new Set(traffic.patches[0].device_ids)).toEqual(new Set(["d-keep", "d-off", "d-new"]));
   });
 
   it("while the read is in flight Commit waits for it, then commits with the full set", async () => {

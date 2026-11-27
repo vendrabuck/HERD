@@ -92,7 +92,7 @@ describe("LiveEditBar", () => {
 
   it("a failed reservation read disables commit and says so", () => {
     const { onCommit } = makeBar({ reservationStatus: "failed" });
-    expect(screen.getByRole("alert")).toHaveTextContent(
+    expect((screen.getByRole("alert")).textContent).toBe(
       "Could not load this reservation, so committing is disabled. Reload the page to try again.",
     );
     const commit = screen.getByRole("button", { name: "Commit to reservation" });
@@ -100,6 +100,18 @@ describe("LiveEditBar", () => {
     fireEvent.click(commit);
     expect(onCommit).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+  });
+
+  it("a read refused as not the owner's says only the owner can commit, with no reload advice", () => {
+    const { onCommit } = makeBar({ reservationStatus: "not-owner" });
+    expect((screen.getByRole("alert")).textContent).toBe(
+      "Only the reservation's owner can commit from this editor",
+    );
+    expect(screen.queryByText(/Reload the page/)).not.toBeInTheDocument();
+    const commit = screen.getByRole("button", { name: "Commit to reservation" });
+    expect(commit).toBeDisabled();
+    fireEvent.click(commit);
+    expect(onCommit).not.toHaveBeenCalled();
   });
 
   it("the fork's loading label comes before the reservation's", () => {

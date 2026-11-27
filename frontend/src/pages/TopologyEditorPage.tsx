@@ -75,7 +75,10 @@ import { QuickConnectPopover } from "@/components/topology-editor/QuickConnectPo
 import { AIDialog } from "@/components/topology-editor/AIDialog";
 import { AICommitDialog } from "@/components/topology-editor/AICommitDialog";
 import { AIProposalBar } from "@/components/topology-editor/AIProposalBar";
-import { LiveEditBar } from "@/components/topology-editor/LiveEditBar";
+import {
+  LiveEditBar,
+  type LiveEditReservationStatus,
+} from "@/components/topology-editor/LiveEditBar";
 import { AsBuiltBar } from "@/components/topology-editor/AsBuiltBar";
 import { ForkSaveResultToast } from "@/components/topology-editor/ForkSaveResultToast";
 import { ForkConflictDialog } from "@/components/topology-editor/ForkConflictDialog";
@@ -205,10 +208,19 @@ function TopologyEditorInner() {
   // Read by id (issue #1319), never found by scanning a page of the owner's
   // list: a reservation past that page left this null, and Commit then
   // computed the device-set union from an empty set. Null while the read is
-  // in flight or after it failed (a 404 for anyone but the owner); Commit
-  // refuses in both cases (handleCommitToReservation, LiveEditBar).
-  const { data: reservationData, isError: reservationLookupFailed } = useReservation(reservationId);
+  // in flight or after it failed with nothing cached; Commit refuses in both
+  // cases (handleCommitToReservation, LiveEditBar). A cached copy counts as
+  // loaded even when a later background refetch failed: Commit unions with
+  // that set, and the server still refuses a reservation that left ACTIVE.
+  const { data: reservationData, error: reservationError } = useReservation(reservationId);
   const liveReservation = reservationData ?? null;
+  const reservationStatus: LiveEditReservationStatus = liveReservation
+    ? "loaded"
+    : !reservationError
+      ? "loading"
+      : isAxiosError(reservationError) && reservationError.response?.status === 404
+        ? "not-owner"
+        : "failed";
   const isLiveEdit = !!reservationId;
   const updateReservation = useUpdateReservation();
   const { data: fork } = useReservationFork(isLiveEdit ? reservationId : null);
@@ -1355,9 +1367,11 @@ function TopologyEditorInner() {
     // canvas. Fail closed: no PATCH, no fork save.
     if (!liveReservation) {
       toast.error(
-        reservationLookupFailed
-          ? "Could not load this reservation, so nothing was committed; reload the page to try again"
-          : "The reservation is still loading; try again in a moment",
+        reservationStatus === "not-owner"
+          ? "Only the reservation's owner can commit from this editor"
+          : reservationStatus === "failed"
+            ? "Could not load this reservation, so nothing was committed; reload the page to try again"
+            : "The reservation is still loading; try again in a moment",
       );
       return;
     }
@@ -1496,7 +1510,7 @@ function TopologyEditorInner() {
     forkLoaded,
     hasInvalidEdges,
     liveReservation,
-    reservationLookupFailed,
+    reservationStatus,
     saveFork,
     autosave,
     persistableCanvas,
@@ -1834,9 +1848,7 @@ function TopologyEditorInner() {
               serverInvalidEdgeCount={serverOnlyInvalidEdgeCount}
               isCommitting={isCommitting}
               forkLoaded={forkLoaded}
-              reservationStatus={
-                liveReservation ? "loaded" : reservationLookupFailed ? "failed" : "loading"
-              }
+              reservationStatus={reservationStatus}
               autosaveStatus={autosave.status}
               onCommit={handleCommitToReservation}
               onCancel={handleCancelLiveEdit}

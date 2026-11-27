@@ -1,5 +1,13 @@
 import type { ForkAutosaveStatus } from "@/hooks/useForkAutosave";
 
+/**
+ * The editor's read of the reservation itself (issue #1319). "loaded" whenever
+ * a copy is held, even when a later background refetch failed; "not-owner" is
+ * the read's 404, which `GET /reservations/{id}` answers to anyone but the
+ * owner (RES-VIEW-1); "failed" is any other failure.
+ */
+export type LiveEditReservationStatus = "loading" | "loaded" | "failed" | "not-owner";
+
 interface LiveEditBarProps {
   deviceCount: number;
   invalidEdgeCount: number;
@@ -17,8 +25,8 @@ interface LiveEditBarProps {
   forkLoaded: boolean;
   // The editor's read of the reservation itself (issue #1319). Commit needs
   // its current device set to compute the pre-save union, so the button stays
-  // disabled until it is "loaded", and a "failed" read says so in red.
-  reservationStatus: "loading" | "loaded" | "failed";
+  // disabled until it is "loaded", and a failed read says why in red.
+  reservationStatus: LiveEditReservationStatus;
   autosaveStatus?: ForkAutosaveStatus;
   onCommit: () => void;
   onCancel: () => void;
@@ -90,6 +98,11 @@ export function LiveEditBar({
             <p className="text-xs text-red-600 mt-1">
               {invalidEdgeCount} edge{invalidEdgeCount !== 1 ? "s" : ""} have no
               physical path; fix or remove them before committing.
+            </p>
+          )}
+          {reservationStatus === "not-owner" && (
+            <p className="text-xs text-red-600 mt-1" role="alert">
+              Only the reservation&apos;s owner can commit from this editor
             </p>
           )}
           {reservationStatus === "failed" && (
