@@ -14,6 +14,9 @@ from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
+    log_consumer_connect_failure,
+    log_consumer_setup_failure,
+    log_consumer_stream_check_failure,
     nak_delay,
     parse_nak_backoff_schedule,
     process_batch_with_heartbeat,
@@ -113,6 +116,11 @@ NATS_FETCH_TIMEOUT_SECONDS = 5
 # inspection and replay (see docs/OPERATIONS.md). The _publish_to_dlq publish stays
 # best-effort and swallows errors so a DLQ outage cannot wedge the consumer.
 NATS_DLQ_SUBJECT = "herd.reservations.dlq.execution"
+
+# The stream and durable this service's one consumer reads; the startup warnings
+# name them (issue #1418).
+EXECUTION_STREAM = "HERD_RESERVATIONS"
+EXECUTION_DURABLE = "execution-consumer"
 
 # Event name for the connection-driven L1 reconcile (ADR 0007, issue #345 P3b).
 WIRING_CHANGED_EVENT = "reservation.wiring_changed"
@@ -6036,6 +6044,13 @@ async def start_nats_consumer(app) -> None:
     to whatever config the server already has, so on a persistent NATS volume
     (`make prod`) a durable provisioned before this fix would silently keep its
     old `backoff` forever without the explicit update.
+
+    Never raises an `Exception`: a failed connect, or a failed setup after a
+    good connect, is logged through herd_common.jetstream's consumer warnings
+    (issue #1418, WIRE-CONSUME-4) and the service keeps running; nothing
+    retries either in this process. Only a failed connect leaves
+    `app.state.nats` unset; after a failed setup the connection is kept, so
+    the outbox relay and the stream ensures in `app.main` still use it.
     """
     import nats
     from nats.js.api import ConsumerConfig
@@ -6046,7 +6061,12 @@ async def start_nats_consumer(app) -> None:
         # warning below is reachable and the service runs without the consumer;
         # an established connection still retries forever.
         nc = await connect_nats(settings.nats_url)
-        app.state.nats = nc
+    except Exception as exc:
+        log_consumer_connect_failure(logger, exc, not_running=[EXECUTION_DURABLE])
+        return
+    app.state.nats = nc
+
+    try:
         js = nc.jetstream()
 
         # Confirm stream exists; this consumer does not own its config (reservations
@@ -6055,11 +6075,11 @@ async def start_nats_consumer(app) -> None:
         try:
             await ensure_stream_exists(
                 js,
-                name="HERD_RESERVATIONS",
+                name=EXECUTION_STREAM,
                 subjects=["herd.reservations.*"],
             )
-        except Exception:
-            logger.warning("Could not create/update NATS stream", exc_info=True)
+        except Exception as exc:
+            log_consumer_stream_check_failure(logger, exc, stream=EXECUTION_STREAM)
 
         # Durable consumer with explicit retry policy: bounded redelivery, a real
         # 30s ack_wait, no `backoff` (issue #895: `backoff` on ConsumerConfig
@@ -6081,14 +6101,14 @@ async def start_nats_consumer(app) -> None:
         # config change to an already-existing durable).
         await ensure_consumer(
             js,
-            stream="HERD_RESERVATIONS",
+            stream=EXECUTION_STREAM,
             subject="herd.reservations.*",
-            durable="execution-consumer",
+            durable=EXECUTION_DURABLE,
             config=consumer_config,
         )
         psub = await js.pull_subscribe(
             "herd.reservations.*",
-            durable="execution-consumer",
+            durable=EXECUTION_DURABLE,
             config=consumer_config,
         )
 
@@ -6133,13 +6153,17 @@ async def start_nats_consumer(app) -> None:
                 await process_batch(msgs, js, _get_db_session)
 
         app.state.nats_consumer_task = asyncio.create_task(_consumer_loop())
-        logger.info("NATS consumer started")
-
-    except Exception:
-        logger.warning(
-            "Failed to connect to NATS; operating without event-driven execution",
-            exc_info=True,
+    except Exception as exc:
+        log_consumer_setup_failure(
+            logger,
+            exc,
+            durable=EXECUTION_DURABLE,
+            stream=EXECUTION_STREAM,
+            not_running=[EXECUTION_DURABLE],
+            running=[],
         )
+        return
+    logger.info("NATS consumer started")
 
 
 async def stop_nats_consumer(app) -> None:
