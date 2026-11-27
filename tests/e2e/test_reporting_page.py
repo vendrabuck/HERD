@@ -7,7 +7,8 @@ revealing two date pickers), the five rollup table cards, and the daily
 trend section. Data volume is seed-dependent, so assertions target the
 always-rendered chrome (headings, labels, buttons) rather than row counts.
 
-The non-admin redirect off /reporting is covered in
+The admin's main navigation link to the page is pinned here; the non-admin
+side (no Reporting link, and the redirect off /reporting) is covered in
 test_register_and_roles.py, which owns the non-admin browser session.
 """
 
@@ -21,6 +22,24 @@ WAIT = 15
 def _open_reporting(driver, base_url):
     driver.get(f"{base_url}/reporting")
     WebDriverWait(driver, WAIT).until(
+        EC.presence_of_element_located((By.XPATH, "//h2[normalize-space()='Utilization Report']"))
+    )
+
+
+def test_admin_main_navigation_links_to_reporting(admin_browser, base_url):
+    """An admin's main navigation ends with a Reporting link that opens the page
+    (issue #1402: the link is shown only to the roles AdminGuard lets in)."""
+    admin_browser.get(f"{base_url}/topology")
+    link = WebDriverWait(admin_browser, WAIT).until(
+        EC.element_to_be_clickable(
+            (By.XPATH, "//nav[@aria-label='Main']/a[normalize-space()='Reporting']")
+        )
+    )
+    main_links = admin_browser.find_elements(By.XPATH, "//nav[@aria-label='Main']/a")
+    assert [a.text.strip() for a in main_links][-1] == "Reporting"
+    link.click()
+    WebDriverWait(admin_browser, WAIT).until(EC.url_contains("/reporting"))
+    WebDriverWait(admin_browser, WAIT).until(
         EC.presence_of_element_located((By.XPATH, "//h2[normalize-space()='Utilization Report']"))
     )
 

@@ -14,6 +14,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { resetOnSignOut } from "@/queryClient";
 import type { User } from "@/types/auth.types";
 import { APP_VERSION } from "@/lib/appVersion";
+import { flushPending } from "../flushPending";
 
 function user(overrides: Partial<User> = {}): User {
   return {
@@ -116,7 +117,7 @@ describe("AppLayout", () => {
     renderLayout("/inventory");
 
     await screen.findByText("alice");
-    for (const label of ["Inventory", "Templates", "Topology", "Reservations", "Reporting"]) {
+    for (const label of ["Inventory", "Templates", "Topology", "Reservations"]) {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText("page content")).toBeInTheDocument();
@@ -583,5 +584,147 @@ describe("AppLayout landmarks and titles (issue #1317)", () => {
 
     unmount();
     expect(document.title).toBe("HERD original");
+  });
+});
+
+// Issue #1402: the main navigation offers Reporting, an AdminGuard page, only to
+// a role that guard lets in (isAdminRole), and to no unknown role. Hidden means
+// absent from the DOM: no link, no aria-hidden copy, no disabled stand-in.
+describe("AppLayout main navigation by role (issue #1402)", () => {
+  const PLAIN_LABELS = ["Inventory", "Templates", "Topology", "Reservations"];
+
+  function mainNav() {
+    return screen.getByRole("navigation", { name: "Main" });
+  }
+
+  // The nav's own links, not the Administration panel's (which sits inside the
+  // same nav element, one level down).
+  function mainNavLinkLabels() {
+    return [...mainNav().querySelectorAll(":scope > a")].map((a) => a.textContent);
+  }
+
+  // Neither admin-only header entry (IAM-UI-17): no Reporting link and no
+  // Administration menu. Every caller first anchors on the state it is about
+  // (the account rendered, the request in flight, or the failed answer
+  // handled), since both are already absent before GET /me answers.
+  function expectNoAdminOnlyEntries() {
+    expect(screen.queryByRole("link", { name: "Reporting" })).toBe(null);
+    // Not merely hidden from the accessibility tree: no element links there.
+    expect(document.querySelector('a[href="/reporting"]')).toBe(null);
+    expect(screen.queryByText("Reporting")).toBe(null);
+    expect(screen.queryByRole("button", { name: "Administration" })).toBe(null);
+  }
+
+  it.each([
+    ["admin", "admin"],
+    ["superadmin", "superadmin"],
+  ])("shows Reporting last in the main navigation for role %s", async (_d, role) => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role }))));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    expect(mainNavLinkLabels()).toEqual([...PLAIN_LABELS, "Reporting"]);
+    expect(screen.getByRole("link", { name: "Reporting" })).toHaveAttribute("href", "/reporting");
+  });
+
+  it.each([
+    ["user", { role: "user" }],
+    ["malformed: wrong case", { role: "Admin" }],
+    ["malformed: empty", { role: "" }],
+    ["malformed: unrecognized", { role: "auditor" }],
+    ["malformed: not a string", { role: 1 }],
+    ["missing: no role field", { role: undefined }],
+  ])("omits Reporting from the DOM for role %s", async (_d, overrides) => {
+    const body: Record<string, unknown> = { ...user(), ...overrides };
+    if (overrides.role === undefined) delete body.role;
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(body)));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
+    expectNoAdminOnlyEntries();
+  });
+
+  it("omits Reporting while the account is still loading, and shows it once an admin loads", async () => {
+    let answer: ((value: Response) => void) | null = null;
+    server.use(
+      http.get("/api/auth/me", () => new Promise<Response>((resolve) => (answer = resolve))),
+    );
+    renderLayoutInDataRouter("/inventory");
+    // Wait until GET /me is actually in flight, so the assertions below see
+    // the loading state rather than a render before the request started.
+    await waitFor(() => expect(answer).not.toBe(null));
+    // The plain links do not wait for the account.
+    expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
+    expectNoAdminOnlyEntries();
+
+    await act(async () => answer!(HttpResponse.json(user({ role: "admin" }))));
+    expect(await screen.findByRole("link", { name: "Reporting" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Administration" })).toBeInTheDocument();
+  });
+
+  it("omits Reporting when the account cannot be loaded", async () => {
+    let answered = false;
+    server.use(
+      http.get("/api/auth/me", () => {
+        answered = true;
+        return new HttpResponse(null, { status: 500 });
+      }),
+    );
+    renderLayoutInDataRouter("/inventory");
+    // The plain links and the absences below already hold while GET /me is
+    // pending, so anchor on the 500 having been served and handled first.
+    await waitFor(() => expect(answered).toBe(true));
+    await flushPending();
+    expect(mainNavLinkLabels()).toEqual(PLAIN_LABELS);
+    expectNoAdminOnlyEntries();
+  });
+
+  it("Tab walks a plain user's main navigation without a Reporting stop", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "user" }))));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    const kb = userEvent.setup();
+    await kb.tab();
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Skip to main content" }));
+    for (const label of PLAIN_LABELS) {
+      await kb.tab();
+      expect(document.activeElement).toBe(screen.getByRole("link", { name: label }));
+    }
+    // No Reporting and no Administration: the next stop is the header's help link.
+    await kb.tab();
+    expect(document.activeElement).toBe(screen.getByRole("link", { name: "Help" }));
+  });
+
+  it("Tab walks an admin's main navigation through Reporting to the Administration button", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "admin" }))));
+    renderLayoutInDataRouter("/inventory");
+    await screen.findByText("alice");
+    const kb = userEvent.setup();
+    await kb.tab();
+    for (const label of [...PLAIN_LABELS, "Reporting"]) {
+      await kb.tab();
+      expect(document.activeElement).toBe(screen.getByRole("link", { name: label }));
+    }
+    await kb.tab();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Administration" }));
+  });
+
+  it("marks Reporting as the current page for an admin on /reporting, and only it", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "admin" }))));
+    renderLayoutInDataRouter("/reporting");
+    await screen.findByText("alice");
+    const reporting = screen.getByRole("link", { name: "Reporting" });
+    expect(reporting).toHaveAttribute("aria-current", "page");
+    expect(reporting.className).toContain("bg-gray-700 text-white");
+    const current = [...mainNav().querySelectorAll('[aria-current="page"]')];
+    expect(current).toEqual([reporting]);
+  });
+
+  it("marks the remaining links normally for a plain user, with no Reporting left to mark", async () => {
+    server.use(http.get("/api/auth/me", () => HttpResponse.json(user({ role: "user" }))));
+    renderLayoutInDataRouter("/topology");
+    await screen.findByText("alice");
+    const current = [...mainNav().querySelectorAll('[aria-current="page"]')];
+    expect(current).toEqual([screen.getByRole("link", { name: "Topology" })]);
+    expectNoAdminOnlyEntries();
   });
 });
