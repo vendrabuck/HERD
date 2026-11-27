@@ -24,6 +24,9 @@ the release winner re-read the row was never undefined. Now:
     becomes a pending join, and the next retry re-allocates and adds on the new number;
   - a failed join on an allocation the retry reads as released is re-resolved before
     its add_to_vlan, which names the fresh allocation's number.
+  - two joins on one port, on connections whose plans yield the port's foreign ACTIVE
+    rows in opposite orders, both finish: the frozen-holder park locks those rows in
+    id order, where plan order deadlocks.
 
 The SQLite suites (test_l2_membership_service.py, test_nats_consumer_vlan_definitions.py,
 test_wiring_retry_l2.py) pin each guard's predicate on one connection; here each party
@@ -1423,3 +1426,187 @@ async def test_a_join_waiting_on_a_release_of_a_frozen_holders_row_never_rewrite
                 await s.execute(delete(model).where(model.reservation_id == holder))
             await s.commit()
         await _cleanup(session_factory, h)
+
+
+# The two forced plans of the lock-order test: one connection walks the partial unique
+# index (rows in VLAN allocation order), the other scans the heap (rows in physical
+# order). Custom plans, so the index's `status = 'ACTIVE'` predicate is usable.
+_INDEX_PLAN = {
+    "enable_seqscan": "off",
+    "enable_bitmapscan": "off",
+    "plan_cache_mode": "force_custom_plan",
+}
+_HEAP_PLAN = {
+    "enable_indexscan": "off",
+    "enable_indexonlyscan": "off",
+    "enable_bitmapscan": "off",
+    "plan_cache_mode": "force_custom_plan",
+}
+
+
+def _planned_engine(application_name: str, plan: dict):
+    settings = {
+        "search_path": EXECUTION_SCHEMA,
+        "lock_timeout": LOCK_TIMEOUT,
+        "application_name": application_name,
+        **plan,
+    }
+    return create_async_engine(PG_DSN, connect_args={"server_settings": settings})
+
+
+def _foreign_rows_on_port(switch: str, port: str, reservation):
+    """The frozen-holder park's read in `record_l2_membership_active`, without its lock
+    and its ORDER BY: the order the connection's plan yields."""
+    return select(L2PortAssignment.id).where(
+        L2PortAssignment.switch_device_id == uuid.UUID(switch),
+        L2PortAssignment.port == port,
+        L2PortAssignment.reservation_id != reservation,
+        L2PortAssignment.status == "ACTIVE",
+    )
+
+
+async def test_two_joins_on_one_port_lock_its_foreign_rows_in_one_order(
+    session_factory, pg_engine, pending
+):
+    """Two sessions whose plans differ (issue #1413). Two other reservations hold the
+    port ACTIVE (not frozen, so the frozen-holder park only reads them, FOR UPDATE).
+    J1 runs on a connection forced onto the partial unique index, which yields the two
+    rows in VLAN allocation order, and J2 on one forced onto a heap scan, which yields
+    them in the opposite (physical) order; the test seeds until the two orders differ.
+    A third session holds the row J1's plan yields first (and J2's last). J1 starts and
+    is seen waiting on it, then J2 starts and is seen waiting, and the third session
+    commits. Locked in plan order, J2 would already hold its first row and wait on the
+    held one behind J1, J1 would then take the held row and wait on J2's, and Postgres
+    would abort one with a deadlock. Locked in id order, both joins take the rows in
+    one order, both finish and record their memberships ACTIVE, and the holders' rows
+    are left as they are."""
+    h = _Harness(n_switches=1)
+    switch = h.switches[0]
+    port = "0/0/1"
+    second = uuid.uuid4()
+    holders = [uuid.uuid4(), uuid.uuid4()]
+    vlan_one, vlan_two = await _free_vlan_numbers(session_factory, 2)
+    engines = []
+    try:
+        alloc_one = await _seed(session_factory, h, vlan_one, scope=[switch], defined=[switch])
+        async with session_factory() as s:
+            alloc = VlanAssignment(
+                reservation_id=second,
+                fabric_id=h.fabric,
+                vlan_id=vlan_two,
+                switch_device_ids=[switch],
+                defined_switch_ids=[switch],
+                status="ACTIVE",
+            )
+            s.add(alloc)
+            await s.commit()
+            alloc_two = alloc.id
+
+        index_app = f"herd-test-1413-ix-{uuid.uuid4().hex[:10]}"
+        heap_app = f"herd-test-1413-hp-{uuid.uuid4().hex[:10]}"
+        index_engine = _planned_engine(index_app, _INDEX_PLAN)
+        heap_engine = _planned_engine(heap_app, _HEAP_PLAN)
+        hold_engine = _engine()
+        engines += [index_engine, heap_engine, hold_engine]
+
+        async def _order(engine) -> list:
+            async with async_sessionmaker(engine)() as s:
+                return list(
+                    (await s.execute(_foreign_rows_on_port(switch, port, h.reservation)))
+                    .scalars()
+                    .all()
+                )
+
+        # Seed the two holder rows; their allocation ids (no allocation rows, so no
+        # release pass ever reads them) set the index order. Re-seed with the ids
+        # swapped until the heap order is the opposite of the index order.
+        low, high = uuid.UUID(int=uuid.uuid4().int >> 8), uuid.UUID(int=(0xFF << 120) | 1)
+        holder_ids: list = []
+        for attempt in range(10):
+            first, later = (high, low) if attempt % 2 == 0 else (low, high)
+            async with session_factory() as s:
+                await s.execute(
+                    delete(L2PortAssignment).where(L2PortAssignment.reservation_id.in_(holders))
+                )
+                await s.commit()
+            for holder, va in zip(holders, (first, later)):
+                async with session_factory() as s:
+                    row = L2PortAssignment(
+                        reservation_id=holder,
+                        vlan_assignment_id=va,
+                        switch_device_id=uuid.UUID(switch),
+                        port=port,
+                        intended="ACTIVE",
+                        status="ACTIVE",
+                    )
+                    s.add(row)
+                    await s.commit()
+            by_index, by_heap = await _order(index_engine), await _order(heap_engine)
+            if len(by_index) == 2 and by_index == list(reversed(by_heap)):
+                holder_ids = by_index
+                break
+        assert holder_ids, "could not stage two plans yielding the rows in opposite orders"
+
+        def _without_second(snapshot):
+            allocations, memberships = snapshot
+            return (
+                [row for row in allocations if row[1] != second],
+                [row for row in memberships if row[1] != second],
+            )
+
+        before = _without_second(await _foreign_snapshot(session_factory, h))
+
+        # The holder takes only the row J1's plan yields first and J2's yields last.
+        hold = pending.session(async_sessionmaker(hold_engine))
+        await hold.execute(
+            select(L2PortAssignment.id)
+            .where(L2PortAssignment.id == holder_ids[0])
+            .with_for_update()
+        )
+        results: dict = {}
+
+        async def _join(name, engine, reservation, allocation):
+            async with async_sessionmaker(engine, expire_on_commit=False)() as s:
+                results[name] = await record_l2_membership_active(
+                    s, reservation, allocation, switch, port
+                )
+
+        # J1 first, seen waiting (it then holds that row's tuple lock), then J2, seen
+        # waiting too.
+        one = pending.task(_join("one", index_engine, h.reservation, alloc_one))
+        waited_one = await _seen_waiting(pg_engine, index_app, one)
+        two = pending.task(_join("two", heap_engine, second, alloc_two))
+        waited_two = await _seen_waiting(pg_engine, heap_app, two)
+        await hold.commit()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(one, two, return_exceptions=True), COORDINATION_TIMEOUT
+        )
+        assert waited_one and waited_two
+        assert [type(o).__name__ for o in outcomes if isinstance(o, BaseException)] == []
+        assert (results["one"].status, results["one"].vlan_assignment_id) == ("ACTIVE", alloc_one)
+        assert (results["two"].status, results["two"].vlan_assignment_id) == ("ACTIVE", alloc_two)
+        async with session_factory() as s:
+            held = (
+                (
+                    await s.execute(
+                        select(L2PortAssignment).where(L2PortAssignment.id.in_(holder_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert sorted((r.status, r.intended, r.last_error) for r in held) == [
+            ("ACTIVE", "ACTIVE", None),
+            ("ACTIVE", "ACTIVE", None),
+        ]
+        assert _without_second(await _foreign_snapshot(session_factory, h)) == before
+    finally:
+        await pending.settle()
+        extra = [*holders, second]
+        async with session_factory() as s:
+            for model in (L2PortAssignment, VlanAssignment):
+                await s.execute(delete(model).where(model.reservation_id.in_(extra)))
+            await s.commit()
+        await _cleanup(session_factory, h)
+        for engine in engines:
+            await engine.dispose()

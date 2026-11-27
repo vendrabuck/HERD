@@ -341,7 +341,7 @@ async def record_l2_membership_active(
     the key-based upsert. The returned row is that failure write's. The existing-ACTIVE
     short-circuit and the frozen park above take no allocation lock: neither writes an
     ACTIVE row. The frozen-holder park of issue #479 reads the other reservations'
-    ACTIVE rows on the port FOR UPDATE, before any allocation lock.
+    ACTIVE rows on the port FOR UPDATE, in id order, before any allocation lock.
 
     The FAILED flip never takes a row that owes a lost join's undo
     (JOIN_UNDO_PENDING_REMOVAL): moving it to this join's allocation would leave the old
@@ -394,7 +394,9 @@ async def record_l2_membership_active(
     # released meanwhile is not loaded and rewritten by the ORM park below. The lock is
     # taken before the allocation's share lock (hold_active_allocation), and is released
     # by this call's commit or by the rollback before a lost join's undo, never held
-    # across a driver call.
+    # across a driver call. The rows are locked in id order (Postgres locks above the
+    # sort), so two joins on one port lock its foreign rows in the same order whatever
+    # plan each connection runs, and cannot deadlock on them.
     stale_result = await db.execute(
         select(L2PortAssignment)
         .where(
@@ -403,6 +405,7 @@ async def record_l2_membership_active(
             L2PortAssignment.reservation_id != res_uuid,
             L2PortAssignment.status == "ACTIVE",
         )
+        .order_by(L2PortAssignment.id)
         .with_for_update()
     )
     for stale in stale_result.scalars().all():
