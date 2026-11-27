@@ -33,6 +33,8 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { TopoBadge } from "@/components/ui/TopoBadge";
 import { EmptyRow } from "@/components/ui/EmptyState";
 import { SkeletonRows } from "@/components/ui/Skeleton";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noEntries } from "@/lib/loadState";
 import type { Device, DeviceFilters, DeviceStatus, TopologyType } from "@/types/device.types";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
@@ -84,8 +86,14 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
   deviceNameMap: Map<string, string> | undefined;
   colSpan: number;
 }) {
-  const { data: ports, isLoading: portsLoading } = usePorts(device.id);
-  const { data: connections, isLoading: connsLoading } = useDeviceConnections(device.id);
+  const portsQuery = usePorts(device.id);
+  const { data: ports } = portsQuery;
+  const portsState = loadState(portsQuery, noEntries);
+  const connectionsQuery = useDeviceConnections(device.id);
+  const { data: connections } = connectionsQuery;
+  // A failed connections fetch would otherwise read "Not connected" on every
+  // port (issue #1320), so it fails the panel like a failed ports fetch.
+  const connectionsState = loadState(connectionsQuery);
 
   const connectionMap = useMemo(() => {
     const map = new Map<string, { deviceId: string; deviceName: string; portName: string }>();
@@ -101,7 +109,7 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
     return map;
   }, [connections, device.id, deviceNameMap]);
 
-  const isLoading = portsLoading || connsLoading;
+  const isLoading = portsState === "loading" || connectionsState === "loading";
 
   return (
     <tr className="bg-gray-50/50">
@@ -109,9 +117,23 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
         <div className="flex gap-6">
           <DeviceInfoPanel device={device} />
           <div className="flex-1 min-w-0">
-            {isLoading ? (
+            {portsState === "error" ? (
+              <LoadError
+                what="this device's ports"
+                error={portsQuery.error}
+                onRetry={() => void portsQuery.refetch()}
+                retrying={portsQuery.isFetching}
+              />
+            ) : connectionsState === "error" ? (
+              <LoadError
+                what="this device's connections"
+                error={connectionsQuery.error}
+                onRetry={() => void connectionsQuery.refetch()}
+                retrying={connectionsQuery.isFetching}
+              />
+            ) : isLoading ? (
               <p className="text-sm text-gray-400">Loading ports...</p>
-            ) : !ports || ports.length === 0 ? (
+            ) : !ports || portsState === "empty" ? (
               <p className="text-sm text-gray-400">No ports configured</p>
             ) : (
               <table className="w-full text-sm">
@@ -318,9 +340,10 @@ export function InventoryPage() {
   if (topologyType) activeFilters.topology_type = topologyType;
   const filtersApplied = Object.keys(activeFilters).length > 0;
   const filters = filtersApplied ? activeFilters : undefined;
-  const { data, isLoading, isError } = usePaginatedDevices(filters, skip, limit, {
+  const devicesQuery = usePaginatedDevices(filters, skip, limit, {
     enabled: !templatePending,
   });
+  const { data, isLoading } = devicesQuery;
 
   const changeStatus = (value: string) => {
     const next = DEVICE_STATUSES.find((v) => v === value) ?? "";
@@ -546,10 +569,16 @@ export function InventoryPage() {
                   <SkeletonRows rows={5} />
                 </div>
               )}
-              {isError && (
-                <p className="text-sm text-red-500 text-center py-8">Failed to load devices</p>
+              {loadState(devicesQuery) === "error" && (
+                <LoadError
+                  what="devices"
+                  error={devicesQuery.error}
+                  onRetry={() => void devicesQuery.refetch()}
+                  retrying={devicesQuery.isFetching}
+                  className="m-4"
+                />
               )}
-              {!isLoading && !isError && devices && (
+              {!isLoading && devices && (
                 <div className="overflow-x-auto">
                 {/* Vertical scroll lives on the outer page wrapper (h-full overflow-y-auto);
                     sticky header cells resolve against that scroll parent. */}

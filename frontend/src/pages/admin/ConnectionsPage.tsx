@@ -15,6 +15,8 @@ import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectD
 import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noEntries, noItems } from "@/lib/loadState";
 
 // The multi-connection dialog is the default create surface; the original
 // single-pair modal survives behind this toggle, the same way the topology
@@ -27,8 +29,10 @@ export function ConnectionsPage() {
   const [filterDeviceSearch, setFilterDeviceSearch] = useState("");
   const [filterDeviceId, setFilterDeviceId] = useState<string | undefined>(undefined);
 
-  const { data, isLoading } = usePaginatedConnections(skip, limit, filterDeviceId);
-  const connections = data?.items;
+  const connectionsQuery = usePaginatedConnections(skip, limit, filterDeviceId);
+  const { data } = connectionsQuery;
+  const state = loadState(connectionsQuery, noItems);
+  const connections = data?.items ?? [];
   const total = data?.total ?? 0;
 
   // Fetch all device names for resolution in the table
@@ -77,8 +81,10 @@ export function ConnectionsPage() {
   );
 
   // Port fetching for selected devices
-  const { data: portsA = [] } = usePorts(deviceAId || undefined);
-  const { data: portsB = [] } = usePorts(deviceBId || undefined);
+  const portsAQuery = usePorts(deviceAId || undefined);
+  const portsBQuery = usePorts(deviceBId || undefined);
+  const portsA = portsAQuery.data ?? [];
+  const portsB = portsBQuery.data ?? [];
 
   const handleCreate = async () => {
     if (!deviceAId) {
@@ -262,9 +268,17 @@ export function ConnectionsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading ? (
+          {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading connections...</p>
-          ) : !connections || connections.length === 0 ? (
+          ) : state === "error" ? (
+            <LoadError
+              what="connections"
+              error={connectionsQuery.error}
+              onRetry={() => void connectionsQuery.refetch()}
+              retrying={connectionsQuery.isFetching}
+              className="m-4"
+            />
+          ) : state === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No connections found</p>
           ) : (
             <div className="overflow-x-auto">
@@ -384,7 +398,16 @@ export function ConnectionsPage() {
                 <option key={p.id} value={p.name}>{p.name}</option>
               ))}
             </select>
-            {deviceAId && portsA.length === 0 && (
+            {deviceAId && loadState(portsAQuery, noEntries) === "error" && (
+              <LoadError
+                what="this device's ports"
+                error={portsAQuery.error}
+                onRetry={() => void portsAQuery.refetch()}
+                retrying={portsAQuery.isFetching}
+                className="mt-2"
+              />
+            )}
+            {deviceAId && loadState(portsAQuery, noEntries) === "empty" && (
               <p className="text-xs text-gray-400 mt-1">No ports configured on this device</p>
             )}
           </div>
@@ -444,7 +467,16 @@ export function ConnectionsPage() {
                 <option key={p.id} value={p.name}>{p.name}</option>
               ))}
             </select>
-            {deviceBId && portsB.length === 0 && (
+            {deviceBId && loadState(portsBQuery, noEntries) === "error" && (
+              <LoadError
+                what="this device's ports"
+                error={portsBQuery.error}
+                onRetry={() => void portsBQuery.refetch()}
+                retrying={portsBQuery.isFetching}
+                className="mt-2"
+              />
+            )}
+            {deviceBId && loadState(portsBQuery, noEntries) === "empty" && (
               <p className="text-xs text-gray-400 mt-1">No ports configured on this device</p>
             )}
           </div>

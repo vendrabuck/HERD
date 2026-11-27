@@ -3,6 +3,8 @@ import toast from "react-hot-toast";
 import { useCurrentUser, useUpdateMyProfile } from "@/api/auth";
 import { ProfileForm } from "@/components/profile/ProfileForm";
 import { profileSaveErrorText } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 import type { ProfileUpdate } from "@/types/auth.types";
 import {
   useNotificationPreferences,
@@ -47,7 +49,8 @@ const DEFAULT_CHANNELS: NotificationChannels = {
  * form through its key with the saved values as the new baseline.
  */
 function ProfileSection() {
-  const { data: user } = useCurrentUser();
+  const userQuery = useCurrentUser();
+  const { data: user } = userQuery;
   const update = useUpdateMyProfile();
 
   const handleSave = async (profile: ProfileUpdate) => {
@@ -75,6 +78,13 @@ function ProfileSection() {
           isPending={update.isPending}
           onSave={handleSave}
         />
+      ) : loadState(userQuery) === "error" ? (
+        <LoadError
+          what="your profile"
+          error={userQuery.error}
+          onRetry={() => void userQuery.refetch()}
+          retrying={userQuery.isFetching}
+        />
       ) : (
         <p className="text-sm text-gray-600">Loading profile...</p>
       )}
@@ -83,7 +93,9 @@ function ProfileSection() {
 }
 
 export function SettingsPage() {
-  const { data: prefs, isLoading } = useNotificationPreferences();
+  const prefsQuery = useNotificationPreferences();
+  const { data: prefs } = prefsQuery;
+  const prefsState = loadState(prefsQuery);
   const update = useUpdateNotificationPreferences();
 
   const [overrides, setOverrides] = useState<{
@@ -120,7 +132,7 @@ export function SettingsPage() {
   // The whole page waits for the preferences, as it did before the Profile
   // section existed: the Settings heading appearing means the Notifications
   // section is there too, which the Selenium settings tests rely on.
-  if (isLoading) {
+  if (prefsState === "loading") {
     return <div className="p-6 text-sm text-gray-600">Loading preferences...</div>;
   }
 
@@ -136,74 +148,88 @@ export function SettingsPage() {
         <section className="bg-white rounded border border-gray-200 p-4">
           <h2 className="text-base font-semibold mb-3">Notifications</h2>
 
-          <div className="mb-4">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={channels.in_app}
-                onChange={(e) => setChannel("in_app", e.target.checked)}
-              />
-              <span>Show in-app notifications</span>
-            </label>
-            <p className="text-xs text-gray-500 mt-1">
-              Disable to stop the bell from showing new items. Existing notifications remain visible
-              until you clear them.
-            </p>
-          </div>
-
-          <div className="mb-4">
-            <div className="text-sm font-medium mb-2">Outbound channels</div>
-            <p className="text-xs text-gray-500 mb-2">
-              Off by default. Enable to also receive notifications outside the app. Transport is
-              configured by your administrator; a channel does nothing until both you opt in and the
-              transport is set up.
-            </p>
-            <div className="space-y-2">
-              {OUTBOUND_CHANNELS.map(({ key, label, hint }) => (
-                <div key={key}>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={channels[key]}
-                      onChange={(e) => setChannel(key, e.target.checked)}
-                    />
-                    <span>{label}</span>
-                  </label>
-                  <p className="text-xs text-gray-500 ml-6">{hint}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="mb-4">
-            <div className="text-sm font-medium mb-2">Notify me about</div>
-            <div className="space-y-1">
-              {EVENT_LABELS.map(({ key, label }) => (
-                <label key={key} className="flex items-center gap-2 text-sm">
+          {/* Issue #1320: preferences that never loaded show no checkboxes and
+              no Save, so a save cannot replace the stored choices with the
+              defaults. */}
+          {prefsState === "error" ? (
+            <LoadError
+              what="your notification preferences"
+              error={prefsQuery.error}
+              onRetry={() => void prefsQuery.refetch()}
+              retrying={prefsQuery.isFetching}
+            />
+          ) : (
+            <>
+              <div className="mb-4">
+                <label className="flex items-center gap-2 text-sm">
                   <input
                     type="checkbox"
-                    checked={events[key] ?? true}
-                    onChange={(e) =>
-                      setOverrides((prev) => ({
-                        ...prev,
-                        events: { ...(prev.events ?? events), [key]: e.target.checked },
-                      }))
-                    }
+                    checked={channels.in_app}
+                    onChange={(e) => setChannel("in_app", e.target.checked)}
                   />
-                  <span>{label}</span>
+                  <span>Show in-app notifications</span>
                 </label>
-              ))}
-            </div>
-          </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Disable to stop the bell from showing new items. Existing notifications remain visible
+                  until you clear them.
+                </p>
+              </div>
 
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={update.isPending}
-            className="text-sm px-3 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            {update.isPending ? "Saving..." : "Save"}
-          </button>
+              <div className="mb-4">
+                <div className="text-sm font-medium mb-2">Outbound channels</div>
+                <p className="text-xs text-gray-500 mb-2">
+                  Off by default. Enable to also receive notifications outside the app. Transport is
+                  configured by your administrator; a channel does nothing until both you opt in and the
+                  transport is set up.
+                </p>
+                <div className="space-y-2">
+                  {OUTBOUND_CHANNELS.map(({ key, label, hint }) => (
+                    <div key={key}>
+                      <label className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={channels[key]}
+                          onChange={(e) => setChannel(key, e.target.checked)}
+                        />
+                        <span>{label}</span>
+                      </label>
+                      <p className="text-xs text-gray-500 ml-6">{hint}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mb-4">
+                <div className="text-sm font-medium mb-2">Notify me about</div>
+                <div className="space-y-1">
+                  {EVENT_LABELS.map(({ key, label }) => (
+                    <label key={key} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={events[key] ?? true}
+                        onChange={(e) =>
+                          setOverrides((prev) => ({
+                            ...prev,
+                            events: { ...(prev.events ?? events), [key]: e.target.checked },
+                          }))
+                        }
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={update.isPending}
+                className="text-sm px-3 py-1.5 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {update.isPending ? "Saving..." : "Save"}
+              </button>
+            </>
+          )}
         </section>
       </div>
     </div>

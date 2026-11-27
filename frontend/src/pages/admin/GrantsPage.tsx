@@ -7,6 +7,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { Grant, GrantCreate } from "@/types/acl.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 
 const RESOURCE_TYPES: Grant["resource_type"][] = ["device", "topology", "reservation", "secret"];
 const PERMISSIONS: Grant["permission"][] = ["view", "manage"];
@@ -26,7 +28,7 @@ export function GrantsPage() {
   const trimmedFilterResourceId = filterResourceId.trim();
   const filterResourceIdValid = UUID_RE.test(trimmedFilterResourceId);
 
-  const { data, isLoading, isError } = useGrants(
+  const grantsQuery = useGrants(
     {
       group_id: filterGroupId || undefined,
       resource_type: filterResourceType || undefined,
@@ -35,10 +37,13 @@ export function GrantsPage() {
     skip,
     limit,
   );
-  const grants = data?.items;
+  const { data } = grantsQuery;
+  const state = loadState(grantsQuery, noItems);
+  const grants = data?.items ?? [];
   const total = data?.total ?? 0;
 
-  const { data: groups } = useGroups();
+  const groupsQuery = useGroups();
+  const { data: groups } = groupsQuery;
   const groupName = (id: string) => {
     const match = groups?.find((g) => g.id === id);
     return match ? match.name : id.slice(0, 8) + "...";
@@ -206,11 +211,17 @@ export function GrantsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading ? (
+          {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading grants...</p>
-          ) : isError ? (
-            <p className="text-sm text-red-600 px-4 py-4">Failed to load grants</p>
-          ) : !grants || grants.length === 0 ? (
+          ) : state === "error" ? (
+            <LoadError
+              what="grants"
+              error={grantsQuery.error}
+              onRetry={() => void grantsQuery.refetch()}
+              retrying={grantsQuery.isFetching}
+              className="m-4"
+            />
+          ) : state === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No grants found</p>
           ) : (
             <div className="overflow-x-auto">
@@ -276,6 +287,15 @@ export function GrantsPage() {
                 </option>
               ))}
             </select>
+            {loadState(groupsQuery) === "error" && (
+              <LoadError
+                what="user groups"
+                error={groupsQuery.error}
+                onRetry={() => void groupsQuery.refetch()}
+                retrying={groupsQuery.isFetching}
+                className="mt-2"
+              />
+            )}
           </div>
 
           <div>

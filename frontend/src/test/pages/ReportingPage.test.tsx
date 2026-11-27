@@ -295,9 +295,9 @@ describe("ReportingPage", () => {
       ),
     );
     renderWithProviders(<ReportingPage />);
-    expect(
-      await screen.findByText("Failed to load report. Try again in a moment."),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the report. The server answered with HTTP 500.",
+    );
     expect(screen.queryByText(/status code/)).not.toBeInTheDocument();
   });
 
@@ -308,9 +308,21 @@ describe("ReportingPage", () => {
       ),
     );
     renderWithProviders(<ReportingPage />);
-    await waitFor(() =>
-      expect(screen.getByText(/Failed to load report/i)).toBeInTheDocument(),
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the report. boom",
     );
+    // Issue #1320: a report that never loaded shows no zero totals, no empty
+    // tables, and no "No data in this window".
+    expect(screen.queryByText("No data in this window")).not.toBeInTheDocument();
+    expect(screen.queryByText("By User")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and the report renders from the answer.
+    server.use(
+      http.get("/api/reservations/reports/utilization", () => HttpResponse.json(REPORT)),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the report" }));
+    expect(await screen.findByText("By User")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("renders fleet utilization stats and per-device rates", async () => {

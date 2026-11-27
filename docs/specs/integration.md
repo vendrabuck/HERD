@@ -975,9 +975,13 @@ kinds on the Settings page.
 - **INTEG-UI-5.** The Settings page shows the in-app toggle, the three outbound toggles
   (off unless stored on), and one toggle per event kind for the seven kinds notifications
   renders (`Reservation failed` since #1077), each on unless stored off; Save sends all channels and events and toasts `Preferences saved` or
-  `Failed to save preferences`. \
+  `Failed to save preferences`. When the preferences read fails, the Notifications
+  section shows `Could not load your notification preferences.` with the server's reason
+  and Retry, and no toggles and no Save, so a save never replaces the stored choices with
+  the defaults; a failed profile read shows `Could not load your profile.` with Retry
+  instead of `Loading profile...` (issue #1320). \
   Enforced in: `frontend/src/pages/SettingsPage.tsx` (`SettingsPage`, `EVENT_LABELS`, `OUTBOUND_CHANNELS`, `handleSave`) \
-  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `shows the failed event on by default and sends an opt-out explicitly`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`, `test_settings_shows_failed_event_toggle_checked_by_default`)
+  Pinned by: `frontend/src/test/pages/SettingsPage.test.tsx` (`shows a loading state then renders all event toggles`, `shows the failed event on by default and sends an opt-out explicitly`, `renders outbound channel toggles defaulting off`, `toggling and saving sends the new payload to the API`, `toasts an error when the save call fails`); `tests/e2e/test_settings_page.py` (`test_settings_event_toggle_round_trip`, `test_settings_email_channel_round_trip`, `test_settings_shows_failed_event_toggle_checked_by_default`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the stored preferences, not the defaults`, `a failed profile load shows its load error instead of loading forever`)
 
 **Out of scope.** The header layout around the bell (`frontend/src/components/layout/AppLayout.tsx`).
 

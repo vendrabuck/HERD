@@ -18,13 +18,19 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { TransferList } from "@/components/ui/TransferList";
 import type { TransferItem } from "@/components/ui/TransferList";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 
 export function DeviceGroupDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const isNew = !id;
 
-  const { data: group, isLoading } = useDeviceGroup(id);
+  const groupQuery = useDeviceGroup(id);
+  const { data: group } = groupQuery;
+  // Issue #1320: an existing device group whose fetch failed renders no form
+  // and no Delete, so neither can act on a group the page never loaded.
+  const groupState = isNew ? "loaded" : loadState(groupQuery);
   const createGroup = useCreateDeviceGroup();
   const updateGroup = useUpdateDeviceGroup();
   const deleteGroup = useDeleteDeviceGroup();
@@ -32,8 +38,10 @@ export function DeviceGroupDetailPage() {
   const bulkRemoveDevices = useBulkRemoveDevices();
   const bulkAddUG = useBulkAddUserGroups();
   const bulkRemoveUG = useBulkRemoveUserGroups();
-  const { data: allDevices } = useAllDevices();
-  const { data: allUserGroups } = useGroups();
+  const devicesQuery = useAllDevices();
+  const { data: allDevices } = devicesQuery;
+  const userGroupsQuery = useGroups();
+  const { data: allUserGroups } = userGroupsQuery;
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -106,11 +114,33 @@ export function DeviceGroupDetailPage() {
     [group?.user_groups, allUserGroups]
   );
 
-  if (!isNew && isLoading) {
+  if (groupState === "loading") {
     return (
       <div className="h-full overflow-y-auto">
         <div className="px-6 xl:px-12 2xl:px-16 py-8">
           <p className="text-sm text-gray-500">Loading device group...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (groupState === "error") {
+    return (
+      <div className="h-full overflow-y-auto">
+        <div className="px-6 xl:px-12 2xl:px-16 py-8">
+          <button
+            onClick={() => navigate("/admin/device-groups")}
+            className="text-sm text-blue-600 hover:text-blue-800 mb-4 inline-block"
+          >
+            Back to Device Groups
+          </button>
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">Edit Device Group</h2>
+          <LoadError
+            what="this device group"
+            error={groupQuery.error}
+            onRetry={() => void groupQuery.refetch()}
+            retrying={groupQuery.isFetching}
+          />
         </div>
       </div>
     );
@@ -362,6 +392,15 @@ export function DeviceGroupDetailPage() {
         title="Add or Remove Devices"
         className="max-w-3xl"
       >
+        {loadState(devicesQuery) === "error" && (
+          <LoadError
+            what="devices"
+            error={devicesQuery.error}
+            onRetry={() => void devicesQuery.refetch()}
+            retrying={devicesQuery.isFetching}
+            className="mb-3"
+          />
+        )}
         <TransferList
           availableItems={availableDevices}
           assignedItems={assignedDevices}
@@ -380,6 +419,15 @@ export function DeviceGroupDetailPage() {
         title="Add or Remove Permissions"
         className="max-w-3xl"
       >
+        {loadState(userGroupsQuery) === "error" && (
+          <LoadError
+            what="user groups"
+            error={userGroupsQuery.error}
+            onRetry={() => void userGroupsQuery.refetch()}
+            retrying={userGroupsQuery.isFetching}
+            className="mb-3"
+          />
+        )}
         <TransferList
           availableItems={availableUGs}
           assignedItems={assignedUGs}

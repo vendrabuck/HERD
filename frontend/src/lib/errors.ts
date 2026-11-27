@@ -108,6 +108,26 @@ export function errorDetail(err: unknown, fallback: string): string {
   return detailText(responseDetail(err), fallback);
 }
 
+/** What a failed load says when no response arrived at all (issue #1320). */
+export const LOAD_FAILURE_NO_ANSWER = "The server did not answer.";
+
+/**
+ * The second sentence of a failed page load (issue #1320, `LoadError`): the
+ * server's `detail` through `errorDetail`, or, when the body carries none, a
+ * fixed sentence naming the HTTP status (a number axios read from the
+ * response, never body text), or LOAD_FAILURE_NO_ANSWER when no response
+ * arrived (a network error, a refused connection).
+ */
+export function loadFailureDetail(err: unknown): string {
+  const status = (err as { response?: { status?: unknown } } | null | undefined)?.response
+    ?.status;
+  const fallback =
+    typeof status === "number" && Number.isInteger(status)
+      ? "The server answered with HTTP " + status + "."
+      : LOAD_FAILURE_NO_ANSWER;
+  return errorDetail(err, fallback);
+}
+
 /**
  * Narrows an axios error's response `detail` to a structured, object-shaped
  * body carrying a given HTTP status (review fix F9, issue #34): the shared

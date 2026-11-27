@@ -13,6 +13,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { Hypervisor } from "@/types/hypervisor.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 
 interface FormState {
   name: string;
@@ -39,11 +41,15 @@ const EMPTY_FORM: FormState = {
 export function HypervisorsPage() {
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading } = usePaginatedHypervisors(skip, limit);
-  const hypervisors = data?.items;
+  const hypervisorsQuery = usePaginatedHypervisors(skip, limit);
+  const { data } = hypervisorsQuery;
+  const state = loadState(hypervisorsQuery, noItems);
+  const hypervisors = data?.items ?? [];
   const total = data?.total ?? 0;
-  const { data: secrets } = useSecrets();
-  const { data: deviceGroups } = useDeviceGroups();
+  const secretsQuery = useSecrets();
+  const { data: secrets } = secretsQuery;
+  const deviceGroupsQuery = useDeviceGroups();
+  const { data: deviceGroups } = deviceGroupsQuery;
 
   const createHypervisor = useCreateHypervisor();
   const updateHypervisor = useUpdateHypervisor();
@@ -248,6 +254,15 @@ export function HypervisorsPage() {
             reference; select a live secret to repair it.
           </p>
         )}
+        {loadState(secretsQuery) === "error" && (
+          <LoadError
+            what="secrets"
+            error={secretsQuery.error}
+            onRetry={() => void secretsQuery.refetch()}
+            retrying={secretsQuery.isFetching}
+            className="mt-2"
+          />
+        )}
         {secrets && secrets.length === 0 && (
           <p className="text-xs text-amber-600 mt-1">
             No secrets exist yet. Create one via the secrets API first, then register the
@@ -275,6 +290,15 @@ export function HypervisorsPage() {
             </option>
           ))}
         </select>
+        {loadState(deviceGroupsQuery) === "error" && (
+          <LoadError
+            what="device groups"
+            error={deviceGroupsQuery.error}
+            onRetry={() => void deviceGroupsQuery.refetch()}
+            retrying={deviceGroupsQuery.isFetching}
+            className="mt-2"
+          />
+        )}
         <p className="text-xs text-gray-500 mt-1">
           Users whose user groups have a permission on this device group can see and book the
           dynamic templates that use this hypervisor. Admins can always book them.
@@ -330,9 +354,17 @@ export function HypervisorsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading ? (
+          {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading hypervisors...</p>
-          ) : !hypervisors || hypervisors.length === 0 ? (
+          ) : state === "error" ? (
+            <LoadError
+              what="hypervisors"
+              error={hypervisorsQuery.error}
+              onRetry={() => void hypervisorsQuery.refetch()}
+              retrying={hypervisorsQuery.isFetching}
+              className="m-4"
+            />
+          ) : state === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No hypervisors found</p>
           ) : (
             <div className="overflow-x-auto">

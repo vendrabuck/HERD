@@ -810,6 +810,13 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   unencodable (a 500). Other non-ASCII text and a character outside the BMP are saved. \
   Enforced in: `services/config/app/main.py` (`update_settings`, `SETTINGS_NOT_UTF8_DETAIL`); `services/config/app/validation_errors.py` (`holds_lone_surrogate`) \
   Pinned by: `services/config/tests/test_config.py` (`test_a_lone_surrogate_is_the_fixed_422_and_writes_nothing`, `test_a_surrogate_pair_and_other_non_ascii_text_are_saved`)
+- **OPS-CONFIG-32.** The config editor builds its form from the schema and fills it from
+  the saved settings. When either read fails, it shows `Could not load the configuration
+  schema.` or `Could not load the saved configuration.` with the server's reason, Retry,
+  and Sign out, and renders no form, Save, or Save and Restart, so a save never writes a
+  blank form over settings the page never read (issue #1320). \
+  Enforced in: `frontend/src/pages/ConfigPage.tsx` (`ConfigEditor`) \
+  Pinned by: `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the saved values, not the schema defaults`)
 
 **Out of scope.** The superadmin seed that reads `SUPERADMIN_*` (`identity-and-access.md`,
 IAM-BOOT-1 to IAM-BOOT-5); the meaning of each field (each area's Configuration section).

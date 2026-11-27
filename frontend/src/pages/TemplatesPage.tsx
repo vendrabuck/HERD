@@ -4,6 +4,8 @@ import toast from "react-hot-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 import { isAdminRole } from "@/lib/roles";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -38,12 +40,10 @@ export function TemplatesPage() {
   const [typeFilter, setTypeFilter] = useState("");
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading, isError } = usePaginatedTemplates(
-    typeFilter || undefined,
-    skip,
-    limit,
-  );
-  const templates = data?.items;
+  const templatesQuery = usePaginatedTemplates(typeFilter || undefined, skip, limit);
+  const { data } = templatesQuery;
+  const state = loadState(templatesQuery, noItems);
+  const templates = data?.items ?? [];
   const total = data?.total ?? 0;
   const deleteTemplate = useDeleteTemplate();
   const createTemplate = useCreateTemplate();
@@ -141,7 +141,7 @@ export function TemplatesPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading && (
+          {state === "loading" && (
             <p
               role="status"
               aria-live="polite"
@@ -150,17 +150,21 @@ export function TemplatesPage() {
               Loading templates...
             </p>
           )}
-          {isError && (
-            <p className="text-sm text-red-500 text-center py-8">
-              Failed to load templates
-            </p>
+          {state === "error" && (
+            <LoadError
+              what="templates"
+              error={templatesQuery.error}
+              onRetry={() => void templatesQuery.refetch()}
+              retrying={templatesQuery.isFetching}
+              className="m-4"
+            />
           )}
-          {templates && templates.length === 0 && (
+          {state === "empty" && (
             <p className="text-sm text-gray-400 text-center py-8">
               No templates found
             </p>
           )}
-          {templates && templates.length > 0 && (
+          {state === "loaded" && (
             <div className="overflow-x-auto">
             <table className="w-full min-w-[700px]">
               <thead>

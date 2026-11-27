@@ -5,14 +5,18 @@ import { usePaginatedGroups, useDeleteGroup } from "@/api/groups";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 
 export function GroupsPage() {
   const navigate = useNavigate();
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading } = usePaginatedGroups(skip, limit);
-  const groups = data?.items;
+  const groupsQuery = usePaginatedGroups(skip, limit);
+  const { data } = groupsQuery;
+  const state = loadState(groupsQuery, noItems);
+  const groups = data?.items ?? [];
   const total = data?.total ?? 0;
   const deleteGroup = useDeleteGroup();
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -43,9 +47,17 @@ export function GroupsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading ? (
+          {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading groups...</p>
-          ) : !groups || groups.length === 0 ? (
+          ) : state === "error" ? (
+            <LoadError
+              what="user groups"
+              error={groupsQuery.error}
+              onRetry={() => void groupsQuery.refetch()}
+              retrying={groupsQuery.isFetching}
+              className="m-4"
+            />
+          ) : state === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No groups found</p>
           ) : (
             <div className="overflow-x-auto">

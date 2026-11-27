@@ -205,14 +205,16 @@ describe("LdapSyncPage", () => {
       refetch: mockRefetch,
     });
     render(<LdapSyncPage />);
-    expect(screen.getByText("Could not load directory sync status.")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load directory sync status. The server did not answer.",
+    );
     expect(
       screen.queryByText(/This deployment uses local authentication/),
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create mapping" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Sync now" })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading directory sync status" }));
     expect(mockRefetch).toHaveBeenCalled();
   });
 

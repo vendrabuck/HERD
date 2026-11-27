@@ -13,6 +13,8 @@ import {
 } from "@/api/ldapSync";
 import { useGroups } from "@/api/groups";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
@@ -41,8 +43,8 @@ const STALE_RUNNING_TITLE =
 const limit = 50;
 
 export function LdapSyncPage() {
-  const { data: status, isLoading: statusLoading, isError: statusError, refetch: refetchStatus } =
-    useLdapSyncStatus();
+  const statusQuery = useLdapSyncStatus();
+  const { data: status, isLoading: statusLoading, isError: statusError } = statusQuery;
   // Fail-closed default: create/sync-now stay disabled unless the status
   // query has actually confirmed ldap mode. Undefined (loading or errored)
   // and "local" both read as false here; see the comment on
@@ -51,7 +53,8 @@ export function LdapSyncPage() {
   const isLdapMode = status?.auth_method === "ldap";
   const actionsEnabled = isLdapMode;
 
-  const { data: groups } = useGroups();
+  const groupsQuery = useGroups();
+  const { data: groups } = groupsQuery;
   const groupName = (id: string) => {
     const match = groups?.find((g) => g.id === id);
     return match ? match.name : id.slice(0, 8) + "...";
@@ -59,11 +62,10 @@ export function LdapSyncPage() {
 
   // --- Mappings section ---
   const [mappingsSkip, setMappingsSkip] = useState(0);
-  const { data: mappingsPage, isLoading: mappingsLoading } = usePaginatedMappings(
-    mappingsSkip,
-    limit,
-  );
-  const mappings = mappingsPage?.items;
+  const mappingsQuery = usePaginatedMappings(mappingsSkip, limit);
+  const { data: mappingsPage, isLoading: mappingsLoading } = mappingsQuery;
+  const mappingsState = loadState(mappingsQuery, noItems);
+  const mappings = mappingsPage?.items ?? [];
   const mappingsTotal = mappingsPage?.total ?? 0;
 
   const createMapping = useCreateMapping();
@@ -79,8 +81,10 @@ export function LdapSyncPage() {
 
   // --- Runs section ---
   const [runsSkip, setRunsSkip] = useState(0);
-  const { data: runsPage, isLoading: runsLoading } = usePaginatedSyncRuns(runsSkip, limit);
-  const runs = runsPage?.items;
+  const runsQuery = usePaginatedSyncRuns(runsSkip, limit);
+  const { data: runsPage } = runsQuery;
+  const runsState = loadState(runsQuery, noItems);
+  const runs = runsPage?.items ?? [];
   const runsTotal = runsPage?.total ?? 0;
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
   const startSyncRun = useStartSyncRun();
@@ -193,15 +197,13 @@ export function LdapSyncPage() {
         </div>
 
         {statusError && (
-          <div className="mb-4 px-4 py-3 rounded-lg border border-red-200 bg-red-50 text-sm text-red-700 flex items-center justify-between gap-4">
-            <span>Could not load directory sync status.</span>
-            <button
-              onClick={() => refetchStatus()}
-              className="px-3 py-1.5 text-sm font-medium text-red-700 bg-white border border-red-300 rounded hover:bg-red-100 transition-colors"
-            >
-              Retry
-            </button>
-          </div>
+          <LoadError
+            what="directory sync status"
+            error={statusQuery.error}
+            onRetry={() => void statusQuery.refetch()}
+            retrying={statusQuery.isFetching}
+            className="mb-4"
+          />
         )}
         {!statusLoading && !statusError && !isLdapMode && (
           <div className="mb-4 px-4 py-3 rounded-lg border border-gray-200 bg-gray-50 text-sm text-gray-700">
@@ -245,9 +247,17 @@ export function LdapSyncPage() {
         )}
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden mb-8">
-          {mappingsLoading ? (
+          {mappingsState === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading mappings...</p>
-          ) : !mappings || mappings.length === 0 ? (
+          ) : mappingsState === "error" ? (
+            <LoadError
+              what="group mappings"
+              error={mappingsQuery.error}
+              onRetry={() => void mappingsQuery.refetch()}
+              retrying={mappingsQuery.isFetching}
+              className="m-4"
+            />
+          ) : mappingsState === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No group mappings found</p>
           ) : (
             <div className="overflow-x-auto">
@@ -307,9 +317,17 @@ export function LdapSyncPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {runsLoading ? (
+          {runsState === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading runs...</p>
-          ) : !runs || runs.length === 0 ? (
+          ) : runsState === "error" ? (
+            <LoadError
+              what="sync runs"
+              error={runsQuery.error}
+              onRetry={() => void runsQuery.refetch()}
+              retrying={runsQuery.isFetching}
+              className="m-4"
+            />
+          ) : runsState === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No sync runs found</p>
           ) : (
             <div className="overflow-x-auto">
@@ -433,6 +451,15 @@ export function LdapSyncPage() {
                 </option>
               ))}
             </select>
+            {loadState(groupsQuery) === "error" && (
+              <LoadError
+                what="HERD groups"
+                error={groupsQuery.error}
+                onRetry={() => void groupsQuery.refetch()}
+                retrying={groupsQuery.isFetching}
+                className="mt-2"
+              />
+            )}
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <button

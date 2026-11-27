@@ -14,6 +14,8 @@ import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag
 import { isUnclassifiedCategory, purposeCategoryLabel } from "@/lib/purposeCategories";
 import { csvSafeCell } from "@/lib/csvSafety";
 import { errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 
 function triggerCsvDownload(filename: string, body: string): void {
   const blob = new Blob([body], { type: "text/csv;charset=utf-8" });
@@ -155,25 +157,47 @@ export function ReportingPage() {
     triggerCsvDownload(`utilization-template-${startDate}-to-${endDate}.csv`, body);
   };
 
+  const header = (
+    <div className="flex items-start justify-between gap-4 flex-wrap">
+      <div>
+        <h2 className="text-lg font-semibold text-gray-900">Utilization Report</h2>
+        <p className="text-sm text-gray-500 mt-1">
+          Who used what, for how long, across completed reservations in the selected window.
+        </p>
+      </div>
+      <RangeSelector
+        preset={preset}
+        setPreset={setPreset}
+        customStart={customStart}
+        setCustomStart={setCustomStart}
+        customEnd={customEnd}
+        setCustomEnd={setCustomEnd}
+      />
+    </div>
+  );
+
+  // Issue #1320: a report that never loaded shows the failure and Retry, not
+  // zero hours, empty charts, and "No data in this window" tables.
+  if (loadState(report) === "error") {
+    return (
+      <div className="h-full overflow-y-auto">
+        <div className="px-6 xl:px-12 2xl:px-16 py-6 space-y-6">
+          {header}
+          <LoadError
+            what="the report"
+            error={report.error}
+            onRetry={() => void report.refetch()}
+            retrying={report.isFetching}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="px-6 xl:px-12 2xl:px-16 py-6 space-y-6">
-        <div className="flex items-start justify-between gap-4 flex-wrap">
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900">Utilization Report</h2>
-            <p className="text-sm text-gray-500 mt-1">
-              Who used what, for how long, across completed reservations in the selected window.
-            </p>
-          </div>
-          <RangeSelector
-            preset={preset}
-            setPreset={setPreset}
-            customStart={customStart}
-            setCustomStart={setCustomStart}
-            customEnd={customEnd}
-            setCustomEnd={setCustomEnd}
-          />
-        </div>
+        {header}
 
         <HeadlineCards
           totalHours={report.data?.total_hours ?? 0}

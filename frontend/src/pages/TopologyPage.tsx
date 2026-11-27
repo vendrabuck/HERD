@@ -44,6 +44,8 @@ import { Pagination } from "@/components/ui/Pagination";
 import { BulkImportExport } from "@/components/ui/BulkImportExport";
 import { exportTopologies, importTopologies } from "@/api/bulk";
 import type { Topology } from "@/types/topology.types";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 
 const TH_CLASS = "px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wide";
 
@@ -251,11 +253,13 @@ export function TopologyPage() {
     query.sortBy = explicitSort.sortBy;
     query.sortDir = explicitSort.sortDir;
   }
-  const { data, isLoading, isError } = usePaginatedTopologies(
+  const topologiesQuery = usePaginatedTopologies(
     skip,
     limit,
     Object.keys(query).length > 0 ? query : undefined,
   );
+  const { data } = topologiesQuery;
+  const state = loadState(topologiesQuery, noItems);
   const topologies = data?.items;
   const total = data?.total ?? 0;
 
@@ -455,22 +459,28 @@ export function TopologyPage() {
           </div>
 
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-            {isLoading && (
+            {state === "loading" && (
               <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
                 Loading topologies...
               </p>
             )}
-            {isError && (
-              <p className="text-sm text-red-500 text-center py-8">Failed to load topologies</p>
+            {state === "error" && (
+              <LoadError
+                what="topologies"
+                error={topologiesQuery.error}
+                onRetry={() => void topologiesQuery.refetch()}
+                retrying={topologiesQuery.isFetching}
+                className="m-4"
+              />
             )}
-            {topologies && topologies.length === 0 && (
+            {state === "empty" && (
               <p className="text-sm text-gray-400 text-center py-8">
                 {filtersApplied
                   ? "No topologies match these filters."
                   : "No topologies yet. Create one to get started."}
               </p>
             )}
-            {topologies && topologies.length > 0 && (
+            {state === "loaded" && topologies && (
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[640px]">
                   <thead>

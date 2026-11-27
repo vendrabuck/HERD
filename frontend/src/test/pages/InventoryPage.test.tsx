@@ -137,8 +137,19 @@ describe("InventoryPage", () => {
     );
     renderWithProviders(<InventoryPage />);
     await waitFor(() =>
-      expect(screen.getByText("Failed to load devices")).toBeInTheDocument(),
+      expect(screen.getByRole("alert")).toHaveTextContent("Could not load devices. boom"),
     );
+    expect(screen.queryByText("No devices found")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and a good empty answer is the empty state.
+    server.use(
+      http.get("/api/inventory/devices", () =>
+        HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading devices" }));
+    expect(await screen.findByText("No devices found")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("renders an empty-row message when the page has no devices", async () => {

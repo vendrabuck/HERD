@@ -115,9 +115,23 @@ describe("TopologyPage loading/error/empty states", () => {
   });
 
   it("shows the exact error text on a failed fetch", () => {
-    mockUsePaginatedTopologies.mockReturnValue({ data: undefined, isLoading: false, isError: true });
+    const refetch = vi.fn();
+    mockUsePaginatedTopologies.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: { response: { status: 500, data: { detail: "database is down" } } },
+      refetch,
+    });
     renderPage();
-    expect(screen.getByText("Failed to load topologies")).toBeInTheDocument();
+    // Issue #1320: the error state names the load, carries the server's
+    // detail as text, offers Retry, and is never the empty state.
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load topologies. database is down",
+    );
+    expect(screen.queryByText(/No topologies/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading topologies" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 
   it("shows the exact empty-state text when there are zero topologies", () => {

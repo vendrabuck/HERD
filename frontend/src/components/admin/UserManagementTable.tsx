@@ -3,6 +3,8 @@ import { usePaginatedUsers, useSetUserRole } from "@/api/admin";
 import { Pagination } from "@/components/ui/Pagination";
 import { EditProfileDialog } from "@/components/admin/EditProfileDialog";
 import { displayName } from "@/lib/profileEdit";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 import type { User } from "@/types/auth.types";
 
 interface UserManagementTableProps {
@@ -13,19 +15,33 @@ interface UserManagementTableProps {
 export function UserManagementTable({ currentUserId, showRoleControls = true }: UserManagementTableProps) {
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading } = usePaginatedUsers(skip, limit);
+  const usersQuery = usePaginatedUsers(skip, limit);
+  const { data } = usersQuery;
+  const state = loadState(usersQuery, noItems);
   const setRole = useSetUserRole();
   // The account whose Edit profile dialog is open (issue #1252), or null.
   const [editing, setEditing] = useState<User | null>(null);
 
-  const users = data?.items;
+  const users = data?.items ?? [];
   const total = data?.total ?? 0;
 
-  if (isLoading) {
+  if (state === "loading") {
     return <p className="text-sm text-gray-500 py-4">Loading users...</p>;
   }
 
-  if (!users || users.length === 0) {
+  if (state === "error") {
+    return (
+      <LoadError
+        what="users"
+        error={usersQuery.error}
+        onRetry={() => void usersQuery.refetch()}
+        retrying={usersQuery.isFetching}
+        className="m-4"
+      />
+    );
+  }
+
+  if (state === "empty") {
     return <p className="text-sm text-gray-500 py-4">No users found</p>;
   }
 
