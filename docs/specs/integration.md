@@ -700,10 +700,11 @@ matters, is cancelled, completes, fails, or is about to end.
 - **INTEG-ROUTE-7.** The end time in the `reservation.created`, `reservation.updated`,
   and `reservation.expiring_soon` bodies is the UTC instant the payload's ISO 8601
   `end_time` names, written `YYYY-MM-DD HH:MM UTC` with seconds and fractions dropped,
-  whatever offset the value carries (#1564). A value with no offset is taken as UTC,
-  never as the host's zone. A missing or non-string `end_time` reads `unknown end`; a
-  string that does not parse, or whose instant falls outside the years 1 to 9999 in UTC,
-  is written unchanged. None of these raises, so the message is still delivered and
+  whatever offset the value carries (#1564); for a year before 1000 the year is written
+  by `strftime("%Y")`, which on Python 3.12 has no leading zeros. A value with no offset
+  is taken as UTC, never as the host's zone. A missing, empty, or non-string `end_time`
+  reads `unknown end`; a non-empty string that does not parse, or whose instant falls
+  outside the years 1 to 9999 in UTC, is written unchanged. None of these raises, so the message is still delivered and
   acked. \
   Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_format_end_time_renders_the_utc_instant`, `test_format_end_time_ignores_the_host_zone`, `test_format_end_time_returns_an_unusable_string_unchanged`, `test_format_end_time_missing_or_non_string_is_unknown_end`, `test_every_end_time_message_states_the_utc_instant`, `test_unusable_end_time_still_notifies`); `services/notifications/tests/test_functional_dispatch_path.py` (`test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack`)

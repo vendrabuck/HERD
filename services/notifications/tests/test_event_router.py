@@ -299,6 +299,9 @@ def test_format_end_time_ignores_the_host_zone(host_zone_far_from_utc, end_time,
         "2026-13-01T00:00:00Z",
         "2026-11-25T25:00:00+00:00",
         "2026-11-25T18:00:00+24:00",
+        # Whitespace is not stripped before parsing, and a long value is not cut.
+        " 2026-11-25T18:00:00Z ",
+        "the end time could not be read from this event payload at all",
         # Parseable, but the instant has no UTC equivalent (before year 1, after 9999).
         "0001-01-01T00:00:00+05:00",
         "9999-12-31T23:00:00-05:00",

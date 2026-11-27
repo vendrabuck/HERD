@@ -13,10 +13,10 @@ def _format_end_time(end_time: object) -> str:
 
     An aware value is converted to UTC before formatting, so the label is true
     whatever offset the event carried; a naive one is taken as UTC, never as the
-    host's local zone. Seconds and fractions are dropped, not rounded. A missing
-    or non-string value renders as ``unknown end``; a string that does not parse,
-    or whose instant has no UTC equivalent, is returned unchanged. Nothing raises,
-    so a bad value never fails the consumer's message.
+    host's local zone. Seconds and fractions are dropped, not rounded. A missing,
+    empty, or non-string value renders as ``unknown end``; a non-empty string that
+    does not parse, or whose instant has no UTC equivalent, is returned unchanged.
+    Nothing raises, so a bad value never fails the consumer's message.
     """
     if not end_time or not isinstance(end_time, str):
         return "unknown end"

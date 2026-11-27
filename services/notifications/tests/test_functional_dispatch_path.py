@@ -194,12 +194,14 @@ async def test_full_fanout_then_redelivery_is_idempotent():
             "0001-01-01T00:00:00+05:00",
             "Reservation for 1 device is active until 0001-01-01T00:00:00+05:00.",
         ),
+        (1764093600, "Reservation for 1 device is active until unknown end."),
     ],
 )
 async def test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack(end_time, body):
     """Issue #1564 through the real consumer path: the stored in-app body states the
-    UTC instant of an offset end_time, and a value with no UTC equivalent is acked and
-    delivered, not naked toward the DLQ."""
+    UTC instant of an offset end_time, and a value with no UTC equivalent or a number
+    (which the old formatter raised on) is acked and delivered, not naked toward the
+    DLQ."""
     set_preferences_client(
         _StubPrefs(NotificationPreferences(channels={"in_app": True}, events={}))
     )
