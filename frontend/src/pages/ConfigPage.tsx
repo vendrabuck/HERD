@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
@@ -16,6 +16,20 @@ import { isPlainObject, loadState } from "@/lib/loadState";
 import { useConfigStore } from "@/stores/configStore";
 import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
+  answerWasLost,
+  lastRestartHeading,
+  readOnOpen,
+  readWithin,
+  waitForRestart,
+  RESTART_FOLLOW_LOST_TEXT,
+  RESTART_RESULT_HEADING,
+  RESTART_NOT_STARTED_TEXT,
+  RESTART_TIMED_OUT_TEXT,
+  RESTART_UNREADABLE_TEXT,
+  type RestartOutcome,
+} from "@/lib/configRestart";
+import {
+  fetchLastRestart,
   useConfigLogin,
   useChangeConfigPassword,
   useConfigSchema,
@@ -23,6 +37,7 @@ import {
   useSaveConfigSettings,
   useApplyConfig,
   type ConfigField,
+  type RestartResult,
 } from "@/api/config";
 
 // -- Config Login --
@@ -300,10 +315,58 @@ function ConfigEditor() {
 
   const [values, setValues] = useState<Record<string, string | number | boolean>>({});
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
-  const [restartResult, setRestartResult] = useState<{
-    restarted: string[];
-    errors: string[];
+  // The Restart Result panel: this click's own run under RESTART_RESULT_HEADING, or a
+  // run the page did not start under a "Last restart, finished ..." heading.
+  const [restartPanel, setRestartPanel] = useState<{
+    result: RestartResult;
+    heading: string;
   } | null>(null);
+  // True while the page waits on a restart: its own Save and Restart, or one the
+  // config service reports as running when the editor opens (issue #1433).
+  const [awaitingRestart, setAwaitingRestart] = useState(false);
+  // Aborted when the editor goes away, which ends any wait for a restart result.
+  const pageLife = useRef<AbortController | null>(null);
+  // Set by the first Save and Restart click: the read made on open then neither shows
+  // nor follows anything, so one run is never reported twice.
+  const clickStarted = useRef(false);
+
+  const showRestartResult = (result: RestartResult, heading: string) => {
+    setRestartPanel({ result, heading });
+    if (result.errors.length === 0) {
+      toast.success(`Restarted ${result.restarted.length} services`);
+    } else {
+      toast.error(`Some services failed to restart`);
+    }
+  };
+
+  // Issue #1433: the last restart the config service started, read when the editor
+  // opens, so a reload during or after a restart shows its true outcome. A finished
+  // one is shown as is, labelled with its finish time; a running one is waited for,
+  // as a lost answer is.
+  useEffect(() => {
+    const life = new AbortController();
+    pageLife.current = life;
+    const follow = async () => {
+      const last = await readOnOpen(fetchLastRestart, life.signal);
+      if (!last || clickStarted.current) return;
+      if (last.state === "done" && last.result) {
+        setRestartPanel({ result: last.result, heading: lastRestartHeading(last.finished_at) });
+        return;
+      }
+      if (last.state !== "running") return;
+      setAwaitingRestart(true);
+      const outcome = await waitForRestart(fetchLastRestart, null, { signal: life.signal });
+      if (outcome.kind === "cancelled") return;
+      setAwaitingRestart(false);
+      if (outcome.kind === "done") {
+        showRestartResult(outcome.result, lastRestartHeading(outcome.finishedAt));
+      } else {
+        toast.error(RESTART_FOLLOW_LOST_TEXT);
+      }
+    };
+    void follow();
+    return () => life.abort();
+  }, []);
 
   // Populate form from settings when loaded
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -374,19 +437,57 @@ function ConfigEditor() {
     }
   };
 
+  const reportLostAnswer = (outcome: Exclude<RestartOutcome, { kind: "done" }>) => {
+    if (outcome.kind === "not_started") toast.error(RESTART_NOT_STARTED_TEXT);
+    else if (outcome.kind === "timed_out") toast.error(RESTART_TIMED_OUT_TEXT);
+    else if (outcome.kind === "unreadable") toast.error(RESTART_UNREADABLE_TEXT);
+  };
+
   const handleSaveAndRestart = async () => {
+    clickStarted.current = true;
     try {
       await saveSettings.mutateAsync(values);
-      toast.success("Configuration saved, restarting services...");
-      const result = await applyConfig.mutateAsync();
-      setRestartResult(result);
-      if (result.errors.length === 0) {
-        toast.success(`Restarted ${result.restarted.length} services`);
-      } else {
-        toast.error(`Some services failed to restart`);
-      }
     } catch {
       toast.error("Failed to save or restart");
+      return;
+    }
+    // From here on any panel would read as this click's result: an earlier run's
+    // result must not stay up when this one fails or has no known outcome.
+    setRestartPanel(null);
+    toast.success("Configuration saved, restarting services...");
+    setAwaitingRestart(true);
+    try {
+      // The record's id before this apply, so an older run is never taken for this one.
+      let priorId: string | null;
+      try {
+        priorId = (await readWithin(fetchLastRestart)).id;
+      } catch {
+        toast.error(RESTART_NOT_STARTED_TEXT);
+        return;
+      }
+      let result: RestartResult;
+      try {
+        result = await applyConfig.mutateAsync();
+      } catch (err) {
+        // A refusal from the config service is a failure. A lost answer is not: the
+        // restart itself can cut the request off (issue #1433), so the verdict comes
+        // from the config service's record of the run.
+        if (!answerWasLost(err)) {
+          toast.error("Failed to save or restart");
+          return;
+        }
+        const outcome = await waitForRestart(fetchLastRestart, priorId, {
+          signal: pageLife.current?.signal,
+        });
+        if (outcome.kind !== "done") {
+          reportLostAnswer(outcome);
+          return;
+        }
+        result = outcome.result;
+      }
+      showRestartResult(result, RESTART_RESULT_HEADING);
+    } finally {
+      setAwaitingRestart(false);
     }
   };
 
@@ -504,17 +605,20 @@ function ConfigEditor() {
         })}
       </div>
 
-      {restartResult && (
-        <div className="mt-4 bg-white rounded-xl shadow-sm border border-gray-200 p-4">
-          <h3 className="text-sm font-semibold text-gray-900 mb-2">Restart Result</h3>
-          {restartResult.restarted.length > 0 && (
+      {restartPanel && (
+        <div
+          data-testid="restart-result"
+          className="mt-4 bg-white rounded-xl shadow-sm border border-gray-200 p-4"
+        >
+          <h3 className="text-sm font-semibold text-gray-900 mb-2">{restartPanel.heading}</h3>
+          {restartPanel.result.restarted.length > 0 && (
             <p className="text-sm text-green-600">
-              Restarted: {restartResult.restarted.join(", ")}
+              Restarted: {restartPanel.result.restarted.join(", ")}
             </p>
           )}
-          {restartResult.errors.length > 0 && (
+          {restartPanel.result.errors.length > 0 && (
             <div className="text-sm text-red-600 mt-1">
-              {restartResult.errors.map((err, i) => (
+              {restartPanel.result.errors.map((err, i) => (
                 <p key={i}>{err}</p>
               ))}
             </div>
@@ -532,10 +636,10 @@ function ConfigEditor() {
         </button>
         <button
           onClick={handleSaveAndRestart}
-          disabled={saveSettings.isPending || applyConfig.isPending}
+          disabled={saveSettings.isPending || applyConfig.isPending || awaitingRestart}
           className="flex-1 bg-blue-600 text-white py-2 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
         >
-          {applyConfig.isPending ? "Restarting..." : "Save and Restart"}
+          {applyConfig.isPending || awaitingRestart ? "Restarting..." : "Save and Restart"}
         </button>
       </div>
 
