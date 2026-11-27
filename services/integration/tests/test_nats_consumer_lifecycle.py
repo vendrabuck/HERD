@@ -18,7 +18,9 @@ both consumer loops racing to drain the same one-shot fake subscription.
 
 import asyncio
 import json
+import logging
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.database import Base
@@ -26,6 +28,18 @@ from app.services import nats_consumer
 from app.services.nats_consumer import start_nats_consumer, stop_nats_consumer
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+
+_LOGGER = "app.services.nats_consumer"
+# Exception text a broker error could carry; no warning may repeat it.
+_EXC_TEXT = "nats://herd-user:tok3n-value@broker:4222 replied with an error"
+
+
+def _records(caplog):
+    return [r for r in caplog.records if r.name == _LOGGER]
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in _records(caplog) if r.levelno == logging.WARNING]
 
 
 class _StubTimeoutError(Exception):
@@ -158,11 +172,12 @@ async def test_start_nats_consumer_connection_failure_is_swallowed():
     )
 
 
-async def test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers():
+async def test_start_nats_consumer_stream_ensure_failure_still_starts_both_consumers(caplog):
     """ensure_stream_exists failing for a stream (e.g. transient broker error
     while the stream already exists) is logged but must not block either pull
     subscription from being set up; the streams are owned by their producing
-    services, not this consumer."""
+    services, not this consumer. Issue #1418 pins the line: the class name
+    only, and that the setup goes ahead."""
     mock_app = MagicMock()
     mock_app.state = MagicMock()
 
@@ -177,15 +192,122 @@ async def test_start_nats_consumer_stream_ensure_failure_still_starts_both_consu
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
         patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_mock),
+        caplog.at_level(logging.WARNING, logger=_LOGGER),
     ):
         await start_nats_consumer(mock_app)
 
+    assert _warnings(caplog) == [
+        f"JetStream stream {stream} could not be checked or created (RuntimeError); the "
+        "consumer setup on it goes ahead, and fails if the stream is missing"
+        for stream in (nats_consumer.NATS_STREAM, nats_consumer.HEALTH_STREAM)
+    ]
     assert ensure_stream_mock.await_count == 2
     assert len(mock_js.subscribe_calls) == 2
     assert isinstance(mock_app.state.nats_consumer_task, asyncio.Task)
     assert isinstance(mock_app.state.nats_health_consumer_task, asyncio.Task)
 
     await _cancel_both(mock_app)
+
+
+class _FailingJetStream(_FakeJetStream):
+    """A `_FakeJetStream` whose add_consumer (ensure_consumer) raises for one
+    durable, or whose pull_subscribe raises for one subject, after a good
+    connect (issue #1418)."""
+
+    def __init__(self, *, fail_add_consumer_for=None, fail_subscribe_for=None):
+        super().__init__()
+        self._fail_add_consumer_for = fail_add_consumer_for
+        self._fail_subscribe_for = fail_subscribe_for
+
+    async def add_consumer(self, stream, config):
+        if config.durable_name == self._fail_add_consumer_for:
+            raise RuntimeError(_EXC_TEXT)
+        await super().add_consumer(stream, config)
+
+    async def pull_subscribe(self, subject_pattern, durable, config):
+        if subject_pattern == self._fail_subscribe_for:
+            raise RuntimeError(_EXC_TEXT)
+        return await super().pull_subscribe(subject_pattern, durable, config)
+
+
+def _setup_failure_line(durable, stream, not_running, running):
+    return (
+        f"NATS consumer setup failed for durable {durable} on stream {stream} "
+        f"(RuntimeError); not running: {not_running}; still running: {running}. The "
+        "connection is kept, but nothing retries the setup, so a consumer that is not "
+        "running starts only when the service is restarted; events published to its "
+        "stream meanwhile wait there, kept up to the stream's max age, and are "
+        "processed after that restart"
+    )
+
+
+async def _start_with(js, caplog):
+    app = SimpleNamespace(state=SimpleNamespace())
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=js)
+    mock_nats = MagicMock()
+    mock_nats.connect = AsyncMock(return_value=mock_nc)
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+        caplog.at_level(logging.INFO, logger=_LOGGER),
+    ):
+        await start_nats_consumer(app)
+    return app, mock_nc
+
+
+async def test_reservations_setup_failure_is_not_called_a_connect_failure(caplog):
+    """Issue #1418: the connect succeeded and the reservations durable's setup
+    raised. The warning names that durable and its stream, lists both durables
+    as not running (the start stops at the first failure, so the health one is
+    never reached), keeps the connection, and carries no exception text."""
+    js = _FailingJetStream(fail_add_consumer_for=nats_consumer.NATS_DURABLE)
+
+    app, mock_nc = await _start_with(js, caplog)
+
+    assert _warnings(caplog) == [
+        _setup_failure_line(
+            nats_consumer.NATS_DURABLE,
+            nats_consumer.NATS_STREAM,
+            f"{nats_consumer.NATS_DURABLE}, {nats_consumer.HEALTH_DURABLE}",
+            "none",
+        )
+    ]
+    assert _records(caplog)[-1].exc_info is None
+    assert "tok3n-value" not in caplog.text
+    # No "consumers started" line: nothing started.
+    assert [r.levelno for r in _records(caplog)] == [logging.WARNING]
+    assert app.state.nats is mock_nc
+    assert not hasattr(app.state, "nats_consumer_task")
+    assert not hasattr(app.state, "nats_health_consumer_task")
+    assert js.subscribe_calls == []
+
+
+async def test_health_setup_failure_leaves_the_reservations_consumer_running(caplog):
+    """Issue #1418: the reservations subscription started and the health one's
+    pull_subscribe raised. The reservations loop keeps running, and the warning
+    says so: only the health durable is not running."""
+    js = _FailingJetStream(fail_subscribe_for=nats_consumer.HEALTH_SUBJECT_PATTERN)
+
+    app, mock_nc = await _start_with(js, caplog)
+    try:
+        assert _warnings(caplog) == [
+            _setup_failure_line(
+                nats_consumer.HEALTH_DURABLE,
+                nats_consumer.HEALTH_STREAM,
+                nats_consumer.HEALTH_DURABLE,
+                nats_consumer.NATS_DURABLE,
+            )
+        ]
+        assert "tok3n-value" not in caplog.text
+        assert app.state.nats is mock_nc
+        task = app.state.nats_consumer_task
+        assert isinstance(task, asyncio.Task)
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not hasattr(app.state, "nats_health_consumer_task")
+    finally:
+        await _cancel_both(app)
 
 
 async def test_start_nats_consumer_wires_both_subscriptions():

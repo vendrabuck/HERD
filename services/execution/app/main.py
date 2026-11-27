@@ -59,8 +59,15 @@ async def _ensure_health_stream(app: FastAPI) -> None:
             max_age_seconds=settings.nats_stream_max_age_seconds,
         )
         logger.info("JetStream stream HERD_HEALTH ready")
-    except Exception:
-        logger.warning("Could not create HERD_HEALTH stream", exc_info=True)
+    except Exception as exc:
+        # Class name only, never the exception text (issue #1418, OPS-NATS-4).
+        logger.warning(
+            "JetStream stream HERD_HEALTH could not be created or updated (%s); the "
+            "connection is kept, so health events publish if the stream exists, and "
+            "while it is missing they wait in the outbox and the relay retries them "
+            "every tick",
+            type(exc).__name__,
+        )
 
 
 async def _ensure_dlq_stream(app: FastAPI) -> None:
@@ -96,8 +103,15 @@ async def _ensure_dlq_stream(app: FastAPI) -> None:
             max_age_seconds=settings.nats_stream_max_age_seconds,
         )
         logger.info("JetStream stream HERD_DLQ ready")
-    except Exception:
-        logger.warning("Could not create HERD_DLQ stream", exc_info=True)
+    except Exception as exc:
+        # Class name only, never the exception text (issue #1418, OPS-NATS-4).
+        logger.warning(
+            "JetStream stream HERD_DLQ could not be created or updated (%s); if it "
+            "exists, dead-lettered messages are kept on it, and while it is missing a "
+            "dead-letter publish fails and the original message is acked, so that "
+            "message is kept nowhere",
+            type(exc).__name__,
+        )
 
 
 async def start_outbox_relay(app: FastAPI) -> None:

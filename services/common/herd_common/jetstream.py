@@ -32,6 +32,13 @@ starts before its stream's producer.
 `connect_nats` (issue #1083) is the one NATS connect every service uses: a
 bounded first connect that raises, then unlimited reconnects once connected.
 
+`log_consumer_connect_failure`, `log_consumer_setup_failure`, and
+`log_consumer_stream_check_failure` (issue #1418) are the startup warnings of
+the three consumer services (execution, notifications, integration), written
+once so the services cannot drift apart. Each says what failed and what
+follows, and carries the exception class name only, never its text or the
+NATS URL (a URL can hold credentials).
+
 `ensure_consumer`, `nak_delay`, and `parse_nak_backoff_schedule` are issue
 #895's helpers: the durable-config upgrade path, and the NAK-delay schedule
 every consumer's transient-error branch consults so a bare `msg.nak()` no
@@ -133,6 +140,76 @@ async def connect_nats(
     )
     nc.options["max_reconnect_attempts"] = -1
     return nc
+
+
+# Consumer startup warnings (issue #1418). A consumer service that fails to
+# start a durable keeps serving its API, and nothing retries the connect or the
+# setup in that process. Nothing the durable would read is lost: the streams use
+# limits retention, so a message published meanwhile stays on its stream until
+# the stream's max age (NATS_STREAM_MAX_AGE_SECONDS) passes, and a durable,
+# existing or created at the restart, reads every message it has not acked. So
+# each line says the events wait and are processed after a restart; none says
+# they are not delivered. WARNING, not ERROR, as for reservations' RES-EVENT-5
+# lines: the service keeps serving and the backlog is delayed, not dropped.
+
+
+def _durable_names(durables: Sequence[str]) -> str:
+    return ", ".join(durables) if durables else "none"
+
+
+def log_consumer_connect_failure(
+    log: logging.Logger, exc: BaseException, *, not_running: Sequence[str]
+) -> None:
+    """Log that `connect_nats` raised, so the durables `not_running` never start."""
+    log.warning(
+        "NATS connect failed (%s); not running: %s. Nothing retries the connect, so "
+        "these consumers start only when the service is restarted with the broker "
+        "reachable; events published to their streams meanwhile wait there, kept up "
+        "to each stream's max age, and are processed after that restart",
+        type(exc).__name__,
+        _durable_names(not_running),
+    )
+
+
+def log_consumer_setup_failure(
+    log: logging.Logger,
+    exc: BaseException,
+    *,
+    durable: str,
+    stream: str,
+    not_running: Sequence[str],
+    running: Sequence[str],
+) -> None:
+    """Log that setting up `durable` on `stream` raised after a good connect.
+
+    `not_running` lists the failed durable and every durable the start did not
+    reach; `running` lists the durables whose loops were already started and
+    keep running.
+    """
+    log.warning(
+        "NATS consumer setup failed for durable %s on stream %s (%s); not running: "
+        "%s; still running: %s. The connection is kept, but nothing retries the "
+        "setup, so a consumer that is not running starts only when the service is "
+        "restarted; events published to its stream meanwhile wait there, kept up to "
+        "the stream's max age, and are processed after that restart",
+        durable,
+        stream,
+        type(exc).__name__,
+        _durable_names(not_running),
+        _durable_names(running),
+    )
+
+
+def log_consumer_stream_check_failure(
+    log: logging.Logger, exc: BaseException, *, stream: str
+) -> None:
+    """Log that `ensure_stream_exists` raised for `stream`; the setup goes on."""
+    log.warning(
+        "JetStream stream %s could not be checked or created (%s); the consumer "
+        "setup on it goes ahead, and fails if the stream is missing",
+        stream,
+        type(exc).__name__,
+    )
 
 
 async def ensure_stream(

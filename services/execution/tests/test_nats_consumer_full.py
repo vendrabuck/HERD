@@ -11,10 +11,16 @@ test_nats_consumer.py.
 
 import asyncio
 import json
+import logging
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# app.main calls setup_logging at import, which clears the root handlers; import
+# it here, before caplog installs its handler, not inside a test.
+from app import main as main_module
 from app.database import Base
 from app.models.driver_cache import DriverCache  # noqa: F401 (register with Base)
 from app.models.execution_run import ExecutionRun
@@ -303,8 +309,9 @@ async def test_start_nats_consumer_loop_fetches_one_message_at_a_time():
 
 
 @pytest.mark.asyncio
-async def test_start_nats_consumer_stream_create_failure():
-    """Stream creation failure is logged but consumer still starts."""
+async def test_start_nats_consumer_stream_create_failure(caplog):
+    """Stream creation failure is logged but consumer still starts. Issue #1418
+    pins the line: the class name only, and that the setup goes ahead."""
     from app.services.nats_consumer import start_nats_consumer
 
     mock_app = MagicMock()
@@ -324,11 +331,16 @@ async def test_start_nats_consumer_stream_create_failure():
     with (
         patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
         patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
+        caplog.at_level(logging.WARNING, logger=_LOGGER),
     ):
         await start_nats_consumer(mock_app)
 
     # Stream creation failed but subscribe still happened
     mock_js.pull_subscribe.assert_called_once()
+    assert _warnings(caplog) == [
+        "JetStream stream HERD_RESERVATIONS could not be checked or created (Exception); "
+        "the consumer setup on it goes ahead, and fails if the stream is missing"
+    ]
 
     # Clean up
     task = mock_app.state.nats_consumer_task
@@ -337,6 +349,94 @@ async def test_start_nats_consumer_stream_create_failure():
         await task
     except asyncio.CancelledError:
         pass
+
+
+_LOGGER = "app.services.nats_consumer"
+# Exception text a broker error could carry; no warning may repeat it.
+_EXC_TEXT = "nats://herd-user:tok3n-value@broker:4222 replied with an error"
+_SETUP_FAILURE_LINE = (
+    "NATS consumer setup failed for durable execution-consumer on stream "
+    "HERD_RESERVATIONS (RuntimeError); not running: execution-consumer; still "
+    "running: none. The connection is kept, but nothing retries the setup, so a "
+    "consumer that is not running starts only when the service is restarted; events "
+    "published to its stream meanwhile wait there, kept up to the stream's max age, "
+    "and are processed after that restart"
+)
+
+
+def _records(caplog):
+    return [r for r in caplog.records if r.name == _LOGGER]
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in _records(caplog) if r.levelno == logging.WARNING]
+
+
+def _connect_then_fail_setup(failing_call: str):
+    """A connect that succeeds to a JetStream whose `failing_call`
+    (`add_consumer`, reached through ensure_consumer, or `pull_subscribe`)
+    raises (issue #1418)."""
+    mock_js = AsyncMock()
+    getattr(mock_js, failing_call).side_effect = RuntimeError(_EXC_TEXT)
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=mock_js)
+    mock_nats_module = MagicMock()
+    mock_nats_module.connect = AsyncMock(return_value=mock_nc)
+    return mock_nats_module, mock_nc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_call", ["add_consumer", "pull_subscribe"])
+async def test_setup_failure_after_a_good_connect_is_not_called_a_connect_failure(
+    caplog, failing_call
+):
+    """Issue #1418: the connect succeeded and the durable's setup raised. The
+    warning names the durable and its stream, keeps the connection, and carries
+    no exception text or traceback; no consumer task is started."""
+    from app.services.nats_consumer import start_nats_consumer
+
+    mock_nats_module, mock_nc = _connect_then_fail_setup(failing_call)
+    app = SimpleNamespace(state=SimpleNamespace())
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        caplog.at_level(logging.INFO, logger=_LOGGER),
+    ):
+        await start_nats_consumer(app)
+
+    assert _warnings(caplog) == [_SETUP_FAILURE_LINE]
+    # No "NATS consumer started" line, and no traceback on the warning.
+    assert [r.levelno for r in _records(caplog)] == [logging.WARNING]
+    assert _records(caplog)[0].exc_info is None
+    assert "tok3n-value" not in caplog.text
+    assert app.state.nats is mock_nc
+    assert not hasattr(app.state, "nats_consumer_task")
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_keeps_the_connection_for_the_stream_ensures(caplog, monkeypatch):
+    """Issue #1418, the lifespan's consumer step: after a setup failure the
+    connection is kept, so `_start_consumer_and_streams` still ensures
+    HERD_HEALTH and HERD_DLQ on it (the outbox relay reads the same
+    app.state.nats), which is what the warning's "the connection is kept"
+    promises."""
+    mock_nats_module, mock_nc = _connect_then_fail_setup("add_consumer")
+    ensure_stream_mock = AsyncMock()
+    monkeypatch.setattr(main_module, "ensure_stream", ensure_stream_mock)
+    app = SimpleNamespace(state=SimpleNamespace())
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats_module)),
+        patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
+        caplog.at_level(logging.WARNING, logger=_LOGGER),
+    ):
+        await main_module._start_consumer_and_streams(app)
+
+    assert _warnings(caplog) == [_SETUP_FAILURE_LINE]
+    assert app.state.nats is mock_nc
+    assert [call.kwargs["name"] for call in ensure_stream_mock.await_args_list] == [
+        "HERD_HEALTH",
+        "HERD_DLQ",
+    ]
 
 
 # --- NATS-redelivery idempotency guard (issue #133) ---

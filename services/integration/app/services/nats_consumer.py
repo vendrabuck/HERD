@@ -33,6 +33,9 @@ from herd_common.jetstream import (
     ensure_consumer,
     ensure_stream_exists,
     heartbeat_interval,
+    log_consumer_connect_failure,
+    log_consumer_setup_failure,
+    log_consumer_stream_check_failure,
     nak_delay,
     parse_nak_backoff_schedule,
     process_batch_with_heartbeat,
@@ -241,17 +244,43 @@ async def start_nats_consumer(app) -> None:
     durable/DLQ knobs (see the module docstring): HERD_RESERVATIONS /
     herd.reservations.* (the original consumer) and HERD_HEALTH /
     herd.health.* (issue #831). Both dispatch to the same `handle_event`.
+
+    Never raises an `Exception`: a failed connect, or a failed setup after a
+    good connect, is logged through herd_common.jetstream's consumer warnings
+    (issue #1418, INTEG-CONSUME-3) and the service keeps serving its API;
+    nothing retries either in this process.
     """
     import nats
     from nats.js.api import ConsumerConfig
 
+    # The reservations subscription is set up first, then the health one; a
+    # failed setup stops the start there, so a durable the start did not reach
+    # is not running either (issue #1418 names each in its warning).
+    subscriptions = (
+        (NATS_STREAM, NATS_SUBJECT_PATTERN, NATS_DURABLE, NATS_DLQ_SUBJECT, "nats_consumer_task"),
+        (
+            HEALTH_STREAM,
+            HEALTH_SUBJECT_PATTERN,
+            HEALTH_DURABLE,
+            HEALTH_DLQ_SUBJECT,
+            "nats_health_consumer_task",
+        ),
+    )
+    durables = [durable for _, _, durable, _, _ in subscriptions]
+
     try:
         # Bounded first connect, unlimited reconnects once connected (issue
         # #1083): a broker that is down at boot raises after a few tries, so the
-        # warning below is reachable and the service runs without the consumer;
+        # warning below is reachable and the service runs without the consumers;
         # an established connection still retries forever.
         nc = await connect_nats(settings.nats_url)
-        app.state.nats = nc
+    except Exception as exc:
+        log_consumer_connect_failure(logger, exc, not_running=durables)
+        return
+    app.state.nats = nc
+
+    running: list[str] = []
+    try:
         js = nc.jetstream()
 
         from app.database import AsyncSessionLocal
@@ -264,8 +293,8 @@ async def start_nats_consumer(app) -> None:
         ):
             try:
                 await ensure_stream_exists(js, name=stream, subjects=[subject_pattern])
-            except Exception:
-                logger.warning("Could not create/update NATS stream %s", stream, exc_info=True)
+            except Exception as exc:
+                log_consumer_stream_check_failure(logger, exc, stream=stream)
 
             consumer_config = ConsumerConfig(
                 max_deliver=NATS_MAX_DELIVER,
@@ -325,19 +354,22 @@ async def start_nats_consumer(app) -> None:
 
             return asyncio.create_task(_consumer_loop())
 
-        app.state.nats_consumer_task = await _make_subscription(
-            NATS_STREAM, NATS_SUBJECT_PATTERN, NATS_DURABLE, NATS_DLQ_SUBJECT
+        for stream, subject_pattern, durable, dlq_subject, task_attr in subscriptions:
+            task = await _make_subscription(stream, subject_pattern, durable, dlq_subject)
+            setattr(app.state, task_attr, task)
+            running.append(durable)
+    except Exception as exc:
+        failed_stream, _, failed_durable, _, _ = subscriptions[len(running)]
+        log_consumer_setup_failure(
+            logger,
+            exc,
+            durable=failed_durable,
+            stream=failed_stream,
+            not_running=durables[len(running) :],
+            running=running,
         )
-        app.state.nats_health_consumer_task = await _make_subscription(
-            HEALTH_STREAM, HEALTH_SUBJECT_PATTERN, HEALTH_DURABLE, HEALTH_DLQ_SUBJECT
-        )
-        logger.info("Integration webhook NATS consumers started (reservations + health)")
-
-    except Exception:
-        logger.warning(
-            "Failed to connect to NATS; integration webhooks will not be delivered",
-            exc_info=True,
-        )
+        return
+    logger.info("Integration webhook NATS consumers started (reservations + health)")
 
 
 async def stop_nats_consumer(app) -> None:

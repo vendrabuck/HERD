@@ -847,7 +847,7 @@ The notifications service consumes the same `herd.reservations.*` events on its 
 - Check `Settings` and confirm the relevant event (`Reservation confirmed`, `updated`, `cancelled`, `completed`, `expiring soon`, `failed`) is still checked and the in-app channel is on.
 - The notifications consumer has its own DLQ subject at `herd.reservations.dlq.notifications` (independent from execution's DLQ). Poison messages or exhausted retries land there; see [OPERATIONS.md](OPERATIONS.md#inspecting-the-nats-dlq).
 - If user-profile is down or misconfigured (missing `INTERNAL_API_TOKEN` match), the consumer fails open and still delivers notifications with defaults; verify user-profile's health endpoint returns 200 if prefs aren't being respected. A failed preferences, admin-list, or contact lookup is never cached, so the next event asks again once the upstream recovers (issue #1075).
-- If the notifications service started while NATS was down, it logged `Failed to connect to NATS; ...` and runs without its consumers until it is restarted: restart it once NATS is up (see [OPERATIONS.md](OPERATIONS.md#nats-is-down)).
+- If the notifications service started while NATS was down, it logged `NATS connect failed (<class>); not running: notifications-consumer, notifications-health-consumer. ...` and runs without its consumers until it is restarted: restart it once NATS is up, and the events published meanwhile are processed then (see [OPERATIONS.md](OPERATIONS.md#nats-is-down)). A `NATS consumer setup failed for durable ...` line means the broker answered but a consumer could not be set up; the line lists which consumers are not running, and a restart once the cause is fixed starts them with nothing lost.
 
 ### DLQ has messages
 
