@@ -7,6 +7,7 @@ raised `csv.Error`, and the route answered 500.
 """
 
 import csv
+import threading
 
 import pytest
 from fastapi import HTTPException
@@ -143,6 +144,94 @@ def test_the_limit_is_put_back_when_the_read_raises_anything_else(monkeypatch):
     with pytest.raises(RuntimeError):
         read_csv_rows("name\n" + "x" * 200_000 + "\n")
     assert csv.field_size_limit() == _DEFAULT_FIELD_LIMIT
+
+
+# Two imports read at once (issue #1417) ----------------------------------------------
+#
+# The importers call the reader on worker threads, so two reads can overlap. The field
+# limit is process-wide: without the lock, a read that started first could put the
+# limit back while a second read was still using its raised one, which made an honest
+# long cell a 422 and left the first read's limit in place for good.
+
+_WAIT = 10.0
+
+
+def test_two_overlapping_reads_never_put_the_limit_back_under_each_other(monkeypatch):
+    """The first read holds inside its rows; the second starts, then the first
+    finishes, then the second reads its long cell. With the lock the second cannot
+    start until the first is done; without it, the first's restore leaves the second
+    reading under the default limit. Mutation-checked: removing the `with
+    _FIELD_LIMIT_LOCK:` fails this (the second read answers 422, and the autouse
+    fixture finds the limit left raised)."""
+    first_cell = "y" * (_DEFAULT_FIELD_LIMIT + 5)
+    long_cell = "x" * (_DEFAULT_FIELD_LIMIT + 10)
+    gates: dict[int, tuple[threading.Event, threading.Event]] = {}
+    second_started = threading.Event()  # at the lock, or inside the read without one
+    second_ident: list[int] = []
+    real_dict_reader = csv.DictReader
+
+    def mark_if_second() -> None:
+        if second_ident and threading.get_ident() == second_ident[0]:
+            second_started.set()
+
+    class _Gated(real_dict_reader):
+        """Holds the first row of a gated thread's read until its gate opens."""
+
+        def __next__(self):
+            gate = gates.pop(threading.get_ident(), None)
+            if gate is not None:
+                inside, go = gate
+                mark_if_second()
+                inside.set()
+                assert go.wait(_WAIT), "the gate never opened"
+            return super().__next__()
+
+    class _WatchedLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            mark_if_second()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc_info) -> None:
+            self._lock.release()
+
+    monkeypatch.setattr(csv_import.csv, "DictReader", _Gated)
+    monkeypatch.setattr(csv_import, "_FIELD_LIMIT_LOCK", _WatchedLock())
+    results: dict[str, object] = {}
+
+    def read(label: str, cell: str, gate: tuple[threading.Event, threading.Event]) -> None:
+        if label == "second":
+            second_ident.append(threading.get_ident())
+        gates[threading.get_ident()] = gate
+        try:
+            results[label] = read_csv_rows("name\n" + cell + "\n")
+        except Exception as exc:
+            results[label] = exc
+
+    first_gate = (threading.Event(), threading.Event())
+    second_gate = (threading.Event(), threading.Event())
+    first = threading.Thread(target=read, args=("first", first_cell, first_gate))
+    second = threading.Thread(target=read, args=("second", long_cell, second_gate))
+    try:
+        first.start()
+        assert first_gate[0].wait(_WAIT), "the first read never started"
+        second.start()
+        assert second_started.wait(_WAIT), "the second read never started"
+        first_gate[1].set()
+        first.join(_WAIT)
+        assert not first.is_alive()
+        assert second_gate[0].wait(_WAIT), "the second read never reached its rows"
+        second_gate[1].set()
+        second.join(_WAIT)
+        assert not second.is_alive()
+    finally:
+        first_gate[1].set()
+        second_gate[1].set()
+    assert results["first"] == [{"name": first_cell}]
+    assert results["second"] == [{"name": long_cell}]
 
 
 # What the csv module reads without complaint, pinned so a change in a later Python

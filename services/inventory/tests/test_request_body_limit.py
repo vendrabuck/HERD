@@ -11,7 +11,9 @@ first. The middleware itself is pinned in `services/common/tests/test_request_bo
 
 from __future__ import annotations
 
+import gc
 import uuid
+import warnings
 
 import pytest
 from app.config import settings
@@ -131,6 +133,102 @@ async def test_an_upload_route_takes_its_own_limit(method, path, data):
     assert reached.status_code in (401, 403), reached.text[:300]
     assert refused.status_code == 413, refused.text[:300]
     assert refused.json() == {"detail": [body_too_large_error(LIMIT + _UPLOAD_BYTES)]}
+
+
+# -- However an import body is sent (issue #1417) -------------------------------------
+#
+# The limit counts what the app reads, so an import body over its route's limit is the
+# 413 whether it declares its length (refused before one byte is read), sends it
+# chunked with no length, or declares less than it sends; and the app has read at most
+# the limit plus the one chunk that crossed it. A body that is not a form is never read
+# as one: a JSON body is read only by the surrogate check, through the limit, and any
+# other type is not read at all. `_Pulled` counts the bytes the app asked for.
+
+_IMPORT_PATHS = ["/devices/import", "/templates/import"]
+_CHUNK = 4096
+_UNCLOSED_SPOOL = "Unclosed file <tempfile.SpooledTemporaryFile"
+
+
+class _Pulled:
+    """A request body sent in `_CHUNK` pieces, counting the bytes the app pulled."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.pulled = 0
+
+    async def __aiter__(self):
+        for start in range(0, len(self.body), _CHUNK):
+            piece = self.body[start : start + _CHUNK]
+            self.pulled += len(piece)
+            yield piece
+
+
+def _multipart(file_bytes: bytes) -> tuple[bytes, dict[str, str]]:
+    import httpx
+
+    request = httpx.Request(
+        "POST", "http://test/", files={"file": ("f.json", file_bytes, "application/json")}
+    )
+    return request.read(), {"content-type": request.headers["content-type"]}
+
+
+@pytest.mark.usefixtures("small_upload_bounds")
+@pytest.mark.parametrize("path", _IMPORT_PATHS)
+@pytest.mark.parametrize("sent", ["declared", "chunked", "understated"])
+async def test_an_import_body_over_its_limit_is_413_however_it_is_sent(path, sent):
+    route_limit = LIMIT + _UPLOAD_BYTES
+    body, headers = _multipart(b"z" * (route_limit + 8 * _CHUNK))
+    if sent == "declared":
+        headers["content-length"] = str(len(body))
+    elif sent == "understated":
+        headers["content-length"] = "100"
+    stream = _Pulled(body)
+    # Starlette's multipart parser closes the spooled file it made only when the parse
+    # fails with its own error, not when the read under it is refused, so a body refused
+    # mid-upload leaves its file to the garbage collector, which warns. That warning is
+    # expected here and collected here, never in a later test.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", _UNCLOSED_SPOOL, ResourceWarning)
+        async with _client() as client:
+            resp = await client.post(path, content=stream, headers=headers)
+        gc.collect()
+    assert resp.status_code == 413, resp.text[:300]
+    assert resp.json() == {"detail": [body_too_large_error(route_limit)]}
+    if sent == "declared":
+        assert stream.pulled == 0
+    else:
+        assert route_limit < stream.pulled <= route_limit + _CHUNK
+
+
+@pytest.mark.usefixtures("small_upload_bounds")
+@pytest.mark.parametrize("path", _IMPORT_PATHS)
+async def test_a_raw_form_body_over_an_import_limit_is_413_and_read_no_further(path):
+    """An urlencoded body is read as a form, through the limit."""
+    route_limit = LIMIT + _UPLOAD_BYTES
+    stream = _Pulled(b"file=" + b"z" * (route_limit + 8 * _CHUNK))
+    async with _client() as client:
+        resp = await client.post(
+            path,
+            content=stream,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+    assert resp.status_code == 413, resp.text[:300]
+    assert resp.json() == {"detail": [body_too_large_error(route_limit)]}
+    assert route_limit < stream.pulled <= route_limit + _CHUNK
+
+
+@pytest.mark.usefixtures("small_upload_bounds")
+@pytest.mark.parametrize("path", _IMPORT_PATHS)
+@pytest.mark.parametrize("content_type", ["application/json", "application/octet-stream"])
+async def test_a_raw_body_that_is_not_a_form_is_never_read(path, content_type):
+    """The route takes a form, so FastAPI does not read any other body, and the
+    surrogate check reads a JSON body only when the app does: nothing of it is
+    buffered, and the route's admin gate answers (no credentials, so 401 or 403)."""
+    stream = _Pulled(b"[" + b" " * (LIMIT + _UPLOAD_BYTES + 8 * _CHUNK) + b"]")
+    async with _client() as client:
+        resp = await client.post(path, content=stream, headers={"content-type": content_type})
+    assert resp.status_code in (401, 403), resp.text[:300]
+    assert stream.pulled == 0
 
 
 def test_the_upload_routes_follow_the_driver_setting_and_the_import_bound():

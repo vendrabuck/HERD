@@ -39,6 +39,14 @@ a device reference that bypassed name resolution entirely (a raw `id` carried in
 `data.device` with no `name`) still cannot reach the L3 pass or the edge pass as
 anything but the existing `missing_device` reason. CSV import shares this same
 path: it parses into the identical canvas shape before `import_topologies` runs.
+
+Off the event loop (issue #1417): an import's decode, CSV or JSON parse, lone
+surrogate scan, and the shape check and device-name collection over every record
+run on a worker thread through `herd_common.bulk_work.run_bulk_work`
+(`_read_import`), before the visibility lookup and the first query; an export's
+records and body are built the same way (`render_export`). Each row's canvas
+rewrite, validation, and writes stay on the event loop in the request's session,
+as an interactive topology save's do.
 """
 
 import copy
@@ -49,6 +57,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.bulk_work import run_bulk_work
 from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
@@ -294,6 +303,15 @@ def records_to_csv(topologies: list[Topology]) -> str:
     return out.getvalue()
 
 
+def render_export(topologies: list[Topology], fmt: str) -> str:
+    """The export body for ``fmt`` ("csv" or "json"). Run on a bulk worker thread
+    (issue #1417): it reads only each topology's ``name`` and ``canvas_data``, column
+    values the route's query already loaded, so it issues no query."""
+    if fmt == "csv":
+        return records_to_csv(topologies)
+    return records_to_json([topology_to_record(t) for t in topologies])
+
+
 # Import parsing -------------------------------------------------------------
 
 
@@ -447,6 +465,24 @@ def rewrite_canvas_names_to_ids(
 # Import ----------------------------------------------------------------------
 
 
+def _read_import(raw: bytes, fmt: str) -> tuple[list[Any], set[str]]:
+    """The import's CPU work, run on a bulk worker thread (issue #1417): the file
+    parsed into records, and every device name the records carry. A record the row
+    loop will reject for its shape (issue #1573) adds no name: this pass reads every
+    record before any row runs."""
+    if fmt == "json":
+        records = parse_json_topologies(raw)
+    elif fmt == "csv":
+        records = parse_csv_topologies(raw)
+    else:
+        raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
+    all_names: set[str] = set()
+    for rec in records:
+        if _record_shape_reason(rec) is None:
+            all_names |= _collect_device_names(rec.get("canvas"))
+    return records, all_names
+
+
 async def import_topologies(
     db: AsyncSession,
     raw: bytes,
@@ -457,12 +493,7 @@ async def import_topologies(
     actor_role: str = "user",
     authorization: str | None = None,
 ) -> BulkImportReport:
-    if fmt == "json":
-        records = parse_json_topologies(raw)
-    elif fmt == "csv":
-        records = parse_csv_topologies(raw)
-    else:
-        raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
+    records, all_names = await run_bulk_work(_read_import, raw, fmt)
 
     # Issue #908: resolve the caller's device visibility ONCE per request,
     # before any name is resolved or any row is judged, mirroring the #763
@@ -478,18 +509,12 @@ async def import_topologies(
         ),
     )
 
-    # Resolve every device name across the whole batch in one inventory call,
-    # then rewrite per topology. Keeps import O(1) HTTP calls regardless of row
-    # count. This lookup stays unfiltered by design (issue #908): it answers
-    # whether a name exists anywhere, exactly the internal resolve-by-name
-    # contract already had; the visibility filter above is applied per row,
-    # below, so a hidden device produces the same outcome as a nonexistent one.
-    all_names: set[str] = set()
-    for rec in records:
-        # A record the row loop will reject for its shape (issue #1573) is skipped
-        # here: this pass reads every record before any row runs.
-        if _record_shape_reason(rec) is None:
-            all_names |= _collect_device_names(rec.get("canvas"))
+    # Resolve every device name across the whole batch (collected by `_read_import`)
+    # in one inventory call, then rewrite per topology. Keeps import O(1) HTTP calls
+    # regardless of row count. This lookup stays unfiltered by design (issue #908):
+    # it answers whether a name exists anywhere, exactly the internal resolve-by-name
+    # contract already had; the visibility filter above is applied per row, below,
+    # so a hidden device produces the same outcome as a nonexistent one.
     try:
         name_to_id = await resolve_device_names(sorted(all_names)) if all_names else {}
     except Exception as exc:
