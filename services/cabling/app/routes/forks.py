@@ -93,26 +93,56 @@ EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL = (
 )
 
 
+async def _saved_canvas_in_its_place(latest: ForkVersion | None) -> dict | None:
+    """What the fork read answers in place of a draft without the shape: the canvas
+    of the latest saved version, which the fork's wiring rows were reconciled to,
+    when that one has the shape; otherwise None (TOPO-SHAPE-8)."""
+    if latest is None:
+        return None
+    return await readable_canvas_or_none(latest.canvas_data, kind="fork_version", row_id=latest.id)
+
+
 async def _answered_draft(fork: ReservationFork, latest: ForkVersion | None) -> dict | None:
     """The canvas the fork read answers: the draft when it has the shape; when it
-    does not, the canvas of the latest saved version, which the fork's wiring rows
-    were reconciled to, when that one has it; otherwise None (TOPO-SHAPE-8)."""
+    does not, ``_saved_canvas_in_its_place`` (TOPO-SHAPE-8)."""
     draft = await readable_canvas_or_none(fork.canvas_data, kind="fork", row_id=fork.id)
-    if draft is not None or fork.canvas_data is None or latest is None:
+    if draft is not None or fork.canvas_data is None:
         return draft
-    return await readable_canvas_or_none(latest.canvas_data, kind="fork_version", row_id=latest.id)
+    return await _saved_canvas_in_its_place(latest)
+
+
+async def _latest_fork_version(db: AsyncSession, fork: ReservationFork) -> ForkVersion | None:
+    """The fork's version with the highest number, the one the fork read answers in
+    place of a draft without the shape."""
+    return (
+        (
+            await db.execute(
+                select(ForkVersion)
+                .where(ForkVersion.fork_id == fork.id)
+                .order_by(ForkVersion.version_number.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
 
 
 async def _refuse_empty_canvas_over_unreadable_draft(
     db: AsyncSession, fork: ReservationFork, canvas: dict
 ) -> None:
     """409 ``EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL`` for a canvas with no nodes
-    when the stored draft does not have the shape and the fork holds a connection
-    or an L3 route row: the fork read answered no canvas for that draft, so such a
-    canvas is what an editor opened on it would send (TOPO-SHAPE-8)."""
+    when the fork read answers no canvas over a draft without the shape (the
+    latest saved version is missing, null, or without the shape too) and the fork
+    holds a connection or an L3 route row: such a canvas is what an editor opened
+    on that read would send. When the read answers the latest saved canvas, a
+    canvas with no nodes is a deliberate clear and saves as any other
+    (TOPO-SHAPE-8)."""
     if canvas.get("nodes"):
         return
     if await stored_canvas_problem(fork.canvas_data) is None:
+        return
+    if await _saved_canvas_in_its_place(await _latest_fork_version(db, fork)) is not None:
         return
     for model in (ForkConnection, ForkL3Route):
         held = await db.execute(select(model.id).where(model.fork_id == fork.id).limit(1))
@@ -781,8 +811,8 @@ async def save_fork_internal(
     fork = await _load_fork(db, reservation_id)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
-    # Every canvas write is held to the shape check, so a draft that has the shape
-    # keeps it: one judged here before the lock is still judged right under it.
+    # Judged before the lock, against the draft and the latest saved version as
+    # this request reads them, as the fork read an editor opened judged them.
     await _refuse_empty_canvas_over_unreadable_draft(db, fork, body.canvas_data)
 
     # Reduce every device node's `data.device` to the allowlist before anything
