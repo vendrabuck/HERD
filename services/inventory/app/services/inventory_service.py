@@ -117,7 +117,9 @@ async def list_devices(
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0
 
-    query = query.offset(skip).limit(limit).order_by(Device.created_at.desc())
+    # Newest first, then id ascending (issue #1589): rows written in one transaction
+    # share created_at, and offset pages over a tie need the id to be disjoint.
+    query = query.order_by(Device.created_at.desc(), Device.id).offset(skip).limit(limit)
     result = await db.execute(query)
     return list(result.unique().scalars().all()), total
 

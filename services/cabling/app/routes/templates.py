@@ -161,7 +161,8 @@ async def list_templates(
         (
             await db.execute(
                 select(TopologyTemplate)
-                .order_by(TopologyTemplate.updated_at.desc())
+                # Most recently updated first, then id ascending (issue #1589).
+                .order_by(TopologyTemplate.updated_at.desc(), TopologyTemplate.id)
                 .offset(skip)
                 .limit(limit)
             )

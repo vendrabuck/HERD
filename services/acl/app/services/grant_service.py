@@ -49,7 +49,8 @@ async def list_grants(
     if resource_id is not None:
         stmt = stmt.where(ResourceGrant.resource_id == resource_id)
 
-    stmt = stmt.order_by(ResourceGrant.granted_at)
+    # id tiebreak (issue #1589): grants made in one transaction share granted_at.
+    stmt = stmt.order_by(ResourceGrant.granted_at, ResourceGrant.id)
     return await paginate(db, stmt, skip=skip, limit=limit)
 
 

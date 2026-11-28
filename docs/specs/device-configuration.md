@@ -714,10 +714,11 @@ apply-job routes of sections 5 and 7.
   token's `username` as `author_name`, and answers 201 with the job. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`schedule_apply_job`) \
   Pinned by: `services/inventory/tests/test_device_configs.py` (`test_schedule_apply_job`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
-- **CFG-JOB-8.** A device's job list is ordered by `scheduled_for`, latest first; an
-  unknown device is 404 `Device not found`. \
+- **CFG-JOB-8.** A device's job list is ordered by `scheduled_for`, latest first, and
+  jobs scheduled for the same instant by id ascending, so `skip` and `limit` pages never
+  overlap or skip (issue #1589); an unknown device is 404 `Device not found`. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`list_apply_jobs`) \
-  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_list_apply_jobs`); `services/inventory/tests/test_router_edge_cases.py` (`test_list_apply_jobs_unknown_device_404`)
+  Pinned by: `services/inventory/tests/test_device_configs.py` (`test_list_apply_jobs`); `services/inventory/tests/test_router_edge_cases.py` (`test_list_apply_jobs_unknown_device_404`); `services/inventory/tests/test_list_order_tiebreak.py` (`test_apply_jobs_list_breaks_scheduled_for_ties_by_id`)
 - **CFG-JOB-9.** A single job read answers the job, or 404 `Apply job not found`. \
   Enforced in: `services/inventory/app/routers/apply_jobs.py` (`get_apply_job`) \
   Pinned by: `services/inventory/tests/test_router_edge_cases.py` (`test_get_apply_job_returns_job`, `test_get_apply_job_not_found_404`)
@@ -989,10 +990,11 @@ reservation can list the runs tagged with it.
   Enforced in: `services/execution/app/routers/executions.py` (`_authorize_runs_list`, `_user_owns_reservation`) \
   Pinned by: `services/execution/tests/test_router_endpoints.py` (`test_list_runs_admin_unchanged`, `test_list_runs_non_admin_without_reservation_id_403`, `test_list_runs_non_owner_with_reservation_id_403`, `test_list_runs_owner_with_reservation_id_allowed`, `test_user_owns_reservation_returns_false_without_authorization`, `test_user_owns_reservation_returns_false_on_httpx_error`); `services/execution/tests/test_router_direct.py` (`test_user_owns_reservation_true_on_200`)
 - **CFG-RUN-2.** The list filters by exact `device_id`, `reservation_id`, and `status`,
-  by `created_after` (inclusive) and `created_before` (exclusive), orders newest first,
-  and pages with `skip` and `limit`. \
+  by `created_after` (inclusive) and `created_before` (exclusive), orders newest first
+  (runs created at the same instant by id ascending, so pages never overlap or skip,
+  issue #1589), and pages with `skip` and `limit`. \
   Enforced in: `services/execution/app/services/execution_service.py` (`list_execution_runs`) \
-  Pinned by: `services/execution/tests/test_execution_crud.py` (`test_list_filter_by_device_id`, `test_list_filter_by_reservation_id`, `test_list_filter_by_status`, `test_list_pagination`, `test_list_combined_filters`); `services/execution/tests/test_execution_service_edges.py` (`test_list_execution_runs_created_after_and_before`)
+  Pinned by: `services/execution/tests/test_execution_crud.py` (`test_list_filter_by_device_id`, `test_list_filter_by_reservation_id`, `test_list_filter_by_status`, `test_list_pagination`, `test_list_combined_filters`); `services/execution/tests/test_execution_service_edges.py` (`test_list_execution_runs_created_after_and_before`); `services/execution/tests/test_list_order_tiebreak.py` (`test_runs_list_breaks_created_at_ties_by_id`)
 - **CFG-RUN-3.** A non-admin's list holds only the runs whose device the caller may see
   under device-group visibility, asked once per request of inventory
   `GET /device-groups/visible-devices` with the caller's own token and 10 seconds,
