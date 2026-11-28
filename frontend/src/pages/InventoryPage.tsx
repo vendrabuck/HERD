@@ -50,6 +50,7 @@ function SelectAllCheckbox({ checked, indeterminate, onChange }: { checked: bool
       type="checkbox"
       checked={checked}
       onChange={onChange}
+      aria-label="Select all devices on this page"
       className="rounded border-gray-300"
     />
   );
@@ -179,9 +180,11 @@ function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showC
     <tr className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer" onClick={rowClick(onClick)}>
       <td className="w-10 px-2 py-2">
         <button
+          type="button"
           onClick={(e) => { e.stopPropagation(); onToggleExpand(); }}
           className="text-gray-400 hover:text-gray-600"
           aria-label={expanded ? "Collapse ports" : "Expand ports"}
+          aria-expanded={expanded}
         >
           <ChevronIcon expanded={expanded} />
         </button>
@@ -193,6 +196,7 @@ function DeviceRow({ device, isAdmin, onCopy, onClick, selected, onToggle, showC
             checked={selected}
             onChange={onToggle}
             onClick={(e) => e.stopPropagation()}
+            aria-label={`Select device ${device.name}`}
             className="rounded border-gray-300"
           />
         </td>

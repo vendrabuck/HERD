@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useId } from "react";
 import { Link } from "react-router-dom";
 import { useDevice, useAllDeviceNames } from "@/api/inventory";
 import { usePorts } from "@/api/ports";
@@ -12,6 +12,7 @@ function ChevronIcon({ expanded }: { expanded: boolean }) {
   return (
     <svg
       className={`w-4 h-4 text-gray-400 transition-transform ${expanded ? "rotate-90" : ""}`}
+      aria-hidden="true"
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -96,6 +97,7 @@ function DeviceRow({
   deviceNameMap: Map<string, string> | undefined;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const panelId = useId();
   const { data: device } = useDevice(deviceId);
 
   const name = device?.name ?? deviceNameMap?.get(deviceId) ?? deviceId.slice(0, 8) + "...";
@@ -109,11 +111,17 @@ function DeviceRow({
     MAINTENANCE: "bg-red-100 text-red-700",
   };
 
+  // The header is a disclosure button (issue #1405), the same shape as the
+  // login page's administrator sign-in: aria-expanded carries the state and
+  // aria-controls names a panel that stays mounted while its content does not.
   return (
     <div className="border-b border-gray-100 last:border-b-0">
-      <div
-        className="flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-gray-50"
-        onClick={() => setExpanded(!expanded)}
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={panelId}
+        className="w-full flex items-center gap-3 px-4 py-2.5 text-left cursor-pointer hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500"
+        onClick={() => setExpanded((open) => !open)}
       >
         <ChevronIcon expanded={expanded} />
         <span className="text-sm font-medium text-gray-800 flex-1">{name}</span>
@@ -121,12 +129,10 @@ function DeviceRow({
         <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${statusColor[status] ?? "bg-gray-100 text-gray-600"}`}>
           {status}
         </span>
+      </button>
+      <div id={panelId} className={expanded ? "pl-7 pb-2" : undefined}>
+        {expanded && <DevicePortsDetail deviceId={deviceId} deviceNameMap={deviceNameMap} />}
       </div>
-      {expanded && (
-        <div className="pl-7 pb-2">
-          <DevicePortsDetail deviceId={deviceId} deviceNameMap={deviceNameMap} />
-        </div>
-      )}
     </div>
   );
 }
