@@ -1,5 +1,6 @@
 /**
- * Issue #1590: the surfaces #1320 left for a follow-up. Each one, driven
+ * Issue #1590: the surfaces #1320 left for a follow-up, and the scheduled-applies
+ * panel beside the configuration history. Each one, driven
  * through its real hooks and MSW, shows a failed read as the shared LoadError
  * (`Could not load <what>.` plus the reason, with Retry) in the place the read
  * would fill, never its empty text, a blank body, or a silent nothing:
@@ -28,6 +29,7 @@ import { ReservationInventoryTab } from "@/components/reservations/ReservationIn
 import { EditDevicesModal } from "@/components/reservations/EditDevicesModal";
 import { DeviceSearchPicker } from "@/components/admin/connections/DeviceSearchPicker";
 import { DeviceConfigSection } from "@/components/device-config/DeviceConfigSection";
+import { ApplyJobsPanel } from "@/components/device-config/ApplyJobsPanel";
 import { ConnectionsPage } from "@/pages/admin/ConnectionsPage";
 import type { Reservation } from "@/types/reservation.types";
 
@@ -158,6 +160,22 @@ interface Spec {
 const configBase = () => [
   http.get(`/api/inventory/devices/${DEV_ID}/apply-jobs`, () => HttpResponse.json(page([]))),
 ];
+
+const APPLY_JOB = {
+  id: "job-1",
+  device_id: DEV_ID,
+  version_id: "ver-1",
+  scheduled_for: "2030-01-02T03:04:00Z",
+  reservation_id: null,
+  dry_run: false,
+  status: "pending",
+  run_id: null,
+  error: null,
+  created_by: "abcdef0123456789",
+  author_name: "sched-author",
+  created_at: STAMP,
+  fired_at: null,
+};
 
 const SPECS: Spec[] = [
   {
@@ -306,6 +324,17 @@ const SPECS: Spec[] = [
     modal: true,
     emptyText: null,
     loadedText: "+hostname edge",
+  },
+  {
+    name: "ApplyJobsPanel scheduled applies",
+    element: () => <ApplyJobsPanel deviceId={DEV_ID} />,
+    handlers: () => [
+      http.get(`/api/inventory/devices/${DEV_ID}/apply-jobs`, () => answer(page([]), page([APPLY_JOB]))),
+    ],
+    what: "scheduled applies",
+    // An answered empty list hides the panel; there is no empty text.
+    emptyText: null,
+    loadedText: "sched-author",
   },
 ];
 

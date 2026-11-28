@@ -1,4 +1,5 @@
 import { cn } from "@/lib/cn";
+import { hasRowsPastPage } from "@/lib/pageCap";
 
 /**
  * The line a search-capped result list shows when the server holds more
@@ -27,7 +28,7 @@ export function MoreMatchesNotice({
   noun: string;
   className?: string;
 }) {
-  if (typeof total !== "number" || !Number.isFinite(total) || total <= shown) return null;
+  if (!hasRowsPastPage(shown, total)) return null;
   return (
     <p className={cn("text-xs text-gray-500", className)}>
       {total - shown} more matching {noun} are not listed. Type more of the name to narrow the list.

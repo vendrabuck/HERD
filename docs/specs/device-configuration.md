@@ -1183,12 +1183,20 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   as given and a validation list as that text, never as an object. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`); `frontend/src/lib/errors.ts` (`configApplyErrorText`, `configRestoreErrorText`, `formatRestoreBlocked`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and a validation list as text (#1314)`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`, `test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
-- **CFG-UI-5.** The scheduled-applies panel is hidden when the device has no jobs,
-  refreshes every 10 seconds, shows each job's status and error, and offers Cancel only
-  on a `pending` job; a refused cancel shows the server's string `detail`, else
-  `Cancel failed`. \
-  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`) \
-  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
+- **CFG-UI-5.** The scheduled-applies panel reads one page of 50 jobs, the latest
+  scheduled first, and refreshes it every 10 seconds, one request per poll and never a
+  walk of every page; when the server's `total` is larger it says `Showing <rows> of
+  <total> scheduled applies, latest scheduled first.` under the table, and a `pending`
+  job past that page cannot be cancelled from the panel. The panel is hidden only when
+  the list answered empty. A failed read before any list arrived shows the heading and
+  the shared load error (`Could not load scheduled applies.` with the reason and Retry)
+  in place of the table; a failed poll keeps the rows that already arrived (or, over a
+  list that was empty, shows the heading) under `Could not refresh scheduled applies.`
+  with the reason and Retry, with no alert, until a poll answers. Each job shows its
+  status and error, with Cancel only on a `pending` job; a refused cancel shows the
+  server's string `detail`, else `Cancel failed` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`, `APPLY_JOBS_PAGE_SIZE`); `frontend/src/components/ui/PageCapNotice.tsx` (`PageCapNotice`); `frontend/src/components/ui/LoadError.tsx` (`LoadError`, `LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`, `a %s failure shows the load error under the heading, and Retry loads the rows`, `a failed poll keeps the rows under a refresh notice, and the next good poll clears it`, `no jobs, then a failed poll, shows the heading and the refresh notice; a good empty poll hides the panel`, `50 jobs of 73 show the cap line, one page per poll and no page walk`, `%s shows no cap line`, `names the page, the total, and the order`, `renders nothing for %s`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-UI-6.** The dry-run review polls the job every 2 seconds until it is `success`,
   `failed`, `skipped`, or `cancelled`, then shows the run's transcript with simulated
   rows marked; Confirm is enabled only on `success`, Cancel dry-run only before it, and a
