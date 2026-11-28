@@ -1087,7 +1087,7 @@ async def test_create_device_duplicate_name(client):
     assert resp1.status_code == 201
     resp2 = await client.post("/devices", json=_device_payload(tid))
     assert resp2.status_code == 409
-    assert "already exists" in resp2.json()["detail"]
+    assert resp2.json()["detail"] == "Device with name 'FW-01' already exists"
 
 
 @pytest.mark.asyncio

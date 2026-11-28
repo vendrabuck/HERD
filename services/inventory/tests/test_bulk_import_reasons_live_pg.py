@@ -26,7 +26,11 @@ routes, with the request session on Postgres:
   import's lookup and the insert is answered by the create functions' own fixed
   details (INV-TPL-14, INV-DEV-1), which the importer keeps;
 - a generated dynamic-instance name is stored whole by the real column whatever the
-  template name's length (INV-DYN-2).
+  template name's length (INV-DYN-2);
+- a device create the database refuses answers `Device with name '<name>' already
+  exists` only for a real unique violation, and `Device violates a database
+  constraint` for any other class 23 refusal, a trigger's or a real foreign key's,
+  on `POST /devices` and in an import row (INV-DEV-11).
 
 Each test carries a marker value in the rows' other cells and asserts each outcome
 and reason exactly, and that neither the response body nor any log record at INFO
@@ -64,7 +68,7 @@ from app.schemas.column_bounds import INT32_MAX, NON_FINITE_NUMBER_MESSAGE, NUL_
 from app.services import bulk_service, hypervisor_service
 from herd_common.pg_live_suite import pg_live_target
 from sqlalchemy import delete, func, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _PG = pg_live_target()
 PG_DSN = _PG.dsn
@@ -843,3 +847,102 @@ async def test_generated_device_names_are_stored_by_the_real_column(
         assert expected[0] == f"{template_name}-{str(reservation_id)[:8]}-1"
     else:
         assert stored[expected[0]] == 255
+
+
+# A device create's integrity refusals ------------------------------------------------
+
+_CONSTRAINT = "Device violates a database constraint"
+
+
+@pytest.mark.parametrize("code", ["23514", "23503", "23502", "23P01", "23000"])
+async def test_a_device_create_refused_for_anything_but_its_name_is_not_a_name_clash(
+    client, session_factory, lab, tag, sentinel, refusing_trigger, caplog, code
+):
+    """Every integrity error on create used to answer `Device with name ... already
+    exists`. A class 23 refusal that is not a unique violation, raised here by the
+    trigger with the row's field data in its message, detail, and hint, answers the
+    generic detail on the route and in an import row; nothing it carries leaks."""
+    caplog.set_level(logging.INFO)
+    name = f"create-{code}-{tag}"
+    payload = {
+        "name": name,
+        "template_id": str(lab["template_id"]),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+
+    item = {
+        "name": f"import-{code}-{tag}",
+        "template_name": lab["template"],
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    imported = await _import(client, "devices", [item], dry_run=False)
+    _assert_clean(imported.text, sentinel)
+    assert _outcomes(imported) == [(f"import-{code}-{tag}", "reject", _CONSTRAINT)]
+
+    _assert_clean(caplog.text, sentinel)
+    assert f"sqlstate={code}" in caplog.text
+    assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+async def test_a_device_create_whose_name_is_taken_is_a_name_clash(client, lab, sentinel):
+    """A real unique violation on create keeps the name detail."""
+    payload = {
+        "name": lab["device"],
+        "template_id": str(lab["template_id"]),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": f"Device with name '{lab['device']}' already exists"}
+
+
+async def test_a_template_deleted_before_a_device_insert_is_not_a_name_clash(
+    client, session_factory, lab, tag, sentinel, caplog, monkeypatch
+):
+    """A real foreign key violation (23503): another connection deletes the device's
+    template after create_device read it and before the insert commits."""
+    caplog.set_level(logging.INFO)
+    async with session_factory() as s:
+        doomed = DeviceTemplate(
+            name=f"pg-live-doomed-{tag}", vendor="V", model="M", sections=_SECTIONS
+        )
+        s.add(doomed)
+        await s.commit()
+        doomed_id = doomed.id
+    real_commit = AsyncSession.commit
+    raced = False
+
+    async def template_goes_first(self):
+        # The request's commit of the new device: another connection deletes the
+        # template first, after create_device has read and checked it.
+        nonlocal raced
+        pending = [obj for obj in self.new if isinstance(obj, Device)]
+        if not raced and any(obj.name == f"fk-{tag}" for obj in pending):
+            raced = True
+            async with session_factory() as other:
+                await other.execute(delete(DeviceTemplate).where(DeviceTemplate.id == doomed_id))
+                await real_commit(other)
+        return await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", template_goes_first)
+    payload = {
+        "name": f"fk-{tag}",
+        "template_id": str(doomed_id),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+    _assert_clean(caplog.text, sentinel)
+    assert raced
+    assert "sqlstate=23503" in caplog.text
+    assert await _names(session_factory, Device, tag) == {lab["device"]}

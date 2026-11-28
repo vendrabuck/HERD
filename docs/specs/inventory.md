@@ -406,8 +406,8 @@ deleted, and can be booked.
 
 - **INV-DEV-1.** A device name is 1 to 255 characters and unique; a duplicate answers
   409 `Device with name '<name>' already exists` on create and on rename. \
-  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceCreate`, `DEVICE_NAME_MAX_LENGTH`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`) \
-  Pinned by: `services/inventory/tests/test_devices.py` (`test_create_device_duplicate_name`, `test_update_device_duplicate_name`); `services/inventory/tests/test_schema_bounds.py` (`test_device_create_name_empty_rejected`, `test_device_create_name_over_cap_rejected`)
+  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceCreate`, `DEVICE_NAME_MAX_LENGTH`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`, `_device_write_refused`) \
+  Pinned by: `services/inventory/tests/test_devices.py` (`test_create_device_duplicate_name`, `test_update_device_duplicate_name`); `services/inventory/tests/test_schema_bounds.py` (`test_device_create_name_empty_rejected`, `test_device_create_name_over_cap_rejected`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_device_create_whose_name_is_taken_is_a_name_clash`)
 - **INV-DEV-2.** `POST /devices` accepts only a template of type `device`: an unknown
   template answers 422 `Template not found`, a port or dynamic template 422. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_device`) \
@@ -447,11 +447,15 @@ deleted, and can be booked.
 - **INV-DEV-11.** An update that sends an explicit null for `name`, `topology_type`,
   `status`, or `field_data` (NOT NULL columns) answers 422 `<field> cannot be null; omit
   the field to leave it unchanged`; an omitted field is left unchanged, and a null
-  `poll_interval_seconds` still clears the override. Only a unique violation at commit
-  answers 409 `Device with name '<name>' already exists`; any other integrity error
-  answers 409 `Device violates a database constraint`. \
-  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceUpdate`); `services/inventory/app/services/inventory_service.py` (`update_device`) \
-  Pinned by: `services/inventory/tests/test_schema_bounds.py` (`test_device_update_explicit_null_on_not_null_column_rejected_by_name`, `test_device_update_explicit_null_poll_interval_still_clears_the_override`); `services/inventory/tests/test_inventory_service_unit.py` (`test_update_device_duplicate_name`, `test_update_device_non_unique_integrity_error_is_not_a_name_clash`); `services/inventory/tests/test_bulk.py` (`test_put_device_explicit_null_status_is_422_naming_the_field`)
+  `poll_interval_seconds` still clears the override. On create and on update alike,
+  only a unique violation at commit answers 409 `Device with name '<name>' already
+  exists`; any other integrity error (a template deleted after the create read it, a
+  NOT NULL, a CHECK, or one a trigger raises) answers 409 `Device violates a database
+  constraint`, naming no constraint and no statement. The refusal is classified by its
+  SQLSTATE, or SQLite's extended error code, never by its text, and the log line
+  names the SQLSTATE only. \
+  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceUpdate`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`, `_device_write_refused`, `DEVICE_CONSTRAINT_DETAIL`); `services/inventory/app/services/db_refusal.py` (`sqlstate_of`, `UNIQUE_VIOLATION`, `SQLITE_SQLSTATES`) \
+  Pinned by: `services/inventory/tests/test_schema_bounds.py` (`test_device_update_explicit_null_on_not_null_column_rejected_by_name`, `test_device_update_explicit_null_poll_interval_still_clears_the_override`); `services/inventory/tests/test_inventory_service_unit.py` (`test_update_device_duplicate_name`, `test_update_device_non_unique_integrity_error_is_not_a_name_clash`, `test_create_device_unique_violation_is_a_taken_name`, `test_create_device_other_integrity_error_is_not_a_name_clash`, `test_update_device_unique_violation_is_a_taken_name`, `test_update_device_other_integrity_error_is_not_a_name_clash`); `services/inventory/tests/test_db_refusal.py` (`test_an_asyncpg_sqlstate_is_read_as_given`, `test_a_sqlite_error_name_maps_to_its_sqlstate`, `test_a_real_sqlite_unique_violation_reads_23505`, `test_text_alone_names_no_class`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_device_create_refused_for_anything_but_its_name_is_not_a_name_clash`, `test_a_template_deleted_before_a_device_insert_is_not_a_name_clash`); `services/inventory/tests/test_bulk.py` (`test_put_device_explicit_null_status_is_422_naming_the_field`)
 - **INV-DEV-12.** Deleting a device removes its ports and its group memberships with it. \
   Enforced in: `services/inventory/app/models/device.py` (`Device`); `services/inventory/app/models/device_group.py` (`DeviceGroupDevice`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_delete_device_cascades_ports`); `services/inventory/tests/test_device_groups.py` (`test_delete_device_cascades_from_group`); `services/inventory/tests/test_storage_constraints.py` (`test_delete_device_cascades_device_group_device`)
@@ -1439,7 +1443,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   NaN; a JSON number with a fraction is truncated), `poll_interval_seconds: must be a
   whole number`. A refused row is rolled back and the rows after it are judged on
   their own (INV-BULK-7). \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_sqlstate_of`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `_RowName`, `DATABASE_REFUSED_REASON`, `DATABASE_UNAVAILABLE_REASON`, `_TRANSIENT_SQLSTATE_CLASSES`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
+  Enforced in: `services/inventory/app/services/db_refusal.py` (`sqlstate_of`, `SQLITE_SQLSTATES`); `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `_RowName`, `DATABASE_REFUSED_REASON`, `DATABASE_UNAVAILABLE_REASON`, `_TRANSIENT_SQLSTATE_CLASSES`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
   Pinned by: `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_device_rows_past_a_column_bound_name_the_field`, `test_template_rows_past_a_column_bound_name_the_field`, `test_a_refusal_raised_outside_the_service_functions_gets_its_fixed_reason`, `test_a_template_whose_driver_goes_before_its_insert_gets_the_fixed_reason`, `test_a_device_name_taken_before_its_insert_gets_the_fixed_reason`); `services/inventory/tests/test_bulk_service_unit.py` (`test_a_refused_row_is_named_by_its_sqlstate`, `test_a_row_whose_connection_was_lost_is_named_unavailable`, `test_a_row_sqlite_refuses_is_named_by_its_error_code`, `test_a_row_that_fails_otherwise_keeps_no_text`, `test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason`, `test_a_json_cell_that_is_not_json_raises_the_fixed_reason`, `test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason`); `services/inventory/tests/test_bulk.py` (`test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route`, `test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason`, `test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason`, `test_an_unexpected_row_failure_is_reported_without_its_text`); `services/inventory/tests/test_column_bounds.py` (`test_the_device_importers_name_the_field_a_row_breaks`, `test_the_template_importers_name_the_field_a_row_breaks`); `tests/integration/test_bulk_import_export.py` (`test_template_import_rows_past_a_column_bound_name_the_field`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
@@ -1719,7 +1723,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `{"error": "device_cabled", "connection_count", "connection_ids"}` | delete of a device a connection names | INV-DEL-4 |
 | 409 | `{"error": "port_cabled", "connection_count", "connection_ids"}` | delete or rename of a port a connection names | INV-PORT-8, INV-PORT-10 |
 | 409 | `Device with name '<name>' already exists` | duplicate device name | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
-| 409 | `Device violates a database constraint` | a non-unique integrity error on device update | INV-DEV-11 |
+| 409 | `Device violates a database constraint` | a non-unique integrity error on device create or update | INV-DEV-11 |
 | 409 | `Could not generate a unique device name for prefix '<prefix>'` | the dynamic-instance name search ran out | INV-DYN-9 |
 | 409 | `Device is not a dynamic instance` | internal delete of a non-dynamic device | INV-DYN-7 |
 | 409 | `Template with name '<name>' already exists` or `Template violates a database constraint` | duplicate template name; another integrity error | INV-TPL-3 |
@@ -1791,7 +1795,7 @@ The calls other services make to inventory are section 7.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
+| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_db_refusal.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
 | Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_threads.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |

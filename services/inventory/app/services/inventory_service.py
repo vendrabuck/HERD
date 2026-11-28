@@ -1,3 +1,4 @@
+import logging
 import uuid
 from typing import Any
 
@@ -10,7 +11,30 @@ from app.models.device import Device, DeviceStatus, TopologyType
 from app.models.driver_package import ConnectionType, DriverPackage
 from app.models.template import DeviceTemplate
 from app.schemas.device import DEVICE_NAME_MAX_LENGTH, DeviceCreate, DeviceUpdate
-from app.services.template_service import _integrity_kind
+from app.services.db_refusal import UNIQUE_VIOLATION, sqlstate_of
+
+logger = logging.getLogger(__name__)
+
+# A device create or update the database refused for anything but a taken name.
+DEVICE_CONSTRAINT_DETAIL = "Device violates a database constraint"
+
+
+def _device_write_refused(exc: IntegrityError, name: str) -> HTTPException:
+    """The answer to an integrity error on a device create or update (INV-DEV-11),
+    classified by its SQLSTATE alone (``db_refusal.sqlstate_of``), never its text.
+
+    A unique violation is a taken name: the name is the only unique column these
+    writes set (``request_id`` is NULL on ``create_device`` and no update changes
+    it, and the id is generated). Any other refusal (a template deleted after the
+    check, a NOT NULL, a CHECK, or one a trigger raises) answers the fixed generic
+    detail, naming no constraint and no statement; the log line names the SQLSTATE
+    only.
+    """
+    sqlstate = sqlstate_of(exc)
+    if sqlstate == UNIQUE_VIOLATION:
+        return HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
+    logger.warning("device write refused by the database: sqlstate=%s", sqlstate or "none")
+    return HTTPException(status_code=409, detail=DEVICE_CONSTRAINT_DETAIL)
 
 
 def validate_field_data(
@@ -162,12 +186,11 @@ async def create_device(
     db.add(device)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"Device with name '{data.name}' already exists",
-        )
+        # Only a unique violation is a taken name; anything else answers the
+        # generic detail (INV-DEV-11), as on update.
+        raise _device_write_refused(exc, data.name) from exc
     await db.refresh(device)
 
     # Auto-assign to "No Pool" default device group
@@ -209,18 +232,9 @@ async def update_device(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        # Only a unique violation is a name clash (the name is the only unique
-        # column an update can change). Anything else keeps a generic 409 so it
-        # is never mislabeled as a duplicate name (issue #1016), the same split
-        # template_service._integrity_http_error makes.
-        if _integrity_kind(exc) == "unique":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Device with name '{device_name}' already exists",
-            ) from exc
-        raise HTTPException(
-            status_code=409, detail="Device violates a database constraint"
-        ) from exc
+        # Only a unique violation is a name clash. Anything else keeps a generic
+        # 409 so it is never mislabeled as a duplicate name (issue #1016).
+        raise _device_write_refused(exc, device_name) from exc
     await db.refresh(device)
     return device
 
