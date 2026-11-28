@@ -82,6 +82,7 @@ from app.services.upstream_failure import (
     unavailable_detail,
     unreachable,
 )
+from app.tasks import expiration
 from app.tasks.expiration import _run_expiration_cycle, _run_fork_archive_reconcile
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
@@ -678,6 +679,63 @@ async def test_a_failed_active_fork_listing_logs_only_the_status(network, caplog
         r for r in _records(caplog) if r.__dict__.get("action") == "fork_reconcile_fetch_failed"
     ]
     assert record.getMessage().endswith("could not fetch active forks from cabling (HTTP 500)")
+    assert record.exc_info is None
+    _assert_absent(caplog)
+
+
+class _StopLoop(Exception):
+    """Raised by the patched sleep to end a loop after one tick."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("loop", "step", "line"),
+    [
+        ("expiration_loop", "_run_expiration_cycle", "Expiration cycle failed"),
+        ("expiration_loop", "_run_reminder_cycle", "Expiry reminder cycle failed"),
+        ("expiration_loop", "_run_fork_archive_reconcile", "Fork archive reconcile cycle failed"),
+        (
+            "expiration_loop",
+            "_run_pending_prune_reconcile",
+            "Pending fork-prune reconcile cycle failed",
+        ),
+        (
+            "purpose_classify_loop",
+            "_run_purpose_classify_reconcile",
+            "Purpose classify reconcile cycle failed",
+        ),
+    ],
+    ids=lambda value: value if value.startswith("_run") else None,
+)
+async def test_a_loop_cycle_that_raises_an_error_status_logs_only_its_label(
+    monkeypatch, caplog, loop, step, line
+):
+    """A cycle that raises an error status out of the loop: the cycle line names the
+    status and attaches no traceback; any other step is a no-op."""
+
+    async def noop():
+        return None
+
+    async def stop(_seconds):
+        raise _StopLoop
+
+    async def fail():
+        raise _status_error(502)
+
+    for name in (
+        "_run_expiration_cycle",
+        "_run_reminder_cycle",
+        "_run_fork_archive_reconcile",
+        "_run_pending_prune_reconcile",
+        "_run_purpose_classify_reconcile",
+    ):
+        monkeypatch.setattr(expiration, name, fail if name == step else noop)
+    monkeypatch.setattr(expiration.asyncio, "sleep", stop)
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(_StopLoop):
+        await getattr(expiration, loop)(interval_seconds=1)
+    (record,) = [r for r in _records(caplog) if r.levelno == logging.ERROR]
+    assert record.getMessage() == f"{line} (HTTP 502)"
     assert record.exc_info is None
     _assert_absent(caplog)
 
