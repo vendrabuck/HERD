@@ -61,7 +61,7 @@ function renderPanel() {
       <HistoryPanel topologyId={TOPO_ID} {...props} />
     </QueryClientProvider>,
   );
-  return props;
+  return { ...props, client };
 }
 
 const rows = () => screen.getAllByRole("checkbox", { name: /^Select version / });
@@ -107,6 +107,24 @@ describe("HistoryPanel lists every version (issue #1591)", () => {
     expect(screen.queryByText("v501")).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox", { name: /^Select version / })).not.toBeInTheDocument();
     expect(screen.queryByText(/^No versions yet\./)).not.toBeInTheDocument();
+  });
+
+  it("a failed refresh keeps the rows under a refresh notice, never the load error beside them", async () => {
+    server.use(history(2, []));
+    const { client } = renderPanel();
+    await screen.findByText("v1");
+
+    // The panel is open with rows; a refetch fails (focus, a save, a restore).
+    server.use(history(2, [], 0));
+    await client.invalidateQueries({ queryKey: ["topologies"] });
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Could not refresh versions. cabling is restarting",
+    );
+    expect(rows()).toHaveLength(2);
+    expect(screen.getByText("v2")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to load versions.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("View, Restore, and Compare reach the oldest version of a long history", async () => {

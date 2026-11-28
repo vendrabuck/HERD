@@ -628,12 +628,15 @@ TOPO-TVER-5 (section 4).
   Pinned by: `services/cabling/tests/test_topology_versions.py` (`test_restore_blocked_by_active_reservation`); `services/cabling/tests/test_route_handlers_direct.py` (`test_versions_restore_blocked_by_active_reservation`)
 - **TOPO-VER-6.** The editor's History panel lists every version of the topology, newest
   first, read across all pages of the list route (500 a page), so the oldest version of
-  a long history can be viewed, compared, and restored; a failed read of any page shows
-  `Failed to load versions.` and no rows, never the newest page alone. By decision
-  (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a Load
-  older control). \
-  Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`) \
-  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `View, Restore, and Compare reach the oldest version of a long history`)
+  a long history can be viewed, compared, and restored; a failed read of any page, before
+  any list has arrived, shows `Failed to load versions.` and no rows, never the newest
+  page alone. A failed refresh while the rows are shown (a refetch on window focus, after
+  a save, or after a restore) keeps those rows and shows `Could not refresh versions.`
+  with the reason and Retry above them, never `Failed to load versions.` beside them. By
+  decision (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a
+  Load older control). \
+  Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `View, Restore, and Compare reach the oldest version of a long history`)
 
 **Out of scope.** Fork versions are section 8.12.
 

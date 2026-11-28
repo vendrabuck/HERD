@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 
 import { useAllTopologyVersions } from "@/api/topologies";
+import { LoadErrorNotice } from "@/components/ui/LoadError";
+import { noEntries } from "@/lib/loadState";
 import type { TopologyVersion } from "@/types/topology.types";
 
 interface HistoryPanelProps {
@@ -30,8 +32,11 @@ export function HistoryPanel({
 }: HistoryPanelProps) {
   const [selected, setSelected] = useState<string[]>([]);
   // Every version, every page (issue #1591, owner option 1): the panel never
-  // lists only the newest page. A failed page fails the whole list.
-  const { data: versions, isLoading, isError } = useAllTopologyVersions(topologyId);
+  // lists only the newest page. A failed page fails the whole list. A failed
+  // refresh (a refetch on focus, after a save or a restore) keeps the rows
+  // that already arrived and says so through LoadErrorNotice instead.
+  const versionsQuery = useAllTopologyVersions(topologyId);
+  const { data: versions, isLoading, isError } = versionsQuery;
 
   const versionsById = useMemo(() => {
     const map = new Map<string, TopologyVersion>();
@@ -82,11 +87,12 @@ export function HistoryPanel({
         </button>
       </div>
 
+      <LoadErrorNotice what="versions" query={versionsQuery} isEmpty={noEntries} className="mx-4 my-2" />
       <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
         {isLoading && (
           <p className="px-4 py-3 text-sm text-gray-500">Loading versions...</p>
         )}
-        {isError && (
+        {isError && !versions && (
           <p className="px-4 py-3 text-sm text-red-600">Failed to load versions.</p>
         )}
         {versions && versions.length === 0 && (
