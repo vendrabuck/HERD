@@ -1311,12 +1311,20 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   The route's own `extends_body_limit` bound covers the whole multipart envelope; this is
   the exact per-file bound, applied to the bytes read: the read asks for one byte past
   the bound, so a file one byte over it is refused, and the cap does not grow when an
-  operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does. Starlette has
-  already received and spooled the upload by then, so this bounds what is copied out of
-  the spool into memory and not the upload itself; a file up to 10 MiB is still decoded
-  and parsed on the event loop. The same rule on inventory is INV-BULK-23. \
-  Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
+  operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does. The same holds
+  for a file sent chunked with no `Content-Length`. Before the route runs, the body
+  limit (OPS-VALID-9 in `operations-and-observability.md`) has already refused a body
+  over the envelope, the default limit plus `IMPORT_UPLOAD_BYTES`, with the same 413
+  naming that larger limit, however the body was sent: one that declares more is
+  refused before any of it is read, and one sent chunked, or declaring less than it
+  sends, once the app has read past the limit, so at most the limit plus the one chunk
+  that crossed it is read. An urlencoded body is read as a form through that limit;
+  any other body that is not a form (JSON included) is not read at all, and the
+  route's authentication answers. Starlette spools an upload within the envelope to a
+  temporary file before the route reads it, so this per-file bound bounds what is
+  copied out of the spool into memory. The same rule on inventory is INV-BULK-23. \
+  Enforced in: `services/cabling/app/routes/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`); `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `extends_body_limit`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`, `test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound`); `services/cabling/tests/test_request_body_limit.py` (`test_the_import_route_takes_its_own_limit`, `test_an_import_body_over_its_limit_is_413_however_it_is_sent`, `test_a_raw_form_body_over_the_import_limit_is_413_and_read_no_further`, `test_a_raw_body_that_is_not_a_form_is_never_read`)
 - **TOPO-BULK-21.** A JSON import item the importer cannot read is a rejected row with
   a fixed reason, `<field>: <message>` naming a path and never a value, and the rest of
   the batch runs (TOPO-BULK-18): an item that is not an object (a list, string, number,
@@ -1353,11 +1361,28 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   grouped: `\n`, `\r\n`, and bare `\r` line endings are all read, a bare `\r` in an
   unquoted cell ends the line, a cell may be as long as the file, and anything the csv
   module still refuses answers 422 `Invalid CSV: line <n> could not be read; fix it and
-  retry` for the whole request with nothing written, dry run included. Before issue
+  retry` for the whole request with nothing written, dry run included. Two reads at
+  once take turns under the reader's lock, as INV-BULK-25 describes. Before issue
   #1574 a cell over 131,072 characters or a bare `\r` outside quotes answered 500 to any
   signed-in user. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_device_cell_past_the_field_limit_is_judged_not_a_500`, `test_a_topology_name_past_the_field_limit_is_read`, `test_every_line_ending_imports_the_same_topologies`, `test_a_cr_only_csv_with_edges_imports_its_wiring`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_reads_a_cr_only_file`, `test_parse_csv_a_csv_error_is_the_fixed_422`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin`)
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`, `_FIELD_LIMIT_LOCK`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_device_cell_past_the_field_limit_is_judged_not_a_500`, `test_a_topology_name_past_the_field_limit_is_read`, `test_every_line_ending_imports_the_same_topologies`, `test_a_cr_only_csv_with_edges_imports_its_wiring`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_reads_a_cr_only_file`, `test_parse_csv_a_csv_error_is_the_fixed_422`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin`); `services/common/tests/test_csv_import.py` (`test_two_overlapping_reads_never_put_the_limit_back_under_each_other`)
+- **TOPO-BULK-23.** The import's file work and the export's rendering run off the
+  event loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
+  whole-file JSON decode and the lone surrogate scan's serialization of the parsed
+  document (from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well). The decode, the
+  CSV or JSON parse, the lone surrogate scan, the shape check of every record, and the
+  collection of the device names to resolve run on a worker thread before the
+  visibility lookup and the first query; the export builds its records and its body
+  the same way, reading only each topology's `name` and `canvas_data`, which its query
+  loaded; the route closes its database session first, so it holds no pooled
+  connection while it waits for a slot or renders. The threads are the shared `run_bulk_work`'s, the ones inventory's importers
+  use (INV-BULK-27 in `inventory.md`): never asyncio's default executor, and at most
+  two bulk parses or renders at once in the process. Each row's canvas rewrite,
+  validation, and writes stay on the event loop in the request's session, as an
+  interactive topology save's do, so every row's outcome and reason are unchanged. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_read_import`, `render_export`); `services/cabling/app/routes/bulk.py` (`export_topologies`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `BULK_WORK_THREADS`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 

@@ -1296,7 +1296,10 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   the rest of the cell starts the next row, a line break inside a quoted cell is kept,
   and a cell may be as long as the file, since the csv module's process-wide field
   limit (131,072 characters by default) is raised to the length of the text, when that
-  is longer, for the read and put back after it. Anything the csv module still refuses answers 422
+  is longer, for the read and put back after it. Two reads at once (two imports, each
+  on its worker thread, INV-BULK-27) take turns: the raise, the read, and the restore
+  run under one lock, so a read never puts the limit back under another read still in
+  progress. Anything the csv module still refuses answers 422
   `Invalid CSV: line <n> could not be read; fix it and retry` for the whole file, where
   `<n>` is the number of physical lines the reader had read (the header is line 1), and
   nothing is written, dry run included; the detail carries no cell and none of the
@@ -1307,8 +1310,8 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   issue #1574 a cell over 131,072 characters or a bare `\r` outside quotes answered
   500, so a template whose icon is a data URL over that length exported to CSV and
   could not be imported back. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_csv`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`, `_field_limit_for`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_device_name_past_the_field_limit_is_judged_not_a_500`, `test_a_field_data_cell_past_the_field_limit_is_read`, `test_a_template_description_past_the_field_limit_is_read`, `test_a_template_with_a_large_icon_round_trips_through_csv`, `test_every_line_ending_imports_the_same_devices`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_csv_reads_every_line_ending`, `test_parse_csv_reads_a_cell_past_the_default_field_limit`, `test_parse_import_answers_the_fixed_422_for_a_csv_error`); `services/common/tests/test_csv_import.py` (`test_every_line_ending_reads_the_same_rows`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_a_line_break_inside_a_quoted_cell_is_kept`, `test_a_cell_past_the_default_field_limit_reads`, `test_the_limit_is_raised_only_during_the_read`, `test_a_csv_error_answers_the_fixed_422_naming_the_line`, `test_a_csv_error_puts_the_previous_limit_back`, `test_input_the_csv_module_reads_leniently`)
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_parse_csv`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`, `_field_limit_for`, `_FIELD_LIMIT_LOCK`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_device_name_past_the_field_limit_is_judged_not_a_500`, `test_a_field_data_cell_past_the_field_limit_is_read`, `test_a_template_description_past_the_field_limit_is_read`, `test_a_template_with_a_large_icon_round_trips_through_csv`, `test_every_line_ending_imports_the_same_devices`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/inventory/tests/test_bulk_service_unit.py` (`test_parse_csv_reads_every_line_ending`, `test_parse_csv_reads_a_cell_past_the_default_field_limit`, `test_parse_import_answers_the_fixed_422_for_a_csv_error`); `services/common/tests/test_csv_import.py` (`test_every_line_ending_reads_the_same_rows`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_a_line_break_inside_a_quoted_cell_is_kept`, `test_a_cell_past_the_default_field_limit_reads`, `test_the_limit_is_raised_only_during_the_read`, `test_a_csv_error_answers_the_fixed_422_naming_the_line`, `test_a_csv_error_puts_the_previous_limit_back`, `test_input_the_csv_module_reads_leniently`, `test_two_overlapping_reads_never_put_the_limit_back_under_each_other`)
 - **INV-BULK-26.** A JSON import item that is not an object (a list, string, number,
   boolean, or null) is rejected with the reason `row is not an object`, and an object
   whose `name` is present, not null, and not a string is rejected with `name: must be a
@@ -1329,13 +1332,46 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   exact per-file bound, applied to the bytes read. The read asks for one byte past the
   bound, so the check is exact and a file one byte over it is refused, and the cap does
   not grow when an operator raises `MAX_REQUEST_BODY_BYTES` the way the envelope does.
-  Note that Starlette has already received the whole upload and spooled it to a
-  temporary file by the time the route reads it, so this bounds what is copied out of
-  the spool into memory and not the upload itself; a file up to 10 MiB is still decoded
-  and parsed on the event loop. The same bound and answer apply to cabling's
+  The same holds for a file sent chunked with no `Content-Length`. Before the route
+  runs, the body limit (OPS-VALID-9 in `operations-and-observability.md`) has already
+  refused a body over the envelope, the default limit plus `IMPORT_UPLOAD_BYTES`, with
+  the same 413 naming that larger limit, however the body was sent: one that declares
+  more is refused before any of it is read, and one sent chunked, or declaring less
+  than it sends, once the app has read past the limit, so at most the limit plus the
+  one chunk that crossed it is read. An urlencoded body is read as a form through
+  that limit; any other body that is not a form (JSON included) is not read at all,
+  and the route's admin gate answers. Starlette spools an upload within the envelope
+  to a temporary file before the route reads it, so this per-file bound bounds what is
+  copied out of the spool into memory. The same bound and answer apply to cabling's
   topology import (`TOPO-BULK-20`). \
-  Enforced in: `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`); `services/cabling/app/routes/bulk.py` (`_read_capped`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_bulk_upload_over_the_bound_is_refused_before_any_parse`, `test_an_upload_at_the_bound_is_accepted`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_templates_import_is_held_to_the_same_bound`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`); `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
+  Enforced in: `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`); `services/cabling/app/routes/bulk.py` (`_read_capped`); `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `extends_body_limit`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_bulk_upload_over_the_bound_is_refused_before_any_parse`, `test_an_upload_at_the_bound_is_accepted`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_templates_import_is_held_to_the_same_bound`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`, `test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound`); `services/inventory/tests/test_request_body_limit.py` (`test_an_upload_route_takes_its_own_limit`, `test_an_import_body_over_its_limit_is_413_however_it_is_sent`, `test_a_raw_form_body_over_an_import_limit_is_413_and_read_no_further`, `test_a_raw_body_that_is_not_a_form_is_never_read`); `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
+- **INV-BULK-27.** An import's file work and an export's rendering run off the event
+  loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
+  whole-file JSON decode and the lone surrogate scan's serialization of the parsed
+  document (from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well). The decode, the CSV or
+  JSON parse, the lone surrogate scan, and the decode of each row's JSON text cell
+  (`field_data` for a device, `sections` for a template) run on a worker thread before
+  the import's first query; an export renders its records into one body the same way.
+  The threads are the shared `run_bulk_work`'s: anyio worker threads, never asyncio's
+  default executor (the one `loop.getaddrinfo` resolves names on, see issue #1416),
+  and at most `BULK_WORK_THREADS` (2) of them run bulk work at once in the process, for
+  every import and export route together; more work waits for a slot, with no bound
+  on the wait. A request cancelled while its work runs gives its slot back only when
+  the thread ends; one cancelled while it waits takes none and runs nothing. The row
+  loop, each row's schema checks and create or update, and every database call stay on
+  the event loop in the request's session. A cell's decode, its value or the text of
+  the decoder's error (the text alone, never the exception, which would keep the
+  whole upload alive in a reference cycle), is applied where the row loop reads the
+  cell, so every row's outcome and reason are the ones an on-loop decode gave
+  (INV-BULK-9, INV-BULK-24).
+  Before issue #1417 all of this ran on the event loop: measured on one core, a 10 MiB
+  JSON file held it about 120 ms, and a 10 MiB CSV file from about 0.3 s to about 1.4 s,
+  more the shorter and more numerous its rows. An export closes its database session
+  before it waits for a slot, so it holds no pooled connection while it waits or
+  renders. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_read_device_import`, `_read_template_import`, `_decode_json_cells`, `_DecodedCell`, `_CellDecodeError`, `_coerce_json_cell`); `services/inventory/app/routers/bulk.py` (`_export_response`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `bulk_work_limiter`, `BULK_WORK_THREADS`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_a_csv_json_cell_is_decoded_off_the_loop`, `test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave`, `test_a_template_sections_cell_is_decoded_with_the_file`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`, `test_two_concurrent_csv_import_reads_with_long_cells_both_read`); `services/inventory/tests/test_bulk_service_unit.py` (`test_decode_json_cells_wraps_text_cells_and_leaves_the_rest`, `test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it`, `test_a_failed_cell_decode_leaves_no_reference_cycle`, `test_identical_failed_cells_share_one_reason_and_hold_no_exception`, `test_a_decoded_cell_is_not_an_empty_cell`); `services/common/tests/test_bulk_work.py` (`test_two_threads_at_most`, `test_anyio_is_handed_the_modules_own_worker_limiter`, `test_work_that_fails_after_its_caller_left_logs_nothing`, `test_the_work_runs_on_a_worker_thread_and_returns_its_result`, `test_an_exception_comes_back_unchanged`, `test_the_work_never_takes_the_default_executor`, `test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_a_cancelled_caller_keeps_its_slot_until_its_thread_ends`, `test_a_caller_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,
