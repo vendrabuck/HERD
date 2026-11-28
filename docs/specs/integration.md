@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `INTEG` (used in rule identifiers, for example `INTEG-HOOK-1`) |
-| Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
+| Last full review | 2026-10-07 |
 | Owning services | integration (`services/integration/`: the `/api/v1` facade, webhook subscriptions, the webhook delivery consumer); notifications (`services/notifications/`: the notification consumer, in-app notifications, the preferences proxy, the outbound channels); the bell and the Settings page in `frontend/` |
 | Other services involved | reservations (every facade call, the lifecycle events, the active-holder lookup), execution (the device health events), auth (the admin list and user contact lookups, API token exchange), user-profile (stored notification preferences), NATS JetStream, external webhook receivers, an SMTP server, a chat incoming webhook |
 | Design records | none; the facade and webhooks shipped under issue #33, the health webhooks under issue #831, the notification channels under issue #40 (see `FEATURES.md`) |

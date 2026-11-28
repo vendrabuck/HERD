@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `WIRE` (used in rule identifiers, for example `WIRE-ORDER-1`) |
-| Verified at | commit `61bebe96` (`v0.6.0-76-g61bebe96`), 2026-10-05 |
+| Last full review | 2026-10-05 |
 | Owning services | execution (`services/execution/`) |
 | Other services involved | reservations (stages the events, answers the corroboration check, proxies the user routes), cabling (the fork's intended wiring and routing intent, fabric lookup), inventory (switch devices, templates, config versions, driver packages), the driver packages run in execution's sandbox |
 | Design records | [ADR 0006](../design/0006-fork-reconcile-and-as-built.md), [ADR 0007](../design/0007-connection-driven-reconcile.md), [ADR 0009](../design/0009-l2-l3-connection-driven-reconcile.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md), [ADR 0018](../design/0018-reconcile-respects-the-drive-claim.md) (Proposed) |

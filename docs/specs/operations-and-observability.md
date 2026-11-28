@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `OPS` (used in rule identifiers, for example `OPS-OUTBOX-1`) |
-| Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
+| Last full review | 2026-10-07 |
 | Owning services | common (`services/common/herd_common/`: logging, settings sources, schema lifecycle, outbox, JetStream helpers, version, the request-validation handler), config (`services/config/`) and its restarter (`infra/restarter/`), secrets (`services/secrets/`), user-profile (`services/user-profile/`), execution (the device health scheduler and its read routes), reservations (the utilization report routes); the About, Config, and Reporting pages in `frontend/` |
 | Other services involved | every backend service (each serves `/health` and `/version`, logs through the shared formatter, and resolves settings through the shared sources), inventory (the poll registry route, the secret reference lookup), auth (user groups for the report), cabling (transit devices for the report), acl (secret grants), notifications and integration (consumers of health events), NATS JetStream, Postgres, Docker (reached only by the restarter, for the config service's restart) |
 | Design records | [ADR 0003](../design/0003-encrypted-credential-store.md), [ADR 0013](../design/0013-lab-purpose-classification.md), [ADR 0017](../design/0017-config-restart-without-the-docker-socket.md) |
