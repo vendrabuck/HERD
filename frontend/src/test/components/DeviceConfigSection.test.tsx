@@ -232,6 +232,37 @@ describe("DeviceConfigSection", () => {
     expect(receivedBody).toEqual({ config: { vlan: 100 }, description: "first cut" });
   });
 
+  it("a created version refreshes the whole list through the real create hook", async () => {
+    // The walked list's key must sit under the "list" prefix that create invalidates.
+    const asked: string[] = [];
+    let saved = false;
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const url = new URL(request.url);
+        asked.push(`${url.searchParams.get("skip")}:${url.searchParams.get("limit")}`);
+        const items = saved
+          ? [makeVersion({ id: "ver-2", version_number: 2 }), makeVersion()]
+          : [makeVersion()];
+        return HttpResponse.json({ items, total: items.length, skip: 0, limit: 500 });
+      }),
+      http.post(VERSIONS_URL, () => {
+        saved = true;
+        return HttpResponse.json({ ...makeVersion({ id: "ver-2", version_number: 2 }), config: {} });
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+    expect(await screen.findByText("1 version")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "New version" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText("2 versions")).toBeInTheDocument();
+    expect(screen.getByText("v2")).toBeInTheDocument();
+    expect(asked).toEqual(["0:500", "0:500"]);
+  });
+
   it("shows a create refusal's string detail and a validation list as text (#1314)", async () => {
     let calls = 0;
     server.use(

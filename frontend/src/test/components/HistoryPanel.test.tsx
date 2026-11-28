@@ -8,10 +8,12 @@
 import { http, HttpResponse } from "msw";
 import { render, screen, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { describe, it, expect, vi } from "vitest";
 
 import { server } from "../mocks/server";
 import { HistoryPanel } from "@/components/topology-editor/HistoryPanel";
+import { useRestoreVersion } from "@/api/topologies";
 import type { TopologyVersion } from "@/types/topology.types";
 
 const TOPO_ID = "topo-1";
@@ -46,7 +48,17 @@ function history(count: number, asked: string[], failSkip?: number) {
   });
 }
 
-function renderPanel() {
+/** Restores version 1 through the editor's real mutation hook. */
+function RestoreHarness() {
+  const restore = useRestoreVersion(TOPO_ID);
+  return (
+    <button type="button" onClick={() => restore.mutate({ versionId: "v-1", body: {} })}>
+      Harness restore
+    </button>
+  );
+}
+
+function renderPanel(extra?: ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -59,6 +71,7 @@ function renderPanel() {
   render(
     <QueryClientProvider client={client}>
       <HistoryPanel topologyId={TOPO_ID} {...props} />
+      {extra}
     </QueryClientProvider>,
   );
   return { ...props, client };
@@ -125,6 +138,38 @@ describe("HistoryPanel lists every version (issue #1591)", () => {
     expect(screen.getByText("v2")).toBeInTheDocument();
     expect(screen.queryByText("Failed to load versions.")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a restore through the editor's mutation walks the list again and shows the new version", async () => {
+    // The list key must sit under a prefix the restore invalidates.
+    const asked: string[] = [];
+    let count = 2;
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const url = new URL(request.url);
+        const skip = Number(url.searchParams.get("skip"));
+        const limit = Number(url.searchParams.get("limit"));
+        asked.push(`${skip}:${limit}`);
+        const all = Array.from({ length: count }, (_, i) => version(count - i));
+        return HttpResponse.json({ items: all.slice(skip, skip + limit), total: count, skip, limit });
+      }),
+      http.post(`${VERSIONS_URL}/v-1/restore`, () => {
+        count = 3;
+        return HttpResponse.json({ id: TOPO_ID, name: "lab" });
+      }),
+    );
+    renderPanel(<RestoreHarness />);
+    await screen.findByText("v2");
+    expect(asked).toEqual(["0:500"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Harness restore" }));
+
+    expect(await screen.findByText("v3")).toBeInTheDocument();
+    expect(rows()).toHaveLength(3);
+    // The restore invalidates the versions prefix and then all topologies, so
+    // the walk may start twice; each is a fresh first page.
+    expect(asked.length).toBeGreaterThan(1);
+    expect(asked.every((a) => a === "0:500")).toBe(true);
   });
 
   it("View, Restore, and Compare reach the oldest version of a long history", async () => {

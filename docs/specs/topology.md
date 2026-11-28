@@ -636,7 +636,7 @@ TOPO-TVER-5 (section 4).
   decision (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a
   Load older control). \
   Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
-  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `View, Restore, and Compare reach the oldest version of a long history`)
+  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `a restore through the editor's mutation walks the list again and shows the new version`, `View, Restore, and Compare reach the oldest version of a long history`)
 
 **Out of scope.** Fork versions are section 8.12.
 
