@@ -1371,7 +1371,7 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
 - **TOPO-BULK-23.** The import's file work and the export's rendering run off the
   event loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
   whole-file JSON decode and the lone surrogate scan's serialization of the parsed
-  document (on one core, about 60 ms and about 50 ms for a 10 MiB file). The decode, the
+  document (from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well). The decode, the
   CSV or JSON parse, the lone surrogate scan, the shape check of every record, and the
   collection of the device names to resolve run on a worker thread before the
   visibility lookup and the first query; the export builds its records and its body
