@@ -1,4 +1,3 @@
-import asyncio
 import gzip
 import hashlib
 import io
@@ -16,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.driver_package import VALID_CONNECTION_TYPES, ConnectionType, DriverPackage
 from app.models.template import DeviceTemplate
-from app.storage import delete_object, download_object, upload_object
+from app.storage import delete_object, download_object, run_on_storage_thread, upload_object
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +136,10 @@ def _inspect_package(filename: str, file_data: bytes) -> tuple[str, dict]:
 
     Both steps are CPU work over up to DRIVER_MAX_SIZE_BYTES, and the archive read
     inflates compressed data, so the async callers run this through
-    ``asyncio.to_thread``, as they do every ``app.storage`` call, and never on the
-    event loop (issue #1327). An HTTPException from ``_parse_driver_metadata`` (the
-    422 size refusals) propagates through ``to_thread`` unchanged.
+    ``app.storage.run_on_storage_thread``, as they do every ``app.storage`` call, never
+    on the event loop (issue #1327) and never on asyncio's default executor (issue
+    #1416). An HTTPException from ``_parse_driver_metadata`` (the 422 size refusals)
+    propagates through it unchanged.
     """
     return hashlib.sha256(file_data).hexdigest(), _parse_driver_metadata(filename, file_data)
 
@@ -211,9 +211,9 @@ async def create_driver(
 
     driver_id = uuid.uuid4()
     storage_key = f"{driver_id}/{filename}"
-    sha256, metadata = await asyncio.to_thread(_inspect_package, filename, file_data)
+    sha256, metadata = await run_on_storage_thread(_inspect_package, filename, file_data)
 
-    await asyncio.to_thread(upload_object, storage_key, file_data)
+    await run_on_storage_thread(upload_object, storage_key, file_data)
 
     package = DriverPackage(
         id=driver_id,
@@ -234,7 +234,7 @@ async def create_driver(
     except IntegrityError:
         await db.rollback()
         try:
-            await asyncio.to_thread(delete_object, storage_key)
+            await run_on_storage_thread(delete_object, storage_key)
         except Exception:
             pass
         raise HTTPException(
@@ -341,14 +341,16 @@ async def replace_driver_file(
     old_storage_key = package.storage_key
     # Read before anything is stored: a package refused for its size (issue #1180)
     # must leave the stored file and the row as they were.
-    sha256, replacement_metadata = await asyncio.to_thread(_inspect_package, filename, file_data)
+    sha256, replacement_metadata = await run_on_storage_thread(
+        _inspect_package, filename, file_data
+    )
 
     # Upload new file first, then delete old one (create-then-delete)
-    await asyncio.to_thread(upload_object, storage_key, file_data)
+    await run_on_storage_thread(upload_object, storage_key, file_data)
 
     if old_storage_key != storage_key:
         try:
-            await asyncio.to_thread(delete_object, old_storage_key)
+            await run_on_storage_thread(delete_object, old_storage_key)
         except Exception:
             pass
 
@@ -366,7 +368,12 @@ async def replace_driver_file(
 
 async def download_driver(db: AsyncSession, driver_id: uuid.UUID) -> tuple[DriverPackage, bytes]:
     package = await get_driver(db, driver_id)
-    data = await asyncio.to_thread(download_object, package.storage_key)
+    # The row is read; the session gives its pooled connection back before the call
+    # waits for a storage thread, so downloads held by a stalled store (any signed-in
+    # user can start one) hold no database connection (issue #1416). close(), not
+    # rollback(): the row's loaded columns stay readable after it.
+    await db.close()
+    data = await run_on_storage_thread(download_object, package.storage_key)
     return package, data
 
 
@@ -387,7 +394,7 @@ async def delete_driver(db: AsyncSession, driver_id: uuid.UUID) -> None:
         )
 
     try:
-        await asyncio.to_thread(delete_object, package.storage_key)
+        await run_on_storage_thread(delete_object, package.storage_key)
     except Exception:
         pass
     await db.delete(package)

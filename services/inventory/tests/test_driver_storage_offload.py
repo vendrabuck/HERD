@@ -7,7 +7,8 @@ loop, so one driver upload or download stalled every other request on the replic
 
 Each test below wraps every blocking callable on the driver path with a recorder that
 notes whether it was called with a running event loop in its thread. A call made on
-the loop sees one; a call made through ``asyncio.to_thread`` does not. The recorders
+the loop sees one; a call made on a storage thread (``app.storage.run_on_storage_thread``,
+issue #1416) does not. The recorders
 delegate to fakes (storage) or to the real code (hashing, parsing), so the routes
 answer as before. No assertion here has a wall-clock bound: the responsiveness test
 sequences on threading events, and its only timeout is the failure path's way out of a

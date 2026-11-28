@@ -1016,12 +1016,35 @@ download, delete); routes under `/drivers`. The package format is in
 - **INV-DRV-19.** A driver upload, file replacement, download, or delete does its
   blocking work off the event loop (issue #1327): the upload's SHA256, the
   `driver_metadata.json` read, and every storage write, read, and delete (a MinIO round
-  trip or a local file operation) run in a worker thread through `asyncio.to_thread`,
-  so the service answers other requests, `GET /health` among them, while one is in
-  flight. A 422 refusal raised by the metadata read in the worker reaches the caller
-  unchanged, and nothing is stored. \
-  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`) \
+  trip or a local file operation) run in a worker thread, one of the storage threads of
+  INV-DRV-22, so the service answers other requests, `GET /health` among them, while
+  one is in flight. A 422 refusal raised by the metadata read in the worker reaches the
+  caller unchanged, and nothing is stored. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`); `services/inventory/app/storage.py` (`run_on_storage_thread`) \
   Pinned by: `services/inventory/tests/test_driver_storage_offload.py` (`test_driver_upload_hashes_parses_and_stores_off_the_event_loop`, `test_a_refused_oversized_metadata_upload_still_parses_off_the_event_loop`, `test_duplicate_name_cleanup_delete_runs_off_the_event_loop`, `test_file_replace_parses_stores_and_deletes_off_the_event_loop`, `test_both_download_routes_read_storage_off_the_event_loop`, `test_driver_delete_removes_the_object_off_the_event_loop`, `test_health_answers_while_a_driver_upload_is_blocked_in_storage`)
+- **INV-DRV-22.** The work of INV-DRV-19 runs on inventory's own pool of
+  `DRIVER_STORAGE_THREADS` (4) storage threads, never on asyncio's default executor,
+  where `loop.getaddrinfo` resolves the names of new database and NATS connections
+  (issue #1416). At most four such calls run at once; another waits for a thread,
+  with no bound on the wait, and one cancelled while it waits never runs. A stalled
+  object store can hold those four threads, and so delay other driver uploads,
+  replacements, downloads, and deletes, but not name resolution, the event loop, or
+  any other worker thread. A download gives its database connection back before it
+  waits for a storage thread, so downloads held by a stalled store hold none. \
+  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`); `services/inventory/app/services/driver_service.py` (`download_driver`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`)
+- **INV-DRV-23.** On MinIO, each request gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
+  (5) without progress on a connect or a body send, or `MINIO_READ_TIMEOUT_SECONDS`
+  (30) without the next bytes of an answer, and a request that fails that way or is
+  answered 500, 502, 503, or 504 is tried again at most `MINIO_RETRIES` (2) times,
+  with no wait a Retry-After header names (issue #1416). Against a store that accepts
+  connections and never answers, one storage call ends within about 136 s (three
+  attempts of at most 35 s, a 0.4 s backoff, and one 30 s read of a download body that
+  stops); the bounds are on each wait for progress, not on a whole transfer. These are
+  named constants, not settings (the issue's triage). The failure answers as
+  INV-DRV-20 and section 10 say. \
+  Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`)
 - **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
   create answers 500 and commits no row, and a storage failure on file replace answers
   500 and leaves the row naming the old archive, which is still stored and still
@@ -1741,7 +1764,7 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
 | inventory to cabling | cabling | `GET /connections/internal/by-port?device_id&port_name` (`X-Internal-Token`, 5 s) | port delete and rename guard: connections naming the port | fail closed: 503 (INV-PORT-8) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
-| inventory to storage | local disk or MinIO | put, get, remove object | driver archives | upload or download failure is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
+| inventory to storage | local disk or MinIO | put, get, remove object, on the storage threads (INV-DRV-22), each MinIO request bounded by INV-DRV-23 | driver archives | upload or download failure, a MinIO timeout included, is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
 | inventory to execution, acl, reservations | | config schema, apply, and fire-time checks | device configuration | specified in `device-configuration.md` |
 
 The calls other services make to inventory are section 7.
@@ -1763,7 +1786,7 @@ The calls other services make to inventory are section 7.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
-| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
+| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_threads.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |
 | Browser end-to-end | `tests/e2e/test_inventory_filters_playwright.py`, `test_inventory_expanded_playwright.py`, `test_inventory_saved_search_late_load_playwright.py`, `test_inventory_effects_playwright.py`, `test_templates_playwright.py`, `test_dynamic_template_authoring_playwright.py`, `test_device_groups.py`, `test_drivers.py`, `test_bulk_import_export.py`, `test_add_device_ui.py` | Nightly and the gates, not per-PR CI |

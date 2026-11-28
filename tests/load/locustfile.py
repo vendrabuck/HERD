@@ -2,7 +2,9 @@
 
 Eleven user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
-- InventoryBrowser: browses devices, templates, and the topologies list
+- InventoryBrowser: browses devices, templates, and the topologies list, and
+  downloads a driver package (issue #1416: downloads run on inventory's storage
+  threads beside the device reads)
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
 - RoutedTopologyValidator: repeatedly validates one topology carrying Layer 3
@@ -257,6 +259,10 @@ class InventoryBrowser(HerdUser):
         resp = self._auth_get("/api/inventory/devices")
         if resp.status_code == 200:
             self._device_ids = [d["id"] for d in resp.json()["items"]]
+        self._driver_ids = []
+        resp = self._auth_get("/api/inventory/drivers")
+        if resp.status_code == 200:
+            self._driver_ids = [d["id"] for d in resp.json()["items"]]
 
     @task(5)
     def list_devices(self):
@@ -271,6 +277,17 @@ class InventoryBrowser(HerdUser):
     @task(2)
     def list_templates(self):
         self._auth_get("/api/inventory/templates")
+
+    @task(1)
+    def download_driver(self):
+        # Any signed-in user may download a package (INV-DRV-17). Concurrent
+        # downloads share inventory's four storage threads (INV-DRV-22), so the
+        # device reads above show whether they stay flat while downloads run.
+        if self._driver_ids:
+            self._auth_get(
+                f"/api/inventory/drivers/{random.choice(self._driver_ids)}/download",
+                name="/api/inventory/drivers/[id]/download",
+            )
 
     @task(2)
     def list_topologies(self):
