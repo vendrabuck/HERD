@@ -371,9 +371,12 @@ name looks like a credential.
   Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-8.** `setup_logging` installs the one JSON handler on the root logger at
   `LOG_LEVEL` (INFO when the name is unknown) and holds `uvicorn.access`,
-  `uvicorn.error`, and `sqlalchemy.engine` at WARNING. \
-  Enforced in: `services/common/herd_common/logging.py` (`setup_logging`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
+  `uvicorn.error`, `sqlalchemy.engine`, and the HTTP client loggers `httpx` and `httpx2`
+  at WARNING, so an outbound request writes no line of the client's own at any
+  `LOG_LEVEL`; the transport loggers `httpcore` and `httpcore2`, which log only at
+  DEBUG, are held at INFO. \
+  Enforced in: `services/common/herd_common/logging.py` (`setup_logging`, `QUIET_LOGGERS`, `HTTP_TRANSPORT_LOGGERS`) \
+  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`, `test_setup_logging_keeps_httpcore_debug_lines_out_even_at_debug_level`, `test_an_outbound_request_writes_no_client_line_to_the_service_log`, `test_an_async_outbound_request_writes_no_client_line_to_the_service_log`, `test_the_client_line_is_what_the_quiet_level_holds_back`); `services/ai-orchestrator/tests/test_sdk_client_logging.py` (`test_an_sdk_client_request_writes_no_client_line_to_the_service_log`, `test_the_sdk_client_line_is_what_the_quiet_level_holds_back`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
 - **OPS-LOG-9.** The config service does not use this formatter: it logs through the
   standard library with no handler of its own, so its lines are plain text and its INFO
   lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
@@ -737,10 +740,12 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   `errors` entry: `Cannot reach the restart service: <ClassName>` (no answer within
   720 seconds, a refused connection, an unresolvable name), `A restart is already in
   progress` (a 409), `The restart service answered HTTP <status>` (any other status),
-  or `The restart service answered an unexpected body`. The restarter's body is never
+  or `The restart service answered an unexpected body` (any other 200 body: not JSON,
+  not the shape, over 64 KiB, or one the parser refuses, such as an integer too long to
+  read or nesting past the interpreter's depth bound). The restarter's body is never
   echoed in those cases; it goes to the log. \
   Enforced in: `services/config/app/docker_ctl.py` (`restart_services`, `_validated`, `IN_PROGRESS_ERROR`, `UNEXPECTED_BODY_ERROR`, `RESTART_TIMEOUT_SECONDS`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_answer_is_passed_through_when_it_has_exactly_the_shape`, `test_a_409_is_the_in_progress_entry`, `test_another_status_is_named_and_the_body_never_echoed`, `test_any_other_200_body_is_the_unexpected_body_entry`, `test_a_refused_connection_is_cannot_reach_with_the_class_only`, `test_an_unresolvable_restarter_is_cannot_reach`, `test_a_silent_restarter_times_out`, `test_apply_passes_the_409_on_as_an_error_entry`)
+  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_answer_is_passed_through_when_it_has_exactly_the_shape`, `test_a_409_is_the_in_progress_entry`, `test_another_status_is_named_and_the_body_never_echoed`, `test_any_other_200_body_is_the_unexpected_body_entry`, `test_the_deep_bodies_are_past_the_parser_bound_here`, `test_a_body_refused_for_its_shape_is_the_unexpected_body_entry`, `test_the_largest_body_that_fits_is_still_passed_through`, `test_apply_answers_and_records_a_shape_refused_body_as_the_unexpected_body_entry`, `test_a_refused_connection_is_cannot_reach_with_the_class_only`, `test_an_unresolvable_restarter_is_cannot_reach`, `test_a_silent_restarter_times_out`, `test_apply_passes_the_409_on_as_an_error_entry`)
 - **OPS-CONFIG-25.** The restarter's HTTP surface is `POST /restart` and `GET /health`
   (`{"status": "ok", "service": "restarter"}`, with no Docker call). `POST /restart`
   ignores its query string, body, and headers. Any other path is 404 `Not found` and
@@ -929,10 +934,18 @@ service's lifespan; `infra/postgres/init.sql`; the upgrade order in
   Pinned by: `services/common/tests/test_schema_init.py` (`test_managed_path_survives_broken_script_location`, `test_broken_script_location_still_surfaces_missing_tables`, `test_managed_missing_tables_surfaced_in_outcome`)
 - **OPS-SCHEMA-7.** When a managed schema lacks model tables, an event consumer's start is
   deferred: the rest of the service starts, a poll every 5 seconds re-checks the tables
-  (warning every 60 seconds, retrying a failed check), and the consumer starts as soon as
-  the tables exist, with no restart. \
-  Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`); `services/common/herd_common/schema_init.py` (`missing_model_tables`) \
-  Pinned by: `services/common/tests/test_consumer_schema_gate.py` (`test_managed_schema_with_no_drift_starts_immediately`, `test_fresh_and_legacy_outcomes_never_gate`, `test_gated_defers_then_starts_when_table_appears`, `test_gated_warns_periodically_while_waiting`, `test_readiness_check_failure_is_retried`); `services/common/tests/test_schema_init.py` (`test_missing_model_tables_recheck_clears_when_table_appears`)
+  (warning every 60 seconds, retrying a failed check), and the consumer start runs as soon
+  as the tables exist, with no restart. A failed check's retry line names the exception
+  class only. The service's start reports whether every consumer it starts is running
+  (issue #1592), and the gate's line after the deferred start says what happened: `Service
+  '<service>': schema is ready; deferred NATS consumer started.` only when it is; when it
+  is not, after the start's own warning, `Service '<service>': schema is ready; the
+  deferred NATS consumer start ran but did not start every consumer (the warning above
+  names those not running).` A start that raises ends the poll with `Background task
+  <service> consumer schema gate ended with <class>` (`background_tasks.log_task_crash`,
+  the class name only), and a start cancelled at shutdown logs nothing more. \
+  Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`); `services/common/herd_common/schema_init.py` (`missing_model_tables`); `services/execution/app/main.py` (`_start_consumer_and_streams`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`) \
+  Pinned by: `services/common/tests/test_consumer_schema_gate.py` (`test_managed_schema_with_no_drift_starts_immediately`, `test_fresh_and_legacy_outcomes_never_gate`, `test_gated_defers_then_starts_when_table_appears`, `test_gated_warns_periodically_while_waiting`, `test_readiness_check_failure_is_retried`, `test_a_deferred_start_that_did_not_start_every_consumer_never_logs_started`, `test_a_deferred_start_that_raised_logs_the_class_only_and_never_started`, `test_a_deferred_start_cancelled_at_shutdown_logs_nothing_after_the_deferral`, `test_the_ungated_start_logs_nothing_of_the_gates_own`); `services/common/tests/test_schema_init.py` (`test_missing_model_tables_recheck_clears_when_table_appears`); `services/execution/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/integration/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/notifications/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/execution/tests/test_main.py` (`test_consumer_step_reports_what_the_consumer_start_reported`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_reports_whether_both_consumers_run`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_reports_whether_both_consumers_run`)
 - **OPS-SCHEMA-8.** Shutdown cancels a pending gate and waits for at most one in-flight
   readiness query to close its connection. \
   Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`stop_consumer_schema_gate`) \

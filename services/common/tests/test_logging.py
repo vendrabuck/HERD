@@ -1,11 +1,19 @@
 import datetime
+import io
 import json
 import logging
 import uuid
 
+import httpx
 import pytest
 from fastapi import FastAPI
-from herd_common.logging import JSONFormatter, RequestLoggingMiddleware, setup_logging
+from herd_common.logging import (
+    HTTP_TRANSPORT_LOGGERS,
+    QUIET_LOGGERS,
+    JSONFormatter,
+    RequestLoggingMiddleware,
+    setup_logging,
+)
 from httpx import ASGITransport, AsyncClient
 
 
@@ -357,17 +365,25 @@ def test_setup_logging_configures_root_logger():
     original_handlers = list(root.handlers)
     original_level = root.level
     original_noisy_levels = {
-        name: logging.getLogger(name).level
-        for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine", "httpcore")
+        name: logging.getLogger(name).level for name in QUIET_LOGGERS + HTTP_TRANSPORT_LOGGERS
     }
     try:
         setup_logging("test-svc")
         assert len(root.handlers) == 1
         assert isinstance(root.handlers[0].formatter, JSONFormatter)
         # Noisy loggers suppressed
-        assert logging.getLogger("uvicorn.access").level == logging.WARNING
-        assert logging.getLogger("sqlalchemy.engine").level == logging.WARNING
-        assert logging.getLogger("httpcore").level == logging.INFO
+        assert QUIET_LOGGERS == (
+            "uvicorn.access",
+            "uvicorn.error",
+            "sqlalchemy.engine",
+            "httpx",
+            "httpx2",
+        )
+        assert HTTP_TRANSPORT_LOGGERS == ("httpcore", "httpcore2")
+        for name in QUIET_LOGGERS:
+            assert logging.getLogger(name).level == logging.WARNING, name
+        for name in HTTP_TRANSPORT_LOGGERS:
+            assert logging.getLogger(name).level == logging.INFO, name
     finally:
         # setup_logging replaces the root logger's handlers wholesale (issue
         # #534 test-isolation follow-up): restore them so later tests in this
@@ -412,15 +428,110 @@ def test_setup_logging_keeps_httpcore_debug_lines_out_even_at_debug_level():
     root = logging.getLogger()
     original_handlers = list(root.handlers)
     original_level = root.level
-    httpcore_logger = logging.getLogger("httpcore")
-    original_httpcore_level = httpcore_logger.level
+    original_levels = {
+        name: logging.getLogger(name).level for name in QUIET_LOGGERS + HTTP_TRANSPORT_LOGGERS
+    }
     try:
         setup_logging("test-svc", level="DEBUG")
         assert root.level == logging.DEBUG
         assert not logging.getLogger("httpcore.http11").isEnabledFor(logging.DEBUG)
-        assert logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        assert not logging.getLogger("httpcore2.http11").isEnabledFor(logging.DEBUG)
     finally:
         root.handlers.clear()
         root.handlers.extend(original_handlers)
         root.setLevel(original_level)
-        httpcore_logger.setLevel(original_httpcore_level)
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
+# -- Quieter request logging: outbound HTTP client lines --
+
+_CLIENT_URL = "https://svc-user:Q7rk-value@upstream.test:8443/v1/things?page=2"
+
+
+@pytest.fixture
+def service_log():
+    """setup_logging as a service runs it, its JSON handler writing to a buffer; the
+    root logger and every level setup_logging sets are restored afterwards."""
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    original_levels = {
+        name: logging.getLogger(name).level for name in QUIET_LOGGERS + HTTP_TRANSPORT_LOGGERS
+    }
+    buffer = io.StringIO()
+
+    def _setup(level: str) -> io.StringIO:
+        setup_logging("test-svc", level=level)
+        root.handlers[0].setStream(buffer)
+        return buffer
+
+    try:
+        yield _setup
+    finally:
+        root.handlers.clear()
+        root.handlers.extend(original_handlers)
+        root.setLevel(original_level)
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
+def _answer(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(418, json={"ok": True}, extensions={"reason_phrase": b"Odd Reason"})
+
+
+def _assert_no_client_line(text: str) -> None:
+    assert "svc-user" not in text
+    assert "Q7rk-value" not in text
+    assert "upstream.test" not in text
+    assert "HTTP Request" not in text
+    assert "Odd Reason" not in text
+
+
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+def test_an_outbound_request_writes_no_client_line_to_the_service_log(service_log, level):
+    """A real httpx call through a mock transport, after setup_logging: the service
+    log holds its own line and none of the client's (no request line, no part of the
+    URL, no reason phrase), at INFO and at DEBUG."""
+    buffer = service_log(level)
+
+    with httpx.Client(transport=httpx.MockTransport(_answer)) as client:
+        response = client.get(_CLIENT_URL)
+    logging.getLogger("herd.test").info("after the call")
+
+    assert response.status_code == 418
+    text = buffer.getvalue()
+    assert [json.loads(line)["message"] for line in text.splitlines()] == ["after the call"]
+    _assert_no_client_line(text)
+
+
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+async def test_an_async_outbound_request_writes_no_client_line_to_the_service_log(
+    service_log, level
+):
+    """The async client logs its request line from its own code path; it is held
+    back the same way."""
+    buffer = service_log(level)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_answer)) as client:
+        response = await client.get(_CLIENT_URL)
+    logging.getLogger("herd.test").info("after the call")
+
+    assert response.status_code == 418
+    text = buffer.getvalue()
+    assert [json.loads(line)["message"] for line in text.splitlines()] == ["after the call"]
+    _assert_no_client_line(text)
+
+
+def test_the_client_line_is_what_the_quiet_level_holds_back(service_log):
+    """The precondition of the two tests above: with its logger at INFO the same call
+    does write the request line, so their passing is the level, not a client that
+    stopped logging."""
+    buffer = service_log("INFO")
+    logging.getLogger("httpx").setLevel(logging.INFO)
+
+    with httpx.Client(transport=httpx.MockTransport(_answer)) as client:
+        client.get(_CLIENT_URL)
+
+    assert "HTTP Request: GET" in buffer.getvalue()
+    assert "upstream.test" in buffer.getvalue()

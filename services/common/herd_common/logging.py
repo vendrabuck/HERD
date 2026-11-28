@@ -205,6 +205,24 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# Loggers setup_logging holds at WARNING whatever LOG_LEVEL is. The two HTTP
+# client loggers write one INFO line per outbound request (method, URL, status,
+# reason phrase): request noise in a service log, which carries HERD's own lines
+# and the access log instead. httpx2 is the fork the Anthropic and OpenAI SDKs
+# import (ai-orchestrator), with the same line under its own logger name.
+QUIET_LOGGERS: tuple[str, ...] = (
+    "uvicorn.access",
+    "uvicorn.error",
+    "sqlalchemy.engine",
+    "httpx",
+    "httpx2",
+)
+
+# The HTTP transport loggers under the clients above, held at INFO (they log only
+# at DEBUG); httpcore2 is httpx2's.
+HTTP_TRANSPORT_LOGGERS: tuple[str, ...] = ("httpcore", "httpcore2")
+
+
 def setup_logging(service_name: str, level: str = "INFO") -> None:
     """Configure root logger with JSON handler; suppress noisy loggers."""
     handler = logging.StreamHandler()
@@ -216,10 +234,10 @@ def setup_logging(service_name: str, level: str = "INFO") -> None:
     root.addHandler(handler)
 
     # Suppress noisy loggers
-    for name in ("uvicorn.access", "uvicorn.error", "sqlalchemy.engine"):
+    for name in QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
     # httpcore logs only at DEBUG, and its DEBUG lines carry the response
     # headers of every outbound call (an identity provider's among them, ADR
-    # 0016); INFO keeps them out even when LOG_LEVEL is DEBUG. httpx's own INFO
-    # line (method, URL, status) stays.
-    logging.getLogger("httpcore").setLevel(logging.INFO)
+    # 0016); INFO keeps them out even when LOG_LEVEL is DEBUG.
+    for name in HTTP_TRANSPORT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO)

@@ -215,6 +215,20 @@ async def test_lifespan_starts_consumer_immediately_when_schema_ready(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [True, False])
+async def test_consumer_step_reports_what_the_consumer_start_reported(monkeypatch, outcome):
+    """Issue #1592: `_start_consumer_and_streams` answers the schema gate with
+    start_nats_consumer's own outcome, and still runs both stream ensures."""
+    _stub_lifespan_periphery(monkeypatch)
+    monkeypatch.setattr(main_module, "start_nats_consumer", AsyncMock(return_value=outcome))
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert await main_module._start_consumer_and_streams(app) is outcome
+    main_module._ensure_health_stream.assert_awaited_once_with(app)
+    main_module._ensure_dlq_stream.assert_awaited_once_with(app)
+
+
+@pytest.mark.asyncio
 async def test_lifespan_defers_consumer_on_managed_schema_missing_tables(monkeypatch):
     """The issue #463 window: consumer start is gated; shutdown cancels the gate.
 

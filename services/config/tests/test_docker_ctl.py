@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import json
 import logging
 import socket
@@ -167,6 +168,129 @@ def test_any_other_200_body_is_the_unexpected_body_entry(restarter, body):
 
     assert result == {"restarted": [], "errors": [UNEXPECTED_BODY_ERROR]}
     assert UNEXPECTED_BODY_ERROR == "The restart service answered an unexpected body"
+
+
+# -- A 200 body the parser refuses for its shape, not its syntax (issue #1594) --
+#
+# `json.loads` raises RecursionError, which is not a ValueError, for a document nested
+# past the interpreter's bound. That bound is the interpreter's, not HERD's: about
+# 10,000 levels on 3.12 and 3.13 (the config image runs 3.12), about 43,000 on 3.14,
+# moving a few levels with the call stack it runs on. So no test pins a depth: the
+# bound is measured on the running interpreter, in a worker thread as POST /apply runs
+# the call, and the cases are either derived from it or are the deepest documents that
+# fit under MAX_RESPONSE_BYTES. A longer body is refused by its length before it is
+# parsed, so the deepest body that fits is the deepest the parser can ever be handed.
+
+_DEPTH_MARGIN = 500
+_CAP = docker_ctl.MAX_RESPONSE_BYTES
+
+
+def _nest(depth: int, inner: str = "") -> str:
+    return "[" * depth + inner + "]" * depth
+
+
+@functools.cache
+def _depth_bound_here() -> int:
+    """The fewest nested arrays `json.loads` refuses with RecursionError, measured
+    in a worker thread (POST /apply runs restart_services in one)."""
+    found: dict[str, int] = {}
+
+    def _measure() -> None:
+        lo, hi = 1, 200_000
+        while lo < hi:
+            mid = (lo + hi) // 2
+            try:
+                json.loads(_nest(mid))
+            except RecursionError:
+                hi = mid
+            else:
+                lo = mid + 1
+        found["bound"] = lo
+
+    worker = threading.Thread(target=_measure)
+    worker.start()
+    worker.join()
+    return found["bound"]
+
+
+def _deepest_arrays_that_fit() -> bytes:
+    return _nest(_CAP // 2).encode()
+
+
+def _deepest_objects_that_fit() -> bytes:
+    levels = (_CAP - 1) // len('{"a":}')
+    return ('{"a":' * levels + "1" + "}" * levels).encode()
+
+
+def _deep_inside_the_shape() -> bytes:
+    head, tail = '{"restarted": ', ', "errors": []}'
+    levels = (_CAP - len(head) - len(tail)) // 2
+    return (head + _nest(levels) + tail).encode()
+
+
+def test_the_deep_bodies_are_past_the_parser_bound_here():
+    """The precondition of the deep cases, stated so an interpreter whose bound no
+    longer fits under the cap fails here, loudly, not by passing a case that never
+    reached the depth refusal."""
+    bound = _depth_bound_here()
+    assert bound + _DEPTH_MARGIN <= _CAP // 2, (
+        f"json.loads refuses only past {bound} levels here, so no body under "
+        f"{_CAP} bytes reaches the depth refusal; the deep cases below no longer "
+        "test the RecursionError catch in _validated"
+    )
+    for body in (_deepest_arrays_that_fit(), _deepest_objects_that_fit()):
+        assert len(body) <= _CAP
+        with pytest.raises(RecursionError):
+            json.loads(body)
+    assert len(_deep_inside_the_shape()) <= _CAP
+    with pytest.raises(RecursionError):
+        json.loads(_deep_inside_the_shape())
+
+
+_SHAPE_REFUSED_BODIES = {
+    "deep-just-past-the-bound": lambda: _nest(_depth_bound_here() + _DEPTH_MARGIN).encode(),
+    "deep-arrays-at-the-cap": _deepest_arrays_that_fit,
+    "deep-objects-at-the-cap": _deepest_objects_that_fit,
+    "deep-inside-the-shape": _deep_inside_the_shape,
+    "long-integer": lambda: ("[" + "1" * 4301 + "]").encode(),
+    "long-integer-entry": lambda: ('{"restarted": [' + "1" * 4301 + '], "errors": []}').encode(),
+    "nan-top-level": lambda: b"NaN",
+    "infinity-entry": lambda: b'{"restarted": [Infinity], "errors": []}',
+    "lone-surrogate-entry": lambda: b'{"restarted": ["\\ud800"], "errors": []}',
+    "null": lambda: b"null",
+    "number": lambda: b"1",
+    "true": lambda: b"true",
+    "empty": lambda: b"",
+    "truncated": lambda: json.dumps(GOOD).encode()[:-1],
+    "good-shape-one-byte-over-the-cap": lambda: (
+        json.dumps(GOOD) + " " * (_CAP + 1 - len(json.dumps(GOOD)))
+    ).encode(),
+}
+
+
+@pytest.mark.parametrize("kind", list(_SHAPE_REFUSED_BODIES))
+def test_a_body_refused_for_its_shape_is_the_unexpected_body_entry(restarter, kind, caplog):
+    body = _SHAPE_REFUSED_BODIES[kind]()
+    restarter.body = body
+    caplog.set_level(logging.ERROR, logger="app.docker_ctl")
+
+    result = restart_services()
+
+    assert result == {"restarted": [], "errors": [UNEXPECTED_BODY_ERROR]}
+    # The body goes to the log, cut at 500 bytes, never to the answer.
+    logged = [r for r in caplog.records if r.name == "app.docker_ctl"]
+    assert [r.getMessage() for r in logged] == [
+        f"The restart service answered an unexpected body: {body[:500]!r}"
+    ]
+
+
+def test_the_largest_body_that_fits_is_still_passed_through(restarter):
+    """The cap's other side: the expected shape padded to exactly the cap is read."""
+    text = json.dumps(GOOD)
+    restarter.body = (text + " " * (_CAP - len(text))).encode()
+    assert len(restarter.body) == _CAP
+
+    assert restart_services() == GOOD
 
 
 def test_a_refused_connection_is_cannot_reach_with_the_class_only(monkeypatch, caplog):
@@ -355,6 +479,30 @@ async def test_last_records_an_error_result_as_answered(async_client, restarter)
 
     assert answered == {"restarted": [], "errors": ["The restart service answered HTTP 500"]}
     assert (await _last(async_client, headers))["result"] == answered
+
+
+@pytest.mark.parametrize(
+    "kind", ["deep-arrays-at-the-cap", "deep-inside-the-shape", "long-integer", "empty"]
+)
+async def test_apply_answers_and_records_a_shape_refused_body_as_the_unexpected_body_entry(
+    async_client, restarter, kind
+):
+    """Issue #1594: a too-deep body was a 500 and a run recorded as ended without a
+    result; every body refused for its shape is the one unexpected-body entry, in the
+    answer and in the record alike."""
+    restarter.body = _SHAPE_REFUSED_BODIES[kind]()
+    headers = await _configured_session(async_client)
+
+    response = await async_client.post("/apply", headers=headers)
+
+    expected = {"restarted": [], "errors": [UNEXPECTED_BODY_ERROR]}
+    assert (response.status_code, response.json()) == (200, expected)
+    last = await _last(async_client, headers)
+    assert (last["state"], last["result"], last["finished_at"]) == (
+        "done",
+        expected,
+        FINISHED_TEXT,
+    )
 
 
 @pytest.mark.parametrize("refusal", ["no-session", "unrotated", "unconfigured"])

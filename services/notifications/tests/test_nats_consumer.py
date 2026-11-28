@@ -1158,3 +1158,33 @@ async def test_process_message_non_object_json_goes_to_dlq(body):
     js.publish.assert_awaited_once_with(nats_consumer.NATS_DLQ_SUBJECT, body)
     msg.ack.assert_awaited_once()
     msg.nak.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["none", "connect", "reservations-setup", "health-setup"])
+async def test_start_nats_consumer_reports_whether_both_consumers_run(monkeypatch, failure):
+    """Issue #1592: the start answers True only when both consumers run, and False
+    after any failure it logged, a health setup failure that leaves the reservations
+    consumer running included; the schema gate words its line from this answer."""
+    js = {
+        "none": _FakeJetStream(),
+        "connect": _FakeJetStream(),
+        "reservations-setup": _FailingJetStream(fail_add_consumer_for=nats_consumer.NATS_DURABLE),
+        "health-setup": _FailingJetStream(fail_subscribe_for=nats_consumer.HEALTH_SUBJECT_PATTERN),
+    }[failure]
+    conn = _FakeNatsConn(js)
+
+    async def _connect(url, **kwargs):
+        if failure == "connect":
+            raise RuntimeError(_EXC_TEXT)
+        return conn
+
+    _install_fake_nats(monkeypatch, _connect)
+    monkeypatch.setattr(nats_consumer, "ensure_stream_exists", _fake_ensure_stream_exists)
+    app = _FakeApp()
+    try:
+        started = await nats_consumer.start_nats_consumer(app)
+    finally:
+        await nats_consumer.stop_nats_consumer(app)
+
+    assert started is (failure == "none")

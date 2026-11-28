@@ -199,13 +199,11 @@ def _test_harness_record(record: logging.LogRecord) -> bool:
     """A record the test harness writes, not auth: aiosqlite (the in-memory test
     database's driver) logs every statement's parameters at DEBUG, where
     production runs asyncpg, which does not, with sqlalchemy.engine held at
-    WARNING by herd_common.logging.setup_logging; and httpx logs each request
-    the TEST client sends to the app (`http://test/...`, the browser's side of
-    the callback URL). httpx records of auth's own calls to the provider, and
-    HERD's access log (`herd.access`, path only), are checked."""
-    if record.name == "aiosqlite":
-        return True
-    return record.name == "httpx" and " http://test/" in record.getMessage()
+    WARNING by herd_common.logging.setup_logging. Every other record is checked,
+    HERD's access log (`herd.access`, path only) and any line of the HTTP client
+    loggers included (setup_logging holds `httpx` at WARNING, so its per-request
+    INFO line is not written, for the test client's requests or auth's own)."""
+    return record.name == "aiosqlite"
 
 
 def _findings(caplog, needles: list[str]) -> list[str]:

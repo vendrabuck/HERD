@@ -890,3 +890,32 @@ async def test_started_consumer_loop_heartbeats_a_slow_handler():
         assert msg.in_progress.await_count >= 3
 
         await _cancel_both(mock_app)
+
+
+@pytest.mark.parametrize("failure", ["none", "connect", "reservations-setup", "health-setup"])
+async def test_start_nats_consumer_reports_whether_both_consumers_run(failure):
+    """Issue #1592: the start answers True only when both consumers run, and False
+    after any failure it logged, a health setup failure that leaves the reservations
+    consumer running included; the schema gate words its line from this answer."""
+    js = {
+        "none": _FakeJetStream(),
+        "connect": _FakeJetStream(),
+        "reservations-setup": _FailingJetStream(fail_add_consumer_for=nats_consumer.NATS_DURABLE),
+        "health-setup": _FailingJetStream(fail_subscribe_for=nats_consumer.HEALTH_SUBJECT_PATTERN),
+    }[failure]
+    app = SimpleNamespace(state=SimpleNamespace())
+    mock_nc = AsyncMock()
+    mock_nc.jetstream = MagicMock(return_value=js)
+    mock_nats = MagicMock()
+    if failure == "connect":
+        mock_nats.connect = AsyncMock(side_effect=RuntimeError(_EXC_TEXT))
+    else:
+        mock_nats.connect = AsyncMock(return_value=mock_nc)
+    with (
+        patch.dict("sys.modules", _patched_nats_modules(mock_nats)),
+        patch("app.services.nats_consumer.ensure_stream_exists", _fake_ensure_stream_exists),
+    ):
+        started = await start_nats_consumer(app)
+    await _cancel_both(app)
+
+    assert started is (failure == "none")

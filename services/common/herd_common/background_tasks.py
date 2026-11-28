@@ -16,9 +16,10 @@ normally is not logged here.
 returns, never raises, what the task ended with, so one dead task cannot stop the
 owner's remaining shutdown steps.
 
-Adopted by reservations' lifespan and the outbox relay's wake-up listener.
-Execution's three `_surface_crash` copies, the consumer schema gate's, and
-inventory's `_log_scheduler_crash` predate it and move to it in a later cleanup.
+Adopted by reservations' lifespan, the outbox relay's wake-up listener, and the
+consumer schema gate's poll task (issue #1592). Execution's three `_surface_crash`
+copies and inventory's `_log_scheduler_crash` predate it and move to it in a later
+cleanup.
 """
 
 import asyncio

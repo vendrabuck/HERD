@@ -32,6 +32,7 @@ from typing import Any
 from sqlalchemy import MetaData
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from herd_common.background_tasks import log_task_crash
 from herd_common.schema_init import SchemaInitOutcome, missing_model_tables
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ async def start_consumer_when_schema_ready(
     engine: AsyncEngine,
     metadata: MetaData,
     schema: str | None,
-    start_consumer: Callable[[Any], Awaitable[None]],
+    start_consumer: Callable[[Any], Awaitable[bool]],
     service: str,
     log: logging.Logger | None = None,
     poll_interval_seconds: float = 5.0,
@@ -55,11 +56,23 @@ async def start_consumer_when_schema_ready(
     """Start the consumer now, or defer it behind a schema-readiness poll.
 
     ``start_consumer`` is the service's ``start_nats_consumer`` (or a wrapper
-    around it); it receives ``app``. On the ungated path it is awaited inline,
-    so a failure there propagates exactly as it did before this gate existed.
+    around it); it receives ``app`` and returns True only when every consumer
+    it starts is running, False after a failure it has already logged (issue
+    #1592). On the ungated path it is awaited inline, its value is not used,
+    and a failure there propagates exactly as it did before this gate existed.
     On the gated path the poll task is stored on
     ``app.state.consumer_schema_gate_task``; pair with
     ``stop_consumer_schema_gate`` at shutdown.
+
+    What the gated path logs once the tables exist is what the start did:
+    ``deferred NATS consumer started`` only when ``start_consumer`` returned
+    True; a warning that the start ran without starting every consumer when it
+    returned anything else (the starter's own warning names those not
+    running); and nothing of its own when the start raised or was cancelled.
+    A start that raised ends the poll task with that exception, which
+    ``background_tasks.log_task_crash`` logs by class name; a cancellation
+    (shutdown) is not logged. The readiness-check retry line and the crash
+    line carry the exception's class name only, never its text.
 
     Cancellation safety (issue #534): ``stop_consumer_schema_gate`` cancels
     the poll task, and a cancel delivered while the readiness query is
@@ -115,19 +128,28 @@ async def start_consumer_when_schema_ready(
                         await asyncio.wait([query_task])
                     raise
             except Exception as exc:  # transient DB trouble must not kill the gate
+                # Class name only: the text is the database driver's message.
                 log.warning(
                     "Service '%s': consumer schema gate could not check readiness "
                     "(%s); will retry.",
                     service,
-                    exc,
+                    type(exc).__name__,
                 )
                 continue
             if not still_missing:
-                await start_consumer(app)
-                log.info(
-                    "Service '%s': schema is ready; deferred NATS consumer started.",
-                    service,
-                )
+                started = await start_consumer(app)
+                if started is True:
+                    log.info(
+                        "Service '%s': schema is ready; deferred NATS consumer started.",
+                        service,
+                    )
+                else:
+                    log.warning(
+                        "Service '%s': schema is ready; the deferred NATS consumer "
+                        "start ran but did not start every consumer (the warning "
+                        "above names those not running).",
+                        service,
+                    )
                 return
             now = time.monotonic()
             if now - last_warned >= warn_interval_seconds:
@@ -141,19 +163,7 @@ async def start_consumer_when_schema_ready(
                 last_warned = now
 
     task = asyncio.create_task(_poll_until_ready())
-
-    def _surface_crash(t: asyncio.Task) -> None:
-        if t.cancelled():
-            return
-        exc = t.exception()
-        if exc is not None:
-            log.error(
-                "Service '%s': consumer schema gate task exited unexpectedly: %s",
-                service,
-                exc,
-            )
-
-    task.add_done_callback(_surface_crash)
+    log_task_crash(task, name=f"{service} consumer schema gate", log=log)
     setattr(app.state, _GATE_TASK_ATTR, task)
 
 

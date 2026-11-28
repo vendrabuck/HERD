@@ -47,12 +47,18 @@ def _error(message: str) -> dict:
 
 
 def _validated(body: bytes) -> dict | None:
-    """The restarter's answer when it is exactly `{restarted, errors}`; else None."""
+    """The restarter's answer when it is exactly `{restarted, errors}`; else None.
+
+    Every body the parser refuses is None: one that is not JSON or not text, holds an
+    integer too long to read (`ValueError`), or is nested past the interpreter's depth
+    bound (`RecursionError`, which is not a `ValueError` and fits under the length cap,
+    issue #1594).
+    """
     if len(body) > MAX_RESPONSE_BYTES:
         return None
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(data, dict) or set(data) != {"restarted", "errors"}:
         return None

@@ -203,8 +203,10 @@ async def test_start_nats_consumer_success():
         patch.dict("sys.modules", patched_modules),
         patch("app.services.nats_consumer.ensure_stream_exists", ensure_stream_exists_mock),
     ):
-        await start_nats_consumer(mock_app)
+        started = await start_nats_consumer(mock_app)
 
+    # The consumer is running, and the start says so (issue #1592).
+    assert started is True
     # Verify the stream was confirmed to exist (this consumer does not own its
     # config; see herd_common.jetstream.ensure_stream_exists)
     ensure_stream_exists_mock.assert_awaited_once_with(
@@ -402,8 +404,10 @@ async def test_setup_failure_after_a_good_connect_is_not_called_a_connect_failur
         patch("app.services.nats_consumer.ensure_stream_exists", AsyncMock()),
         caplog.at_level(logging.INFO, logger=_LOGGER),
     ):
-        await start_nats_consumer(app)
+        started = await start_nats_consumer(app)
 
+    # The failure is reported to the caller too, for the schema gate (issue #1592).
+    assert started is False
     assert _warnings(caplog) == [_SETUP_FAILURE_LINE]
     # No "NATS consumer started" line, and no traceback on the warning.
     assert [r.levelno for r in _records(caplog)] == [logging.WARNING]
