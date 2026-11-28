@@ -24,6 +24,11 @@ from sqlalchemy import Column, Integer, MetaData, String, Table
 from sqlalchemy.ext.asyncio import create_async_engine
 
 GATED = SchemaInitOutcome(SchemaInitResult.ALREADY_MANAGED, frozenset({"widget"}))
+STARTED_LINE = "Service 'testsvc': schema is ready; deferred NATS consumer started."
+NOT_STARTED_LINE = (
+    "Service 'testsvc': schema is ready; the deferred NATS consumer start ran but did "
+    "not start every consumer (the warning above names those not running)."
+)
 
 
 @pytest.fixture
@@ -58,15 +63,19 @@ def _app():
 
 
 class _Starter:
-    """Stand-in for start_nats_consumer: counts calls, signals the first."""
+    """Stand-in for start_nats_consumer: counts calls, signals the first, and
+    returns `outcome` (True: every consumer running; False: a failure the real
+    starter has already logged, issue #1592)."""
 
-    def __init__(self):
+    def __init__(self, outcome=True):
         self.calls = 0
         self.started = asyncio.Event()
+        self.outcome = outcome
 
     async def __call__(self, app):
         self.calls += 1
         self.started.set()
+        return self.outcome
 
 
 async def _start(app, outcome, engine, metadata, starter, **kwargs):
@@ -135,8 +144,10 @@ async def test_gated_defers_then_starts_when_table_appears(engine, metadata, cap
         await asyncio.wait_for(task, timeout=2.0)
 
     assert starter.calls == 1
-    ready = [r for r in caplog.records if "schema is ready" in r.getMessage()]
-    assert ready, "expected a consumer-started log line"
+    ready = [
+        (r.levelno, r.getMessage()) for r in caplog.records if "schema is ready" in r.getMessage()
+    ]
+    assert ready == [(logging.INFO, STARTED_LINE)]
 
 
 async def test_gated_warns_periodically_while_waiting(engine, metadata, caplog):
@@ -227,7 +238,12 @@ async def test_readiness_check_failure_is_retried(engine, metadata, caplog, monk
 
     assert starter.calls == 1
     retried = [r for r in caplog.records if "could not check readiness" in r.getMessage()]
-    assert len(retried) == 2
+    # Class name only (issue #1592): the text is the database driver's message.
+    assert [r.getMessage() for r in retried] == [
+        "Service 'testsvc': consumer schema gate could not check readiness "
+        "(RuntimeError); will retry."
+    ] * 2
+    assert "transient database trouble" not in caplog.text
 
 
 async def test_cancel_mid_query_does_not_leak_the_connection(engine, metadata, monkeypatch):
@@ -275,3 +291,110 @@ async def test_cancel_mid_query_does_not_leak_the_connection(engine, metadata, m
     # at an arbitrary later point.
     await engine.dispose()
     gc.collect()
+
+
+# -- What the gate logs for each ending of a deferred start (issue #1592) --
+
+
+async def _tables_ready(engine, metadata):
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
+
+def _gate_records(caplog):
+    return [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.name == "herd_common.consumer_schema_gate"
+    ]
+
+
+@pytest.mark.parametrize("outcome", [False, None], ids=["failed", "no-answer"])
+async def test_a_deferred_start_that_did_not_start_every_consumer_never_logs_started(
+    engine, metadata, caplog, outcome
+):
+    """The starter logged its own warning and reported the failure; the gate's last
+    word is that the start ran without starting every consumer, never `started`. Only
+    a starter that answers True is reported as started."""
+    app = _app()
+    starter = _Starter(outcome=outcome)
+    await _tables_ready(engine, metadata)
+
+    with caplog.at_level(logging.INFO):
+        await _start(app, GATED, engine, metadata, starter, poll_interval_seconds=0.01)
+        await asyncio.wait_for(app.state.consumer_schema_gate_task, timeout=2.0)
+
+    assert starter.calls == 1
+    after_deferral = _gate_records(caplog)[1:]
+    assert after_deferral == [(logging.WARNING, NOT_STARTED_LINE)]
+    assert "consumer started" not in caplog.text
+
+
+async def test_a_deferred_start_that_raised_logs_the_class_only_and_never_started(
+    engine, metadata, caplog
+):
+    """A start that raises ends the gate task with that exception, logged once by
+    `background_tasks.log_task_crash` with the class name, never its text."""
+    app = _app()
+    await _tables_ready(engine, metadata)
+
+    async def _raising_starter(app):
+        raise RuntimeError("broker said something private")
+
+    with caplog.at_level(logging.INFO):
+        await _start(app, GATED, engine, metadata, _raising_starter, poll_interval_seconds=0.01)
+        task = app.state.consumer_schema_gate_task
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    after_deferral = _gate_records(caplog)[1:]
+    assert after_deferral == [
+        (logging.ERROR, "Background task testsvc consumer schema gate ended with RuntimeError")
+    ]
+    crash = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert (crash[0].action, crash[0].task_name, crash[0].error_class) == (
+        "background_task_crashed",
+        "testsvc consumer schema gate",
+        "RuntimeError",
+    )
+    assert "broker said something private" not in caplog.text
+    assert "schema is ready" not in caplog.text
+
+
+async def test_a_deferred_start_cancelled_at_shutdown_logs_nothing_after_the_deferral(
+    engine, metadata, caplog
+):
+    """Shutdown cancels a start still in progress: no started line, no crash line."""
+    app = _app()
+    await _tables_ready(engine, metadata)
+    entered = asyncio.Event()
+    finished = []
+
+    async def _slow_starter(app):
+        entered.set()
+        await asyncio.Event().wait()
+        finished.append(True)
+        return True
+
+    with caplog.at_level(logging.INFO):
+        await _start(app, GATED, engine, metadata, _slow_starter, poll_interval_seconds=0.01)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        await stop_consumer_schema_gate(app)
+
+    assert app.state.consumer_schema_gate_task.cancelled()
+    assert finished == []
+    assert _gate_records(caplog)[1:] == []
+
+
+@pytest.mark.parametrize("outcome", [True, False], ids=["started", "failed"])
+async def test_the_ungated_start_logs_nothing_of_the_gates_own(engine, metadata, caplog, outcome):
+    """On the ungated path the starter's own lines are the whole story."""
+    app = _app()
+    starter = _Starter(outcome=outcome)
+    ready_outcome = SchemaInitOutcome(SchemaInitResult.ALREADY_MANAGED)
+
+    with caplog.at_level(logging.INFO):
+        await _start(app, ready_outcome, engine, metadata, starter)
+
+    assert starter.calls == 1
+    assert _gate_records(caplog) == []

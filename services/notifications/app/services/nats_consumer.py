@@ -211,7 +211,7 @@ async def process_batch(
     await process_batch_with_heartbeat(msgs, _one, NATS_HEARTBEAT_SECONDS)
 
 
-async def start_nats_consumer(app) -> None:
+async def start_nats_consumer(app) -> bool:
     """Start the NATS consumers as background tasks during app lifespan.
 
     Two subscriptions:
@@ -225,7 +225,9 @@ async def start_nats_consumer(app) -> None:
     Never raises an `Exception`: a failed connect, or a failed setup after a
     good connect, is logged through herd_common.jetstream's consumer warnings
     (issue #1418, INTEG-NCONSUME-3) and the service keeps serving its API;
-    nothing retries either in this process.
+    nothing retries either in this process. Returns True when both consumers
+    are running and False after either failure, so the schema gate's line
+    after a deferred start says which happened (issue #1592, OPS-SCHEMA-7).
     """
     import nats
     from nats.js.api import ConsumerConfig
@@ -253,7 +255,7 @@ async def start_nats_consumer(app) -> None:
         nc = await connect_nats(settings.nats_url)
     except Exception as exc:
         log_consumer_connect_failure(logger, exc, not_running=durables)
-        return
+        return False
     app.state.nats = nc
 
     running: list[str] = []
@@ -357,8 +359,9 @@ async def start_nats_consumer(app) -> None:
             not_running=durables[len(running) :],
             running=running,
         )
-        return
+        return False
     logger.info("NATS consumers started (reservations + health)")
+    return True
 
 
 async def stop_nats_consumer(app) -> None:

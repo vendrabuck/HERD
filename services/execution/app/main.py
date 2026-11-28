@@ -171,16 +171,20 @@ async def stop_outbox_relay(app: FastAPI) -> None:
         pass
 
 
-async def _start_consumer_and_streams(app: FastAPI) -> None:
+async def _start_consumer_and_streams(app: FastAPI) -> bool:
     """Start the NATS consumer, then ensure the streams its connection enables.
 
     The stream ensures read app.state.nats, which start_nats_consumer sets, so
     they must follow it. Grouped so the issue #463 schema gate preserves that
-    ordering when consumer start is deferred past boot.
+    ordering when consumer start is deferred past boot. Returns what
+    start_nats_consumer returned (True only when the consumer is running), for
+    the gate's line after a deferred start (issue #1592); the stream ensures
+    log their own failures and do not change it.
     """
-    await start_nats_consumer(app)
+    started = await start_nats_consumer(app)
     await _ensure_health_stream(app)
     await _ensure_dlq_stream(app)
+    return started
 
 
 @asynccontextmanager

@@ -6103,7 +6103,7 @@ async def process_batch(msgs: list, js, session_factory: Callable) -> None:
     await process_batch_with_heartbeat(msgs, _one, NATS_HEARTBEAT_SECONDS)
 
 
-async def start_nats_consumer(app) -> None:
+async def start_nats_consumer(app) -> bool:
     """Start the NATS consumer as a background task during app lifespan.
 
     Subscribes to "herd.reservations.*" events with a durable consumer, configures
@@ -6124,6 +6124,9 @@ async def start_nats_consumer(app) -> None:
     retries either in this process. Only a failed connect leaves
     `app.state.nats` unset; after a failed setup the connection is kept, so
     the outbox relay and the stream ensures in `app.main` still use it.
+    Returns True when the consumer is running and False after either failure,
+    so the schema gate's line after a deferred start says which happened
+    (issue #1592, OPS-SCHEMA-7).
     """
     import nats
     from nats.js.api import ConsumerConfig
@@ -6136,7 +6139,7 @@ async def start_nats_consumer(app) -> None:
         nc = await connect_nats(settings.nats_url)
     except Exception as exc:
         log_consumer_connect_failure(logger, exc, not_running=[EXECUTION_DURABLE])
-        return
+        return False
     app.state.nats = nc
 
     try:
@@ -6235,8 +6238,9 @@ async def start_nats_consumer(app) -> None:
             not_running=[EXECUTION_DURABLE],
             running=[],
         )
-        return
+        return False
     logger.info("NATS consumer started")
+    return True
 
 
 async def stop_nats_consumer(app) -> None:

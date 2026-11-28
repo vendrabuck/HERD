@@ -931,10 +931,18 @@ service's lifespan; `infra/postgres/init.sql`; the upgrade order in
   Pinned by: `services/common/tests/test_schema_init.py` (`test_managed_path_survives_broken_script_location`, `test_broken_script_location_still_surfaces_missing_tables`, `test_managed_missing_tables_surfaced_in_outcome`)
 - **OPS-SCHEMA-7.** When a managed schema lacks model tables, an event consumer's start is
   deferred: the rest of the service starts, a poll every 5 seconds re-checks the tables
-  (warning every 60 seconds, retrying a failed check), and the consumer starts as soon as
-  the tables exist, with no restart. \
-  Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`); `services/common/herd_common/schema_init.py` (`missing_model_tables`) \
-  Pinned by: `services/common/tests/test_consumer_schema_gate.py` (`test_managed_schema_with_no_drift_starts_immediately`, `test_fresh_and_legacy_outcomes_never_gate`, `test_gated_defers_then_starts_when_table_appears`, `test_gated_warns_periodically_while_waiting`, `test_readiness_check_failure_is_retried`); `services/common/tests/test_schema_init.py` (`test_missing_model_tables_recheck_clears_when_table_appears`)
+  (warning every 60 seconds, retrying a failed check), and the consumer start runs as soon
+  as the tables exist, with no restart. A failed check's retry line names the exception
+  class only. The service's start reports whether every consumer it starts is running
+  (issue #1592), and the gate's line after the deferred start says what happened: `Service
+  '<service>': schema is ready; deferred NATS consumer started.` only when it is; when it
+  is not, after the start's own warning, `Service '<service>': schema is ready; the
+  deferred NATS consumer start ran but did not start every consumer (the warning above
+  names those not running).` A start that raises ends the poll with `Background task
+  <service> consumer schema gate ended with <class>` (`background_tasks.log_task_crash`,
+  the class name only), and a start cancelled at shutdown logs nothing more. \
+  Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`start_consumer_when_schema_ready`); `services/common/herd_common/schema_init.py` (`missing_model_tables`); `services/execution/app/main.py` (`_start_consumer_and_streams`); `services/execution/app/services/nats_consumer.py` (`start_nats_consumer`); `services/integration/app/services/nats_consumer.py` (`start_nats_consumer`); `services/notifications/app/services/nats_consumer.py` (`start_nats_consumer`) \
+  Pinned by: `services/common/tests/test_consumer_schema_gate.py` (`test_managed_schema_with_no_drift_starts_immediately`, `test_fresh_and_legacy_outcomes_never_gate`, `test_gated_defers_then_starts_when_table_appears`, `test_gated_warns_periodically_while_waiting`, `test_readiness_check_failure_is_retried`, `test_a_deferred_start_that_did_not_start_every_consumer_never_logs_started`, `test_a_deferred_start_that_raised_logs_the_class_only_and_never_started`, `test_a_deferred_start_cancelled_at_shutdown_logs_nothing_after_the_deferral`, `test_the_ungated_start_logs_nothing_of_the_gates_own`); `services/common/tests/test_schema_init.py` (`test_missing_model_tables_recheck_clears_when_table_appears`); `services/execution/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/integration/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/notifications/tests/test_nats_connect_real_client.py` (`test_a_deferred_start_with_the_broker_down_never_logs_started`); `services/execution/tests/test_main.py` (`test_consumer_step_reports_what_the_consumer_start_reported`); `services/integration/tests/test_nats_consumer_lifecycle.py` (`test_start_nats_consumer_reports_whether_both_consumers_run`); `services/notifications/tests/test_nats_consumer.py` (`test_start_nats_consumer_reports_whether_both_consumers_run`)
 - **OPS-SCHEMA-8.** Shutdown cancels a pending gate and waits for at most one in-flight
   readiness query to close its connection. \
   Enforced in: `services/common/herd_common/consumer_schema_gate.py` (`stop_consumer_schema_gate`) \
