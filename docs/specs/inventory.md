@@ -1399,8 +1399,10 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   cannot store, such as a NUL` (22021, 22P05), and `a value does not fit the type of
   its column` (any other code of class 22). No reason names a constraint. Any other
   SQLSTATE, or none, is `the database refused the row`, and so is a SQLAlchemy error
-  that is not a driver error (`PendingRollbackError` or `InvalidRequestError`, for
-  example); any other failure is `the row could not be imported`. The service logs a
+  that is not a driver error (`InvalidRequestError`, for example), except a
+  `PendingRollbackError`, which reads the unavailable reason: the row loop rolls back
+  after every failed row, so it arises only for a row tried after the session's
+  connection was lost; any other failure is `the row could not be imported`. The service logs a
   warning naming the SQLSTATE for a driver error, and only the exception's class name
   for any other failure. In a JSON import, a `template_name`, `driver_name`, or
   `hypervisor_name` that is present, not null, and not a string (0 and false

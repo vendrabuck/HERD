@@ -3,8 +3,9 @@
 A value that passes an inventory request schema is one its column accepts
 (docs/specs/inventory.md section 8.17):
 
-- a string field written to a `String(n)` column is at most `n` characters, the
-  column's own length read from `app/models` (`column_string`);
+- a string field written to a `String(n)` column is at most `n` characters, equal to
+  the column's length in `app/models`, an equality `test_column_bounds.py` pins
+  (`column_string`);
 - an integer field written to an `Integer` column is within Postgres's `integer`
   range (`INT32_MAX`);
 - a string field written to a text or varchar column holds no NUL character,

@@ -39,7 +39,12 @@ from app.services.bulk_service import (
 )
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy.exc import DBAPIError, IntegrityError, InvalidRequestError
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    InvalidRequestError,
+    PendingRollbackError,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -986,9 +991,22 @@ async def test_a_row_sqlite_refuses_is_named_by_its_error_code(
         (lambda: ValueError(_SENTINEL), ROW_UNEXPECTED_REASON),
         (lambda: AttributeError(_SENTINEL), ROW_UNEXPECTED_REASON),
         (lambda: InvalidRequestError(f"Object {_SENTINEL} is not bound"), _REFUSED),
+        (
+            lambda: PendingRollbackError(f"Can't reconnect until rolled back {_SENTINEL}"),
+            _TRANSIENT,
+        ),
         (lambda: HTTPException(status_code=409, detail={"v": _SENTINEL}), ROW_UNEXPECTED_REASON),
     ],
-    ids=["runtime", "key", "type", "value", "attribute", "sqlalchemy", "http-detail-object"],
+    ids=[
+        "runtime",
+        "key",
+        "type",
+        "value",
+        "attribute",
+        "sqlalchemy",
+        "pending-rollback",
+        "http-detail-object",
+    ],
 )
 async def test_a_row_that_fails_otherwise_keeps_no_text(db_setup, importer, make_failure, reason):
     report = await _import_one_refused_row(importer, make_failure())

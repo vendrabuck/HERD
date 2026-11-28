@@ -43,7 +43,7 @@ from herd_common.rehearsal import rehearsal_session
 from herd_common.validation_errors import holds_lone_surrogate
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, PendingRollbackError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
@@ -229,6 +229,10 @@ def _row_failure_reason(exc: Exception) -> str:
         return _database_reason(exc)
     if isinstance(exc, SQLAlchemyError):
         logger.warning("bulk import row failed in the database layer: %s", type(exc).__name__)
+        if isinstance(exc, PendingRollbackError):
+            # The row loop rolls back after every failed row, so this arises only
+            # when the session's connection is gone: the row never reached the database.
+            return DATABASE_UNAVAILABLE_REASON
         return DATABASE_REFUSED_REASON
     logger.warning("bulk import row failed: %s", type(exc).__name__)
     return ROW_UNEXPECTED_REASON
