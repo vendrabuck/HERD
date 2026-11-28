@@ -491,7 +491,7 @@ If a single-deployer adoption ever made consolidation worthwhile, the two servic
 1. `ai-orchestrator`: distinct dependency surface (Anthropic and OpenAI SDKs, pdfplumber, jsonschema), distinct rate-limit and cost profile, often the candidate for feature-gating in adopter environments. The provider abstraction lets the same service target either Anthropic SaaS or self-hosted inference without code changes.
 2. `execution`: driver-code execution handles device credentials and is the natural home for stronger isolation if it is added, so it belongs on its own deployment boundary.
 
-The other nine services are candidates to merge into a single FastAPI app with module boundaries preserved (separate routers, separate Pydantic models, separate test suites, single shared database with table prefixes). That refactor would not change the user-facing functionality; it is a deployment-shape change only, and it is not on the active roadmap.
+The other nine services are candidates to merge into a single FastAPI app with module boundaries preserved (separate routers, separate Pydantic models, separate test suites, single shared database with table prefixes). That refactor would not change the user-facing functionality; it is a deployment-shape change only, and it is not on the active roadmap. Of those nine, `acl` and `user-profile` stay separate services by decision (issue #1353, 2026-11-28: folding them into `auth` was considered and dropped).
 
 ## Deeper references
 

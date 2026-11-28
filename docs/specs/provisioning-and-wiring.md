@@ -2326,6 +2326,14 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   first logs in to the switch.
   Recorded in issue #1209, [DRIVERS.md](../DRIVERS.md), and the docstring of
   `_release_orphaned_allocations`.
+- The database sessions of the wiring paths set no `lock_timeout` (and no
+  `statement_timeout`): execution's engine, built by `herd_common.database.make_database`,
+  sets neither, so a wiring write that meets a row lock, or the VLAN allocation advisory
+  lock, held by a stuck transaction waits without a bound. A bound would raise
+  `LockNotAvailable`, which each caller would have to map (a NAK on the consumer, a
+  per-reservation skip in the retry tick, a 503 on the manual retry route); that mapping
+  belongs to ADR 0018 phase 3, which the 2026-11-25 decision on issue #1481 stopped.
+  Recorded in issue #1498 (item 5).
 
 ### Rules with no test
 
