@@ -23,6 +23,11 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
+from herd_common.upstream_body import (
+    WRONG_FIELD,
+    UpstreamBodyUnusable,
+    read_json_body,
+)
 from sqlalchemy import String, and_, cast, exists, false, func, null, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,6 +89,92 @@ def _fault_injection_enabled() -> bool:
     }
 
 
+# Issue #1577: the fixed 503 detail for an inventory answer that cannot be used.
+INVENTORY_ANSWER_UNUSABLE = "Inventory service returned an answer that could not be read"
+
+# Issue #1577: the fixed 503 detail for a cabling validate answer that cannot be used.
+CABLING_VALIDATION_ANSWER_UNUSABLE = "Cabling validation returned an answer that could not be read"
+
+_TOPOLOGY_TYPE_VALUES = frozenset(t.value for t in TopologyType)
+
+
+class UpstreamAnswerUnusable(RuntimeError):
+    """A 2xx from inventory or cabling whose body cannot be used (issue #1577).
+
+    A RuntimeError, so the create and PATCH routes answer it as 503 with its
+    message, which is always one of the fixed constants above, never body or
+    decoder text. The wrappers that turn other exceptions into
+    `Failed to contact inventory service: ...` re-raise this type unchanged.
+    """
+
+
+def _log_unusable_answer(action: str, exc: UpstreamBodyUnusable, **fields: str) -> None:
+    """One WARNING for an upstream answer that could not be used: a fixed action
+    and the helper's fixed reason, never body or exception text (issue #1577)."""
+    logger.warning(
+        "An upstream answer could not be read (%s, %s)",
+        action,
+        exc.reason,
+        extra={"action": action, "reason": exc.reason, **fields},
+    )
+
+
+def _is_uuid_text(value: object) -> bool:
+    """True for a string the stdlib UUID parser accepts."""
+    if not isinstance(value, str):
+        return False
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_json_integer(value: object) -> bool:
+    """True for an int that is not a bool (JSON true and false load as bools)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _optional_list_of(value: object, item_type: type) -> bool:
+    """True for an absent or null list, or a list whose every entry is `item_type`."""
+    return value is None or (
+        isinstance(value, list) and all(isinstance(v, item_type) for v in value)
+    )
+
+
+def _usable_device_record(entry: object) -> bool:
+    """Whether one device record from inventory carries every field the create and
+    PATCH checks read, each of the declared type (`DeviceResponse`): `id` a UUID
+    string, `topology_type` a known topology type, `name` and `status` strings, and
+    `exclusive`, when present, a boolean (issue #1577)."""
+    if not isinstance(entry, dict):
+        return False
+    topology_type = entry.get("topology_type")
+    return (
+        _is_uuid_text(entry.get("id"))
+        and isinstance(topology_type, str)
+        and topology_type in _TOPOLOGY_TYPE_VALUES
+        and isinstance(entry.get("name"), str)
+        and isinstance(entry.get("status"), str)
+        and isinstance(entry.get("exclusive", True), bool)
+    )
+
+
+def _read_device_batch(resp) -> list[dict]:
+    """The device list of inventory's `POST /devices/batch` answer, or
+    UpstreamAnswerUnusable (503) for a body that is not an object holding an
+    `items` list of usable device records (issue #1577)."""
+    try:
+        body = read_json_body(resp, expect=dict)
+        items = body.get("items")
+        if not isinstance(items, list) or not all(_usable_device_record(d) for d in items):
+            raise UpstreamBodyUnusable(WRONG_FIELD)
+    except UpstreamBodyUnusable as exc:
+        _log_unusable_answer("inventory_device_batch_unusable", exc)
+        raise UpstreamAnswerUnusable(INVENTORY_ANSWER_UNUSABLE) from None
+    return items
+
+
 async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
     """Fetch device info from Inventory service in a single batch call (issue #314).
 
@@ -105,7 +196,7 @@ async def _fetch_devices(device_ids: list[uuid.UUID], token: str) -> list[dict]:
             timeout=10.0,
         )
         resp.raise_for_status()
-        devices = resp.json()["items"]
+    devices = _read_device_batch(resp)
 
     found_ids = {uuid.UUID(str(d["id"])) for d in devices}
     missing = [did for did in device_ids if did not in found_ids]
@@ -163,7 +254,13 @@ async def _fetch_devices_best_effort(
             if resp.status_code == 404:
                 raise _DeviceGoneFromInventory(f"Device {device_id} not found in inventory")
             resp.raise_for_status()
-            return resp.json()
+            # Issue #1577: a body that is not an object, or whose `exclusive` is not
+            # a boolean, raises UpstreamBodyUnusable, which gather collects like any
+            # other failed fetch, so every reader treats the device as exclusive.
+            body = read_json_body(resp, expect=dict)
+            if not isinstance(body.get("exclusive", True), bool):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
+            return body
 
         return await asyncio.gather(*[fetch_one(did) for did in device_ids], return_exceptions=True)
 
@@ -187,9 +284,31 @@ async def _fetch_dynamic_templates(template_ids: list[uuid.UUID], token: str) ->
             if resp.status_code == 404:
                 raise ValueError(f"Template {template_id} not found in inventory")
             resp.raise_for_status()
-            return resp.json()
+            try:
+                body = read_json_body(resp, expect=dict)
+                if not _usable_template_record(body):
+                    raise UpstreamBodyUnusable(WRONG_FIELD)
+            except UpstreamBodyUnusable as exc:
+                _log_unusable_answer("inventory_template_unusable", exc)
+                raise UpstreamAnswerUnusable(INVENTORY_ANSWER_UNUSABLE) from None
+            return body
 
         return await asyncio.gather(*[fetch_one(tid) for tid in template_ids])
+
+
+def _usable_template_record(body: dict) -> bool:
+    """Whether a template record from inventory carries the fields the dynamic
+    check reads, each of the declared type (`TemplateResponse`): `id` a UUID
+    string, `template_type` a string, `hypervisor_id` absent, null, or a UUID
+    string, and `name` absent, null, or a string (issue #1577)."""
+    hypervisor_id = body.get("hypervisor_id")
+    name = body.get("name")
+    return (
+        _is_uuid_text(body.get("id"))
+        and isinstance(body.get("template_type"), str)
+        and (hypervisor_id is None or _is_uuid_text(hypervisor_id))
+        and (name is None or isinstance(name, str))
+    )
 
 
 HYPERVISOR_CHECK_UNAVAILABLE = (
@@ -222,11 +341,13 @@ async def _fetch_hypervisor_internal(hypervisor_id: str) -> dict | None:
     if resp.status_code != 200:
         raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
     try:
-        body = resp.json()
-    except ValueError as exc:
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from exc
-    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+        body = read_json_body(resp, expect=dict)
+        name = body.get("name")
+        if not isinstance(body.get("enabled"), bool) or not (name is None or isinstance(name, str)):
+            raise UpstreamBodyUnusable(WRONG_FIELD)
+    except UpstreamBodyUnusable as exc:
+        _log_unusable_answer("inventory_hypervisor_unusable", exc)
+        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from None
     return body
 
 
@@ -249,8 +370,8 @@ async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
     unique_ids = list(dict.fromkeys(req.template_id for req in dynamic_requests))
     try:
         templates = await _fetch_dynamic_templates(unique_ids, token)
-    except ValueError as exc:
-        raise exc
+    except (ValueError, UpstreamAnswerUnusable):
+        raise
     except Exception as exc:
         raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
 
@@ -352,7 +473,13 @@ async def _validate_topology_connectivity(
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling validation returned {resp.status_code}: {resp.text}")
 
-    body = resp.json()
+    try:
+        body = read_json_body(resp, expect=dict)
+        if not _usable_validation_answer(body):
+            raise UpstreamBodyUnusable(WRONG_FIELD)
+    except UpstreamBodyUnusable as exc:
+        _log_unusable_answer("cabling_validation_unusable", exc)
+        raise UpstreamAnswerUnusable(CABLING_VALIDATION_ANSWER_UNUSABLE) from None
 
     booked_ids = {str(d) for d in device_ids}
     canvas_device_ids = set(body.get("device_ids") or [])
@@ -409,6 +536,20 @@ async def _validate_topology_connectivity(
     if route_summaries:
         raise TopologyRoutingIntentInvalid(invalid_routes, message)
     raise ValueError(message)
+
+
+def _usable_validation_answer(body: dict) -> bool:
+    """Whether cabling's validate answer carries the fields the topology check
+    reads, each of the declared type (`TopologyValidationResponse`): `valid` a
+    boolean, `device_ids` a list of strings, and `invalid_edges` and
+    `invalid_routes` lists of objects; the three lists may be absent or null
+    (issue #1577)."""
+    return (
+        isinstance(body.get("valid"), bool)
+        and _optional_list_of(body.get("device_ids"), str)
+        and _optional_list_of(body.get("invalid_edges"), dict)
+        and _optional_list_of(body.get("invalid_routes"), dict)
+    )
 
 
 def _summarize(entries: list[str], *, limit: int = 5) -> str:
@@ -578,8 +719,9 @@ async def _create_reservation_fork(
         # else still raises, just with an empty list, and the raw detail is
         # carried alongside for a caller that wants it.
         try:
-            detail = resp.json().get("detail") or {}
-        except ValueError:
+            detail = read_json_body(resp, expect=dict).get("detail") or {}
+        except UpstreamBodyUnusable:
+            # Issue #1577: a refusal whose body cannot be read is still final.
             detail = {}
         device_ids: list[str] = []
         if isinstance(detail, dict) and detail.get("error") == "fork_device_not_member":
@@ -587,8 +729,13 @@ async def _create_reservation_fork(
         raise ForkMembershipRefused(device_ids, detail)
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
-    body = resp.json()
-    return int(body["version_number"])
+    # Issue #1577: a 2xx whose body is not an object with an integer
+    # version_number raises UpstreamBodyUnusable, which is not retryable here.
+    body = read_json_body(resp, expect=dict)
+    version_number = body.get("version_number")
+    if not _is_json_integer(version_number):
+        raise UpstreamBodyUnusable(WRONG_FIELD)
+    return version_number
 
 
 async def _create_reservation_fork_best_effort(
@@ -606,10 +753,12 @@ async def _create_reservation_fork_best_effort(
     the bench; the fork is created lazily on first edit.
 
     Returns True unless the create itself exhausted its retries (the genuine
-    failure case), so a caller that wants to notice repeated failure, like the
-    expiration sweep's fork backstop, can (issue #448 item 1). A null topology_id
+    failure case) or answered a 2xx it cannot read, so a caller that wants to
+    notice repeated failure, like the expiration sweep's fork backstop, can (issue
+    #448 item 1). A null topology_id
     (Decision 3 Case A) is a deliberate skip, not a failure, and still returns
-    True; only the retry-exhausted except branch returns False. The best-effort
+    True; only two branches return False: the retry-exhausted except branch, and a
+    2xx whose answer cannot be read (UpstreamBodyUnusable, issue #1577). The best-effort
     wiring_changed staging that follows a successful create is itself independently
     best-effort and does not affect this return value.
 
@@ -674,6 +823,18 @@ async def _create_reservation_fork_best_effort(
             # the dedicated except clause below.
             retryable=(RuntimeError, httpx.HTTPError),
         )
+    except UpstreamBodyUnusable as exc:
+        # Issue #1577: cabling answered 2xx, so the fork likely exists, but its
+        # answer could not be read, so there is no version to stage. Counted as a
+        # failed create; once the active-fork listing shows the fork, the sweep's
+        # wiring heal (RES-FORK-13) stages it and the backstop leaves it alone.
+        _log_unusable_answer(
+            "reservation_fork_create_answer_unusable",
+            exc,
+            reservation_id=str(reservation_id),
+            topology_id=str(topology_id),
+        )
+        return False
     except ForkMembershipRefused as exc:
         logger.warning(
             "Fork creation refused for reservation %s (cabling 409, definitive, "
@@ -804,9 +965,18 @@ async def _prune_removed_devices_from_fork(
         return _PRUNE_OUTCOME_CONVERGED
     if resp.status_code >= 400:
         raise RuntimeError(f"Cabling fork prune returned {resp.status_code}: {resp.text}")
-    data = resp.json()
-    if not data.get("changed"):
+    # Issue #1577: a 2xx whose body is not the declared shape raises
+    # UpstreamBodyUnusable; the marker is kept and the wrapper logs it.
+    data = read_json_body(resp, expect=dict)
+    changed = data.get("changed")
+    if not isinstance(changed, bool):
+        raise UpstreamBodyUnusable(WRONG_FIELD)
+    if not changed:
         return _PRUNE_OUTCOME_CONVERGED
+    if not _is_json_integer(data.get("version_number")) or not _optional_list_of(
+        data.get("released"), dict
+    ):
+        raise UpstreamBodyUnusable(WRONG_FIELD)
 
     # Stage the released delta exactly as the user save handler does; its own atomic
     # outbox+ledger commit. A staging failure leaves cabling's committed version
@@ -1065,6 +1235,15 @@ async def _prune_removed_devices_from_fork_best_effort(
             factor=2.0,
             max_delay=5.0,
         )
+    except UpstreamBodyUnusable as exc:
+        # Issue #1577: cabling answered 2xx with a body that could not be read.
+        # The marker stays, so the sweep retries it like any other failed prune.
+        _log_unusable_answer(
+            "reservation_fork_prune_answer_unusable",
+            exc,
+            reservation_id=str(reservation_id),
+        )
+        return
     except Exception:
         logger.error(
             "Fork prune failed for reservation %s; removed-device wiring not yet released, "
@@ -1246,6 +1425,16 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
         )
 
 
+def _usable_active_fork_entry(entry: object) -> bool:
+    """Whether one entry of cabling's active-fork listing is an object with a UUID
+    string `reservation_id` and a JSON integer `latest_fork_version` (issue #1577)."""
+    return (
+        isinstance(entry, dict)
+        and _is_uuid_text(entry.get("reservation_id"))
+        and _is_json_integer(entry.get("latest_fork_version"))
+    )
+
+
 async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
     """Return (reservation_id, latest_fork_version) for every ACTIVE fork, paging fully.
 
@@ -1278,13 +1467,25 @@ async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
                 timeout=10.0,
             )
             resp.raise_for_status()
-            body = resp.json()
+            # Issue #1577: an unusable body raises; the caller skips the tick's
+            # fork reconcile (RES-FORK-15), as for any other failure here.
+            # Every field is checked before it is converted, so a wrong one raises
+            # the helper's fixed-text exception, never a conversion error that
+            # quotes the value into the caller's exc_info log.
+            body = read_json_body(resp, expect=dict)
+            entries = body.get("forks", [])
+            if not isinstance(entries, list) or not all(
+                _usable_active_fork_entry(entry) for entry in entries
+            ):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
             page = [
-                (uuid.UUID(str(entry["reservation_id"])), int(entry["latest_fork_version"]))
-                for entry in body.get("forks", [])
+                (uuid.UUID(entry["reservation_id"]), entry["latest_fork_version"])
+                for entry in entries
             ]
             forks.extend(page)
             total = body.get("total", len(forks))
+            if not _is_json_integer(total):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
             skip += limit
             if not page or len(page) < limit or skip >= total:
                 break
@@ -1814,8 +2015,8 @@ async def create_reservation(
     # 1. Fetch all devices from inventory (concurrently)
     try:
         devices = await _fetch_devices(data.device_ids, token)
-    except ValueError as exc:
-        raise exc
+    except (ValueError, UpstreamAnswerUnusable):
+        raise
     except Exception as exc:
         raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
 
@@ -2765,8 +2966,8 @@ async def update_reservation(
             # Fetch all new devices to validate
             try:
                 new_devices = await _fetch_devices(data.device_ids, token)
-            except ValueError as exc:
-                raise exc
+            except (ValueError, UpstreamAnswerUnusable):
+                raise
             except Exception as exc:
                 raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
 
