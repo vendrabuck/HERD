@@ -350,9 +350,11 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   Pinned by: `services/inventory/tests/test_templates_internal.py` (`test_internal_template_exposes_driver_sha256_and_filename`, `test_internal_template_null_driver_fields_for_port_template`); `services/inventory/tests/test_template_default_redaction.py` (`test_admin_template_reads_return_password_defaults_in_clear`, `test_internal_template_read_returns_password_defaults_in_clear`)
 - **INV-TPL-21.** The templates page's Copy creates `Copy of <name>` carrying the
   type, driver, hypervisor, exclusive flag, icon, description, identity, poll interval,
-  and sections, and shows the server's detail when the create is refused. \
-  Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`handleCopy`) \
-  Pinned by: `frontend/src/test/pages/TemplatesPage.test.tsx` (`copies a dynamic template with template_type, driver_id, and hypervisor_id (issue #473)`, `copies a device template with its driver and identity fields`, `surfaces the backend detail on a copy failure`)
+  and sections, and shows the server's detail when the create is refused. The copy's
+  name always fits its column: a source name too long for the prefix is cut from its
+  end, by characters, to make `Copy of <name>` exactly 255 characters. \
+  Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`handleCopy`); `frontend/src/lib/copyName.ts` (`copyName`, `NAME_MAX_LENGTH`) \
+  Pinned by: `frontend/src/test/pages/TemplatesPage.test.tsx` (`copies a dynamic template with template_type, driver_id, and hypervisor_id (issue #473)`, `copies a device template with its driver and identity fields`, `surfaces the backend detail on a copy failure`, `cuts a long template name so the copy's name fits its 255-character column`); `frontend/src/test/lib/copyName.test.ts` (`a %i-character name gives a copy name within the 255-character column`, `never splits a character outside the BMP`)
 - **INV-TPL-22.** The templates page offers All, Device, Port, and Dynamic type filters,
   and shows Create Template, Copy, and Delete only to admins. \
   Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`TYPE_FILTER_OPTIONS`, `TemplatesPage`) \
@@ -630,7 +632,7 @@ size per user. Admins can also copy and bulk-delete devices.
 **Surfaces.** User interface `frontend/src/pages/InventoryPage.tsx`,
 `frontend/src/lib/inventoryFilters.ts`; route `GET /devices` (and the port and cabling
 connection reads for an expanded row). Import and export controls and Copy render for
-admins only. Copy names the new device `Copy of <name>` and sends the source's template,
+admins only. Copy names the new device `Copy of <name>` (cut to fit, INV-LIST-16) and sends the source's template,
 topology type, and `field_data`, leaving the status to the default; the Template
 filter pages through the device templates instead of stopping at the first 500
 (issue #1336).
@@ -718,9 +720,10 @@ filter pages through the device templates instead of stopping at the first 500
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`selects and deselects every row`, `deletes every selected device and reports the count on full success`, `reports a partial failure count when one delete fails`, `says remove the cables first when a bulk delete is refused as cabled (issue #940)`)
 - **INV-LIST-16.** Copy creates a new device and then copies the source's ports one at
   a time; the toast reports how many ports were copied or failed, and a failed port
-  copy does not undo the device. \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`handleCopy`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`duplicates a device with its ports and reports the count`, `reports the count of ports that failed to copy without failing the whole operation`, `shows an error toast when the device create itself fails`)
+  copy does not undo the device. The copy's name always fits its column, cut as
+  INV-TPL-21 says. \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`handleCopy`); `frontend/src/lib/copyName.ts` (`copyName`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`duplicates a device with its ports and reports the count`, `reports the count of ports that failed to copy without failing the whole operation`, `shows an error toast when the device create itself fails`, `cuts a long device name so the copy's name fits its 255-character column`)
 
 **Out of scope.** The filter panel's layout component (`ListFilterPanel`) is shared by
 every list page and carries no inventory rule. Cabling connections shown in an
@@ -1533,9 +1536,12 @@ instance lifecycle is `dynamic-resources.md`'s.
   Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_rejects_non_dynamic_template_422`)
 - **INV-DYN-2.** Without a name, the device is named `<template name>-<first 8
   characters of reservation_id>-<n>`, with `n` counting up from 1 past every name
-  already taken. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`, `test_internal_create_name_collision_disambiguates`)
+  already taken. A generated device name always fits its column: when the whole name
+  would pass 255 characters, the template name is cut from its end, by characters,
+  so the name is exactly 255 with the `-<reservation>-<n>` suffix whole; the name
+  depends only on the template name, the reservation, and `n`. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `generated_device_name`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`, `test_internal_create_name_collision_disambiguates`, `test_a_generated_device_name_always_fits_its_column`, `test_internal_create_generated_names_fit_the_column_at_the_boundary_lengths`)
 - **INV-DYN-3.** `field_data` is validated against the template with unknown keys
   allowed, so instance attributes the recipe returns are kept; defaults and required
   fields still apply. \

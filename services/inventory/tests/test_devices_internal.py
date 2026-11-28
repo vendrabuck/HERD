@@ -162,6 +162,70 @@ async def test_internal_create_name_collision_disambiguates(client):
     assert second.json()["name"].endswith("-2")
 
 
+# --- A generated device name always fits its column ---
+
+# A character outside the BMP: four bytes in UTF-8, one character to varchar(n) and
+# to the schema bounds, which count characters.
+_WIDE = "\U0001d11e"
+_RID = uuid.UUID("0123abcd-0000-4000-8000-00000000f00d")
+
+
+@pytest.mark.parametrize("char", ["t", _WIDE, "\u00e9"])
+@pytest.mark.parametrize("length", [1, 243, 244, 245, 246, 254, 255])
+@pytest.mark.parametrize("n", [1, 9, 10, 99, 100, 10_000])
+def test_a_generated_device_name_always_fits_its_column(char, length, n):
+    from app.schemas.device import DEVICE_NAME_MAX_LENGTH
+    from app.services.inventory_service import generated_device_name
+
+    template_name = char * length
+    suffix = f"-0123abcd-{n}"
+    name = generated_device_name(template_name, _RID, n)
+
+    assert len(name) <= DEVICE_NAME_MAX_LENGTH == 255
+    # The suffix is kept whole; only the template part is cut, from its end.
+    assert name.endswith(suffix)
+    kept = name[: -len(suffix)]
+    assert template_name.startswith(kept)
+    if length + len(suffix) <= DEVICE_NAME_MAX_LENGTH:
+        assert name == template_name + suffix
+    else:
+        assert len(name) == DEVICE_NAME_MAX_LENGTH
+    # Deterministic, and a different n gives a different name.
+    assert generated_device_name(template_name, _RID, n) == name
+    assert generated_device_name(template_name, _RID, n + 1) != name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("char", ["t", _WIDE])
+@pytest.mark.parametrize("length", [244, 245, 255])
+async def test_internal_create_generated_names_fit_the_column_at_the_boundary_lengths(
+    client, char, length
+):
+    """A dynamic template name of 245 to 255 characters made the generated name
+    longer than the devices.name column. At 244 the name fits whole; past it the
+    template part is shortened, the suffix kept, and the names stay distinct."""
+    template_name = char * length
+    tid = await _create_dynamic_template(client, template_name)
+    rid = uuid.uuid4()
+    body = {"template_id": tid, "reservation_id": str(rid), "field_data": {"image": "u"}}
+
+    first = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    second = await client.post("/devices/internal", headers=_TOKEN, json=body)
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    names = [first.json()["name"], second.json()["name"]]
+    for n, name in enumerate(names, start=1):
+        suffix = f"-{str(rid)[:8]}-{n}"
+        assert len(name) <= 255
+        assert name == template_name[: 255 - len(suffix)] + suffix
+    if length == 244:
+        assert names[0] == f"{template_name}-{str(rid)[:8]}-1"
+    else:
+        assert len(names[0]) == 255
+    assert names[0] != names[1]
+
+
 @pytest.mark.asyncio
 async def test_internal_create_explicit_name(client):
     tid = await _create_dynamic_template(client)

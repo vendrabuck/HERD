@@ -24,7 +24,9 @@ routes, with the request session on Postgres:
   `update_device`'s own detail;
 - a driver deleted, or a device name taken, by another connection between the
   import's lookup and the insert is answered by the create functions' own fixed
-  details (INV-TPL-14, INV-DEV-1), which the importer keeps.
+  details (INV-TPL-14, INV-DEV-1), which the importer keeps;
+- a generated dynamic-instance name is stored whole by the real column whatever the
+  template name's length (INV-DYN-2).
 
 Each test carries a marker value in the rows' other cells and asserts each outcome
 and reason exactly, and that neither the response body nor any log record at INFO
@@ -61,7 +63,7 @@ from app.models.template import DeviceTemplate
 from app.schemas.column_bounds import INT32_MAX, NON_FINITE_NUMBER_MESSAGE, NUL_CHARACTER_MESSAGE
 from app.services import bulk_service, hypervisor_service
 from herd_common.pg_live_suite import pg_live_target
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 _PG = pg_live_target()
@@ -762,3 +764,82 @@ async def test_a_device_name_taken_before_its_insert_gets_the_fixed_reason(
     async with session_factory() as s:
         winner = (await s.execute(select(Device).where(Device.name == raced))).scalar_one()
         assert winner.field_data == {"pw": "first"}
+
+
+# A generated device name always fits its column -----------------------------------
+
+
+@pytest.mark.parametrize("length", [244, 245, 255])
+async def test_generated_device_names_are_stored_by_the_real_column(
+    client, session_factory, lab, tag, sentinel, caplog, length
+):
+    """The internal create names a dynamic instance after its template (INV-DYN-2).
+    With a template name of 245 to 255 characters (four-byte characters here) every
+    generated name is stored whole by the real devices.name column, two creates get
+    distinct names, and no log record carries the request's field data."""
+    caplog.set_level(logging.INFO)
+    async with session_factory() as s:
+        recipe = DriverPackage(
+            name=f"pg-live-recipe-{tag}",
+            connection_type="Hypervisor",
+            filename="r.zip",
+            storage_key=f"r-{tag}",
+            size_bytes=1,
+            sha256="0" * 64,
+            uploaded_by="pg",
+        )
+        hypervisor = Hypervisor(
+            name=f"pg-live-hv-{tag}",
+            endpoint="https://hv.example:8006",
+            hypervisor_type="proxmox",
+            secret_id=uuid.uuid4(),
+        )
+        s.add_all([recipe, hypervisor])
+        await s.flush()
+        template = DeviceTemplate(
+            name=_at(length, tag),
+            template_type="dynamic",
+            vendor="V",
+            model="M",
+            driver_id=recipe.id,
+            hypervisor_id=hypervisor.id,
+            sections=_SECTIONS,
+        )
+        s.add(template)
+        await s.commit()
+        template_id, template_name = template.id, template.name
+
+    reservation_id = uuid.uuid4()
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(reservation_id),
+        "field_data": {"pw": sentinel},
+    }
+    answers = [
+        await client.post(
+            "/devices/internal", headers={"X-Internal-Token": "test-token"}, json=body
+        )
+        for _ in range(2)
+    ]
+
+    expected = []
+    for n in (1, 2):
+        suffix = f"-{str(reservation_id)[:8]}-{n}"
+        expected.append(template_name[: 255 - len(suffix)] + suffix)
+    for resp, name in zip(answers, expected, strict=True):
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["name"] == name
+    _assert_clean(caplog.text, sentinel)
+    async with session_factory() as s:
+        rows = await s.execute(
+            select(Device.name, func.char_length(Device.name)).where(
+                Device.template_id == template_id
+            )
+        )
+        stored = dict(rows.all())
+    assert set(stored) == set(expected)
+    assert all(chars <= 255 for chars in stored.values())
+    if length == 244:
+        assert expected[0] == f"{template_name}-{str(reservation_id)[:8]}-1"
+    else:
+        assert stored[expected[0]] == 255

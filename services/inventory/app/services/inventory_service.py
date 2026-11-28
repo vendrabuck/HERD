@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.device import Device, DeviceStatus, TopologyType
 from app.models.driver_package import ConnectionType, DriverPackage
 from app.models.template import DeviceTemplate
-from app.schemas.device import DeviceCreate, DeviceUpdate
+from app.schemas.device import DEVICE_NAME_MAX_LENGTH, DeviceCreate, DeviceUpdate
 from app.services.template_service import _integrity_kind
 
 
@@ -241,6 +241,23 @@ async def delete_device(db: AsyncSession, device_id: uuid.UUID) -> bool:
 _MAX_NAME_ATTEMPTS = 10_000
 
 
+def generated_device_name(template_name: str, reservation_id: uuid.UUID, n: int) -> str:
+    """The name of the n-th generated dynamic-instance device of a reservation:
+    "<template name>-<first 8 characters of reservation_id>-<n>", always within the
+    devices.name column (DEVICE_NAME_MAX_LENGTH characters).
+
+    A template name is itself up to DEVICE_NAME_MAX_LENGTH characters, so the
+    template part is cut from its end, by characters (what the column counts),
+    until the whole name fits; the "-<reservation>-<n>" suffix is never cut. The
+    name is a function of its three inputs alone, and two names with a different n
+    differ in their suffix. Names of two templates that agree on their first
+    characters may agree on the cut part; the database's unique name then refuses
+    the second, and the caller tries the next n, as for any taken name.
+    """
+    suffix = f"-{str(reservation_id)[:8]}-{n}"
+    return template_name[: DEVICE_NAME_MAX_LENGTH - len(suffix)] + suffix
+
+
 def _unique_conflict_target(exc: IntegrityError) -> str:
     """Which column a unique-violation IntegrityError hit: "request_id" or "name".
 
@@ -316,7 +333,8 @@ async def create_dynamic_instance_device(
 
     Accepts only dynamic templates. When name is omitted the server generates
     "<template-name>-<first 8 chars of reservation_id>-<n>", disambiguating n on
-    collision. field_data is validated against the template but tolerates unknown
+    collision, with the template part shortened so the name fits its column
+    (generated_device_name). field_data is validated against the template but tolerates unknown
     keys, since the recipe's create_instance result carries instance attributes
     that are not template fields.
 
@@ -361,12 +379,20 @@ async def create_dynamic_instance_device(
             raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
         device = outcome
     else:
-        prefix = f"{template.name}-{str(reservation_id)[:8]}"
+        # Read once, before the loop: a refused insert rolls back, which expires the
+        # template row. The prefix is named in the exhaustion detail only; each tried
+        # name is generated_device_name's.
+        template_name = template.name
+        prefix = f"{template_name}-{str(reservation_id)[:8]}"
         device: Device | None = None
         n = 1
         while device is None and n <= _MAX_NAME_ATTEMPTS:
             outcome = await _insert_dynamic_device(
-                db, f"{prefix}-{n}", template_id, field_data, request_id
+                db,
+                generated_device_name(template_name, reservation_id, n),
+                template_id,
+                field_data,
+                request_id,
             )
             if outcome == "request_id":
                 # A concurrent create with this request_id won the race; converge
