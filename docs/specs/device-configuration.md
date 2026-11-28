@@ -1389,13 +1389,17 @@ the child entry point `services/execution/app/services/_runner.py`;
 - **CFG-SBX-8.** A package's `requirements.txt` is installed into `_deps` (60 seconds,
   no resource limits, errors only logged) only when `ALLOW_DRIVER_PIP_INSTALL` is true
   and `_deps` does not exist yet, by `python -I -B -m pip install -r <requirements.txt>
-  --target <_deps> -q`, so pip, too, imports nothing from the package directory or the
-  current directory (issue #1180). The install child is started and ended as the driver
+  --target <_deps> -q` with `PATH` as its whole environment, so pip, too, imports
+  nothing from the package directory or the current directory (issue #1180) and sees
+  none of the device context. The install child is started and ended as the driver
   child is (CFG-SBX-5): in a session of its own, its process group killed before it is
   reaped however it ends, its timeout reached when it has not exited or its output is
-  still open (issue #1407). \
-  Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`, `_run_child`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_requirements_txt_skipped_when_pip_install_disabled`, `test_requirements_txt_installed_when_pip_install_enabled`, `test_execute_with_existing_deps_dir`, `test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes`, `test_run_child_timeout_kills_the_group_and_raises`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_pip_install_exception_swallowed`)
+  still open (issue #1407). An install that raises, times out, or exits non-zero is
+  logged and the driver child still runs. Each sandbox call installs before its child
+  unless its caller passes `install_dependencies=False`; the wiring path does that on
+  every attempt and installs once per action itself (WIRE-DRIVER-8, issue #1495). \
+  Enforced in: `services/execution/app/services/driver_sandbox.py` (`prepare_driver_dependencies`, `execute_driver_method`, `_run_child`) \
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_requirements_txt_skipped_when_pip_install_disabled`, `test_requirements_txt_installed_when_pip_install_enabled`, `test_prepare_driver_dependencies_answers_every_case`, `test_install_dependencies_false_never_runs_pip`, `test_the_default_still_installs_before_each_call`, `test_execute_with_existing_deps_dir`, `test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes`, `test_run_child_timeout_kills_the_group_and_raises`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_pip_install_exception_swallowed`)
 - **CFG-SBX-9.** The child runs as execution's own user with no namespace, filesystem,
   or network separation; driver packages are trusted code. By decision; see
   [DRIVERS.md](../DRIVERS.md), "Execution sandbox". \

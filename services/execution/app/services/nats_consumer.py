@@ -164,6 +164,7 @@ WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 NON_RETRYABLE_REASON_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
 
 
+
 def _wiring_load_failure(exc: BaseException, switch_id: str) -> tuple[str, int]:
     """The (last_error, attempts) a wiring row records when ``load_driver`` raised.
 
@@ -208,6 +209,19 @@ async def _run_sandbox(*args, **kwargs):
     from app.services.driver_sandbox import execute_driver_method
 
     return await asyncio.to_thread(execute_driver_method, *args, **kwargs)
+
+
+async def _prepare_driver_dependencies(driver_path: str) -> str:
+    """Run `driver_sandbox.prepare_driver_dependencies` off the event loop, once per
+    wiring driver action (issue #1495, `_run_driver_with_retry`).
+
+    It may wait on a `pip install` child for up to DRIVER_PIP_INSTALL_TIMEOUT_SECONDS,
+    so it runs on a worker thread like `_run_sandbox`. It never raises; its answer
+    (installed, failed, not needed, disabled) is returned for the caller and the tests.
+    """
+    from app.services.driver_sandbox import prepare_driver_dependencies
+
+    return await asyncio.to_thread(prepare_driver_dependencies, driver_path)
 
 
 class TransientUpstreamError(RuntimeError):
@@ -2232,7 +2246,18 @@ async def _run_driver_with_retry(
     retried up to WIRING_DRIVER_ATTEMPTS with exponential backoff. Returns
     (success, attempts, last_error, last_result). A driver failure is compensated
     per connection and never NAKs the message (Decision 7).
+
+    The package's dependency install (`driver_sandbox.prepare_driver_dependencies`,
+    a `pip install` only with ALLOW_DRIVER_PIP_INSTALL on, a package that has a
+    `requirements.txt`, and no `_deps` yet) runs ONCE per call, before the first
+    attempt, and every attempt runs with `install_dependencies=False` (issue #1495).
+    So one action spends at most one install, bounded by
+    DRIVER_PIP_INSTALL_TIMEOUT_SECONDS, plus its attempts, each bounded by the sandbox
+    timeout; a failed or timed-out install is logged and is not repeated by the
+    remaining attempts, which run the driver child without the missing dependencies.
+    The next action (or the next pass) tries the install again, once.
     """
+    await _prepare_driver_dependencies(driver_path)
     delay = WIRING_DRIVER_INITIAL_DELAY
     last_error: str | None = None
     last_result: dict | None = None
@@ -2245,6 +2270,7 @@ async def _run_driver_with_retry(
                 context,
                 method_kwargs=method_kwargs,
                 password_keys=password_keys,
+                install_dependencies=False,
             )
         except Exception as exc:  # noqa: BLE001 - sandbox failures are per-connection
             last_error = f"driver raised: {exc}"

@@ -587,13 +587,17 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_l1_success_flip_clears_the_claim`, `test_l1_release_clears_the_claim`, `test_l1_row_identity_failure_write_clears_the_claim`, `test_l1_key_upsert_failure_write_clears_the_claim`, `test_l2_stale_build_park_clears_the_claim`, `test_l3_success_flip_clears_the_claim`, `test_l3_release_clears_the_claim`)
 - **WIRE-CLAIM-3.** The claim budget of a drive of N driver actions is three attempts
   times N times `EXECUTION_TIMEOUT_SECONDS`, plus N times the in-line backoff (0.6 s),
-  rounded up to the next whole minute strictly after that sum, computed in whole
-  milliseconds; there is no setting of its own. An L1 row and an L2 remove are three
-  actions (the switch's login, the row's own op, the switch's logout): 5 minutes at the
-  defaults, and for every whole-second timeout the plain round-up it was before #1482,
-  with at least 1.2 seconds of slack. An L2 add is four, one more for the undo of a
-  join that lost its allocation (#1413, WIRE-VLAN-4), passed as a per-call budget of
-  `claim_budget(4)`: 7 minutes at the defaults. An L3 pin is claimed once for its whole drive, so
+  plus, while `ALLOW_DRIVER_PIP_INSTALL` is on, N times the dependency install's 60
+  seconds (one install per action, WIRE-DRIVER-8, #1495; counted for every action while
+  the flag is on, whether or not the package needs it), rounded up to the next whole
+  minute strictly after that sum, computed in whole milliseconds; there is no setting
+  of its own. An L1 row and an L2 remove are three actions (the switch's login, the
+  row's own op, the switch's logout): 5 minutes at the defaults (8 with the flag on),
+  and for every whole-second timeout the plain round-up of the sum, as before #1482,
+  with at least 1.2 seconds of slack whether the flag is on or off. An L2 add is four, one more for
+  the undo of a join that lost its allocation (#1413, WIRE-VLAN-4), passed as a
+  per-call budget of `claim_budget(4)`: 7 minutes at the defaults (11 with the flag
+  on). An L3 pin is claimed once for its whole drive, so
   `_apply_l3_adjacency` counts the route operations R it is about to drive (the residue
   removals plus one call per route, or a reconcile's removals plus additions) after the
   driver load and immediately before the login, then claims with
@@ -604,14 +608,14 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   three-action budget. Pinned at the defaults: 5 minutes for R of 0 or 1, 7 for 2, 19
   for 10, 75 for 47, 309 for 200, 1,530 for 1,000, 3,057 for 2,000, and 76,337 (about
   53 days) for 50,000. The sum
-  counts every attempt's sandbox timeout and every backoff sleep; time outside it is
-  each action's time outside its sandbox timers (the two execution-run writes, the
-  worker-thread hop, the sandbox's temp-file I/O, the child's fork and exec before the
-  subprocess timer starts, the kill and reap after a timeout) and, with
-  `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` the sandbox runs before the driver
-  child, with its own 60-second timeout, on every attempt while a package with a
-  `requirements.txt` has no `_deps/` directory (no budget counts the install, L1 and L2
-  included). The guarantee for an L3 pin: its claim outlives the drive when every
+  counts every attempt's sandbox timeout, every backoff sleep, and with the flag on each
+  action's install timeout; time outside it is each action's time outside those timers
+  (the two execution-run writes, the worker-thread hops, the sandbox's temp-file I/O,
+  the fork and exec of the install and driver children before their timers start, the
+  kill and reap after a timeout). Before #1495 the install ran on every attempt and no
+  budget counted it, so one action could spend 180 seconds outside the sum. A 60-second
+  install per action adds a whole number of minutes to every row, so the slack figures
+  in this rule hold with the flag on as with it off. The guarantee for an L3 pin: its claim outlives the drive when every
   attempt runs to its timeout as long as the drive's time outside the sum stays under N
   seconds (the allowance) plus the rounding slack; the slack is a multiple of 0.2
   seconds and at least 0.2 seconds at any whole-second timeout, and at the default
@@ -632,8 +636,8 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
   limit when the pin was stored before the limit existed, and can grow past it because
   each failed provision records its own set plus the removals that did not confirm (a
   known limit). \
-  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`) \
-  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_claim_with_their_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`, `test_the_route_limit_puts_a_number_on_the_longest_claim_at_the_defaults`)
+  Enforced in: `services/execution/app/services/wiring_claim.py` (`claim_budget`, `l3_pin_claim_budget`, `install_ms_per_action`, `WiringRowClaims`); `services/execution/app/services/nats_consumer.py` (`_apply_l3_adjacency`, `_run_driver_with_retry`) \
+  Pinned by: `services/execution/tests/test_wiring_claim.py` (`test_with_pip_install_on_the_budget_counts_one_install_per_action`, `test_with_pip_install_on_an_l3_pins_budget_counts_one_install_per_action`, `test_with_pip_install_on_an_l3_pins_claim_outlives_one_install_per_action`, `test_claim_budget_covers_one_row_worst_case_drive`, `test_claim_budget_scales_with_the_driver_timeout`, `test_the_one_row_budget_is_unchanged_for_l1_and_l2`, `test_l3_pin_claim_budget_is_r_plus_two_actions_rounded_up`, `test_l3_pin_claim_budget_outlives_every_drive_and_by_at_most_a_minute`, `test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finishes`, `test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive`, `test_l1_and_l2_rows_claim_with_their_row_budget`, `test_a_per_call_budget_sets_only_that_claims_stamp`, `test_a_sized_l3_claim_still_expires_at_its_stamp`, `test_the_smallest_l3_slack_at_the_default_timeout_is_four_tenths_of_a_second`, `test_an_l3_pins_claim_outlives_its_drive_with_overhead_just_under_the_allowance`, `test_known_limit_overhead_far_over_the_allowance_lets_a_rival_claim`, `test_the_route_limit_puts_a_number_on_the_longest_claim_at_the_defaults`)
 
 ## 5. API surface
 
@@ -1430,9 +1434,9 @@ it fails, and counted as done only when the driver's own answer says so.
   Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_execute_failing_driver`, `test_execute_timeout`, `test_execute_connect_ports_via_method_kwargs`)
 - **WIRE-DRIVER-2.** A failed action is retried in line, three attempts in all, sleeping
   0.2 seconds then doubling to at most 2 seconds; the attempts made are added to the row
-  on failure. \
+  on failure. The tests pin the attempt count; no test asserts the backoff delays. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_driver_with_retry`, `WIRING_DRIVER_ATTEMPTS`, `WIRING_DRIVER_INITIAL_DELAY`, `WIRING_DRIVER_MAX_DELAY`) \
-  Pinned by: none
+  Pinned by: `services/execution/tests/test_wiring_driver_install_once.py` (`test_a_failed_install_is_tried_once_per_action_not_once_per_attempt`, `test_every_attempt_is_run_without_the_sandbox_install`)
 - **WIRE-DRIVER-3.** An action fails when the sandbox reports failure, or when its output
   is a dict with a `success` key whose value is falsy; output with no `success` key
   succeeds. \
@@ -1466,6 +1470,21 @@ it fails, and counted as done only when the driver's own answer says so.
   text never carries the exception's message, which goes only to the log. \
   Enforced in: `services/execution/app/services/nats_consumer.py` (`_wiring_load_failure`, `_apply_wiring_pairs`, `_run_vlan_definition_op`, `_apply_l2_memberships`, `_apply_l3_adjacency`); `services/execution/app/services/driver_loader.py` (`is_permanent_load_failure`, `driver_load_failure_text`); `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`) \
   Pinned by: `services/execution/tests/test_nats_consumer_wiring_changed.py` (`test_driver_load_raise_parks_pairs_failed_without_nak`); `services/execution/tests/test_wiring_driver_load_classification.py` (`test_wiring_load_failure_reason_and_attempts_by_kind`, `test_l1_transient_download_failure_parks_build_and_release_retryable`, `test_l1_broken_package_parks_build_and_release_permanent`, `test_l2_transient_download_failure_parks_add_and_remove_retryable`, `test_l2_transient_failure_during_vlan_define_parks_the_add_retryable`, `test_l3_transient_download_failure_parks_provision_and_deprovision_retryable`, `test_l3_broken_package_parks_provision_and_deprovision_permanent`, `test_l1_transient_rows_converge_on_the_next_retry_tick`, `test_l2_transient_remove_converges_on_the_next_retry_tick`, `test_l3_transient_rows_converge_on_the_next_retry_tick`, `test_l1_broken_package_rows_are_not_retried_by_the_tick`, `test_teardown_l1_removal_with_transient_download_failure_stays_retryable`); `services/execution/tests/test_upstream_total_deadlines.py` (`test_wiring_retry_with_a_stalled_download_returns_the_transient_outcome`); `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_pinned_reasons_not_retryable`)
+
+- **WIRE-DRIVER-8.** A wiring driver action installs the package's dependencies at
+  most once, before its first attempt: `_run_driver_with_retry` calls
+  `prepare_driver_dependencies` (on a worker thread) and then runs each attempt with
+  `install_dependencies=False`, so no attempt installs. The install runs only with
+  `ALLOW_DRIVER_PIP_INSTALL` on, for a package that has a `requirements.txt` and no
+  `_deps` yet (CFG-SBX-8), and is stopped at 60 seconds
+  (`DRIVER_PIP_INSTALL_TIMEOUT_SECONDS`). An install that fails, times out, or exits
+  non-zero is logged and not repeated by the remaining attempts, which run the driver
+  child without the missing dependencies; the next action, and the next pass, try it
+  once again. So one action's worst case is one install timeout plus three attempt
+  timeouts plus the backoff, which is what the claim budget counts (WIRE-CLAIM-3).
+  Before #1495 every attempt installed while `_deps` was missing. \
+  Enforced in: `services/execution/app/services/nats_consumer.py` (`_run_driver_with_retry`, `_prepare_driver_dependencies`); `services/execution/app/services/driver_sandbox.py` (`prepare_driver_dependencies`, `execute_driver_method`, `DRIVER_PIP_INSTALL_TIMEOUT_SECONDS`) \
+  Pinned by: `services/execution/tests/test_wiring_driver_install_once.py` (`test_a_failed_install_is_tried_once_per_action_not_once_per_attempt`, `test_each_action_tries_the_install_once_again`, `test_an_install_that_succeeds_is_not_repeated_by_the_next_action`, `test_no_install_runs_when_none_is_due_or_enabled`, `test_every_attempt_is_run_without_the_sandbox_install`); `services/execution/tests/test_driver_sandbox.py` (`test_install_dependencies_false_never_runs_pip`, `test_the_install_timeout_is_sixty_seconds`)
 
 **Out of scope.** Driver package loading, caching, and validation (`inventory.md`,
 `device-configuration.md`); the driver method contract (`DRIVERS.md`).
@@ -2042,7 +2061,8 @@ holding foreign allocation and membership rows, and WIRE-VLAN-4's reservation-wi
 check (issue #1497), whose live-Postgres suite
 `test_reservation_wide_allocation_check_live_pg.py` was run on a throwaway Postgres 16
 against an empty execution schema and then against one seeded with foreign rows.
-The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
+The in-line retry's attempt count (WIRE-DRIVER-2) is asserted through the real sandbox
+since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
 
 ## 13. Known limits and gaps
 
@@ -2331,6 +2351,4 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
 
 - WIRE-GATE-5: payload device ids are not cross-checked.
 - WIRE-DISPATCH-6: the warning logged when the health-tier update fails.
-- WIRE-DRIVER-2: the in-line retry makes three attempts with backoff (only the constant
-  is asserted).
 - WIRE-STATUS-6: the internal routes answer 500 with no token configured.

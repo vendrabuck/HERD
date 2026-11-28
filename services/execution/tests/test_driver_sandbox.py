@@ -275,6 +275,111 @@ def test_requirements_txt_installed_when_pip_install_enabled(monkeypatch):
     ]
     assert "PYTHONPATH" not in pip_envs[0]
     assert pip_kwargs[0] == {"timeout": 60, "text": False}
+    # Issue #1495: pip gets PATH only, none of the device context the child gets.
+    assert set(pip_envs[0]) == {"PATH"}
+
+
+# --- prepare_driver_dependencies: the install, once per caller (issue #1495) ---
+
+
+def _pip_fake(monkeypatch, behaviour):
+    """Stub `_run_child` for the pip command only; `behaviour(cmd)` returns the
+    CompletedProcess or raises. Returns the list of pip commands seen."""
+    real_run = driver_sandbox._run_child
+    seen = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:6] == ["python", "-I", "-B", "-m", "pip", "install"]:
+            seen.append(cmd)
+            return behaviour(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(driver_sandbox, "_run_child", fake_run)
+    return seen
+
+
+def _with_requirements(driver_code=VALID_L1_DRIVER) -> str:
+    driver_dir = _make_driver_dir(driver_code)
+    with open(os.path.join(driver_dir, "requirements.txt"), "w") as f:
+        f.write("# empty requirements\n")
+    return driver_dir
+
+
+def _done(returncode):
+    return subprocess.CompletedProcess(["pip"], returncode, b"", b"")
+
+
+def _timed_out(cmd):
+    raise subprocess.TimeoutExpired(cmd, driver_sandbox.DRIVER_PIP_INSTALL_TIMEOUT_SECONDS)
+
+
+def _cannot_start(cmd):
+    raise OSError("no python")
+
+
+def test_the_install_timeout_is_sixty_seconds():
+    """The constant the wiring claim budget counts once per action (issue #1495)."""
+    assert driver_sandbox.DRIVER_PIP_INSTALL_TIMEOUT_SECONDS == 60
+
+
+@pytest.mark.parametrize(
+    ("flag", "has_requirements", "has_deps", "behaviour", "expected", "pip_runs"),
+    [
+        # Not due: no requirements.txt, or _deps already there; the flag does not matter.
+        (True, False, False, None, driver_sandbox.DEPS_NOT_NEEDED, 0),
+        (True, True, True, None, driver_sandbox.DEPS_NOT_NEEDED, 0),
+        (False, False, False, None, driver_sandbox.DEPS_NOT_NEEDED, 0),
+        (False, True, True, None, driver_sandbox.DEPS_NOT_NEEDED, 0),
+        # Due but off: nothing runs.
+        (False, True, False, None, driver_sandbox.DEPS_INSTALL_DISABLED, 0),
+        # Due and on: one pip run, whatever it ends in.
+        (True, True, False, lambda cmd: _done(0), driver_sandbox.DEPS_INSTALLED, 1),
+        (True, True, False, lambda cmd: _done(1), driver_sandbox.DEPS_INSTALL_FAILED, 1),
+        (True, True, False, _timed_out, driver_sandbox.DEPS_INSTALL_FAILED, 1),
+        (True, True, False, _cannot_start, driver_sandbox.DEPS_INSTALL_FAILED, 1),
+    ],
+)
+def test_prepare_driver_dependencies_answers_every_case(
+    monkeypatch, flag, has_requirements, has_deps, behaviour, expected, pip_runs
+):
+    """The whole space of (flag, requirements.txt, _deps, pip's ending): pip runs
+    exactly when the install is due and enabled, and an install that exits non-zero,
+    times out, or cannot start answers `failed` and never raises."""
+    monkeypatch.setattr(driver_sandbox.settings, "allow_driver_pip_install", flag)
+    driver_dir = _with_requirements() if has_requirements else _make_driver_dir(VALID_L1_DRIVER)
+    if has_deps:
+        os.makedirs(os.path.join(driver_dir, "_deps"))
+    seen = _pip_fake(monkeypatch, behaviour or (lambda cmd: pytest.fail("pip must not run")))
+    assert driver_sandbox.prepare_driver_dependencies(driver_dir) == expected
+    assert len(seen) == pip_runs
+
+
+@pytest.mark.parametrize("behaviour", [lambda cmd: _done(0), lambda cmd: _done(2), _timed_out])
+def test_install_dependencies_false_never_runs_pip(monkeypatch, behaviour):
+    """`install_dependencies=False`, what the wiring path passes on every attempt of an
+    action (issue #1495): no pip run even while the install is due and enabled, and
+    the driver child still runs."""
+    monkeypatch.setattr(driver_sandbox.settings, "allow_driver_pip_install", True)
+    driver_dir = _with_requirements()
+    seen = _pip_fake(monkeypatch, behaviour)
+    result = execute_driver_method(
+        driver_dir, "login", {"HERD_device_id": "test"}, timeout=15, install_dependencies=False
+    )
+    assert result["success"] is True
+    assert seen == []
+
+
+def test_the_default_still_installs_before_each_call(monkeypatch):
+    """The callers that make one sandbox call per action (manual runs, health polls,
+    the schema extraction, recipes) keep the default: an install that failed leaves
+    no _deps, so each such call tries again."""
+    monkeypatch.setattr(driver_sandbox.settings, "allow_driver_pip_install", True)
+    driver_dir = _with_requirements()
+    seen = _pip_fake(monkeypatch, _timed_out)
+    for _ in range(2):
+        result = execute_driver_method(driver_dir, "login", {"HERD_device_id": "t"}, timeout=15)
+        assert result["success"] is True
+    assert len(seen) == 2
 
 
 DEPS_IMPORT_DRIVER = """

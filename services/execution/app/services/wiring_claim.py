@@ -123,10 +123,27 @@ ROW_DRIVER_ACTIONS = 3
 L3_ACTION_UNTIMED_OVERHEAD_ALLOWANCE_MS = 1000
 
 
+def install_ms_per_action() -> int:
+    """The dependency install's share of one driver action's worst case, in whole
+    milliseconds (issue #1495): DRIVER_PIP_INSTALL_TIMEOUT_SECONDS while
+    ALLOW_DRIVER_PIP_INSTALL is on, read live, else 0.
+
+    `_run_driver_with_retry` runs the install at most once per action, before its first
+    attempt, so it is counted once per action, not once per attempt. It is counted for
+    every action while the flag is on, whether or not the package needs an install:
+    the budget does not know the package, and an action that installs nothing finishes
+    early, which only leaves the claim longer than its drive."""
+    from app.services.driver_sandbox import DRIVER_PIP_INSTALL_TIMEOUT_SECONDS
+
+    if not settings.allow_driver_pip_install:
+        return 0
+    return DRIVER_PIP_INSTALL_TIMEOUT_SECONDS * 1000
+
+
 def _worst_case_ms(driver_actions: int, extra_ms_per_action: int = 0) -> int:
     """The summed worst case of `driver_actions` actions, in whole milliseconds:
-    every attempt running to the sandbox timeout, every backoff sleep, plus
-    `extra_ms_per_action` per action."""
+    the dependency install (`install_ms_per_action`), every attempt running to the
+    sandbox timeout, every backoff sleep, plus `extra_ms_per_action` per action."""
     from app.services.nats_consumer import (
         WIRING_DRIVER_ATTEMPTS,
         WIRING_DRIVER_BACKOFF_FACTOR,
@@ -141,7 +158,8 @@ def _worst_case_ms(driver_actions: int, extra_ms_per_action: int = 0) -> int:
         delay *= WIRING_DRIVER_BACKOFF_FACTOR
 
     per_action_ms = (
-        WIRING_DRIVER_ATTEMPTS * max(1, settings.execution_timeout_seconds) * 1000
+        install_ms_per_action()
+        + WIRING_DRIVER_ATTEMPTS * max(1, settings.execution_timeout_seconds) * 1000
         + backoff_ms_per_action
         + extra_ms_per_action
     )
@@ -165,8 +183,12 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
         `WIRING_DRIVER_INITIAL_DELAY` (0.2s) then doubled by
         `WIRING_DRIVER_BACKOFF_FACTOR`, capped at `WIRING_DRIVER_MAX_DELAY`, for
         `attempts - 1` sleeps per action.
+      - With `ALLOW_DRIVER_PIP_INSTALL` on, the package's dependency install, which
+        `_run_driver_with_retry` runs at most once per action before its first attempt,
+        stopped at `driver_sandbox.DRIVER_PIP_INSTALL_TIMEOUT_SECONDS` (60s): 60s per
+        action (`install_ms_per_action`, issue #1495). Off (the default), 0.
 
-    So the bound is attempts * actions * timeout + actions * backoff, rounded UP to
+    So the bound is actions * (install + attempts * timeout + backoff), rounded UP to
     the next whole minute strictly after it. Rounding up is what keeps the expiry
     safely clear of a drive that is still running, and the whole-minute figure
     matches the health scheduler's flat five-minute CLAIM_WINDOW, the same idiom one
@@ -181,19 +203,17 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
     Time outside the sum, which this budget does not count: each action's time
     outside its sandbox timers (the execution-run writes, the worker thread hop, the
     sandbox's temp-file I/O, the child's fork and exec, the kill and reap after a
-    timeout), covered only by the rounding's slack; and, with
-    `ALLOW_DRIVER_PIP_INSTALL` on, the `pip install` `execute_driver_method` runs
-    before the driver child, with its own 60s timeout, on every attempt while a
-    package that has a `requirements.txt` has no `_deps/` directory yet (an install
-    that fails or times out before pip writes that directory leaves none, so it runs
-    again on the next attempt), which makes that attempt's worst case 60s plus the
-    timeout.
+    timeout, and with the flag on the same steps of the install child and its worker
+    thread hop), covered only by the rounding's slack. Before issue #1495 the install
+    ran on every attempt and no budget counted it, so one action could spend 180s
+    outside the sum and a one-row claim could expire mid-drive.
 
     The default, `ROW_DRIVER_ACTIONS` (3), is one L1 or L2 row: the per-switch
     `login`, the row's own connect/disconnect or add/remove op, and the per-switch
     `logout`. The login and logout are shared by every row on the switch, so charging
     all three to each row is deliberately generous. That is 3 * 3 * 30s = 270s plus
-    1.8s of backoff, which rounds to 5 minutes at the default timeout. An L3 pin
+    1.8s of backoff, which rounds to 5 minutes at the default timeout; with the flag
+    on, 3 * 60s more, 451.8s, which rounds to 8 minutes. An L3 pin
     drives more than one op under its one claim, so it is sized by
     `l3_pin_claim_budget` instead (issue #1482).
 
@@ -221,8 +241,10 @@ def l3_pin_claim_budget(route_operations: int) -> timedelta:
     as long as the time the drive spends outside its sandbox timers and backoff sleeps
     stays under N times the allowance plus the rounding slack (at least 0.4s at the
     default timeout, first at 129 route operations; at least 0.2s at any whole-second
-    timeout), that is, under one second per action on average plus that slack. The
-    `pip install` named in `claim_budget` is outside it.
+    timeout), that is, under one second per action on average plus that slack. With
+    `ALLOW_DRIVER_PIP_INSTALL` on, each action's sum includes its one dependency
+    install (`install_ms_per_action`, issue #1495), and the time the install child
+    spends outside its own timer is part of what the allowance covers.
 
     No cap, deliberately: a cap below the worst-case drive would let a second pass
     claim the pin while this one is still inside the driver, which is the double
