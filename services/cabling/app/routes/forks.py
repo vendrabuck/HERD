@@ -218,7 +218,8 @@ async def list_active_forks_internal(
         await db.execute(
             select(ReservationFork.id, ReservationFork.reservation_id)
             .where(ReservationFork.status == ForkStatus_ACTIVE)
-            .order_by(ReservationFork.created_at)
+            # Oldest first, then id ascending (issue #1589), so offset pages are disjoint.
+            .order_by(ReservationFork.created_at, ReservationFork.id)
             .offset(skip)
             .limit(limit)
         )

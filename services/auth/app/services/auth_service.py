@@ -128,7 +128,9 @@ async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID | str) -> User | N
 
 
 async def get_all_users(db: AsyncSession, skip: int = 0, limit: int = 50) -> tuple[list[User], int]:
-    stmt = select(User).order_by(User.created_at)
+    # id tiebreak (issue #1589): accounts created in one transaction share created_at,
+    # and offset pages over a tie have no defined order without it.
+    stmt = select(User).order_by(User.created_at, User.id)
     return await paginate(db, stmt, skip=skip, limit=limit)
 
 
