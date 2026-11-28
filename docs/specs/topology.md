@@ -1258,9 +1258,12 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   is held to the topology routes' bound, judged once its surrounding whitespace is
   stripped: one longer than `NAME_MAX_LENGTH` (100) characters is rejected `name: must
   be at most 100 characters`, and one holding a NUL character `name: must not hold a
-  NUL character`, in a JSON or a CSV import alike. \
+  NUL character`, in a JSON or a CSV import alike. The bound holds for a name that
+  matches an existing topology too, one stored with a longer name before the routes
+  held this bound included: the row is rejected and the stored topology is left as it
+  was. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`, `_record_shape_reason`, `NAME_TOO_LONG_REASON`, `NAME_HOLDS_NUL_REASON`); `services/cabling/app/services/device_resolver.py` (`name_batches`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`, `test_a_topology_name_is_held_to_the_topology_routes_bound`, `test_a_topology_name_past_the_field_limit_is_read`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup`)
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`, `test_a_topology_name_is_held_to_the_topology_routes_bound`, `test_a_long_name_is_refused_even_when_it_names_an_existing_topology`, `test_a_topology_name_past_the_field_limit_is_read`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup`)
 - **TOPO-BULK-11.** For a non-admin, visibility is read once per request (503 and nothing
   processed when it fails); a name resolving to a hidden device is reported exactly like
   an unknown name, and a device node carrying a raw id with no name is redacted before
@@ -2049,9 +2052,12 @@ Calls into this area are in section 7. Cabling publishes no event.
   whose `device_ids` is a list of UUID strings, the device batch a list of objects each
   with a UUID `id`, the config an object or null whose `config` is an object or null
   and whose `id` is a UUID or absent) fails closed as a failed call does, with the
-  fixed reason. \
+  fixed reason. Two readings are lenient by decision: a visibility object with no
+  `device_ids` key reads as an empty set (a `device_ids` of null cannot be used), and
+  the config fetch reads an `id` that JSON makes false (null, `0`, `0.0`, `""`,
+  `false`, `[]`, or `{}`) as absent, so that config has no version id. \
   Enforced in: `services/cabling/app/services/visible_devices.py` (`fetch_visible_device_ids`); `services/cabling/app/services/device_group_guard.py` (`fetch_device_group_ids`); `services/cabling/app/services/connection_service.py` (`_resolve_group_cache_for_batch`); `services/cabling/app/services/reservation_guard.py` (`find_blocking_reservations`, `find_blocking_reservations_strict`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`); `services/cabling/app/services/l3_validation.py` (`L3InventoryContext`) \
-  Pinned by: `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`, `test_an_unexpected_row_failure_is_reported_by_class_only`, `test_the_visibility_lookup_logs_and_raises_the_class_only`, `test_the_edit_lock_lookup_logs_the_class_only`, `test_the_delete_guard_logs_the_class_only`, `test_the_delete_guard_logs_an_unreadable_body_by_class_only`, `test_the_device_group_lookup_logs_the_class_only`, `test_the_bulk_device_group_lookup_logs_the_class_only`, `test_the_routing_pass_failure_carries_the_class_only`, `test_a_body_fault_in_either_lookup_logs_its_traceback`, `test_the_delete_guard_answers_a_body_nested_too_deep_with_its_503`, `test_a_visibility_body_that_cannot_be_used_fails_closed`, `test_a_visibility_body_of_uuid_strings_is_read`, `test_a_routing_pass_body_that_cannot_be_used_fails_closed`, `test_a_routing_pass_body_of_the_documented_shape_is_read`)
+  Pinned by: `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`, `test_an_unexpected_row_failure_is_reported_by_class_only`, `test_the_visibility_lookup_logs_and_raises_the_class_only`, `test_the_edit_lock_lookup_logs_the_class_only`, `test_the_delete_guard_logs_the_class_only`, `test_the_delete_guard_logs_an_unreadable_body_by_class_only`, `test_the_device_group_lookup_logs_the_class_only`, `test_the_bulk_device_group_lookup_logs_the_class_only`, `test_the_routing_pass_failure_carries_the_class_only`, `test_a_body_fault_in_either_lookup_logs_its_traceback`, `test_the_delete_guard_answers_a_body_nested_too_deep_with_its_503`, `test_a_visibility_body_that_cannot_be_used_fails_closed`, `test_a_visibility_body_of_uuid_strings_is_read`, `test_a_visibility_object_with_no_device_ids_reads_as_none_visible`, `test_a_config_id_that_json_makes_false_reads_as_absent`, `test_a_routing_pass_body_that_cannot_be_used_fails_closed`, `test_a_routing_pass_body_of_the_documented_shape_is_read`)
 
 ## 11. Configuration
 

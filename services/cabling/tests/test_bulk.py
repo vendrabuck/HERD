@@ -1914,6 +1914,27 @@ async def test_a_topology_name_is_held_to_the_topology_routes_bound(user_client,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", ["true", "false"])
+async def test_a_long_name_is_refused_even_when_it_names_an_existing_topology(user_client, dry_run):
+    """A topology stored with a name over the bound (before the routes held one) is
+    not updated through the import: the row naming it is rejected by its length,
+    and the stored row is left as it was."""
+    name = "n" * 150
+    seeded = {"nodes": [], "edges": [], "marker": "kept"}
+    tid = await _seed_topology(name, USER_ID, seeded)
+    resp = await _import_json(
+        user_client, [{"name": name, "canvas": {"nodes": [], "edges": []}}], dry_run=dry_run
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "name: must be at most 100 characters")
+    ]
+    async with TestSessionLocal() as session:
+        stored = await session.get(Topology, uuid.UUID(tid))
+        assert (stored.name, stored.canvas_data) == (name, seeded)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
 @pytest.mark.parametrize("dry_run", [True, False])
 async def test_every_line_ending_imports_the_same_topologies(user_client, ending, dry_run):

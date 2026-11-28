@@ -310,6 +310,7 @@ _UNUSABLE_VISIBILITY = {
     "not_json": "<html>",
     "a_list": "[]",
     "ids_not_a_list": '{"device_ids": "x"}',
+    "ids_null": '{"device_ids": null}',
     "an_id_not_a_string": '{"device_ids": [5]}',
     "an_id_not_a_uuid": '{"device_ids": ["not-a-uuid"]}',
     "too_deep": "[" * 100_000 + "]" * 100_000,
@@ -403,3 +404,26 @@ async def test_a_routing_pass_body_of_the_documented_shape_is_read():
     with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer("null"))):
         await ctx.load_configs([other])
     assert (ctx.config(other), ctx.config_version_id(other)) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_visibility_object_with_no_device_ids_reads_as_none_visible():
+    """By decision (TOPO-CALL-1): an absent key is an empty set; a null one is not."""
+    from app.services import visible_devices
+
+    with patch.object(visible_devices, "call_service", AsyncMock(return_value=_answer("{}"))):
+        assert await visible_devices.fetch_visible_device_ids(uuid.uuid4(), "Bearer t") == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("falsy", ["null", "0", "0.0", '""', "false", "[]", "{}"])
+async def test_a_config_id_that_json_makes_false_reads_as_absent(falsy):
+    """By decision (TOPO-CALL-1): the config is read, with no version id."""
+    from app.services import l3_validation
+
+    device_id = uuid.uuid4()
+    ctx = l3_validation.L3InventoryContext()
+    body = '{"id": ' + falsy + ', "config": {"interfaces": {}}}'
+    with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer(body))):
+        await ctx.load_configs([device_id])
+    assert (ctx.config(device_id), ctx.config_version_id(device_id)) == ({"interfaces": {}}, None)
