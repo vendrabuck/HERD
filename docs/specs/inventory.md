@@ -696,13 +696,17 @@ filter pages through the device templates instead of stopping at the first 500
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`keeps an expanded row open when a list change still contains it`, `drops an expanded row whose id left the list and does not resurrect it`, `still clears the bulk selection on a list change while keeping the expansion`)
 - **INV-LIST-13.** An expanded row lists the device's ports and, per port, the device
-  and port it is cabled to, matched by port name. When the ports fetch or the
-  connections fetch fails, the row shows that failure (`Could not load this device's
-  ports.` or `Could not load this device's connections.`, then the server's reason) with
-  Retry in place of the list, never `No ports configured` or a column of `Not connected`
-  (issue #1320). \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`ExpandedPortsRow`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`resolves a connected port to the other device's name and port, linked to that device`, `shows an unconnected port as Not connected`); `frontend/src/test/pages/pageLoadFailureSecondary.test.tsx` (`a failed load shows the load error where it would fill, and Retry clears it`)
+  and port it is cabled to, matched by port name. When the ports fetch fails, the row
+  shows `Could not load this device's ports.` and the server's reason with Retry in place
+  of the list, never `No ports configured`; a device whose ports fetch answered empty
+  shows `No ports configured` whatever its connections fetch did. For a device with
+  ports, a failed connections fetch shows `Could not load this device's connections.`
+  and the reason with Retry in place of the list, never a column of `Not connected`
+  (issue #1320); a failed connections refresh while the list shows keeps the peers and
+  shows `Could not refresh this device's connections.` with the reason and Retry above
+  the list (issue #1590). \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`ExpandedPortsRow`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`resolves a connected port to the other device's name and port, linked to that device`, `shows an unconnected port as Not connected`, `a device with no ports shows No ports configured even when its connections read fails`, `a failed connections refresh keeps the peers under a refresh notice`); `frontend/src/test/pages/pageLoadFailureSecondary.test.tsx` (`a failed load shows the load error where it would fill, and Retry clears it`)
 - **INV-LIST-14.** Selection checkboxes and the Actions column (Copy) are shown to admins
   only; the bulk-action bar appears once an admin selects a device. Each row checkbox is
   named `Select device <name>` and the header checkbox `Select all devices on this page`;

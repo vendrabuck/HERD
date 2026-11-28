@@ -36,11 +36,12 @@ function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const utils = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>{node}</MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...utils, client };
 }
 
 // Two <dialog> elements are always mounted (BulkImportExport's import modal
@@ -305,11 +306,12 @@ describe("InventoryPage", () => {
     }
 
     async function renderAndExpand() {
-      renderWithProviders(<InventoryPage />);
+      const utils = renderWithProviders(<InventoryPage />);
       await waitFor(() =>
         expect(screen.getByText("fw-edge-01")).toBeInTheDocument(),
       );
       fireEvent.click(screen.getByLabelText("Expand ports"));
+      return utils;
     }
 
     it("shows a loading message while ports and connections are pending", async () => {
@@ -339,6 +341,74 @@ describe("InventoryPage", () => {
       await waitFor(() =>
         expect(screen.getByText("No ports configured")).toBeInTheDocument(),
       );
+    });
+
+    it("a device with no ports shows No ports configured even when its connections read fails", async () => {
+      server.use(
+        deviceListHandler(),
+        http.get("/api/inventory/devices/:id/ports", () => HttpResponse.json([])),
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ detail: "cabling is restarting" }, { status: 503 }),
+        ),
+      );
+      await renderAndExpand();
+      expect(await screen.findByText("No ports configured")).toBeInTheDocument();
+      expect(
+        screen.queryByText("Could not load this device's connections.", { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("a failed connections refresh keeps the peers under a refresh notice", async () => {
+      const cable = {
+        id: "conn-1",
+        device_a_id: "aaaaaaaa-1111-2222-3333-444444444444",
+        port_a: "eth0",
+        device_b_id: "bbbbbbbb-1111-2222-3333-444444444444",
+        port_b: "eth1",
+        connection_type: "ethernet",
+        notes: null,
+        created_by: "admin",
+        created_at: "2026-01-01T00:00:00Z",
+      };
+      server.use(
+        deviceListHandler(),
+        http.get("/api/inventory/devices/:id/ports", () =>
+          HttpResponse.json([
+            {
+              id: "port-1",
+              name: "eth0",
+              device_id: "aaaaaaaa-1111-2222-3333-444444444444",
+              template_id: "pt-1",
+              template_name: null,
+              template_icon: null,
+              field_data: {},
+              created_at: "2026-01-01T00:00:00Z",
+              updated_at: "2026-01-01T00:00:00Z",
+            },
+          ]),
+        ),
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ items: [cable], total: 1, skip: 0, limit: 500 }),
+        ),
+      );
+      const { client } = await renderAndExpand();
+      expect(await screen.findByText(/, eth1$/)).toBeInTheDocument();
+
+      server.use(
+        http.get("/api/cabling/connections", () =>
+          HttpResponse.json({ detail: "cabling is restarting" }, { status: 503 }),
+        ),
+      );
+      await client.invalidateQueries({ queryKey: ["connections"] });
+
+      const notice = await screen.findByText(
+        "Could not refresh this device's connections. cabling is restarting",
+      );
+      expect(notice.closest('[role="status"]')).not.toBeNull();
+      expect(screen.getByText(/, eth1$/)).toBeInTheDocument();
+      expect(
+        screen.queryByText("Could not load this device's connections.", { exact: false }),
+      ).not.toBeInTheDocument();
     });
 
     it("shows an unconnected port as Not connected", async () => {

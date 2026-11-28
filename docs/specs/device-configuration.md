@@ -1150,11 +1150,17 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
 
 **Rules.**
 
-- **CFG-UI-1.** The configuration section shows the version count, a table of versions
-  with author and time, an empty state, and an error line when the list fails; its
-  buttons are shown to every viewer, and the server decides who may use them. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
-  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`)
+- **CFG-UI-1.** The configuration section shows the version count and a table of every
+  version with author and time, read across all pages of the list (500 a page, newest
+  first, issue #1590), each version once even when one is saved between two page reads;
+  `No config versions yet.` and the count need a successful answer,
+  and a failed read of any page shows the shared load error (`Could not load config
+  versions.` with Retry) and no rows, never the empty text; a failed refresh while the
+  table shows keeps the rows and the count and shows `Could not refresh config versions.`
+  with the reason and Retry above the table, with no alert; its buttons are shown to
+  every viewer, and the server decides who may use them. \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone (issue #1590)`, `a created version refreshes the whole list through the real create hook`, `a failed refresh keeps the rows under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
 - **CFG-UI-2.** New version parses the text as JSON in the browser, an empty box being
   `{}`; a parse error is shown in the dialog and nothing is sent, and a server refusal
   shows the server's `detail`. \
@@ -1177,18 +1183,32 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   as given and a validation list as that text, never as an object. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`); `frontend/src/lib/errors.ts` (`configApplyErrorText`, `configRestoreErrorText`, `formatRestoreBlocked`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and a validation list as text (#1314)`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`, `test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
-- **CFG-UI-5.** The scheduled-applies panel is hidden when the device has no jobs,
-  refreshes every 10 seconds, shows each job's status and error, and offers Cancel only
-  on a `pending` job; a refused cancel shows the server's string `detail`, else
-  `Cancel failed`. \
-  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`) \
-  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
+- **CFG-UI-5.** The scheduled-applies panel reads one page of 50 jobs, the latest
+  scheduled first, and refreshes it every 10 seconds, one request per poll and never a
+  walk of every page; when the server's `total` is larger it says `Showing <rows> of
+  <total> scheduled applies, latest scheduled first.` under the table, and a `pending`
+  job past that page cannot be cancelled from the panel. The panel is hidden only when
+  the list answered empty. A failed read before any list arrived shows the heading and
+  the shared load error (`Could not load scheduled applies.` with the reason and Retry)
+  in place of the table; a failed poll keeps the rows that already arrived (or, over a
+  list that was empty, shows the heading) under `Could not refresh scheduled applies.`
+  with the reason and Retry, with no alert, until a poll answers. Each job shows its
+  status and error, with Cancel only on a `pending` job; a refused cancel shows the
+  server's string `detail`, else `Cancel failed` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`, `APPLY_JOBS_PAGE_SIZE`); `frontend/src/components/ui/PageCapNotice.tsx` (`PageCapNotice`); `frontend/src/components/ui/LoadError.tsx` (`LoadError`, `LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`, `a %s failure shows the load error under the heading, and Retry loads the rows`, `a failed poll keeps the rows under a refresh notice, and the next good poll clears it`, `no jobs, then a failed poll, shows the heading and the refresh notice; a good empty poll hides the panel`, `50 jobs of 73 show the cap line, one page per poll and no page walk`, `%s shows no cap line`, `names the page, the total, and the order`, `renders nothing for %s`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-UI-6.** The dry-run review polls the job every 2 seconds until it is `success`,
   `failed`, `skipped`, or `cancelled`, then shows the run's transcript with simulated
   rows marked; Confirm is enabled only on `success`, Cancel dry-run only before it, and a
   refused confirm shows the server's `detail`. \
   Enforced in: `frontend/src/components/reservations/AIApplyConfirmModal.tsx` (`AIApplyConfirmModal`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJob`, `TERMINAL_STATUSES`) \
   Pinned by: `frontend/src/test/components/AIApplyConfirmModal.test.tsx` (`renders the plan text`, `shows the transcript with simulated badges once the dry-run succeeds`, `disables Confirm until the dry-run succeeds`, `Confirm POSTs to the confirm endpoint and closes`, `Cancel button cancels the dry-run job and closes`, `Confirm endpoint 409 (failed dry-run) surfaces detail as toast`); `tests/e2e/test_device_config_apply_playwright.py` (`test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
+- **CFG-UI-7.** A failed read behind View (`Could not load this config version.`) or
+  Compare (`Could not load the config diff.`), or an answer that is not a JSON object,
+  shows the shared load error with Retry as the dialog's body, never an empty dialog;
+  while a Retry's read is on its way the button reads `Retrying...` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`ViewVersionModal`, `DiffModal`) \
+  Pinned by: `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `a 200 JSON list shows the load error, never an empty dialog`, `the Retry button reads Retrying... until the read answers`)
 
 **Out of scope.** When the assistant opens the review (`ai-features.md`); the rest of
 the device page (`inventory.md`).

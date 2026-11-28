@@ -5,6 +5,7 @@ import {
   LIST_MAX_PAGES,
   LIST_PAGE_SIZE_MAX,
   ListPagingLimitError,
+  uniqueById,
 } from "@/api/paging";
 import type { PaginatedResponse } from "@/types/pagination.types";
 
@@ -106,5 +107,28 @@ describe("fetchAllPages (issues #703 and #1336)", () => {
     await expect(fetchAllPages(fetchPage, { pageSize: 3, maxPages: 4 })).rejects.toBeInstanceOf(
       ListPagingLimitError,
     );
+  });
+});
+
+describe("uniqueById (issues #1590 and #1591)", () => {
+  it("drops a repeated id, keeping the first occurrence and the order", () => {
+    const rows = [
+      { id: "c", n: 1 },
+      { id: "b", n: 2 },
+      { id: "b", n: 3 },
+      { id: "a", n: 4 },
+      { id: "c", n: 5 },
+    ];
+    expect(uniqueById(rows)).toEqual([
+      { id: "c", n: 1 },
+      { id: "b", n: 2 },
+      { id: "a", n: 4 },
+    ]);
+  });
+
+  it("returns a list with no repeats unchanged, and an empty list as empty", () => {
+    const rows = [{ id: "x" }, { id: "y" }];
+    expect(uniqueById(rows)).toEqual(rows);
+    expect(uniqueById([])).toEqual([]);
   });
 });

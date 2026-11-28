@@ -30,7 +30,8 @@ export class ListPagingLimitError extends Error {
  * order is a stable total order and no row is inserted or deleted during the
  * walk. Every route this helper walks has a total order since #1589, so only a
  * list that changes during the walk can still repeat a row or skip one at a
- * page boundary; this helper neither detects nor removes that.
+ * page boundary; this helper neither detects nor removes that. A caller whose
+ * list gains rows during a walk drops the repeats with `uniqueById`.
  *
  * The walk ends on a short page (fewer rows than asked for, an empty page
  * included) or when `skip` reaches the reported `total`. Pages are fetched
@@ -56,4 +57,21 @@ export async function fetchAllPages<T>(
     if (skip >= resp.total) return all;
   }
   throw new ListPagingLimitError(maxPages);
+}
+
+/**
+ * The rows with any repeated `id` dropped, keeping the first occurrence and the
+ * order (#1590, #1591). For a walked list that can grow during the walk: a row
+ * saved at the head of a newest-first list between two page reads shifts every
+ * older row down one place, so the row at the page boundary comes back as the
+ * first row of the next page. Dropping the repeat keeps each row once (and
+ * React's keys unique); the new row itself arrives with the next read.
+ */
+export function uniqueById<T extends { id: string }>(rows: T[]): T[] {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
 }

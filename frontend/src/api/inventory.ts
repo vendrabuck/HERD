@@ -223,6 +223,28 @@ export function usePaginatedDevices(
   });
 }
 
+/** Rows one device typeahead asks for; more matches show `MoreMatchesNotice`. */
+export const DEVICE_SEARCH_LIMIT = 20;
+
+/**
+ * The query behind a device typeahead (issue #1590), rendered by
+ * `DeviceSearchResults`: the first DEVICE_SEARCH_LIMIT devices whose name
+ * contains the trimmed `term`, fetched only once the term has at least
+ * `minLength` characters (and at least one). `active` says whether the
+ * typeahead shows its results; an inactive search sends no request.
+ */
+export function useDeviceSearch(term: string, minLength = 2) {
+  const trimmed = term.trim();
+  const active = trimmed.length >= Math.max(minLength, 1);
+  const query = usePaginatedDevices(
+    active ? { search: trimmed } : undefined,
+    0,
+    DEVICE_SEARCH_LIMIT,
+    { enabled: active },
+  );
+  return { active, query };
+}
+
 // Issue #391: inventory's DELETE /devices/{id} 409s with a structured
 // {error: "device_in_use", reservation_ids: [...]} detail (no `message` key,
 // unlike the fork-save conflict shape), so the generic `detail` string
