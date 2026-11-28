@@ -245,7 +245,8 @@ def _suggestion_refusal(body: object) -> str | None:
 
 def _purpose_classify_403_is_feature_off(resp) -> tuple[bool, object]:
     """Decide whether a 403 from the orchestrator means "the feature is off
-    there" (issue #706), and return the detail for logging either way.
+    there" (issue #706), and return the detail either way (the caller logs its
+    JSON type, never its text).
 
     A 403 on this route is reachable two ways: the flag-off refusal, and an
     internal-token mismatch (see docs/AI_PURPOSE_CLASSIFICATION.md and
@@ -427,13 +428,14 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
                 },
             )
             return "feature_off"
+        # The detail's JSON type only, never its text (it is the orchestrator's).
         logger.warning(
             "Purpose classify reconcile: orchestrator returned 403 for %s that is "
-            "NOT the feature-off marker (detail=%r); this looks like an "
+            "NOT the feature-off marker (a detail of type %s); this looks like an "
             "internal-token mismatch, not the flag being off; ending this tick, "
             "no attempt counted",
             reservation_id,
-            detail,
+            type(detail).__name__,
             extra={
                 "action": "purpose_classify_forbidden",
                 "reservation_id": str(reservation_id),

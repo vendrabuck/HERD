@@ -28,6 +28,7 @@ from app.schemas.reservation import (
     UserPurposeBucket,
     UtilizationReport,
 )
+from app.services.upstream_failure import failure_label, unreachable
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ async def _cabling_fork_devices_batch(reservation_ids: list[uuid.UUID]) -> httpx
             ),
         )
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
+        raise unreachable("cabling", exc) from exc
 
 
 async def _fetch_transit_devices(
@@ -708,7 +709,10 @@ async def fetch_fleet_devices(auth_header: str | None) -> list[dict] | None:
                     )
                     return None
     except httpx.HTTPError as exc:
-        logger.warning("inventory service unreachable while building the fleet report: %s", exc)
+        logger.warning(
+            "inventory service unreachable while building the fleet report (%s)",
+            failure_label(exc),
+        )
         return None
     return devices
 
@@ -761,10 +765,12 @@ async def fetch_user_groups_map(
                         (uuid.UUID(g["id"]), g.get("name") or "") for g in (groups or [])
                     ]
     except httpx.HTTPError as exc:
-        logger.warning("auth service unreachable while fetching user groups: %s", exc)
+        logger.warning(
+            "auth service unreachable while fetching user groups (%s)", failure_label(exc)
+        )
         return empty
     except Exception as exc:
-        logger.warning("unexpected error in fetch_user_groups_map: %s", exc)
+        logger.warning("unexpected error in fetch_user_groups_map (%s)", type(exc).__name__)
         return empty
     return {uid: out.get(uid, []) for uid in user_ids}
 
@@ -825,10 +831,12 @@ async def fetch_execution_run_count(
                 headers={"Authorization": auth_header},
             )
     except httpx.HTTPError as exc:
-        logger.warning("execution service unreachable for run-count lookup: %s", exc)
+        logger.warning(
+            "execution service unreachable for run-count lookup (%s)", failure_label(exc)
+        )
         return None
     if resp.status_code != 200:
-        logger.warning("execution run-count returned %s: %s", resp.status_code, resp.text[:200])
+        logger.warning("execution run-count returned %s", resp.status_code)
         return None
     try:
         data = read_json_body(resp, expect=dict)

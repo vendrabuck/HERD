@@ -1077,8 +1077,9 @@ reconcile on the expiration loop.
   Enforced in: `services/reservations/app/services/reservation_service.py` (`_create_reservation_fork_best_effort`, `_create_reservation_fork`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_create_reservation_fork_posts_to_cabling`, `test_create_reservation_fork_skips_when_no_topology`); `services/reservations/tests/test_expiration.py` (`test_activation_threads_booking_user_into_fork`)
 - **RES-FORK-2.** A cabling 409 or 422 on fork create is final: not retried, logged
-  `reservation_fork_membership_refused`, and remembered in process memory so the sweep
-  stops retrying it; the reservation stays `ACTIVE`, unwired. A 409 or 422 whose body
+  `reservation_fork_membership_refused` with cabling's status code and, for the
+  membership shape, the named device ids that are UUID strings (never cabling's
+  detail), and remembered in process memory so the sweep stops retrying it; the reservation stays `ACTIVE`, unwired. A 409 or 422 whose body
   cannot be read (it does not parse, or is not an object) is final the same way, with an
   empty detail (issue #1577). A 2xx whose body cannot be read (it does not parse, or is
   not an object with an integer `version_number`) is not retried, stages nothing, and
@@ -1301,16 +1302,19 @@ caller.
   Enforced in: `services/reservations/app/main.py` (`lifespan`); `services/common/herd_common/jetstream.py` (`connect_nats`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_creates_and_cancels_expiration_and_purpose_classify_tasks`)
 - **RES-EVENT-5.** The startup warning states what happens to events (issue #1337). A
-  failed connect logs `NATS unavailable at <url>; events wait in the outbox until the
+  failed connect logs `NATS unavailable (<class>); events wait in the outbox until the
   service is restarted with the broker reachable`. A connect that succeeds while
   ensuring the `HERD_RESERVATIONS` stream fails (a create of a missing stream, or an
   update of one that exists, which execution may have created) keeps the connection,
   so the relay publishes: at once when the stream exists, and while it is missing each
   failed publish leaves its row in the outbox for the next tick
   (`operations-and-observability.md`, OPS-OUTBOX-6). That case logs `JetStream stream
-  HERD_RESERVATIONS could not be created or updated at <url>; the connection is kept,
+  HERD_RESERVATIONS could not be created or updated (<class>); the connection is kept,
   so events publish if the stream exists, and while it is missing they wait in the
-  outbox and the relay retries them every tick`. Neither says events are skipped. \
+  outbox and the relay retries them every tick`. Neither says events are skipped. Each
+  names the exception's class only; no startup line holds the broker URL
+  (`NATS_URL`, which can carry `user:password@`), and a successful connect logs
+  `Connected to NATS`. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect`)
 
@@ -1370,6 +1374,66 @@ user in the flow. The routes, callers, and answers are in section 7.
 
 **Out of scope.** How each caller uses the answer is in that caller's area.
 
+### 8.16 Failure wording for calls to other services
+
+**What it does.** When reservations cannot get an answer it can use from inventory,
+cabling, execution, auth, or the AI orchestrator, the error a user sees and the log
+line an operator reads say which service and what kind of failure, in fixed words.
+Neither repeats what the other service answered or the text of the error raised.
+
+**Surfaces.** The 503 answers of create, PATCH, and the fork and wiring routes
+(section 9); the log lines of the background fork calls, the inventory status
+updates, the utilization report's reads, the purpose classify sweep, and the
+provision-result callback.
+
+**Rules.**
+
+- **RES-UPSTREAM-1.** A failed call to inventory, cabling, or execution on create,
+  PATCH, or a fork or wiring route answers 503 with fixed text: `Failed to contact
+  <service> service: <label>` for a call that raised, where the label is `HTTP
+  <status>` for an error status raised by `raise_for_status` and the exception's class
+  name otherwise; `<call> returned <status>` for an error status (`Cabling validation`,
+  `Cabling fork-create`); `Failed to reserve devices in inventory after retries`; or
+  one of the fixed constants (the hypervisor check, the unusable answers of issue
+  #1577, a missing internal token). The detail never holds the body the service
+  answered or the exception's own text. The background fork create, archive, and
+  prune raise the same messages (`Cabling fork-create returned <status>`, `Cabling
+  fork-archive returned <status>`, `Cabling fork prune returned <status>`), so the
+  traceback their failure lines attach starts with that message; for a call that
+  raised it also holds the httpx exception the message chains. \
+  Enforced in: `services/reservations/app/services/upstream_failure.py` (`UpstreamUnavailable`, `unreachable`, `answered`, `failure_label`); `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_validate_topology_connectivity`, `_create_reservation_fork`, `_prune_removed_devices_from_fork`, `_cabling_fork_call`, `_execution_wiring_call`, `_lazy_create_reservation_fork`, `_archive_reservation_fork`, `create_reservation`, `update_reservation`, `INVENTORY_RESERVE_FAILED`, `HYPERVISOR_CHECK_UNAVAILABLE`) \
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unreachable_names_the_class_and_never_the_text`, `test_an_http_status_error_is_labelled_by_its_status`, `test_answered_names_the_call_and_the_status`, `test_create_names_the_class_when_inventory_cannot_be_reached`, `test_create_names_the_status_when_inventory_answers_an_error`, `test_create_names_only_the_status_of_a_failed_topology_validation`, `test_create_names_the_class_when_cabling_validation_cannot_be_reached`, `test_create_names_the_class_when_a_dynamic_template_cannot_be_read`, `test_a_create_whose_inventory_flip_fails_answers_fixed_wording`, `test_patch_names_the_class_when_inventory_cannot_be_reached`, `test_a_failed_lazy_fork_create_names_only_the_status`, `test_a_fork_route_without_an_internal_token_answers_fixed_wording`, `test_a_failed_fork_create_logs_only_the_status`, `test_a_failed_fork_archive_logs_only_the_status`, `test_a_failed_fork_prune_logs_only_the_status`, `test_a_fork_call_that_cannot_reach_cabling_logs_only_the_class`); `services/reservations/tests/test_fork_endpoints.py` (`test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_transport_error_is_503_failed_to_contact`)
+- **RES-UPSTREAM-2.** A route that catches a `RuntimeError` (create, PATCH, and the
+  fork and wiring routes) answers 503 with its message only when it is an
+  `UpstreamUnavailable`, the type every message of RES-UPSTREAM-1 has
+  (`UpstreamAnswerUnusable` is one). Any other `RuntimeError` answers `A service this
+  request depends on is unavailable` and is logged at WARNING with `action`
+  `unexpected_runtime_error` and its class name only. \
+  Enforced in: `services/reservations/app/services/upstream_failure.py` (`unavailable_detail`, `SERVICE_UNAVAILABLE`); `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `update_reservation_by_id`, `get_reservation_fork`, `update_reservation_fork_canvas`, `save_reservation_fork`, `get_reservation_fork_version`, `restore_reservation_fork_version`, `get_reservation_wiring_status`, `retry_reservation_wiring`) \
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unavailable_detail_keeps_a_worded_failure_and_replaces_any_other`, `test_a_runtime_error_no_rule_words_answers_the_fixed_detail`)
+- **RES-UPSTREAM-3.** A log line about a failed call names the status code, the
+  exception's class name (or the label of RES-UPSTREAM-1), and ids only: a failed
+  inventory device status update (`Failed to update device <id> status to <status>
+  (<label>)`), cabling's definitive fork-create refusal (RES-FORK-2), the utilization
+  report's inventory, auth, and execution reads (`(<label>)` for a call that raised,
+  the class name for any other error of the group read, the status alone for an
+  error status of the run count), and an orchestrator 403 that is not the feature-off
+  marker (the detail's JSON type, never its text). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_update_device_statuses`, `_create_reservation_fork_best_effort`, `ForkMembershipRefused`); `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `fetch_user_groups_map`, `fetch_execution_run_count`); `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`) \
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_a_create_whose_inventory_flip_fails_answers_fixed_wording`, `test_a_definitive_fork_refusal_logs_the_status_and_device_ids_only`, `test_the_fleet_read_logs_only_the_class`, `test_the_group_read_logs_only_the_class`, `test_the_run_count_read_logs_only_the_class_or_status`); `services/reservations/tests/test_reservation_service_unit.py` (`test_fork_best_effort_port_claim_409_is_not_retried`, `test_create_reservation_fork_raises_membership_refused_on_any_409`); `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_403_bad_token_is_not_feature_off`)
+- **RES-UPSTREAM-4.** A failed provision result is logged at ERROR with `action`
+  `reservation_provision_result_failed` and `error_class`: the class name when the
+  callback's `error` is exactly execution's form `provisioning failed: <ClassName>`,
+  else null (the message then reads `no class name reported`). No other text of
+  `error` is logged or stored. \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`apply_provision_result`, `_provision_error_class`, `_PROVISION_ERROR_FORM`) \
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_a_failed_provision_result_logs_only_a_class_name`)
+
+**Out of scope.** What a relayed 4xx or 5xx detail of a fork or wiring route holds is
+RES-FORK-10 and RES-FORK-18; validation messages built from inventory or cabling data
+(device and template names, topology edge and route reasons) are the create rules of
+sections 8.1, 8.3, and 8.4.
+
 ## 9. Errors
 
 FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
@@ -1423,19 +1487,21 @@ sweep, and event delivery never return an error to a caller.
 | 422 | `Hypervisor '<name>' is disabled; these dynamic templates cannot be booked until an admin enables it: <template names>` | a dynamic request names a template whose hypervisor is disabled | RES-DYN-10 |
 | 422 | `The hypervisor of these dynamic templates no longer exists: <template names>` | the hypervisor a dynamic template names is gone | RES-DYN-10 |
 | 422 | `Calendar window cannot exceed <N> days (requested ...)` | calendar window too wide | RES-CAL-2 |
-| 503 | `Failed to contact inventory service: ...` | inventory unreachable on create, PATCH, or the dynamic template check | RES-CREATE-9, RES-PATCH-6, RES-DYN-1 |
+| 503 | `Failed to contact inventory service: <label>` (`HTTP <status>` for an error status, else the exception's class name) | inventory unreachable or answering an error status on create, PATCH, or the dynamic template check | RES-CREATE-9, RES-PATCH-6, RES-DYN-1, RES-UPSTREAM-1 |
 | 503 | `Inventory service returned an answer that could not be read` | inventory answered 200 on create, PATCH, or the dynamic template check with a body that does not parse or is not the declared shape | RES-CREATE-9, RES-PATCH-6, RES-DYN-1 |
 | 503 | `Failed to contact inventory service while checking the hypervisor of a dynamic template` | the hypervisor check of a dynamic request cannot be answered | RES-DYN-10 |
 | 503 | `Could not verify device visibility; reservations were not returned. Retry the request.` | non-admin calendar while the visibility lookup cannot be answered | RES-CAL-3 |
-| 503 | `Failed to reserve devices in inventory after retries: ...` | the create-path inventory flip exhausted its attempts | RES-CREATE-15 |
-| 503 | `Cabling validation returned <status>: ...` or `Failed to contact cabling service: ...` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8 |
+| 503 | `Failed to reserve devices in inventory after retries` | the create-path inventory flip exhausted its attempts | RES-CREATE-15, RES-UPSTREAM-1 |
+| 503 | `Cabling validation returned <status>` or `Failed to contact cabling service: <class>` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8, RES-UPSTREAM-1 |
 | 503 | `Cabling validation returned an answer that could not be read` | cabling answered topology validation on create or PATCH with a 200 whose body does not parse or is not the declared shape | RES-TOPO-6, RES-PATCH-8 |
 | 503 | `{"error": "purpose_classification_disabled"}` | Classify now with the feature off | RES-PURPOSE-13 |
 | 503 | cabling's JSON detail, or `Cabling service is unavailable` | cabling answered 5xx to a forwarded fork call, or a 2xx whose body does not parse (the latter is always the fixed wording) | RES-FORK-10 |
 | 503 | `Cabling answered the save, but its answer could not be read; reload the fork to see whether the save was applied` | cabling answered a save with a 2xx whose body does not parse | RES-FORK-10 |
 | 503 | `Execution service is unavailable` | execution answered 5xx to a wiring call, or a 2xx whose body does not parse | RES-FORK-18 |
-| 503 | `Cabling fork-create returned <status>: ...` | a lazy fork create was refused or failed | RES-FORK-5 |
-| 503 | `Failed to contact cabling service: ...` or the execution equivalent | the upstream of a fork or wiring route is unreachable | RES-FORK-10, RES-FORK-18 |
+| 503 | `Cabling fork-create returned <status>` | a lazy fork create was refused or failed | RES-FORK-5, RES-UPSTREAM-1 |
+| 503 | `Failed to contact cabling service: <class>` or the execution equivalent | the upstream of a fork or wiring route is unreachable | RES-FORK-10, RES-FORK-18, RES-UPSTREAM-1 |
+| 503 | `internal_api_token not configured; cannot reach cabling forks`, or `...; cannot reach execution` | a fork or wiring route while reservations has no internal token | RES-UPSTREAM-1 |
+| 503 | `A service this request depends on is unavailable` | a create, PATCH, fork, or wiring route caught a `RuntimeError` that no rule words | RES-UPSTREAM-2 |
 
 Codes that are success but do nothing: cancel on a finished reservation answers 204
 (RES-CANCEL-3); release on a non-`ACTIVE` reservation answers 200 with the unchanged

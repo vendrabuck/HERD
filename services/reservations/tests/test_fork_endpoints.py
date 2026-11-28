@@ -28,6 +28,7 @@ from app.services import reservation_service
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
+from tests._upstream_bodies import MARKER
 
 OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
@@ -654,16 +655,18 @@ async def test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status(
     cabling, create_status
 ):
     """400 is the lowest refusal; the 409 RES-FORK-5 names is among them. The re-read
-    would return the fork, so a refusal that fell through would answer 200."""
+    would return the fork, so a refusal that fell through would answer 200. The detail
+    names cabling's status only, never what cabling's body held."""
     rid = await _insert_reservation(topology_id=uuid.uuid4())
     _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
     cabling.post(FORKS_URL).mock(
-        return_value=_resp(create_status, {"detail": "fork create refused"})
+        return_value=_resp(create_status, {"detail": f"fork create refused {MARKER}"})
     )
     async with _client_as(OWNER_ID) as ac:
         resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 503
-    assert resp.json()["detail"].startswith(f"Cabling fork-create returned {create_status}: ")
+    assert resp.json() == {"detail": f"Cabling fork-create returned {create_status}"}
+    assert MARKER not in resp.text
 
 
 @pytest.mark.asyncio
@@ -678,11 +681,12 @@ async def test_a_lazy_create_that_cannot_reach_cabling_answers_503(cabling, erro
     rule says what it becomes, so an `except` narrowed to TransportError passes here."""
     rid = await _insert_reservation(topology_id=uuid.uuid4())
     _mock_fork_read(cabling, rid, {"reservation_id": str(rid)})
-    cabling.post(FORKS_URL).mock(side_effect=error)
+    cabling.post(FORKS_URL).mock(side_effect=error(f"{MARKER} http://u:pw@cabling"))
     async with _client_as(OWNER_ID) as ac:
         resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 503
-    assert resp.json()["detail"].startswith("Failed to contact cabling service: ")
+    assert resp.json() == {"detail": f"Failed to contact cabling service: {error.__name__}"}
+    assert MARKER not in resp.text
 
 
 @pytest.mark.asyncio

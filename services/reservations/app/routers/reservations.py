@@ -69,6 +69,7 @@ from app.services.reservation_service import (
     stage_wiring_changed,
     update_reservation,
 )
+from app.services.upstream_failure import unavailable_detail
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ async def create_new_reservation(
     except LookupError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return reservation
 
 
@@ -770,7 +771,7 @@ async def update_reservation_by_id(
     except LookupError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     return reservation
@@ -1069,7 +1070,7 @@ async def get_reservation_fork(
                 "GET", f"/internal/forks/{reservation_id}", on_behalf_of=on_behalf_of
             )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1103,7 +1104,7 @@ async def update_reservation_fork_canvas(
             json_body={"canvas_data": body.canvas_data},
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1167,7 +1168,7 @@ async def save_reservation_fork(
             timeout=_FORK_SAVE_TIMEOUT_SECONDS,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
 
     # Relay first: this raises the mapped user-facing error on a cabling 4xx/5xx (the
     # ARCHIVED 409, a port-conflict 409, or a 503), so nothing is staged when the save
@@ -1241,7 +1242,7 @@ async def get_reservation_fork_version(
             "GET", f"/internal/forks/{reservation_id}/versions/{version_id}"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1280,7 +1281,7 @@ async def restore_reservation_fork_version(
             "POST", f"/internal/forks/{reservation_id}/versions/{version_id}/restore"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1311,7 +1312,7 @@ async def get_reservation_wiring_status(
             "GET", f"/internal/reservations/{reservation_id}/wiring-status"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_execution_response(resp)
 
 
@@ -1355,7 +1356,7 @@ async def retry_reservation_wiring(
             "POST", f"/internal/reservations/{reservation_id}/wiring/retry"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_execution_response(resp)
 
 

@@ -62,7 +62,7 @@ from sqlalchemy import select
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
 from tests._route_table import otherwise_valid_request, path_segments, routes_where
-from tests._upstream_bodies import NOT_AN_OBJECT, UNPARSEABLE, assert_nothing_leaked
+from tests._upstream_bodies import MARKER, NOT_AN_OBJECT, UNPARSEABLE, assert_nothing_leaked
 from tests._upstream_bodies import answer as bad_answer
 
 OWNER_ID = str(uuid.uuid4())
@@ -474,14 +474,17 @@ async def test_an_upstream_transport_error_is_503_failed_to_contact(network, met
     connect failure, a timeout, a protocol error): what RES-FORK-10 calls a transport
     failure and RES-FORK-18 an absence. An httpx error outside TransportError (`DecodingError`,
     `TooManyRedirects`) is not tried: no rule says what it becomes, so an `except`
-    narrowed to TransportError passes here."""
+    narrowed to TransportError passes here. The error's own text (here a marker and an
+    address with userinfo) never reaches the answer: the detail names the class only."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     service = _upstream_of(method, route)[0]
-    network.route().mock(side_effect=error)
+    network.route().mock(side_effect=error(f"{MARKER} http://svc-user:svc-pw@upstream"))
     async with _client_as(OWNER_ID, "user") as ac:
         resp = await ac.request(method, **_request_for(route, target.id))
     assert resp.status_code == 503
-    assert resp.json()["detail"].startswith(f"Failed to contact {service} service: ")
+    assert resp.json() == {"detail": f"Failed to contact {service} service: {error.__name__}"}
+    assert MARKER not in resp.text
+    assert "svc-pw" not in resp.text
     assert network.calls.call_count == 1
 
 
