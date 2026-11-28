@@ -216,7 +216,7 @@ async def create_template_from_topology(
     topology = await db.get(Topology, topology_id)
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
-    require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
+    await require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
 
     # _extract_role_template already reduces every device dict to {"role": ...},
     # a minimal shape with nothing outside the allowlist by construction; strip
@@ -249,7 +249,7 @@ async def get_template(
     template = await db.get(TopologyTemplate, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
+    await require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
     # Read-side strip (belt and braces, see routes/topologies.py's
     # get_topology): never mutates the ORM object, only the response value.
     detail = TemplateDetail.model_validate(template)
@@ -275,7 +275,7 @@ async def update_template(
         raise HTTPException(status_code=403, detail="Not authorized to modify this template")
     if body.canvas_data is None:
         # As a topology PUT: the answer carries the stored canvas.
-        require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
+        await require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
 
     if body.name is not None:
         template.name = body.name
@@ -321,7 +321,7 @@ async def instantiate_template(
     template = await db.get(TopologyTemplate, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
-    require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
+    await require_readable_canvas(template.canvas_data, kind="template", row_id=template.id)
 
     role_assignments = body.role_assignments or {}
     # This creates a real Topology/TopologyVersion row directly, bypassing

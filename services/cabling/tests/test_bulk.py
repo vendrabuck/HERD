@@ -2060,6 +2060,45 @@ async def test_the_device_names_are_collected_with_the_parse(user_client):
     ]
 
 
+@pytest.mark.asyncio
+async def test_each_record_is_judged_once_with_the_parse(user_client, monkeypatch):
+    """Each record's shape reason is computed once, on the parse's worker thread,
+    and the row loop rejects by that reason without judging the canvas again."""
+    from app.services import bulk_service
+
+    loop_thread = threading.get_ident()
+    calls: list[int] = []
+    real_reason = bulk_service._record_shape_reason
+    real_problem = bulk_service.canvas_problem
+
+    def recording_reason(rec):
+        calls.append(threading.get_ident())
+        return real_reason(rec)
+
+    def recording_problem(canvas):
+        calls.append(threading.get_ident())
+        return real_problem(canvas)
+
+    monkeypatch.setattr(bulk_service, "_record_shape_reason", recording_reason)
+    monkeypatch.setattr(bulk_service, "canvas_problem", recording_problem)
+    items = [
+        {"name": "lab", "canvas": {"nodes": [{"id": "n1"}], "edges": []}},
+        {"name": "bad", "canvas": {"nodes": "not-a-list"}},
+        {"name": "other"},
+    ]
+    with _resolver({}):
+        resp = await _import_json(user_client, items, dry_run="true")
+    assert resp.status_code == 200, resp.text
+    assert [(r["identity"], r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("lab", "create", None),
+        ("bad", "reject", "canvas.nodes: must be a list"),
+        ("other", "create", None),
+    ]
+    # One reason and one canvas check per record, none on the loop's thread.
+    assert len(calls) == 2 * len(items)
+    assert loop_thread not in calls
+
+
 class _RefusingExecutor(concurrent.futures.ThreadPoolExecutor):
     """A default executor that fails any work handed to it."""
 

@@ -470,22 +470,24 @@ def rewrite_canvas_names_to_ids(
 # Import ----------------------------------------------------------------------
 
 
-def _read_import(raw: bytes, fmt: str) -> tuple[list[Any], set[str]]:
+def _read_import(raw: bytes, fmt: str) -> tuple[list[Any], list[str | None], set[str]]:
     """The import's CPU work, run on a bulk worker thread (issue #1417): the file
-    parsed into records, and every device name the records carry. A record the row
-    loop will reject for its shape (issue #1573) adds no name: this pass reads every
-    record before any row runs."""
+    parsed into records, each record's shape reason (`_record_shape_reason`, None
+    for a record that has the shape), and every device name the records carry. The
+    row loop rejects a record by the reason computed here and judges its shape
+    nowhere else; a record with a reason adds no name."""
     if fmt == "json":
         records = parse_json_topologies(raw)
     elif fmt == "csv":
         records = parse_csv_topologies(raw)
     else:
         raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
+    reasons = [_record_shape_reason(rec) for rec in records]
     all_names: set[str] = set()
-    for rec in records:
-        if _record_shape_reason(rec) is None:
+    for rec, reason in zip(records, reasons, strict=True):
+        if reason is None:
             all_names |= _collect_device_names(rec.get("canvas"))
-    return records, all_names
+    return records, reasons, all_names
 
 
 async def import_topologies(
@@ -498,7 +500,7 @@ async def import_topologies(
     actor_role: str = "user",
     authorization: str | None = None,
 ) -> BulkImportReport:
-    records, all_names = await run_bulk_work(_read_import, raw, fmt)
+    records, reasons, all_names = await run_bulk_work(_read_import, raw, fmt)
 
     # Issue #908: resolve the caller's device visibility ONCE per request,
     # before any name is resolved or any row is judged, mirroring the #763
@@ -525,9 +527,18 @@ async def import_topologies(
     except Exception as exc:
         logger.warning("import_device_name_resolve_failed error=%s", type(exc).__name__)
         raise HTTPException(status_code=503, detail=IMPORT_RESOLVE_UNAVAILABLE_DETAIL) from None
+    # A resolved id is the one value name resolution writes into a canvas
+    # (`data.device.id`), and the shape check requires a string there: an answer
+    # holding anything else is refused as one that could not be used (a null one
+    # leaves its name unresolved, as an absent one does).
+    if not all(
+        device_id is None or isinstance(device_id, str) for device_id in name_to_id.values()
+    ):
+        logger.warning("import_device_name_resolve_unusable reason=device_id_not_a_string")
+        raise HTTPException(status_code=503, detail=IMPORT_RESOLVE_UNAVAILABLE_DETAIL)
 
     is_admin = actor_role in ("admin", "superadmin")
-    rows_args = (records, name_to_id, visible_ids, actor_id, actor_name, is_admin)
+    rows_args = (records, reasons, name_to_id, visible_ids, actor_id, actor_name, is_admin)
     if dry_run:
         # Issue #1064: the dry run is a rehearsal of the commit, not a
         # separate code path, so its report equals the committing report row
@@ -543,6 +554,7 @@ async def import_topologies(
 async def _import_topology_rows(
     db: AsyncSession,
     records: list[dict[str, Any]],
+    reasons: list[str | None],
     name_to_id: dict[str, str],
     visible_ids: set[uuid.UUID] | None,
     actor_id: uuid.UUID,
@@ -550,15 +562,15 @@ async def _import_topology_rows(
     is_admin: bool,
 ) -> BulkImportReport:
     """Run every topology row through the real create and update path on `db`
-    (the request session, or a rehearsal session for a dry run)."""
+    (the request session, or a rehearsal session for a dry run). `reasons` holds
+    each record's shape reason, computed with the parse (`_read_import`)."""
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
     from app.services.topology_validation import run_full_topology_validation
 
     report = _empty_report(False)
 
-    for index, rec in enumerate(records):
-        shape_reason = _record_shape_reason(rec)
+    for index, (rec, shape_reason) in enumerate(zip(records, reasons, strict=True)):
         if shape_reason is not None:
             name = rec.get("name") if isinstance(rec, dict) else None
             report.rows.append(
@@ -611,21 +623,6 @@ async def _import_topology_rows(
                 # route does (issue #763), so it reports the existing
                 # `missing_device` reason and never reaches the L3 pass.
                 rewritten = redact_invisible_device_nodes(rewritten, visible_ids)
-
-            # The canvas about to be stored, device ids now the ones inventory
-            # answered, is held to the shape check once more, as every canvas
-            # write is (TOPO-SHAPE-5).
-            stored_problem = canvas_problem(rewritten)
-            if stored_problem is not None:
-                report.rows.append(
-                    RowResult(
-                        row=index,
-                        action="reject",
-                        identity=name,
-                        reason=stored_problem.text("canvas"),
-                    )
-                )
-                continue
 
             # Run the existing full validator (edges + L3) against the rewritten
             # canvas before any write; it is read-only, reading connections (and,

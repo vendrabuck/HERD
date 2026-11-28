@@ -11,16 +11,20 @@ fails here.
 import copy
 import json
 import math
+import threading
 
 import pytest
+from app.services import canvas_shape
 from app.services.bulk_service import parse_csv_topologies
 from app.services.canvas_shape import (
+    INLINE_CHECK_VALUES,
     MAX_CANVAS_DEPTH,
     STORED_CANVAS_UNREADABLE_DETAIL,
     CanvasProblem,
     canvas_problem,
     readable_canvas_or_none,
     require_readable_canvas,
+    stored_canvas_problem,
 )
 from fastapi import HTTPException
 
@@ -479,12 +483,12 @@ def test_a_csv_import_record_passes():
 # The read-side helpers -------------------------------------------------------------------
 
 
-def test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one(caplog):
+async def test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one(caplog):
     good = _base()
-    assert require_readable_canvas(good, kind="topology", row_id=None) is good
-    assert require_readable_canvas(None, kind="topology", row_id=None) is None
+    assert await require_readable_canvas(good, kind="topology", row_id=None) is good
+    assert await require_readable_canvas(None, kind="topology", row_id=None) is None
     with pytest.raises(HTTPException) as exc:
-        require_readable_canvas({"nodes": ["marker-9f3c"]}, kind="topology", row_id=None)
+        await require_readable_canvas({"nodes": ["marker-9f3c"]}, kind="topology", row_id=None)
     assert exc.value.status_code == 409
     assert exc.value.detail == STORED_CANVAS_UNREADABLE_DETAIL
     assert exc.value.detail == (
@@ -498,12 +502,66 @@ def test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one(cap
     assert all("marker-9f3c" not in m for m in messages)
 
 
-def test_readable_canvas_or_none_gives_none_for_a_bad_canvas(caplog):
+async def test_readable_canvas_or_none_gives_none_for_a_bad_canvas(caplog):
     good = _base()
-    assert readable_canvas_or_none(good, kind="fork", row_id=None) is good
-    assert readable_canvas_or_none({"edges": "x"}, kind="fork", row_id=None) is None
+    assert await readable_canvas_or_none(good, kind="fork", row_id=None) is good
+    assert await readable_canvas_or_none({"edges": "x"}, kind="fork", row_id=None) is None
     assert any(
         "stored_canvas_unreadable kind=fork" in r.getMessage()
         and "canvas_data.edges: must be a list" in r.getMessage()
         for r in caplog.records
     )
+
+
+def _threads_of_the_check(monkeypatch) -> list[int]:
+    """Record the thread each full ``canvas_problem`` call runs on."""
+    seen: list[int] = []
+    real = canvas_shape.canvas_problem
+
+    def recording(canvas):
+        seen.append(threading.get_ident())
+        return real(canvas)
+
+    monkeypatch.setattr(canvas_shape, "canvas_problem", recording)
+    return seen
+
+
+async def test_a_stored_canvas_within_the_budget_is_judged_on_the_loop(monkeypatch):
+    """Each list item costs one, so `INLINE_CHECK_VALUES` empty edges are exactly
+    the budget: judged where the request runs, with no worker thread."""
+    seen = _threads_of_the_check(monkeypatch)
+    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
+    assert await stored_canvas_problem(canvas) is None
+    assert seen == []
+    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)] + [1]}
+    assert await stored_canvas_problem(bad) == CanvasProblem(
+        ("edges", INLINE_CHECK_VALUES - 1), OBJECT
+    )
+    # An item costs one more for each of its keys, and a nested container one
+    # plus one for each of its values: each canvas here is exactly the budget.
+    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 1)}]}
+    assert await stored_canvas_problem(one_wide_item) is None
+    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 3)}}]}
+    assert await stored_canvas_problem(nested) is None
+    assert seen == []
+
+
+async def test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread(monkeypatch):
+    """One value more and the whole check runs on a bulk worker thread, with the
+    same answer the check gives anywhere."""
+    seen = _threads_of_the_check(monkeypatch)
+    loop_thread = threading.get_ident()
+    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES + 1)]}
+    assert await stored_canvas_problem(canvas) is None
+    assert len(seen) == 1 and seen[0] != loop_thread
+    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)] + [{"id": 1}]}
+    assert await stored_canvas_problem(bad) == CanvasProblem(
+        ("edges", INLINE_CHECK_VALUES, "id"), STRING
+    )
+    assert len(seen) == 2 and seen[1] != loop_thread
+    # Each of the exact-budget canvases of the test above, one value larger.
+    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES)}]}
+    assert await stored_canvas_problem(one_wide_item) is None
+    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 2)}}]}
+    assert await stored_canvas_problem(nested) is None
+    assert len(seen) == 4 and loop_thread not in seen

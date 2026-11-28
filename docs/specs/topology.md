@@ -1372,8 +1372,10 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   event loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
   whole-file JSON decode and the lone surrogate scan's serialization of the parsed
   document (from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well). The decode, the
-  CSV or JSON parse, the lone surrogate scan, the shape check of every record, and the
-  collection of the device names to resolve run on a worker thread before the
+  CSV or JSON parse, the lone surrogate scan, the shape check of every record (each
+  record's reason is computed there once, and the row loop rejects by it without
+  judging the canvas again), and the collection of the device names to resolve run on
+  a worker thread before the
   visibility lookup and the first query; the export builds its records and its body
   the same way, reading only each topology's `name` and `canvas_data`, which its query
   loaded; the route closes its database session first, so it holds no pooled
@@ -1383,7 +1385,7 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   validation, and writes stay on the event loop in the request's session, as an
   interactive topology save's do, so every row's outcome and reason are unchanged. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_read_import`, `render_export`); `services/cabling/app/routes/bulk.py` (`export_topologies`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `BULK_WORK_THREADS`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_each_record_is_judged_once_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
 - **TOPO-BULK-24.** The export leaves out every topology whose stored canvas does not
   have the shape of TOPO-SHAPE-1 to TOPO-SHAPE-3, logs each one as TOPO-SHAPE-7
   describes, and exports every other topology; the response carries
@@ -1851,12 +1853,17 @@ sections 8.4 to 8.14.
   or save whose `canvas_data` does not have the shape answer 422 with the one item
   `{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": "canvas_data.<path>:
   <message>"}` and store nothing. The import holds each record's canvas to the same
-  check (TOPO-BULK-21), and once more the canvas it is about to store, whose device ids
-  are the ones inventory answered, rejecting the row with `canvas.<path>: <message>`;
-  every other canvas write builds its canvas from a stored one that TOPO-SHAPE-6 or
-  TOPO-SHAPE-8 has already judged. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`CanvasData`, `_check_canvas_data`); `services/cabling/app/schemas/topology.py` (`TopologyUpdate`); `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`); `services/cabling/app/schemas/fork.py` (`ForkCanvasUpdate`, `ForkSaveRequest`); `services/cabling/app/services/bulk_service.py` (`_import_topology_rows`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_topology_put_refuses_a_bad_canvas_and_stores_nothing`, `test_a_template_create_and_update_refuse_a_bad_canvas`, `test_a_fork_canvas_put_and_save_refuse_a_bad_canvas`, `test_an_import_row_is_checked_again_after_its_names_are_resolved`); `tests/integration/test_bulk_import_export.py` (`test_a_canvas_without_the_shape_is_a_422_and_the_export_still_answers`)
+  check (TOPO-BULK-21), rejecting the row with `canvas.<path>: <message>`. Name
+  resolution then changes only `data.device.id`, to the id inventory answered, so the
+  import requires every id in inventory's answer to be a string or null and answers
+  any other answer with the 503 of TOPO-BULK-9 before any row runs; every other canvas
+  write builds its canvas from a stored one that TOPO-SHAPE-6 or TOPO-SHAPE-8 has
+  already judged. The body check runs where the request body is validated, on the
+  event loop: on one core it judges a canvas at the routes' body bound in about 30 ms
+  to about 280 ms, more the smaller and more numerous its items and the more nested
+  containers they hold. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`CanvasData`, `_check_canvas_data`); `services/cabling/app/schemas/topology.py` (`TopologyUpdate`); `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`); `services/cabling/app/schemas/fork.py` (`ForkCanvasUpdate`, `ForkSaveRequest`); `services/cabling/app/services/bulk_service.py` (`_import_topology_rows`, `import_topologies`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_topology_put_refuses_a_bad_canvas_and_stores_nothing`, `test_a_template_create_and_update_refuse_a_bad_canvas`, `test_a_fork_canvas_put_and_save_refuse_a_bad_canvas`, `test_a_resolved_device_id_that_is_not_a_string_refuses_the_import`); `tests/integration/test_bulk_import_export.py` (`test_a_canvas_without_the_shape_is_a_422_and_the_export_still_answers`)
 - **TOPO-SHAPE-6.** A stored topology, topology version, or template canvas that does
   not have the shape answers 409 `Stored canvas cannot be read; save a new canvas to
   replace it, or delete it` on every route that reads it: the topology GET, clone, both
@@ -1867,9 +1874,15 @@ sections 8.4 to 8.14.
   403, so the owner replaces it or deletes it. By decision (the module docstring of
   `canvas_shape.py`), as stored data no reader can render is answered elsewhere
   (OPS-SECRET-19 in `operations-and-observability.md`), and so the editor never opens a
-  drawing it could not load as an empty one. No stored row is rewritten. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`)
+  drawing it could not load as an empty one. No stored row is rewritten. Every read of
+  a stored canvas here and in TOPO-SHAPE-8 judges it through `stored_canvas_problem`: a
+  canvas of at most `INLINE_CHECK_VALUES` (20,000) values, counting each list item and
+  each container with each of its keys and values, is judged on the event loop, in at
+  most about 1 ms to about 7 ms on one core; a larger one is judged on a bulk worker
+  thread (`run_bulk_work`, TOPO-BULK-23), whose slots it shares with the import and the
+  export. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`)
 - **TOPO-SHAPE-7.** Each stored canvas found without the shape is logged once per
   read, at warning: `stored_canvas_unreadable kind=<kind> id=<row id>
   problem=canvas_data.<path>: <message>`, and nothing of the canvas. \

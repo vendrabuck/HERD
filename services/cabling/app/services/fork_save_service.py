@@ -1079,18 +1079,20 @@ async def prune_fork_devices(
             .all()
         )
 
-    def _saved_canvas(version: ForkVersion | None) -> dict | None:
+    async def _saved_canvas(version: ForkVersion | None) -> dict | None:
         # A saved canvas that fails the shape check is read as none: no edge is
         # known to remain, so every row touching a removed device releases, and
         # the appended version's canvas is null.
         if version is None:
             return None
-        return readable_canvas_or_none(version.canvas_data, kind="fork_version", row_id=version.id)
+        return await readable_canvas_or_none(
+            version.canvas_data, kind="fork_version", row_id=version.id
+        )
 
-    def _pruned_draft(draft: dict | None) -> tuple[dict | None, bool]:
+    async def _pruned_draft(draft: dict | None) -> tuple[dict | None, bool]:
         # A draft that fails the shape check is left as it is (a later save
         # replaces it, and its membership check refuses a removed device).
-        readable = readable_canvas_or_none(draft, kind="fork", row_id=fork_id)
+        readable = await readable_canvas_or_none(draft, kind="fork", row_id=fork_id)
         if readable is None:
             return draft, False
         pruned, changed, _, _ = prune_canvas_for_devices(readable, removed)
@@ -1098,13 +1100,13 @@ async def prune_fork_devices(
 
     latest = await _latest_version()
     current_version = latest.version_number if latest is not None else 0
-    saved_canvas = _saved_canvas(latest)
+    saved_canvas = await _saved_canvas(latest)
     _, _, remaining_edge_ids, pruned_edge_ids = prune_canvas_for_devices(saved_canvas, removed)
     to_release = _rows_released_by_prune(
         await _current_rows(), removed, remaining_edge_ids, pruned_edge_ids
     )
     l3_to_release_precheck = await _current_l3_rows()
-    pruned_draft, draft_changed = _pruned_draft(fork.canvas_data)
+    pruned_draft, draft_changed = await _pruned_draft(fork.canvas_data)
 
     if not to_release and not l3_to_release_precheck:
         if draft_changed:
@@ -1128,11 +1130,11 @@ async def prune_fork_devices(
                 select(ReservationFork.canvas_data).where(ReservationFork.id == fork_id)
             )
         ).scalar_one()
-        fork.canvas_data = _pruned_draft(committed_draft)[0]
+        fork.canvas_data = (await _pruned_draft(committed_draft))[0]
 
         latest_now = await _latest_version()
         pruned_saved, _, remaining_now, pruned_now = prune_canvas_for_devices(
-            _saved_canvas(latest_now), removed
+            await _saved_canvas(latest_now), removed
         )
         snapshot.canvas_data = pruned_saved
 

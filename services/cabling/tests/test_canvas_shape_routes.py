@@ -16,6 +16,7 @@ import csv
 import io
 import json
 import math
+import threading
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -32,7 +33,8 @@ from app.models.fork import (
 )
 from app.models.template import TopologyTemplate
 from app.models.topology import Topology, TopologyVersion
-from app.services.canvas_shape import STORED_CANVAS_UNREADABLE_DETAIL
+from app.services import canvas_shape
+from app.services.canvas_shape import INLINE_CHECK_VALUES, STORED_CANVAS_UNREADABLE_DETAIL
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -412,16 +414,22 @@ async def test_an_import_row_with_a_bad_canvas_is_rejected_and_the_rest_imports(
 
 
 @pytest.mark.asyncio
-async def test_an_import_row_is_checked_again_after_its_names_are_resolved(client):
-    """The canvas the import stores carries the device ids inventory answered: one
-    that is not a string is refused before the write, like any other canvas."""
+@pytest.mark.parametrize(
+    "device_id", [5, True, ["x"], {"id": "x"}], ids=["int", "true", "list", "object"]
+)
+async def test_a_resolved_device_id_that_is_not_a_string_refuses_the_import(
+    client, caplog, device_id
+):
+    """Name resolution writes inventory's answer into `data.device.id`, which the
+    shape check requires to be a string: an answer holding anything else is the
+    503 of a resolution that could not be used, and nothing is stored."""
     raw = json.dumps(
         [
             {
-                "name": "bad",
+                "name": "lab",
                 "canvas": {"nodes": [{"id": "n1", "data": {"device": {"name": "sw"}}}]},
             },
-            {"name": "good"},
+            {"name": "other"},
         ]
     ).encode()
     with (
@@ -431,15 +439,19 @@ async def test_an_import_row_is_checked_again_after_its_names_are_resolved(clien
         ),
         patch(
             "app.services.bulk_service.resolve_device_names",
-            new=AsyncMock(return_value={"sw": 5}),
+            new=AsyncMock(return_value={"sw-ok": str(uuid.uuid4()), "sw": device_id}),
         ),
     ):
         resp = await _import(client, raw)
-    assert resp.status_code == 200, resp.text
-    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
-        ("reject", "bad", "canvas.nodes.0.data.device.id: must be a string"),
-        ("create", "good", None),
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "detail": "Could not resolve device names; the import was not processed. Retry the request."
+    }
+    assert [r.getMessage() for r in caplog.records if r.name == "app.services.bulk_service"] == [
+        "import_device_name_resolve_unusable reason=device_id_not_a_string"
     ]
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(Topology.name))).scalars().all() == []
 
 
 # Read side: a collection walk ----------------------------------------------------------------
@@ -534,6 +546,33 @@ async def test_every_reader_of_a_bad_topology_answers_409(client, kind):
         templates = (await db.execute(select(TopologyTemplate))).scalars().all()
     assert names == ["bad"]
     assert templates == []
+
+
+@pytest.mark.asyncio
+async def test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread(
+    client, monkeypatch
+):
+    """A topology read whose canvas holds more than `INLINE_CHECK_VALUES` values is
+    judged on a bulk worker thread, good or bad, with the answer a small one gets."""
+    seen: list[int] = []
+    real = canvas_shape.canvas_problem
+
+    def recording(canvas):
+        seen.append(threading.get_ident())
+        return real(canvas)
+
+    monkeypatch.setattr(canvas_shape, "canvas_problem", recording)
+    wide = [{} for _ in range(INLINE_CHECK_VALUES)]
+    good_id = await _seed_topology("wide-good", USER_A, {"nodes": [], "edges": [*wide, {}]})
+    bad_id = await _seed_topology("wide-bad", USER_A, {"nodes": [], "edges": [*wide, 1]})
+    small_id = await _seed_topology("small", USER_A, _good_canvas())
+    loop_thread = threading.get_ident()
+    assert (await client.get(f"/topologies/{good_id}")).status_code == 200
+    resp = await client.get(f"/topologies/{bad_id}")
+    assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
+    assert len(seen) == 2 and loop_thread not in seen
+    assert (await client.get(f"/topologies/{small_id}")).status_code == 200
+    assert len(seen) == 2
 
 
 @pytest.mark.asyncio

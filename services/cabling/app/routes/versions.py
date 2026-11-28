@@ -97,7 +97,9 @@ async def diff_versions(
     version_a = await _load_version(db, topology_id, a)
     version_b = await _load_version(db, topology_id, b)
     for version in (version_a, version_b):
-        require_readable_canvas(version.canvas_data, kind="topology_version", row_id=version.id)
+        await require_readable_canvas(
+            version.canvas_data, kind="topology_version", row_id=version.id
+        )
     # Read-side strip (belt and braces, see get_topology): diff_canvas echoes
     # whole node dicts verbatim into nodes_added/nodes_removed/nodes_modified,
     # so a pre-fix row's device node would otherwise leak field_data straight
@@ -119,7 +121,7 @@ async def get_version(
 ):
     await _load_topology(db, topology_id)
     version = await _load_version(db, topology_id, version_id)
-    require_readable_canvas(version.canvas_data, kind="topology_version", row_id=version.id)
+    await require_readable_canvas(version.canvas_data, kind="topology_version", row_id=version.id)
     # Read-side strip (belt and braces, see get_topology): build the response
     # model explicitly and overwrite its canvas_data rather than mutate the
     # ORM object, so this read never persists what it strips.
@@ -144,7 +146,7 @@ async def restore_version(
     topology = await _load_topology(db, topology_id)
     _require_mutator(topology, payload)
     version = await _load_version(db, topology_id, version_id)
-    require_readable_canvas(version.canvas_data, kind="topology_version", row_id=version.id)
+    await require_readable_canvas(version.canvas_data, kind="topology_version", row_id=version.id)
 
     authorization = request.headers.get("authorization", "")
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""

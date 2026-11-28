@@ -159,7 +159,7 @@ async def get_topology(
         raise HTTPException(status_code=404, detail="Topology not found")
     # A stored canvas without the shape every reader assumes is answered with the
     # fixed 409 (canvas_shape.require_readable_canvas, TOPO-SHAPE-6).
-    require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
+    await require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
     # Read-side strip (belt and braces): the write side already reduces a
     # device node's data.device to the allowlist before a row is stored, but a
     # stack that upgraded images without running `make migrate` (the missed
@@ -195,7 +195,7 @@ async def update_topology(
         # The answer carries the stored canvas, so an update that keeps a stored
         # canvas which fails the shape check is refused; one that sends a canvas
         # replaces it, which is how its owner repairs it.
-        require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
+        await require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
 
     # Reduce a device node's `data.device` to the allowlist before it ever
     # reaches a comparison or a write: canvas_changed must judge the stripped
@@ -280,7 +280,7 @@ async def clone_topology(
     source = await db.get(Topology, topology_id)
     if not source:
         raise HTTPException(status_code=404, detail="Topology not found")
-    require_readable_canvas(source.canvas_data, kind="topology", row_id=source.id)
+    await require_readable_canvas(source.canvas_data, kind="topology", row_id=source.id)
 
     # source.canvas_data was already stripped when it was written; strip again
     # here anyway (cheap and idempotent) rather than trust that invariant across
@@ -342,7 +342,7 @@ async def validate_topology_internal(
     topology = await db.get(Topology, topology_id)
     if not topology:
         raise HTTPException(status_code=404, detail="Topology not found")
-    require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
+    await require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
     return await run_full_topology_validation(topology.canvas_data, db, check_routes=l3)
 
 
@@ -379,7 +379,7 @@ async def validate_topology(
     user_role = payload.get("role", "user")
     if str(topology.created_by) != payload["sub"] and user_role not in ("admin", "superadmin"):
         raise HTTPException(status_code=403, detail="Not authorized to validate this topology")
-    require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
+    await require_readable_canvas(topology.canvas_data, kind="topology", row_id=topology.id)
 
     visible_ids = await resolve_caller_visibility(
         payload,
