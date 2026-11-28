@@ -1,8 +1,8 @@
 """Exception and upstream text never reaches an answer, a report row, or a log line.
 
 Each test makes a dependency fail with an exception whose text holds a distinctive
-service address, and checks that the answer and every log line carry the exception's
-class name or fixed wording only.
+marker, and checks that the answer and every log line carry the exception's class
+name or fixed wording only.
 """
 
 import io

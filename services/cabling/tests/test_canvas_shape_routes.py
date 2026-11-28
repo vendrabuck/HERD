@@ -68,9 +68,8 @@ def _nested(levels: int) -> dict:
     return value
 
 
-# Stored canvases that fail the check, one of each kind of problem. "deep" is past
-# the response models' serialization limit (about 255 levels), "nan" and
-# "lone_surrogate" are values no JSON response can render.
+# Stored canvases that fail the check, one of each kind of problem ("deep" is nested
+# far past the bound, which is far below any reader's nesting limit).
 BAD_STORED = {
     "node_not_an_object": {"nodes": [1], "edges": []},
     "nodes_a_string": {"nodes": "abc", "edges": []},
@@ -470,7 +469,7 @@ async def test_a_resolved_device_id_that_is_not_a_string_refuses_the_import(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fmt", ["json", "csv"])
 @pytest.mark.parametrize("kind", list(BAD_STORED))
-async def test_one_users_bad_stored_canvas_leaves_another_users_export_whole(client, fmt, kind):
+async def test_the_export_leaves_out_a_bad_stored_canvas_and_exports_the_rest(client, fmt, kind):
     """User A's row, stored without the shape, is in the table; user B's export
     answers 200 with B's topologies, leaves A's out, and says how many it left out."""
     await _seed_topology("a-broken", USER_A, BAD_STORED[kind])

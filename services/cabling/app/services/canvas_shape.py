@@ -46,8 +46,8 @@ validator answers a refused canvas with one 422 item
 ``{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": "<path>: <message>"}``;
 the topology import judges each record's canvas with the same function (its own
 reason, ``canvas.<path>: <message>``). The body check runs where pydantic validates
-the request body, on the event loop. Read side: a stored canvas written before this
-check can still fail it. ``require_readable_canvas`` answers 409
+the request body, on the event loop. Read side: a stored canvas need not have the
+shape. ``require_readable_canvas`` answers 409
 ``STORED_CANVAS_UNREADABLE_DETAIL`` for a route that needs the canvas, and
 ``readable_canvas_or_none`` gives a reader that can do without the canvas None
 instead; both judge through ``stored_canvas_problem``, which keeps a canvas larger
@@ -75,10 +75,7 @@ logger = logging.getLogger(__name__)
 # The deepest a stored canvas may nest, the canvas object being level 1. What the
 # editor, the AI commit, the seed data, and the importers write nests about seven
 # levels (canvas, nodes, a node, data, l3, routes, a route). The bound is far above
-# that and far below the response models' serialization limit (about 255 levels,
-# counted from the response itself, which holds the canvas a few levels down) and
-# the interpreter's recursion limit, so every canvas it admits can be rendered
-# again by every reader.
+# that and far below any reader's nesting limit.
 MAX_CANVAS_DEPTH = 64
 
 MUST_BE_AN_OBJECT = "must be an object"

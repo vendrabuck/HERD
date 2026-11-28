@@ -411,12 +411,12 @@ async def test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_
     ],
     ids=["node_not_an_object", "deep"],
 )
-async def test_a_canvas_without_the_shape_is_a_422_and_the_export_still_answers(
+async def test_a_canvas_without_the_shape_is_a_422_and_the_topology_exports_as_stored(
     user_client, canvas_json, message
 ):
     """TOPO-SHAPE-5 and TOPO-BULK-24 through the gateway, as a non-admin: the canvas
     PUT is refused with the one `canvas_shape` item and stores nothing, and the
-    export, which walks every topology, still answers 200 with this one in it."""
+    export, which walks every topology, answers 200 with this one in it, as stored."""
     name = f"int-canvas-shape-{uuid.uuid4().hex[:8]}"
     failure: BaseException | None = None
     try:

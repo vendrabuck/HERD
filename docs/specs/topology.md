@@ -1395,7 +1395,7 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   `X-Export-Skipped: <n>`, the number left out (`0` when none is), for JSON and CSV
   alike. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`render_export`, `_readable_topologies`); `services/cabling/app/routes/bulk.py` (`export_topologies`, `EXPORT_SKIPPED_HEADER`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_one_users_bad_stored_canvas_leaves_another_users_export_whole`, `test_an_export_with_nothing_bad_skips_nothing`, `test_a_skipped_topology_is_logged_by_id_and_problem_only`)
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_export_leaves_out_a_bad_stored_canvas_and_exports_the_rest`, `test_an_export_with_nothing_bad_skips_nothing`, `test_a_skipped_topology_is_logged_by_id_and_problem_only`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1848,7 +1848,7 @@ sections 8.4 to 8.14.
   3. The check walks with a stack, so a canvas nested past the interpreter's recursion
   limit is judged, not raised on. By decision (the constant's comment in
   `canvas_shape.py`): what HERD writes nests about seven levels, and 64 stays far below
-  the response models' serialization limit and the recursion limit. \
+  any reader's nesting limit. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`MAX_CANVAS_DEPTH`, `_drain`) \
   Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_the_bound_is_what_the_docstring_says`, `test_a_node_at_the_bound_passes_and_one_past_it_is_refused`, `test_lists_count_as_levels_like_objects`, `test_another_top_level_key_is_judged_and_never_named`, `test_a_canvas_past_the_recursion_limit_is_judged_not_raised_on`)
 - **TOPO-SHAPE-3.** No number in a canvas is `NaN` or infinite (a literal such as `1e400`
@@ -1877,7 +1877,7 @@ sections 8.4 to 8.14.
   to about 280 ms, more the smaller and more numerous its items and the more nested
   containers they hold. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`CanvasData`, `_check_canvas_data`); `services/cabling/app/schemas/topology.py` (`TopologyUpdate`); `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`); `services/cabling/app/schemas/fork.py` (`ForkCanvasUpdate`, `ForkSaveRequest`); `services/cabling/app/services/bulk_service.py` (`_import_topology_rows`, `import_topologies`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_topology_put_refuses_a_bad_canvas_and_stores_nothing`, `test_a_template_create_and_update_refuse_a_bad_canvas`, `test_a_fork_canvas_put_and_save_refuse_a_bad_canvas`, `test_a_resolved_device_id_that_is_not_a_string_refuses_the_import`); `tests/integration/test_bulk_import_export.py` (`test_a_canvas_without_the_shape_is_a_422_and_the_export_still_answers`)
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_topology_put_refuses_a_bad_canvas_and_stores_nothing`, `test_a_template_create_and_update_refuse_a_bad_canvas`, `test_a_fork_canvas_put_and_save_refuse_a_bad_canvas`, `test_a_resolved_device_id_that_is_not_a_string_refuses_the_import`); `tests/integration/test_bulk_import_export.py` (`test_a_canvas_without_the_shape_is_a_422_and_the_topology_exports_as_stored`)
 - **TOPO-SHAPE-6.** A stored topology, topology version, or template canvas that does
   not have the shape answers 409 `Stored canvas cannot be read; save a new canvas to
   replace it, or delete it` on every route that reads it: the topology GET, clone, both
@@ -1992,9 +1992,8 @@ Calls into this area are in section 7. Cabling publishes no event.
 | Out | reservations | `GET /internal/by-topology/{topology_id}` (internal token, 5 s) | edit lock on PUT, version restore, and import | Fail open: treated as no reservation (TOPO-EDIT-6) |
 | Out | reservations | `GET /internal/by-topology/{topology_id}` (internal token, 5 s) | delete guard | Fail closed: 503, nothing deleted (TOPO-DEL-3) |
 
-- **TOPO-CALL-1.** When one of these calls fails, the answer and every log line name the
-  exception's class and fixed wording only, never its text (which can name the service
-  address) or a value from the answer: the visibility, device-group, edit lock, delete
+- **TOPO-CALL-1.** When one of these calls fails, the answer and every log line carry
+  the exception's class name and fixed wording only, and no value from the answer: the visibility, device-group, edit lock, delete
   guard, name resolution, and routing-pass lookups, and an import row that raised. A
   failure in the edit lock's or the device-group lookup's own reading of the body is
   logged with its traceback as well; a transport failure is not. The visibility lookup,

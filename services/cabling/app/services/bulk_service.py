@@ -106,14 +106,12 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
 
-# A row whose handling raised something other than an HTTPException: the reason names
-# the exception's class and nothing it carries, since its text can hold a statement,
-# a parameter, or another service's address.
+# A row whose handling raised something other than an HTTPException: the reason and
+# the log carry the exception's class name.
 ROW_FAILED_REASON_PREFIX = "row could not be imported: "
 
-# The resolve-by-name call to inventory failed (TOPO-BULK-9): a fixed answer, with the
-# exception's class in the log line and nothing of its text, which names the service
-# address.
+# The resolve-by-name call to inventory failed (TOPO-BULK-9): a fixed answer, and the
+# log carries the exception's class name.
 IMPORT_RESOLVE_UNAVAILABLE_DETAIL = (
     "Could not resolve device names; the import was not processed. Retry the request."
 )

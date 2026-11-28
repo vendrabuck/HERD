@@ -1426,8 +1426,8 @@ async def test_import_resolver_failure_raises_503():
             with pytest.raises(HTTPException) as exc:
                 await import_topologies(db, raw, "json", True, USER_ID, "viewer")
     assert exc.value.status_code == 503
-    # Fixed wording: the exception's text (here, a service address) is not answered,
-    # and is not chained for a handler to render either.
+    # Fixed wording: the detail carries none of the exception, and nothing is
+    # chained for a handler to render.
     assert exc.value.detail == (
         "Could not resolve device names; the import was not processed. Retry the request."
     )
@@ -1490,8 +1490,7 @@ async def test_import_unexpected_exception_rejects_row():
                     db, raw, "json", False, USER_ID, "viewer"
                 )
     assert report.rejected == 1
-    # The class name only: an exception's text can hold a statement, a parameter, or
-    # another service's address, and the reason is answered to the caller.
+    # The reason answered to the caller carries the class name only.
     assert report.rows[0].reason == "row could not be imported: RuntimeError"
     assert "kaboom" not in report.model_dump_json()
 
@@ -2951,8 +2950,8 @@ def test_device_resolver_drops_a_name_no_device_can_have():
 
 @pytest.mark.asyncio
 async def test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup():
-    """The name is never sent, so the row is rejected as unresolved and the rest of
-    the import goes on, instead of the whole request failing on the lookup."""
+    """The name is never sent, so its row is rejected as unresolved and the rest of
+    the import goes on."""
     import json
 
     from app.services import device_resolver
