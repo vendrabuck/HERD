@@ -44,6 +44,7 @@ from app.services.reservation_service import (
     release_devices_not_held_by_others,
     stage_wiring_changed,
 )
+from app.services.upstream_failure import failure_label, traceback_for
 
 # Terminal reservation statuses whose fork the standing reconciler may archive.
 TERMINAL_STATUSES = (
@@ -548,9 +549,10 @@ async def _run_expiration_cycle() -> None:
         for did, result in zip(device_ids, fetch_results):
             if isinstance(result, BaseException):
                 logger.warning(
-                    "Auto-expire: could not fetch device %s; assuming exclusive",
+                    "Auto-expire: could not fetch device %s; assuming exclusive (%s)",
                     did,
-                    exc_info=result,
+                    failure_label(result),
+                    exc_info=traceback_for(result),
                 )
                 exclusive_ids.append(did)
             elif result.get("exclusive", True):
@@ -646,10 +648,11 @@ async def _run_fork_archive_reconcile() -> None:
     """
     try:
         forks = await _fetch_active_forks()
-    except Exception:
+    except Exception as exc:
         logger.error(
-            "Fork archive reconcile: could not fetch active forks from cabling",
-            exc_info=True,
+            "Fork archive reconcile: could not fetch active forks from cabling (%s)",
+            failure_label(exc),
+            exc_info=traceback_for(exc),
             extra={"action": "fork_reconcile_fetch_failed"},
         )
         return
@@ -1114,20 +1117,32 @@ async def expiration_loop(interval_seconds: int = 60) -> None:
     while True:
         try:
             await _run_expiration_cycle()
-        except Exception:
-            logger.error("Expiration cycle failed", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Expiration cycle failed (%s)", failure_label(exc), exc_info=traceback_for(exc)
+            )
         try:
             await _run_reminder_cycle()
-        except Exception:
-            logger.error("Expiry reminder cycle failed", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Expiry reminder cycle failed (%s)", failure_label(exc), exc_info=traceback_for(exc)
+            )
         try:
             await _run_fork_archive_reconcile()
-        except Exception:
-            logger.error("Fork archive reconcile cycle failed", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Fork archive reconcile cycle failed (%s)",
+                failure_label(exc),
+                exc_info=traceback_for(exc),
+            )
         try:
             await _run_pending_prune_reconcile()
-        except Exception:
-            logger.error("Pending fork-prune reconcile cycle failed", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Pending fork-prune reconcile cycle failed (%s)",
+                failure_label(exc),
+                exc_info=traceback_for(exc),
+            )
         await asyncio.sleep(interval_seconds)
 
 
@@ -1151,6 +1166,10 @@ async def purpose_classify_loop(interval_seconds: int = 60) -> None:
     while True:
         try:
             await _run_purpose_classify_reconcile()
-        except Exception:
-            logger.error("Purpose classify reconcile cycle failed", exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "Purpose classify reconcile cycle failed (%s)",
+                failure_label(exc),
+                exc_info=traceback_for(exc),
+            )
         await asyncio.sleep(interval_seconds)

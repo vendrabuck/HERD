@@ -17,6 +17,9 @@ sent or the address it was reached at.
 - `unavailable_detail(exc)`: the 503 detail a route answers for a
   `RuntimeError`: the message of an `UpstreamUnavailable`, and for any other
   `RuntimeError` the fixed `SERVICE_UNAVAILABLE`, logged by class name.
+- `traceback_for(exc)`: the `exc_info` argument of a failure line about a call
+  to another service: no traceback when the error or any exception it chains is
+  an `httpx.HTTPStatusError`, else the error itself.
 """
 
 import logging
@@ -39,6 +42,39 @@ def failure_label(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
     return type(exc).__name__
+
+
+def _chain(exc: BaseException):
+    """`exc` and every exception a traceback of it prints: its `__cause__`, its
+    `__context__`, and the members of an exception group, each once."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
+def traceback_for(exc: BaseException) -> BaseException | None:
+    """The `exc_info` argument of a log line about a failed call to another service.
+
+    None (no traceback) when `exc` or any exception it chains is an
+    `httpx.HTTPStatusError`: that error's text is the status line the other service
+    sent, reason phrase included, and the request URL, userinfo included. The line
+    names the status through `failure_label` instead. Any other error keeps its
+    traceback: for a transport error that holds the httpx or OS error text, which
+    for a protocol error includes one line of what the other side sent.
+    """
+    if any(isinstance(linked, httpx.HTTPStatusError) for linked in _chain(exc)):
+        return None
+    return exc
 
 
 def unreachable(service: str, exc: BaseException) -> UpstreamUnavailable:

@@ -57,6 +57,7 @@ from app.services.upstream_failure import (
     UpstreamUnavailable,
     answered,
     failure_label,
+    traceback_for,
     unreachable,
 )
 
@@ -877,7 +878,7 @@ async def _create_reservation_fork_best_effort(
         )
         _fork_membership_refused.add(reservation_id)
         return True
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork creation failed for reservation %s; leaving fork_id null",
             reservation_id,
@@ -886,7 +887,7 @@ async def _create_reservation_fork_best_effort(
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
         return False
 
@@ -1269,7 +1270,7 @@ async def _prune_removed_devices_from_fork_best_effort(
             reservation_id=str(reservation_id),
         )
         return
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork prune failed for reservation %s; removed-device wiring not yet released, "
             "the pending-prune marker keeps the sweep retrying it",
@@ -1279,7 +1280,7 @@ async def _prune_removed_devices_from_fork_best_effort(
                 "reservation_id": str(reservation_id),
                 "removed_device_ids": [str(d) for d in removed_device_ids],
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
         return
     if outcome == _PRUNE_OUTCOME_NO_FORK and await _fork_may_still_appear(reservation_id):
@@ -1445,7 +1446,7 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
             factor=2.0,
             max_delay=5.0,
         )
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork archive failed for reservation %s; as-built record not frozen",
             reservation_id,
@@ -1453,7 +1454,7 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
                 "action": "reservation_fork_archive_failed",
                 "reservation_id": str(reservation_id),
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -1715,7 +1716,7 @@ async def _update_device_statuses(
             did,
             status,
             failure_label(exc),
-            exc_info=exc,
+            exc_info=traceback_for(exc),
         )
 
     if failed and raise_on_failure:
@@ -1944,10 +1945,11 @@ async def _release_exclusive_devices_best_effort(
             )
         elif isinstance(result, BaseException):
             logger.warning(
-                "Could not fetch device %s during %s; assuming exclusive",
+                "Could not fetch device %s during %s; assuming exclusive (%s)",
                 did,
                 context_label,
-                exc_info=result,
+                failure_label(result),
+                exc_info=traceback_for(result),
             )
             exclusive_ids.append(did)
         elif result.get("exclusive", True):
@@ -1978,7 +1980,7 @@ async def _release_exclusive_devices_best_effort(
             context_label,
             reservation_id,
             extra=extra,
-            exc_info=exc,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -2006,7 +2008,7 @@ async def _revert_flipped_devices_best_effort(
         return
     try:
         await _update_device_statuses(releasable, "AVAILABLE")
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Failed to revert RESERVED devices after a lost activation: %s",
             reservation_id,
@@ -2015,7 +2017,7 @@ async def _revert_flipped_devices_best_effort(
                 "reservation_id": str(reservation_id),
                 "device_ids": [str(d) for d in releasable],
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -2285,7 +2287,7 @@ async def create_reservation(
             if releasable:
                 try:
                     await _update_device_statuses(releasable, "AVAILABLE")
-                except Exception:
+                except Exception as revert_exc:
                     logger.error(
                         "Failed to revert RESERVED devices after provisioning failure: %s",
                         reservation.id,
@@ -2294,7 +2296,7 @@ async def create_reservation(
                             "reservation_id": str(reservation.id),
                             "device_ids": [str(d) for d in releasable],
                         },
-                        exc_info=True,
+                        exc_info=traceback_for(revert_exc),
                     )
             logger.error(
                 "Reservation provisioning failed: %s",
@@ -2304,7 +2306,7 @@ async def create_reservation(
                     "reservation_id": str(reservation.id),
                     "user_id": str(user_id),
                 },
-                exc_info=exc,
+                exc_info=traceback_for(exc),
             )
             raise UpstreamUnavailable(INVENTORY_RESERVE_FAILED) from exc
 
@@ -2888,7 +2890,7 @@ async def _hold_added_devices_after_edit(
                 "user_id": str(user_id),
                 "device_ids": [str(d) for d in device_ids],
             },
-            exc_info=exc,
+            exc_info=traceback_for(exc),
         )
     if not flipped:
         return

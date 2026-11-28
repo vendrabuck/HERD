@@ -54,6 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.reservation import Reservation, ReservationDynamicRequest, ReservationStatus
+from app.services.upstream_failure import traceback_for
 
 logger = logging.getLogger(__name__)
 
@@ -383,13 +384,13 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
         )
         await _bump_purpose_classify_attempts(reservation_id)
         return "timeout"
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "Purpose classify reconcile: call to the orchestrator failed for %s "
             "(a transport error, not a timeout); treating this as transient for "
             "this tick, no attempt counted",
             reservation_id,
-            exc_info=True,
+            exc_info=traceback_for(exc),
             extra={
                 "action": "purpose_classify_transient",
                 "reservation_id": str(reservation_id),

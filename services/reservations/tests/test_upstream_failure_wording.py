@@ -9,14 +9,18 @@ can quote that body or the address the service was reached at (`user:password@`
 included).
 
 Each test makes the upstream answer or raise with `SENTINEL` (in the body, in the
-exception's text, and in an address with userinfo) and asserts that it reaches none
-of the answer, the rows, the outbox payloads, or any log record at any level (its
-message, its traceback, and every attribute), while the fixed wording, the class
-name, and the status do. One test is narrower, and says why: a background fork call
-that raised logs a traceback that chains the httpx exception itself, so only the
-line's message and the exception it logs are checked there. Nothing between the
-route (or the background function) and the network is patched: respx answers under
-httpx.
+exception's text, and in an address with userinfo), answers an error status with
+`REASON` as the status line's reason phrase, and reaches every service at a
+configured URL with `user:<USERINFO_SECRET>@` userinfo. It asserts that none of them
+reaches the answer, the rows, the outbox payloads, or any log record at any level
+(its message, its traceback, and every attribute), while the fixed wording, the class
+name, and the status do. The one record left out is httpx's own INFO request line
+(logger `httpx`), which `herd_common.logging.setup_logging` keeps by decision and
+which names the method, the URL, and the status line. One test is narrower, and says
+why: a background fork call that raised logs a traceback that chains the httpx
+exception itself, so only the line's message and the exception it logs are checked
+there. Nothing between the route (or the background function) and the network is
+patched: respx answers under httpx.
 
 The sites:
 
@@ -29,6 +33,9 @@ The sites:
   raising (RES-UPSTREAM-1), and a definitive fork-create refusal (RES-UPSTREAM-3).
 - the utilization report's inventory, auth, and execution reads (RES-UPSTREAM-3).
 - the provision-result callback's `error` (RES-UPSTREAM-4).
+- the tracebacks: an error status's traceback is not attached anywhere a failed
+  device status update, device read, or active-fork listing is logged
+  (`traceback_for`, RES-UPSTREAM-3).
 """
 
 import logging
@@ -62,16 +69,20 @@ from app.services.reservation_service import (
     _archive_reservation_fork_best_effort,
     _create_reservation_fork_best_effort,
     _fork_membership_refused,
+    _hold_added_devices_after_edit,
     _prune_removed_devices_from_fork_best_effort,
+    _release_exclusive_devices_best_effort,
 )
 from app.services.upstream_failure import (
     SERVICE_UNAVAILABLE,
     UpstreamUnavailable,
     answered,
     failure_label,
+    traceback_for,
     unavailable_detail,
     unreachable,
 )
+from app.tasks.expiration import _run_expiration_cycle, _run_fork_archive_reconcile
 from fastapi.security import HTTPAuthorizationCredentials
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -85,12 +96,17 @@ USERINFO_SECRET = "upstream-userinfo-pw-3f7a"
 # the address with userinfo.
 EXC_TEXT = f"{SENTINEL} at http://svc-user:{USERINFO_SECRET}@upstream:8000/x"
 BODY = {"detail": f"{SENTINEL} refused", "trace": EXC_TEXT}
+# The reason phrase of every error status the tests answer: an httpx.HTTPStatusError's
+# text quotes it, with the request URL.
+REASON = "upstream-reason-phrase-5d21"
 
 TOKEN = "internal-token-wording"
-INV = settings.inventory_service_url
-CAB = settings.cabling_service_url
-EXE = settings.execution_service_url
-AUTH = settings.auth_service_url
+# Every service is configured at a URL with userinfo, which the request URL (and so an
+# httpx.HTTPStatusError's text) keeps.
+INV = f"http://svc-user:{USERINFO_SECRET}@inventory:8000"
+CAB = f"http://svc-user:{USERINFO_SECRET}@cabling:8000"
+EXE = f"http://svc-user:{USERINFO_SECRET}@execution:8000"
+AUTH = f"http://svc-user:{USERINFO_SECRET}@auth:8000"
 OWNER = uuid.uuid4()
 DEVICE = uuid.uuid4()
 TEMPLATE = uuid.uuid4()
@@ -125,8 +141,13 @@ def _no_retry_wait(monkeypatch):
 
 @pytest.fixture
 def network(monkeypatch):
-    """respx under httpx for every outbound call; the internal token is set."""
+    """respx under httpx for every outbound call; the internal token is set, and every
+    service URL carries userinfo."""
     monkeypatch.setattr(settings, "internal_api_token", TOKEN)
+    monkeypatch.setattr(settings, "inventory_service_url", INV)
+    monkeypatch.setattr(settings, "cabling_service_url", CAB)
+    monkeypatch.setattr(settings, "execution_service_url", EXE)
+    monkeypatch.setattr(settings, "auth_service_url", AUTH)
     with respx.mock(assert_all_called=False) as router:
         yield router
 
@@ -157,8 +178,9 @@ def _client() -> AsyncClient:
 
 
 def _error_status(status: int = 500) -> httpx.Response:
-    """An error answer whose JSON body holds the sentinel."""
-    return httpx.Response(status, json=BODY)
+    """An error answer whose JSON body holds the sentinel and whose status line's
+    reason phrase is REASON."""
+    return httpx.Response(status, json=BODY, extensions={"reason_phrase": REASON.encode()})
 
 
 def _device() -> dict:
@@ -209,12 +231,20 @@ async def _stored_text() -> str:
     return "\n".join(parts)
 
 
+def _records(caplog) -> list[logging.LogRecord]:
+    """Every record but httpx's own request line (see the module docstring)."""
+    return [r for r in caplog.records if r.name not in ("httpx", "httpcore")]
+
+
 def _assert_absent(caplog, *texts: str) -> None:
-    """The sentinel and the userinfo appear in no text given, no log record's message,
-    traceback, or attribute (every `extra=` key), at any level."""
-    record_texts = [caplog.text] + [str(vars(r)) for r in caplog.records]
+    """The sentinel, the reason phrase, and the userinfo appear in no text given, no log
+    record's message, traceback, or attribute (every `extra=` key), at any level."""
+    formatter = logging.Formatter()
+    record_texts = [formatter.format(r) for r in _records(caplog)]
+    record_texts += [str(vars(r)) for r in _records(caplog)]
     for text in [*texts, *record_texts]:
         assert SENTINEL not in text
+        assert REASON not in text
         assert USERINFO_SECRET not in text
 
 
@@ -254,6 +284,68 @@ def test_unavailable_detail_keeps_a_worded_failure_and_replaces_any_other(caplog
     (first, second) = [r for r in caplog.records if r.__dict__.get("action")]
     assert (first.error_class, second.error_class) == ("RuntimeError", "RecursionError")
     _assert_absent(caplog)
+
+
+def _status_error(status: int = 500) -> httpx.HTTPStatusError:
+    """A real error status raised by raise_for_status, from a URL with userinfo."""
+    request = httpx.Request("POST", f"{INV}/devices/{DEVICE}/status")
+    response = _error_status(status)
+    response.request = request
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        assert REASON in str(exc) and USERINFO_SECRET in str(exc)
+        return exc
+    raise AssertionError("raise_for_status did not raise")
+
+
+def _raised(exc: BaseException, *, cause: BaseException | None = None, context=None):
+    """`exc` raised, with its `__cause__` or `__context__` set the way `raise ... from`
+    and a raise inside an `except` set them."""
+    exc.__cause__ = cause
+    exc.__context__ = context if context is not None else cause
+    return exc
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _status_error(),
+        lambda: _raised(UpstreamUnavailable("Failed to contact x"), cause=_status_error()),
+        lambda: _raised(RuntimeError("worded"), context=_status_error()),
+        lambda: _raised(
+            RuntimeError("outer"), context=_raised(ValueError("inner"), cause=_status_error())
+        ),
+        lambda: ExceptionGroup("group", [ValueError("a"), _status_error()]),
+    ],
+    ids=["status_error", "as_cause", "as_context", "two_levels_down", "in_a_group"],
+)
+def test_traceback_for_withholds_the_traceback_of_an_error_status_anywhere_in_the_chain(build):
+    assert traceback_for(build()) is None
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: httpx.ConnectError(EXC_TEXT),
+        lambda: httpx.RemoteProtocolError("illegal status line"),
+        lambda: _raised(UpstreamUnavailable("worded"), cause=httpx.ReadTimeout("t")),
+        lambda: RuntimeError("inventory status update failed for 1 device(s)"),
+        lambda: ExceptionGroup("group", [ValueError("a"), KeyError("b")]),
+    ],
+    ids=["transport", "protocol", "chained_transport", "plain", "group_without_one"],
+)
+def test_traceback_for_keeps_the_traceback_of_any_other_error(build):
+    exc = build()
+    assert traceback_for(exc) is exc
+
+
+def test_traceback_for_ends_on_a_chain_that_loops():
+    first, second = RuntimeError("a"), RuntimeError("b")
+    first.__context__, second.__context__ = second, first
+    assert traceback_for(first) is first
+    second.__cause__ = _status_error()
+    assert traceback_for(first) is None
 
 
 # --- create and PATCH --------------------------------------------------------------------
@@ -350,8 +442,15 @@ async def test_a_create_whose_inventory_flip_fails_answers_fixed_wording(network
         subjects = [e.subject for e in (await s.execute(select(OutboxEvent))).scalars()]
     assert row.status == ReservationStatus.FAILED
     assert subjects == ["herd.reservations.failed"]
-    # Each failed device update is logged with its status, never the body.
-    assert "status to RESERVED (HTTP 500)" in caplog.text
+    # Each failed device update is logged with its status, never the body, and with no
+    # traceback (an error status's text quotes the reason phrase and the URL).
+    updates = [r for r in _records(caplog) if "status to RESERVED (HTTP 500)" in r.getMessage()]
+    assert len(updates) == 3
+    assert all(r.exc_info is None for r in updates)
+    (failed,) = [
+        r for r in _records(caplog) if r.__dict__.get("action") == "reservation_provision_failed"
+    ]
+    assert failed.exc_info is not None
     _assert_absent(caplog, resp.text, await _stored_text())
 
 
@@ -508,6 +607,79 @@ async def test_a_fork_call_that_cannot_reach_cabling_logs_only_the_class(network
     ]
     assert SENTINEL not in record.getMessage()
     assert SENTINEL not in str(record.exc_info[1])
+
+
+# --- tracebacks of an error status -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_release_whose_device_read_and_status_update_fail_logs_no_error_status_text(
+    network, caplog
+):
+    """The release path's device read and status update both answer 500: each line
+    names the status, none attaches the error status's traceback, and the final
+    RuntimeError's traceback holds only HERD's text."""
+    rid = await _insert(ReservationStatus.FAILED)
+    network.get(f"{INV}/devices/{DEVICE}/internal").mock(return_value=_error_status(500))
+    flip = network.post(f"{INV}/devices/{DEVICE}/status").mock(return_value=_error_status(502))
+    caplog.set_level(logging.DEBUG)
+    await _release_exclusive_devices_best_effort(rid, [DEVICE], "release_wording_test")
+    assert flip.call_count == 3
+    (read,) = [r for r in _records(caplog) if "assuming exclusive" in r.getMessage()]
+    assert read.getMessage().endswith("assuming exclusive (HTTP 500)")
+    assert read.exc_info is None
+    updates = [r for r in _records(caplog) if "status to AVAILABLE (HTTP 502)" in r.getMessage()]
+    assert len(updates) == 3 and all(r.exc_info is None for r in updates)
+    (final,) = [r for r in _records(caplog) if r.__dict__.get("action") == "release_wording_test"]
+    assert final.exc_info is not None
+    _assert_absent(caplog)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hold_of_added_devices_logs_no_error_status_text(network, caplog):
+    rid = await _insert(ReservationStatus.ACTIVE)
+    network.post(f"{INV}/devices/{DEVICE}/status").mock(return_value=_error_status(500))
+    caplog.set_level(logging.DEBUG)
+    async with Session() as s:
+        await _hold_added_devices_after_edit(s, rid, [DEVICE], OWNER)
+    (hold,) = [
+        r for r in _records(caplog) if r.__dict__.get("action") == "reservation_update_hold_failed"
+    ]
+    assert hold.exc_info is not None
+    assert "status to RESERVED (HTTP 500)" in "\n".join(r.getMessage() for r in _records(caplog))
+    _assert_absent(caplog)
+
+
+@pytest.mark.asyncio
+async def test_an_auto_expire_whose_device_read_fails_logs_no_error_status_text(network, caplog):
+    rid = await _insert(
+        ReservationStatus.ACTIVE, start=NOW - timedelta(hours=3), end=NOW - timedelta(hours=1)
+    )
+    network.get(f"{INV}/devices/{DEVICE}/internal").mock(return_value=_error_status(503))
+    flip = network.post(f"{INV}/devices/{DEVICE}/status").mock(return_value=httpx.Response(200))
+    network.route().mock(return_value=httpx.Response(204))
+    caplog.set_level(logging.DEBUG)
+    await _run_expiration_cycle()
+    async with Session() as s:
+        assert (await s.get(Reservation, rid)).status == ReservationStatus.COMPLETED
+    assert flip.call_count == 1
+    (read,) = [r for r in _records(caplog) if "Auto-expire: could not fetch" in r.getMessage()]
+    assert read.getMessage().endswith("assuming exclusive (HTTP 503)")
+    assert read.exc_info is None
+    _assert_absent(caplog, await _stored_text())
+
+
+@pytest.mark.asyncio
+async def test_a_failed_active_fork_listing_logs_only_the_status(network, caplog):
+    network.get(f"{CAB}/internal/forks").mock(return_value=_error_status(500))
+    caplog.set_level(logging.DEBUG)
+    await _run_fork_archive_reconcile()
+    (record,) = [
+        r for r in _records(caplog) if r.__dict__.get("action") == "fork_reconcile_fetch_failed"
+    ]
+    assert record.getMessage().endswith("could not fetch active forks from cabling (HTTP 500)")
+    assert record.exc_info is None
+    _assert_absent(caplog)
 
 
 # --- the provision-result callback ---------------------------------------------------------
