@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 def to_utc_instant(dt: datetime) -> datetime:
     """The instant `dt` names, as an aware UTC datetime.
 
-    An aware value is converted; a naive one is taken as UTC, never as the
+    An aware value is converted; a value with no tzinfo is taken as UTC, never as the
     host's local zone (which is what astimezone would assume). Raises
     OverflowError when the instant has no UTC equivalent (for example
     0001-01-01T00:00:00+05:00, which is before year 1 in UTC); the caller
