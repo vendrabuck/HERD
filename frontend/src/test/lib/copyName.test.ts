@@ -4,6 +4,9 @@ import { COPY_NAME_PREFIX, NAME_MAX_LENGTH, copyName } from "@/lib/copyName";
 // A character outside the BMP: two UTF-16 units, one character to the server.
 const WIDE = "\u{1D11E}";
 const codePoints = (s: string) => Array.from(s).length;
+// A unicode-mode regex reads a well-formed surrogate pair as one code point, so
+// \p{Cs} (a surrogate) matches only half of a pair left on its own.
+const hasLoneSurrogate = (s: string) => /\p{Cs}/u.test(s);
 
 describe("copyName", () => {
   it("prefixes a name that fits whole", () => {
@@ -29,11 +32,17 @@ describe("copyName", () => {
     },
   );
 
+  it("detects a lone surrogate, and only a lone one", () => {
+    expect(hasLoneSurrogate(WIDE)).toBe(false);
+    expect(hasLoneSurrogate(WIDE.slice(0, 1))).toBe(true);
+    expect(hasLoneSurrogate("a" + WIDE.slice(1))).toBe(true);
+  });
+
   it("never splits a character outside the BMP", () => {
     const copy = copyName(WIDE.repeat(255));
-    // A split would leave a lone surrogate, which is not a whole character.
-    expect(Array.from(copy).every((c) => c.length === 1 || c === WIDE)).toBe(true);
-    expect(copy.length).toBe(COPY_NAME_PREFIX.length + 2 * (NAME_MAX_LENGTH - 8));
+    // A cut by UTF-16 units would end on the first half of a pair.
+    expect(hasLoneSurrogate(copy)).toBe(false);
+    expect(copy).toBe(COPY_NAME_PREFIX + WIDE.repeat(NAME_MAX_LENGTH - 8));
   });
 
   it("is deterministic", () => {

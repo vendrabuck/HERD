@@ -8,7 +8,8 @@ every new database and NATS connection. These tests pin INV-DRV-22 and INV-DRV-2
 
 - storage calls run on ``app.storage``'s own pool of ``DRIVER_STORAGE_THREADS`` (4)
   threads: with more calls blocked than the default executor has threads, at most
-  four run at once and ``loop.getaddrinfo`` still answers;
+  four run at once and ``loop.getaddrinfo`` still answers; a call sees its caller's
+  context variables, and one cancelled while it waits for a thread never runs;
 - through the routes, concurrent downloads blocked in storage hold no pooled
   database connection, and each answers its own archive once released;
 - the MinIO client sends through a pool built with the named timeouts and retry
@@ -28,6 +29,7 @@ honoured Retry-After), each far above what a passing run takes.
 
 import asyncio
 import contextlib
+import contextvars
 import io
 import logging
 import socket
@@ -129,6 +131,46 @@ async def test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged(
         await storage.run_on_storage_thread(refuse)
 
 
+_CALLER_VALUE: contextvars.ContextVar[str] = contextvars.ContextVar("caller_value")
+
+
+async def test_the_callers_context_variables_reach_the_storage_call():
+    """A storage thread starts with an empty context; the call sees the caller's
+    context variables because ``run_on_storage_thread`` copies them, as
+    ``asyncio.to_thread`` did (the request's log context rides on them)."""
+    token = _CALLER_VALUE.set("set by the caller")
+    try:
+        seen = await storage.run_on_storage_thread(_CALLER_VALUE.get)
+    finally:
+        _CALLER_VALUE.reset(token)
+    assert seen == "set by the caller"
+
+
+async def test_a_call_cancelled_while_it_waits_for_a_thread_never_runs():
+    gate = _Gate()
+    ran = threading.Event()
+    running = [
+        asyncio.ensure_future(storage.run_on_storage_thread(gate, i))
+        for i in range(storage.DRIVER_STORAGE_THREADS)
+    ]
+    try:
+        await _until(lambda: gate.entered == storage.DRIVER_STORAGE_THREADS)
+        pool = storage.storage_executor()
+        waiting = asyncio.ensure_future(storage.run_on_storage_thread(ran.set))
+        await _until(lambda: pool._work_queue.qsize() == 1)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    finally:
+        gate.release.set()
+    assert await asyncio.gather(*running) == list(range(storage.DRIVER_STORAGE_THREADS))
+    # Every thread is free again and the queue is drained: a call that was going
+    # to run would have run before this one returns.
+    for _ in range(2 * storage.DRIVER_STORAGE_THREADS):
+        await storage.run_on_storage_thread(lambda: None)
+    assert not ran.is_set()
+
+
 # Through the routes --------------------------------------------------------------
 
 
@@ -189,13 +231,16 @@ async def test_downloads_waiting_on_storage_hold_no_database_connection_and_resp
     ):
         ids = {}
         for n in range(6):
+            # One archive per driver: a second _driver_zip call can stamp another
+            # modification time into the bytes.
+            archive = _driver_zip(n)
             resp = await client.post(
                 "/drivers",
                 data={"name": f"Pkg{n}", "connection_type": "Management"},
-                files={"file": ("d.zip", io.BytesIO(_driver_zip(n)), "application/zip")},
+                files={"file": ("d.zip", io.BytesIO(archive), "application/zip")},
             )
             assert resp.status_code == 201, resp.text
-            ids[resp.json()["id"]] = _driver_zip(n)
+            ids[resp.json()["id"]] = archive
 
         downloads = {
             driver_id: asyncio.ensure_future(client.get(f"/drivers/{driver_id}/download"))

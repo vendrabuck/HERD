@@ -837,8 +837,11 @@ describe("InventoryPage", () => {
       );
     });
 
-    it("cuts a long device name so the copy's name fits its 255-character column", async () => {
-      const longName = "d".repeat(255);
+    it.each([
+      ["an ASCII character", "d"],
+      ["a character outside the BMP", "\u{1D11E}"],
+    ])("cuts a long device name of %s so the copy's name fits its column", async (_kind, char) => {
+      const longName = char.repeat(255);
       let sentName: string | undefined;
       server.use(
         http.get("/api/inventory/devices", () =>
@@ -865,8 +868,8 @@ describe("InventoryPage", () => {
       fireEvent.click(screen.getByTitle("Duplicate device"));
 
       await waitFor(() => expect(sentName).toBeDefined());
-      expect(sentName).toBe("Copy of " + "d".repeat(247));
-      expect(sentName).toHaveLength(255);
+      expect(sentName).toBe("Copy of " + char.repeat(247));
+      expect(Array.from(sentName as string)).toHaveLength(255);
     });
 
     it("reports a plain success message when the device has no ports", async () => {
