@@ -9,6 +9,7 @@ import {
   EMPTY_CONNECTIONS,
   mockStandardPorts,
   connectionFixture,
+  failedQuery,
 } from "../fixtures/wiringFixtures";
 import type { BulkConnectionResult } from "@/types/connection.types";
 import type { Port } from "@/types/port.types";
@@ -716,5 +717,52 @@ describe("MultiConnectDialog", () => {
     expect(within(targetColumn).getByText("0/0/1")).toBeInTheDocument();
     expect(within(targetColumn).queryByText("eth1")).not.toBeInTheDocument();
     expect(TARGET_PORTS.map((p) => p.name)).toContain("0/0/1");
+  });
+});
+
+// Issue #1320: the default create surface on the Connections page shows a
+// failed ports or connections read as a load error with Retry, never as "No
+// ports configured" or as every port free to cable.
+describe("MultiConnectDialog load failures", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStandardPorts(mockUsePorts);
+    mockUseDeviceConnections.mockReturnValue({ data: EMPTY_CONNECTIONS, isLoading: false });
+    mockUsePaginatedDevices.mockReturnValue(DEVICE_RESULTS);
+  });
+
+  it("a failed ports read on Device A shows the load error in its column", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("inventory is down", refetch);
+    mockUsePorts.mockImplementation((deviceId: string) =>
+      deviceId === SOURCE_DEVICE ? failed : { data: TARGET_PORTS, isLoading: false },
+    );
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices();
+    const column = screen.getByTestId("port-column-source");
+    expect(within(column).getByRole("alert")).toHaveTextContent(
+      "Could not load this device's ports. inventory is down",
+    );
+    expect(within(column).queryByText("No ports configured")).not.toBeInTheDocument();
+    fireEvent.click(within(column).getByRole("button", { name: "Retry loading this device's ports" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed connections read on Device B leaves nothing to stage", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("cabling is down", refetch);
+    mockUseDeviceConnections.mockImplementation((deviceId: string | undefined) =>
+      deviceId === TARGET_DEVICE ? failed : { data: EMPTY_CONNECTIONS, isLoading: false },
+    );
+    render(<MultiConnectDialog {...baseProps()} />);
+    pickBothDevices();
+    const column = screen.getByTestId("port-column-target");
+    expect(within(column).getByRole("alert")).toHaveTextContent(
+      "Could not load this device's connections. cabling is down",
+    );
+    expect(within(column).queryByText("0/0/1")).not.toBeInTheDocument();
+    clickPort("eth1");
+    expect(screen.queryByText(/selected\. Click a port/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create connections" })).toBeDisabled();
   });
 });

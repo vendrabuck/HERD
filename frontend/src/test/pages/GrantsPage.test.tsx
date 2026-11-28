@@ -246,8 +246,16 @@ describe("GrantsPage", () => {
       http.get("/api/acl/grants", () => HttpResponse.json({ detail: "boom" }, { status: 500 })),
     );
     renderWithProviders(<GrantsPage />);
-    await waitFor(() => expect(screen.getByText("Failed to load grants")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("Could not load grants. boom"),
+    );
     expect(screen.queryByText("No grants found")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and a good empty answer is the empty state.
+    server.use(grantsHandler([]));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading grants" }));
+    expect(await screen.findByText("No grants found")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("deletes a grant through the confirm dialog", async () => {

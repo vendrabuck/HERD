@@ -11,6 +11,8 @@ import {
 } from "@/lib/errors";
 import { ArrowLeft, Eye, EyeOff, ChevronDown, ChevronRight } from "lucide-react";
 import { AuthorCredit } from "@/components/layout/AuthorCredit";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 import { useConfigStore } from "@/stores/configStore";
 import { configPasswordLengthOk } from "@/lib/configPassword";
 import {
@@ -301,8 +303,12 @@ function FieldInput({
 // -- Config Editor --
 
 function ConfigEditor() {
-  const { data: schema, isLoading: schemaLoading } = useConfigSchema();
-  const { data: settings, isLoading: settingsLoading } = useConfigSettings();
+  const schemaQuery = useConfigSchema();
+  const { data: schema } = schemaQuery;
+  const settingsQuery = useConfigSettings();
+  const { data: settings } = settingsQuery;
+  const schemaState = loadState(schemaQuery, undefined, Array.isArray);
+  const settingsState = loadState(settingsQuery, undefined, isPlainObject);
   const saveSettings = useSaveConfigSettings();
   const applyConfig = useApplyConfig();
   const clearConfigToken = useConfigStore((s) => s.clearConfigToken);
@@ -485,17 +491,40 @@ function ConfigEditor() {
     }
   };
 
-  if (schemaLoading || settingsLoading) {
+  // Issue #1320: the form is built from the schema and filled from the saved
+  // settings; when either failed to load there is no form, so a save can
+  // never write a blank form over settings the page never read.
+  const failedQuery =
+    schemaState === "error"
+      ? { what: "the configuration schema", query: schemaQuery }
+      : settingsState === "error"
+        ? { what: "the saved configuration", query: settingsQuery }
+        : null;
+  if (failedQuery) {
     return (
-      <div className="text-center py-12 text-gray-500">Loading configuration...</div>
+      <div className="w-full max-w-2xl">
+        <div className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold text-gray-900">HERD Configuration</h1>
+          <button
+            onClick={() => clearConfigToken()}
+            className="text-sm text-gray-500 hover:text-gray-700"
+          >
+            Sign out
+          </button>
+        </div>
+        <LoadError
+          what={failedQuery.what}
+          error={failedQuery.query.error}
+          onRetry={() => void failedQuery.query.refetch()}
+          retrying={failedQuery.query.isFetching}
+        />
+      </div>
     );
   }
 
-  if (!schema) {
+  if (schemaState === "loading" || settingsState === "loading" || !schema) {
     return (
-      <div className="text-center py-12 text-red-500">
-        Failed to load configuration schema
-      </div>
+      <div className="text-center py-12 text-gray-500">Loading configuration...</div>
     );
   }
 
@@ -516,6 +545,18 @@ function ConfigEditor() {
         </button>
       </div>
 
+      <LoadErrorNotice
+        what="the configuration schema"
+        query={schemaQuery}
+        isValid={Array.isArray}
+        className="mb-4"
+      />
+      <LoadErrorNotice
+        what="the saved configuration"
+        query={settingsQuery}
+        isValid={isPlainObject}
+        className="mb-4"
+      />
       <div className="space-y-4">
         {groups.map((group) => {
           const groupFields = schema.filter((f) => f.group === group);

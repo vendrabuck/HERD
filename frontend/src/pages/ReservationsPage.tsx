@@ -51,6 +51,8 @@ import { CreateReservationModal } from "@/components/reservations/CreateReservat
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { EmptyState } from "@/components/ui/EmptyState";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 import type {
   Reservation,
   ReservationSortField,
@@ -388,7 +390,7 @@ export function ReservationsPage() {
     }
   };
 
-  const { data, isLoading, isError } = usePaginatedReservations(
+  const reservationsQuery = usePaginatedReservations(
     skip,
     limit,
     allReservations,
@@ -396,6 +398,7 @@ export function ReservationsPage() {
     filtersApplied ? filters : undefined,
     { enabled: !categoryPending },
   );
+  const { data, isLoading } = reservationsQuery;
   const { data: deviceNames } = useAllDeviceNames();
   const reservations = data?.items;
   const total = data?.total ?? 0;
@@ -574,13 +577,20 @@ export function ReservationsPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <LoadErrorNotice what="reservations" query={reservationsQuery} className="m-4" />
           {listLoading && (
             <p role="status" aria-live="polite" className="text-sm text-gray-400 text-center py-8">
               Loading reservations...
             </p>
           )}
-          {isError && (
-            <p className="text-sm text-red-500 text-center py-8">Failed to load reservations</p>
+          {loadState(reservationsQuery) === "error" && (
+            <LoadError
+              what="reservations"
+              error={reservationsQuery.error}
+              onRetry={() => void reservationsQuery.refetch()}
+              retrying={reservationsQuery.isFetching}
+              className="m-4"
+            />
           )}
           {reservations && reservations.length === 0 && (
             filtersApplied ? (

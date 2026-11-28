@@ -16,6 +16,8 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { PurposeCategoryTag } from "@/components/reservations/PurposeCategoryTag";
 import { purposeCategoryLabel } from "@/lib/purposeCategories";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 import type { PurposeReviewItem } from "@/types/reservation.types";
 
 // Admin review surface for AI purpose suggestions (issue #646 phase 2, ADR
@@ -31,11 +33,8 @@ export function PurposeReviewPage() {
   // clicked, before the server confirms, and comes back if the call fails.
   const [removedIds, setRemovedIds] = useState<Record<string, boolean>>({});
 
-  const { data, isLoading, isError } = usePurposeReview(
-    skip,
-    PAGE_SIZE,
-    categoryFilter || undefined,
-  );
+  const reviewQuery = usePurposeReview(skip, PAGE_SIZE, categoryFilter || undefined);
+  const { data } = reviewQuery;
   const { data: categoriesData } = usePurposeCategories();
   const categories = categoriesData?.categories ?? [];
   const { data: users } = useAllUsers();
@@ -49,6 +48,7 @@ export function PurposeReviewPage() {
   const backfill = useBackfillPurposeClassification();
 
   const items = (data?.items ?? []).filter((item) => !removedIds[item.reservation_id]);
+  const state = loadState(reviewQuery, () => items.length === 0);
   const total = data?.total ?? 0;
 
   const groups = useMemo(() => {
@@ -145,15 +145,19 @@ export function PurposeReviewPage() {
           </select>
         </div>
 
-        {isLoading ? (
+        <LoadErrorNotice what="the review queue" query={reviewQuery} className="mb-3" />
+        {state === "loading" ? (
           <Card>
             <SkeletonRows rows={5} />
           </Card>
-        ) : isError ? (
-          <Card>
-            <EmptyState>Failed to load the review queue</EmptyState>
-          </Card>
-        ) : items.length === 0 ? (
+        ) : state === "error" ? (
+          <LoadError
+            what="the review queue"
+            error={reviewQuery.error}
+            onRetry={() => void reviewQuery.refetch()}
+            retrying={reviewQuery.isFetching}
+          />
+        ) : state === "empty" ? (
           <Card>
             <EmptyState>Nothing to review</EmptyState>
           </Card>

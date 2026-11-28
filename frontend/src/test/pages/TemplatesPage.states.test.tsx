@@ -114,9 +114,23 @@ describe("TemplatesPage loading/error/empty states", () => {
   });
 
   it("shows the exact error text on a failed fetch", () => {
-    mockUsePaginatedTemplates.mockReturnValue({ data: undefined, isLoading: false, isError: true });
+    const refetch = vi.fn();
+    mockUsePaginatedTemplates.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: { response: { status: 500, data: { detail: "database is down" } } },
+      refetch,
+    });
     renderPage();
-    expect(screen.getByText("Failed to load templates")).toBeInTheDocument();
+    // Issue #1320: the error state names the load, carries the server's
+    // detail as text, offers Retry, and is never the empty state.
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load templates. database is down",
+    );
+    expect(screen.queryByText("No templates found")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading templates" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 
   it("shows the exact empty-state text when there are zero templates", () => {

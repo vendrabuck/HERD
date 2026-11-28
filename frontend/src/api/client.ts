@@ -1,5 +1,6 @@
 import axios, { type AxiosError, type InternalAxiosRequestConfig } from "axios";
 import { readStoredTokens, useAuthStore, type StoredTokens } from "@/stores/authStore";
+import { rejectUnreadableAnswer } from "./answerGuard";
 
 interface RetryableRequest extends InternalAxiosRequestConfig {
   _retry?: boolean;
@@ -271,6 +272,9 @@ export function skipsRefresh(url: string | undefined): boolean {
   const path = (url ?? "").split(/[?#]/, 1)[0];
   return REFRESH_SKIP_PATHS.some((skipped) => path.endsWith(skipped));
 }
+
+// A 2xx the caller cannot read as JSON is an error, never data (issue #1320).
+apiClient.interceptors.response.use(rejectUnreadableAnswer);
 
 apiClient.interceptors.response.use(
   (response) => response,

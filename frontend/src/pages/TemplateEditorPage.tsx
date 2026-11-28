@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { isAxiosError } from "axios";
 import toast from "react-hot-toast";
 import { TOAST_CLEARANCE_CLASS } from "@/lib/toastClearance";
 import {
@@ -18,6 +19,8 @@ import type {
   SectionDefinition,
 } from "@/types/template.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 const DEFAULT_FIELD: FieldDefinition = {
   key: "",
@@ -43,11 +46,17 @@ export function TemplateEditorPage() {
   const isNew = id === "new" || !id;
   const navigate = useNavigate();
 
-  const { data: existing, isLoading } = useTemplate(isNew ? undefined : id);
+  const templateQuery = useTemplate(isNew ? undefined : id);
+  const { data: existing } = templateQuery;
+  // Issue #1320: a 404 reads "Template not found"; any other failed load is a
+  // load error with Retry, never an editor over a template that never loaded.
+  const templateState = isNew ? "loaded" : loadState(templateQuery, undefined, isPlainObject);
   const createTemplate = useCreateTemplate();
   const updateTemplate = useUpdateTemplate();
-  const { data: drivers } = useDrivers();
-  const { data: hypervisors } = useHypervisors();
+  const driversQuery = useDrivers();
+  const { data: drivers } = driversQuery;
+  const hypervisorsQuery = useHypervisors();
+  const { data: hypervisors } = hypervisorsQuery;
   const { data: aiStatus } = useAIStatus();
   const suggestIdentity = useSuggestTemplateIdentity();
   const user = useAuthStore((s) => s.user);
@@ -296,7 +305,7 @@ export function TemplateEditorPage() {
     setEditing(false);
   };
 
-  if (!isNew && isLoading) {
+  if (templateState === "loading") {
     return (
       <div className="h-full flex items-center justify-center">
         <p className="text-sm text-gray-400">Loading template...</p>
@@ -304,10 +313,30 @@ export function TemplateEditorPage() {
     );
   }
 
-  if (!isNew && !existing && !isLoading) {
+  if (templateState === "error") {
+    if (isAxiosError(templateQuery.error) && templateQuery.error.response?.status === 404) {
+      return (
+        <div className="h-full flex items-center justify-center">
+          <p className="text-sm text-red-500">Template not found</p>
+        </div>
+      );
+    }
     return (
-      <div className="h-full flex items-center justify-center">
-        <p className="text-sm text-red-500">Template not found</p>
+      <div className="h-full overflow-y-auto">
+        <div className="max-w-4xl mx-auto px-6 pt-6 space-y-6">
+          <button
+            onClick={() => navigate("/templates")}
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+          >
+            Back
+          </button>
+          <LoadError
+            what="this template"
+            error={templateQuery.error}
+            onRetry={() => void templateQuery.refetch()}
+            retrying={templateQuery.isFetching}
+          />
+        </div>
       </div>
     );
   }
@@ -317,6 +346,13 @@ export function TemplateEditorPage() {
       {/* Issue #988: the page ends in the full-width "+ Add Section" button at
           the bottom centre; the bottom padding lets it scroll clear of a toast. */}
       <div className={`max-w-4xl mx-auto px-6 pt-6 space-y-6 ${TOAST_CLEARANCE_CLASS}`}>
+        {!isNew && (
+          <LoadErrorNotice
+            what="this template"
+            query={templateQuery}
+            isValid={isPlainObject}
+          />
+        )}
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-900">
             {isNew ? "Create Template" : editing ? "Edit Template" : "Template Details"}
@@ -493,6 +529,15 @@ export function TemplateEditorPage() {
                         </option>
                       ))}
                   </select>
+                  {loadState(driversQuery) === "error" && (
+                    <LoadError
+                      what="drivers"
+                      error={driversQuery.error}
+                      onRetry={() => void driversQuery.refetch()}
+                      retrying={driversQuery.isFetching}
+                      className="mt-2"
+                    />
+                  )}
                   {templateType === "dynamic" &&
                     drivers &&
                     drivers.filter((d) => d.connection_type === "Hypervisor").length === 0 && (
@@ -525,6 +570,15 @@ export function TemplateEditorPage() {
                       </option>
                     ))}
                   </select>
+                  {loadState(hypervisorsQuery) === "error" && (
+                    <LoadError
+                      what="hypervisors"
+                      error={hypervisorsQuery.error}
+                      onRetry={() => void hypervisorsQuery.refetch()}
+                      retrying={hypervisorsQuery.isFetching}
+                      className="mt-2"
+                    />
+                  )}
                   {hypervisors && hypervisors.length === 0 && (
                     <p className="text-xs text-amber-600 mt-1">
                       No hypervisors registered. Register one from the Hypervisors

@@ -146,7 +146,7 @@ export function WiringDialog({
   onConfirm,
   onCancel,
 }: WiringDialogProps) {
-  const { source, target, connectionsLoading } = usePortAvailability(sourceDeviceId, targetDeviceId);
+  const { source, target, connectionsUnknown } = usePortAvailability(sourceDeviceId, targetDeviceId);
   const deviceName: Record<Side, string> = { source: sourceDeviceName, target: targetDeviceName };
   const topologyType: Record<Side, TopologyType> = {
     source: sourceTopologyType,
@@ -293,7 +293,7 @@ export function WiringDialog({
   // there is exactly one place that decides arm vs complete vs disarm.
   const handlePortActivate = useCallback(
     (side: Side, port: Port) => {
-      if (connectionsLoading) return;
+      if (connectionsUnknown) return;
       const visual = visuals[side].get(port.id);
       if (visual?.status === "session-wired") {
         setErrorMessage(`${port.name} already has a line in this session`);
@@ -326,7 +326,7 @@ export function WiringDialog({
       }
       completeConnection(pendingSource, { side, port });
     },
-    [connectionsLoading, visuals, pendingSource, completeConnection],
+    [connectionsUnknown, visuals, pendingSource, completeConnection],
   );
 
   const handlePortMouseDown = useCallback((side: Side, port: Port, e: React.MouseEvent) => {
@@ -384,7 +384,7 @@ export function WiringDialog({
       setDragFrom(null);
 
       if (press.moved) {
-        if (connectionsLoading) return;
+        if (connectionsUnknown) return;
         const originVisual = visuals[press.side].get(press.port.id);
         if (originVisual?.status !== "free") return;
         const el = (e.target as HTMLElement)?.closest?.("[data-port-id]") as HTMLElement | null;
@@ -416,7 +416,7 @@ export function WiringDialog({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [connectionsLoading, visuals, sideData, completeConnection, handlePortActivate]);
+  }, [connectionsUnknown, visuals, sideData, completeConnection, handlePortActivate]);
 
   // Recompute session-line endpoints from the currently mounted row refs. A
   // port scrolled out of view or filtered out has no ref: its end of the
@@ -485,7 +485,7 @@ export function WiringDialog({
   }, []);
 
   const handleConnectOneToOne = useCallback(() => {
-    if (connectionsLoading) return;
+    if (connectionsUnknown) return;
     const freeSource = filteredSourcePorts.filter((p) => sourceVisuals.get(p.id)?.status === "free");
     const freeTarget = filteredTargetPorts.filter((p) => targetVisuals.get(p.id)?.status === "free");
     const n = Math.min(freeSource.length, freeTarget.length);
@@ -505,7 +505,7 @@ export function WiringDialog({
     setPendingSource(null);
     setErrorMessage(null);
   }, [
-    connectionsLoading,
+    connectionsUnknown,
     filteredSourcePorts,
     filteredTargetPorts,
     sourceVisuals,
@@ -516,9 +516,9 @@ export function WiringDialog({
   ]);
 
   const handleConfirm = useCallback(() => {
-    if (sessionConnections.length === 0 || connectionsLoading) return;
+    if (sessionConnections.length === 0 || connectionsUnknown) return;
     onConfirm(sessionConnections);
-  }, [sessionConnections, connectionsLoading, onConfirm]);
+  }, [sessionConnections, connectionsUnknown, onConfirm]);
 
   const handleAreaClick = useCallback((e: React.MouseEvent) => {
     if (e.target === e.currentTarget) setSelectedLineId(null);
@@ -574,13 +574,14 @@ export function WiringDialog({
       ports: filteredPorts[side],
       totalCount: sideData[side].ports.length,
       isLoading: sideData[side].isLoading,
+      loadError: sideData[side].loadError,
       visuals: visuals[side],
       cabledCount: sideData[side].cabled.size,
       filter: filter[side],
       onFilterChange: filterChangeForSide[side],
       armedPortId: armedPortIdForSide(side),
       highlightFree: highlightForSide(side),
-      interactionDisabled: connectionsLoading,
+      interactionDisabled: connectionsUnknown,
     };
   }
   const sourceActivate = useCallback((port: Port) => handlePortActivate("source", port), [handlePortActivate]);
@@ -754,7 +755,7 @@ export function WiringDialog({
           <Button variant="ghost" size="sm" onClick={() => setReviewOpen((v) => !v)}>
             Review ({sessionConnections.length})
           </Button>
-          <Button variant="outline" size="sm" onClick={handleConnectOneToOne} disabled={connectionsLoading}>
+          <Button variant="outline" size="sm" onClick={handleConnectOneToOne} disabled={connectionsUnknown}>
             Connect 1:1 in order
           </Button>
           <Button variant="secondary" size="sm" onClick={onCancel}>
@@ -764,7 +765,7 @@ export function WiringDialog({
             variant="primary"
             size="sm"
             onClick={handleConfirm}
-            disabled={sessionConnections.length === 0 || connectionsLoading}
+            disabled={sessionConnections.length === 0 || connectionsUnknown}
           >
             {confirmLabel}
           </Button>

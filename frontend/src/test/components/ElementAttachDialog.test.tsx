@@ -5,6 +5,7 @@ import {
   EMPTY_CONNECTIONS,
   mockStandardPorts,
   connectionFixture,
+  failedQuery,
 } from "../fixtures/wiringFixtures";
 
 const mockUsePorts = vi.fn();
@@ -150,5 +151,39 @@ describe("ElementAttachDialog", () => {
       expect(screen.getByText("Mgmt VLAN")).toBeInTheDocument();
       unmount();
     }
+  });
+});
+
+// Issue #1320: the attach dialog's port column shows a failed ports or
+// connections read as a load error with Retry, and nothing can be attached.
+describe("ElementAttachDialog load failures", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStandardPorts(mockUsePorts);
+    mockUseDeviceConnections.mockReturnValue({ data: EMPTY_CONNECTIONS, isLoading: false });
+  });
+
+  it("a failed ports read shows the load error, never No ports configured", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("inventory is down", refetch);
+    mockUsePorts.mockReturnValue(failed);
+    render(<ElementAttachDialog {...baseProps()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this device's ports. inventory is down",
+    );
+    expect(screen.queryByText("No ports configured")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this device's ports" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed connections read shows the load error and lists no port to attach", () => {
+    const refetch = vi.fn();
+    const failed = failedQuery("cabling is down", refetch);
+    mockUseDeviceConnections.mockReturnValue(failed);
+    render(<ElementAttachDialog {...baseProps()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this device's connections. cabling is down",
+    );
+    expect(screen.queryByText("eth1")).not.toBeInTheDocument();
   });
 });

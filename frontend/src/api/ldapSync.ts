@@ -43,7 +43,9 @@ export function isRunStale(run: LdapSyncRun, now: number = Date.now()): boolean 
 export function runsRefetchInterval(
   page: PaginatedResponse<LdapSyncRun> | undefined,
 ): number | false {
-  if (!page) return false;
+  // A body without an items list (issue #1320) polls nothing; the page shows
+  // it as a load error.
+  if (!page || !Array.isArray(page.items)) return false;
   const anyActivelyRunning = page.items.some((run) => run.status === "running" && !isRunStale(run));
   return anyActivelyRunning ? 2000 : false;
 }
