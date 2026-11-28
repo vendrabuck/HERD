@@ -14,6 +14,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from herd_common.bulk_work import run_bulk_work
 from herd_common.validation_errors import body_too_large_error, extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,10 +58,11 @@ async def _read_capped(file: UploadFile, limit: int) -> bytes:
     ``MAX_REQUEST_BODY_BYTES``.
 
     Starlette has already received the upload and spooled it to a temporary file
-    by the time a route reads it, so this does not stop the upload early. It
-    bounds what is copied out of the spool into memory. A file up to 10 MiB is
-    still decoded and parsed on the event loop, the loop every reservation and
-    topology read depends on; step 2 of #1417 is not done here.
+    by the time a route reads it, so this does not stop the upload early; the body
+    limit has already refused a body over the route's envelope, declared or
+    streamed. This bounds what is copied out of the spool into memory. The file is
+    then decoded and parsed on a bulk worker thread, off the event loop
+    (``herd_common.bulk_work``).
 
     The 413 has the shape the body-limit middleware builds; only the byte count
     in its message tells a client which of the two bounds refused the request.
@@ -78,13 +80,15 @@ _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
 
 
-def _export_response(records, columns, resource, fmt, text_columns=None):
+async def _export_response(records, columns, resource, fmt, text_columns=None):
+    """The export file. The records are plain dicts built on the event loop; their
+    rendering into one body runs on a bulk worker thread (issue #1417)."""
     if fmt == "json":
-        body = records_to_json(records, resource)
+        body = await run_bulk_work(records_to_json, records, resource)
         media = _JSON_MEDIA
         ext = "json"
     else:
-        body = records_to_csv(records, columns, text_columns)
+        body = await run_bulk_work(records_to_csv, records, columns, text_columns)
         media = _CSV_MEDIA
         ext = "csv"
     return Response(
@@ -110,7 +114,9 @@ async def export_devices(
     stmt = select(Device).where(Device.request_id.is_(None)).order_by(Device.name)
     devices = (await db.execute(stmt)).unique().scalars().all()
     records = [device_to_record(d) for d in devices]
-    return _export_response(records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS)
+    return await _export_response(
+        records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS
+    )
 
 
 @router.post("/devices/import", response_model=BulkImportReport)
@@ -149,7 +155,7 @@ async def export_templates(
         for hv_id, hv_name in (await db.execute(select(Hypervisor.id, Hypervisor.name)))
     }
     records = [template_to_record(t, hypervisor_names) for t in templates]
-    return _export_response(
+    return await _export_response(
         records, TEMPLATE_CSV_COLUMNS, "templates", format, TEMPLATE_CSV_TEXT_COLUMNS
     )
 

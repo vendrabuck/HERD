@@ -20,6 +20,8 @@ from app.services.bulk_service import (
     _coerce_bool,
     _coerce_int,
     _coerce_json_cell,
+    _decode_json_cells,
+    _DecodedCell,
     _parse_csv,
     _parse_json,
     _row_shape_reason,
@@ -696,3 +698,51 @@ async def test_import_templates_invalid_row_rolls_back_and_rejects(db_setup):
         )
     assert report.rejected == 1
     assert report.rows[0].action == "reject"
+
+
+# The JSON cells decoded with the file (issue #1417) ----------------------------------
+
+
+def test_decode_json_cells_wraps_text_cells_and_leaves_the_rest():
+    """Mutation-checked: dropping the `value == ""` skip wraps the empty cell and
+    fails this."""
+    native = {"model": "x"}
+    rows = [
+        {"name": "text", "field_data": '{"model": "x"}'},
+        {"name": "empty", "field_data": ""},
+        {"name": "null", "field_data": None},
+        {"name": "absent"},
+        {"name": "native", "field_data": native},
+        {"name": "number", "field_data": 5},
+        ["not", "an", "object"],
+    ]
+    _decode_json_cells(rows, "field_data", {})
+    assert isinstance(rows[0]["field_data"], _DecodedCell)
+    assert _coerce_json_cell(rows[0]["field_data"], {}) == {"model": "x"}
+    assert rows[1]["field_data"] == ""
+    assert rows[2]["field_data"] is None
+    assert "field_data" not in rows[3]
+    assert rows[4]["field_data"] is native
+    assert rows[5]["field_data"] == 5
+    assert rows[6] == ["not", "an", "object"]
+
+
+def test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it():
+    rows = [{"field_data": "{not json"}, {"field_data": '"\\ud800"'}]
+    _decode_json_cells(rows, "field_data", {})
+    with pytest.raises(json.JSONDecodeError) as syntax:
+        _coerce_json_cell(rows[0]["field_data"], {})
+    with pytest.raises(json.JSONDecodeError) as direct:
+        _coerce_json_cell("{not json", {})
+    assert str(syntax.value) == str(direct.value)
+    with pytest.raises(ValueError) as surrogate:
+        _coerce_json_cell(rows[1]["field_data"], {})
+    assert str(surrogate.value) == (
+        "a JSON cell holds a lone surrogate escape, which is not valid text"
+    )
+
+
+def test_a_decoded_cell_is_not_an_empty_cell():
+    """The device update keeps a row's `field_data` only when the cell is neither
+    None nor empty; a decoded cell stands for non-empty text."""
+    assert _DecodedCell({}, None) not in (None, "")

@@ -435,3 +435,68 @@ async def test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin(user_cli
         raise
     finally:
         await _delete_topologies_named(user_client, name, failure)
+
+
+# The upload bound through the gateway (issue #1417) ---------------------------------
+#
+# A file one byte over IMPORT_UPLOAD_BYTES (10 MiB) answers the 413 naming the bound on
+# every import route, and a body streamed with no Content-Length past the route's whole
+# limit (MAX_REQUEST_BODY_BYTES plus 10 MiB, whatever the stack sets) answers the same
+# 413 naming that limit, so neither reaches the parse. Each is a dry run refused before
+# any row, so nothing needs cleaning up.
+
+_IMPORT_UPLOAD_BYTES = 10 * 1024 * 1024
+_IMPORT_ROUTES = [
+    ("admin", "/inventory/devices/import"),
+    ("admin", "/inventory/templates/import"),
+    ("user", "/cabling/topologies/import"),
+]
+
+
+def _body_too_large(resp: httpx.Response) -> str:
+    """The message of the body limit's one 413 item."""
+    assert resp.status_code == 413, resp.text[:300]
+    [item] = resp.json()["detail"]
+    assert item["type"] == "body_too_large"
+    assert item["loc"] == ["body"]
+    return item["msg"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("who", "path"), _IMPORT_ROUTES)
+async def test_an_import_file_one_byte_over_the_bound_is_413(admin_client, user_client, who, path):
+    client = admin_client if who == "admin" else user_client
+    resp = await client.post(
+        path,
+        params={"format": "json", "dry_run": "true"},
+        files={
+            "file": ("f.json", io.BytesIO(b" " * (_IMPORT_UPLOAD_BYTES + 1)), "application/json")
+        },
+    )
+    assert _body_too_large(resp) == f"Request body is larger than {_IMPORT_UPLOAD_BYTES} bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("who", "path"), _IMPORT_ROUTES)
+async def test_an_import_body_streamed_past_the_route_limit_is_413(
+    admin_client, user_client, who, path
+):
+    client = admin_client if who == "admin" else user_client
+    request = httpx.Request(
+        "POST",
+        "http://placeholder/",
+        files={"file": ("f.json", b" " * (_IMPORT_UPLOAD_BYTES * 2), "application/json")},
+    )
+    body = request.read()
+    headers = {"content-type": request.headers["content-type"]}
+
+    async def chunks():
+        for start in range(0, len(body), 64 * 1024):
+            yield body[start : start + 64 * 1024]
+
+    resp = await client.post(
+        path, params={"format": "json", "dry_run": "true"}, content=chunks(), headers=headers
+    )
+    message = _body_too_large(resp)
+    limit = int(message.removeprefix("Request body is larger than ").removesuffix(" bytes"))
+    assert _IMPORT_UPLOAD_BYTES < limit < 2 * _IMPORT_UPLOAD_BYTES

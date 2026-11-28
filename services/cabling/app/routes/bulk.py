@@ -26,6 +26,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
+from herd_common.bulk_work import run_bulk_work
 from herd_common.validation_errors import body_too_large_error, extends_body_limit
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,12 +35,7 @@ from app.database import get_db
 from app.dependencies import get_current_user_payload
 from app.models.topology import Topology
 from app.schemas.bulk import BulkImportReport
-from app.services.bulk_service import (
-    import_topologies,
-    records_to_csv,
-    records_to_json,
-    topology_to_record,
-)
+from app.services.bulk_service import import_topologies, render_export
 
 router = APIRouter(prefix="/topologies", tags=["topology-bulk"])
 
@@ -63,8 +59,10 @@ async def _read_capped(file: UploadFile, limit: int) -> bytes:
 
     Starlette has already received the upload and spooled it to a temporary file
     by the time a route reads it, so this bounds what is copied out of the spool
-    into memory and not the upload itself. A file up to 10 MiB is still decoded
-    and parsed on the event loop; step 2 of #1417 is not done here.
+    into memory and not the upload itself; the body limit has already refused a
+    body over the route's envelope, declared or streamed. The file is then decoded
+    and parsed on a bulk worker thread, off the event loop
+    (``herd_common.bulk_work``).
     """
     raw = await file.read(limit + 1)
     if len(raw) > limit:
@@ -88,12 +86,9 @@ async def export_topologies(
     carry isolated nodes.
     """
     topologies = list((await db.execute(select(Topology).order_by(Topology.name))).scalars().all())
-    if format == "csv":
-        body = records_to_csv(topologies)
-        media, ext = "text/csv", "csv"
-    else:
-        body = records_to_json([topology_to_record(t) for t in topologies])
-        media, ext = "application/json", "json"
+    # Issue #1417: the records and the body are built on a bulk worker thread.
+    body = await run_bulk_work(render_export, topologies, format)
+    media, ext = ("text/csv", "csv") if format == "csv" else ("application/json", "json")
     return Response(
         content=body,
         media_type=media,

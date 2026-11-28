@@ -11,6 +11,13 @@ same create/update service functions on a
 back at the end, so the dry-run report matches the committing run row for row
 and nothing is written.
 
+Off the event loop (issue #1417): an import's decode, CSV or JSON parse, lone
+surrogate scan, and the decode of every row's JSON cell (`field_data`, `sections`)
+run on a worker thread through `herd_common.bulk_work.run_bulk_work` before the
+first query (`_read_device_import`, `_read_template_import`); the row loop, its
+schema checks, and every database call stay on the event loop in the request's
+session. An export's rendering of its records into one body runs the same way.
+
 There is no cross-schema bulk path: this lives in the inventory service and only
 touches the inventory schema, matching the service-boundary rule.
 """
@@ -22,6 +29,7 @@ import uuid
 from typing import Any
 
 from fastapi import HTTPException
+from herd_common.bulk_work import run_bulk_work
 from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
@@ -301,6 +309,38 @@ def parse_import(
     raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
 
 
+class _DecodedCell:
+    """A JSON cell already decoded on the parse thread (issue #1417): what
+    `_coerce_json_cell` returned for it there, or the exception it raised, which
+    `_coerce_json_cell` hands back or raises again when the row loop reaches the
+    cell, so the row's outcome and reason are the ones an on-loop decode gave. It
+    equals neither None nor "", as the non-empty text it stands for does not."""
+
+    __slots__ = ("error", "value")
+
+    def __init__(self, value: Any, error: Exception | None) -> None:
+        self.value = value
+        self.error = error
+
+
+def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
+    """Decode, in place, each object row's non-empty text in `column` into a
+    `_DecodedCell` (issue #1417). Runs on the parse thread with the file parse, so a
+    cell as large as the file is not decoded on the event loop. Any other value
+    (absent, null, empty, a native object or list, a number) is left for the row
+    loop, which reads it without a parse."""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get(column)
+        if not isinstance(value, str) or value == "":
+            continue
+        try:
+            row[column] = _DecodedCell(_coerce_json_cell(value, default), None)
+        except Exception as exc:  # raised again, unchanged, where the loop reads it
+            row[column] = _DecodedCell(None, exc)
+
+
 def _coerce_json_cell(value: Any, default: Any) -> Any:
     """Decode a CSV cell that carries JSON (field_data, sections).
 
@@ -308,8 +348,14 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
     json.loads. An empty cell yields the supplied default. A cell the parser
     refuses for its depth or an over-long integer raises ValueError with the fixed
     JSON_CELL_UNREADABLE_REASON (issue #1511); a syntax error keeps the decoder's
-    own message, which names a position, never the cell's content.
+    own message, which names a position, never the cell's content. A cell already
+    decoded on the parse thread (`_DecodedCell`, issue #1417) gives back that
+    decode's value, or raises its exception.
     """
+    if isinstance(value, _DecodedCell):
+        if value.error is not None:
+            raise value.error
+        return value.value
     if value is None or value == "":
         return default
     if isinstance(value, (dict, list)):
@@ -356,6 +402,14 @@ def _validation_reason(exc: ValidationError) -> str:
 # Import: devices ------------------------------------------------------------
 
 
+def _read_device_import(raw: bytes, fmt: str) -> list[Any]:
+    """The device file parsed and its `field_data` cells decoded: the import's CPU
+    work, run on a bulk worker thread (issue #1417)."""
+    rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS, DEVICE_CSV_TEXT_COLUMNS)
+    _decode_json_cells(rows, "field_data", {})
+    return rows
+
+
 async def import_devices(
     db: AsyncSession,
     raw: bytes,
@@ -364,7 +418,7 @@ async def import_devices(
     actor_id: uuid.UUID | None,
     actor_name: str | None,
 ) -> BulkImportReport:
-    rows = parse_import(raw, fmt, DEVICE_CSV_COLUMNS, DEVICE_CSV_TEXT_COLUMNS)
+    rows = await run_bulk_work(_read_device_import, raw, fmt)
     if dry_run:
         async with rehearsal_session(db) as rehearsal:
             report = await _import_device_rows(rehearsal, rows, actor_id, actor_name)
@@ -508,6 +562,14 @@ async def _import_device_rows(
 # Import: templates ----------------------------------------------------------
 
 
+def _read_template_import(raw: bytes, fmt: str) -> list[Any]:
+    """The template file parsed and its `sections` cells decoded: the import's CPU
+    work, run on a bulk worker thread (issue #1417)."""
+    rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS, TEMPLATE_CSV_TEXT_COLUMNS)
+    _decode_json_cells(rows, "sections", [])
+    return rows
+
+
 async def import_templates(
     db: AsyncSession,
     raw: bytes,
@@ -515,7 +577,7 @@ async def import_templates(
     dry_run: bool,
     actor_id: uuid.UUID | None,
 ) -> BulkImportReport:
-    rows = parse_import(raw, fmt, TEMPLATE_CSV_COLUMNS, TEMPLATE_CSV_TEXT_COLUMNS)
+    rows = await run_bulk_work(_read_template_import, raw, fmt)
     if dry_run:
         async with rehearsal_session(db) as rehearsal:
             report = await _import_template_rows(rehearsal, rows, actor_id)
