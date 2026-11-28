@@ -75,6 +75,7 @@ export function ReservationStatusTab({ reservation, onUpdated }: Props) {
             {editing ? (
               <input
                 type="datetime-local"
+                aria-label="End time"
                 value={endTime}
                 onChange={(e) => setEndTime(e.target.value)}
                 className="mt-0.5 w-full border border-gray-300 rounded px-2 py-1 text-sm"
@@ -94,6 +95,7 @@ export function ReservationStatusTab({ reservation, onUpdated }: Props) {
             value={purpose}
             onChange={(e) => setPurpose(e.target.value)}
             placeholder="Purpose"
+            aria-label="Purpose"
             className="mt-0.5 w-full border border-gray-300 rounded px-2 py-1 text-sm"
           />
         ) : (

@@ -692,9 +692,12 @@ filter pages through the device templates instead of stopping at the first 500
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`ExpandedPortsRow`) \
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`resolves a connected port to the other device's name and port, linked to that device`, `shows an unconnected port as Not connected`); `frontend/src/test/pages/pageLoadFailureSecondary.test.tsx` (`a failed load shows the load error where it would fill, and Retry clears it`)
 - **INV-LIST-14.** Selection checkboxes and the Actions column (Copy) are shown to admins
-  only; the bulk-action bar appears once an admin selects a device. \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`, `DeviceRow`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`hides admin-only controls for a non-admin user`, `shows the bulk-action bar after an admin selects a device`)
+  only; the bulk-action bar appears once an admin selects a device. Each row checkbox is
+  named `Select device <name>` and the header checkbox `Select all devices on this page`;
+  the header checkbox is mixed while some but not all listed rows are selected (issue
+  #1405). \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`, `DeviceRow`, `SelectAllCheckbox`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`hides admin-only controls for a non-admin user`, `shows the bulk-action bar after an admin selects a device`, `names each row checkbox by its device and the select-all box by its scope (issue #1405)`, `selects from the keyboard and shows the mixed state on select-all (issue #1405)`)
 - **INV-LIST-15.** Select-all covers the current page only. Bulk delete calls the
   single delete route once per selected device with no bulk endpoint, waits for every
   call, and reports the counts; when any refusal was `device_cabled` it says to remove

@@ -125,6 +125,7 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
           <input
             type="text"
             placeholder="Search available devices..."
+            aria-label="Search available devices"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm mb-2"
@@ -139,17 +140,22 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
             {availableDevices
               .filter((d) => !selectedIds.has(d.id))
               .map((d) => (
-                <div
+                // The whole row is one native button (issue #1405), so Tab
+                // reaches it and Enter or Space adds the device; there is no
+                // second click handler on a wrapper to fire twice.
+                <button
                   key={d.id}
-                  className="flex items-center justify-between px-3 py-1.5 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 cursor-pointer"
+                  type="button"
+                  aria-label={`Add ${d.name}`}
+                  className="w-full flex items-center justify-between px-3 py-1.5 text-left border-b border-gray-100 last:border-b-0 hover:bg-gray-50 cursor-pointer focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500"
                   onClick={() => handleToggle(d.id)}
                 >
-                  <div>
+                  <span>
                     <span className="text-sm text-gray-700">{d.name}</span>
                     <span className="text-xs text-gray-400 ml-2">{d.template_name}</span>
-                  </div>
+                  </span>
                   <span className="text-xs text-blue-600">Add</span>
-                </div>
+                </button>
               ))}
           </div>
         </div>

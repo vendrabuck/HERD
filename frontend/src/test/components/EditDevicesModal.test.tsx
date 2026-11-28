@@ -1,5 +1,6 @@
 import { http, HttpResponse } from "msw";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
@@ -24,6 +25,7 @@ beforeAll(() => {
 });
 
 import { server } from "../mocks/server";
+import { tabTo } from "../rowNavigationHarness";
 import { EditDevicesModal } from "@/components/reservations/EditDevicesModal";
 import type { Reservation } from "@/types/reservation.types";
 
@@ -229,6 +231,36 @@ describe("EditDevicesModal", () => {
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("conflict"));
     expect(onUpdated).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe("EditDevicesModal keyboard and names (issue #1405)", () => {
+  // Activation toggles membership, so a row whose click fired twice would add
+  // the device and take it out again: a count of 3 proves exactly one toggle.
+  it.each([
+    ["Enter", "{Enter}"],
+    ["Space", " "],
+  ])("Tab reaches the Add control and %s adds the device once", async (_label, key) => {
+    const user = userEvent.setup();
+    renderModal();
+    const add = await screen.findByRole("button", { name: "Add switch-gamma" });
+    await tabTo(user, add);
+    await user.keyboard(key);
+    expect(screen.getByText("Selected Devices (3)")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add switch-gamma" })).not.toBeInTheDocument();
+  });
+
+  it("a click on the Add control adds the device once", async () => {
+    const user = userEvent.setup();
+    renderModal();
+    await user.click(await screen.findByRole("button", { name: "Add switch-gamma" }));
+    expect(screen.getByText("Selected Devices (3)")).toBeInTheDocument();
+  });
+
+  it("names the available-devices search box", async () => {
+    renderModal();
+    await screen.findByText("switch-gamma");
+    expect(screen.getByRole("textbox", { name: "Search available devices" })).toBeInTheDocument();
   });
 });
 
