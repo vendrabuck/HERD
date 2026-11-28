@@ -28,7 +28,7 @@ from app.models.reservation import (
     ReservationStatus,
     TopologyType,
 )
-from app.schemas.reservation import ReservationUpdate, _as_utc
+from app.schemas.reservation import ReservationUpdate, _naive_as_utc
 from app.services.reservation_service import (
     TopologyDeviceNotMember,
     TopologyRoutingIntentInvalid,
@@ -1565,13 +1565,13 @@ async def test_purpose_classify_loop_happy_path_single_iteration():
 
 def test_as_utc_naive_treated_as_utc():
     naive = datetime(2026, 1, 1, 0, 0)
-    out = _as_utc(naive)
+    out = _naive_as_utc(naive)
     assert out.tzinfo == timezone.utc
 
 
 def test_as_utc_aware_left_unchanged():
     aware = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
-    assert _as_utc(aware) is aware
+    assert _naive_as_utc(aware) is aware
 
 
 def test_reservation_update_device_ids_none_passes():
