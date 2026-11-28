@@ -51,6 +51,7 @@ from app.models.fork import (
 )
 from app.models.topology import Topology, TopologyVersion
 from app.services.canvas_nodes import strip_device_nodes
+from app.services.canvas_shape import require_readable_canvas
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
@@ -191,6 +192,15 @@ async def create_fork(
 
     parent_canvas, pinned_version_id = await _resolve_parent_canvas(
         db, parent_topology_id, parent_version_id
+    )
+    # A parent canvas that fails the shape check is refused (409) before anything
+    # is written: the fork would copy it. It is judged as written, with the edge id
+    # bound, since its edge ids go into fork_connections.edge_key below.
+    await require_readable_canvas(
+        parent_canvas,
+        kind="fork_parent",
+        row_id=pinned_version_id or parent_topology_id,
+        as_written=True,
     )
     # The parent topology's canvas_data was already stripped when it was written;
     # strip again here anyway (cheap, idempotent) since forking is its own write

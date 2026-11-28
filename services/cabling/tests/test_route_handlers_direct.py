@@ -1265,7 +1265,13 @@ def test_parse_json_items_not_a_list_raises_422():
         ),
         ({}, None),
         ({"name": None, "canvas": None}, None),
-        ({"name": "Lab", "canvas": {"nodes": None, "edges": "not read here"}}, None),
+        ({"name": "Lab", "canvas": {"nodes": None, "edges": None}}, None),
+        # The whole canvas is held to the one shape check (canvas_shape), edges too.
+        ({"name": "Lab", "canvas": {"nodes": None, "edges": "x"}}, "canvas.edges: must be a list"),
+        (
+            {"name": "Lab", "canvas": {"edges": [{"source": 1}]}},
+            "canvas.edges.0.source: must be a string",
+        ),
         ({"name": "Lab", "canvas": {"nodes": [{"data": {"device": {"name": "sw"}}}]}}, None),
     ],
 )
@@ -1415,11 +1421,17 @@ async def test_import_resolver_failure_raises_503():
     async with TestSession() as db:
         with patch(
             "app.services.bulk_service.resolve_device_names",
-            new=AsyncMock(side_effect=RuntimeError("inventory down")),
+            new=AsyncMock(side_effect=RuntimeError("http://inventory:8000/devices/resolve")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await import_topologies(db, raw, "json", True, USER_ID, "viewer")
     assert exc.value.status_code == 503
+    # Fixed wording: the detail carries none of the exception, and nothing is
+    # chained for a handler to render.
+    assert exc.value.detail == (
+        "Could not resolve device names; the import was not processed. Retry the request."
+    )
+    assert exc.value.__cause__ is None
 
 
 @pytest.mark.asyncio
@@ -1478,7 +1490,9 @@ async def test_import_unexpected_exception_rejects_row():
                     db, raw, "json", False, USER_ID, "viewer"
                 )
     assert report.rejected == 1
-    assert "kaboom" in report.rows[0].reason
+    # The reason answered to the caller carries the class name only.
+    assert report.rows[0].reason == "row could not be imported: RuntimeError"
+    assert "kaboom" not in report.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -2930,6 +2944,37 @@ def test_device_resolver_drops_a_name_no_device_can_have():
 
     too_long = "x" * (device_resolver.DEVICE_NAME_MAX_LENGTH + 1)
     assert device_resolver.name_batches([too_long, "", "a"]) == [["a"]]
+    # No device name holds a NUL character: inventory's lookup cannot take one.
+    assert device_resolver.name_batches(["\x00", "sw\x00", "\x00sw", "s\x00w", "a"]) == [["a"]]
+
+
+@pytest.mark.asyncio
+async def test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup():
+    """The name is never sent, so its row is rejected as unresolved and the rest of
+    the import goes on."""
+    import json
+
+    from app.services import device_resolver
+    from app.services.bulk_service import import_topologies
+
+    raw = json.dumps(
+        [
+            {
+                "name": "Lab",
+                "canvas": {"nodes": [{"id": "n1", "data": {"device": {"name": "sw\x00"}}}]},
+            },
+            {"name": "Other"},
+        ]
+    ).encode()
+    factory, client, _ = _mock_httpx_client(json_data={"resolved": {}})
+    async with TestSession() as db:
+        with patch.object(device_resolver.httpx, "AsyncClient", factory):
+            report = await import_topologies(db, raw, "json", True, USER_ID, "viewer", "admin")
+    client.post.assert_not_awaited()
+    assert [(r.identity, r.action, r.reason) for r in report.rows] == [
+        ("Lab", "reject", "unresolved device names: sw\x00"),
+        ("Other", "create", None),
+    ]
 
 
 @pytest.mark.asyncio

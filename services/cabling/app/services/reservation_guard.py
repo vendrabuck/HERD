@@ -3,6 +3,7 @@ import uuid
 
 import httpx
 from fastapi import HTTPException
+from herd_common.upstream_body import UpstreamBodyUnusable, read_json_body
 
 from app.config import settings
 
@@ -23,8 +24,8 @@ async def find_blocking_reservations(topology_id: uuid.UUID) -> list[dict]:
 
     A reservation is blocking when its status is ACTIVE, PENDING_PROVISION, or
     PENDING. Returns an empty list if the reservations service is unreachable
-    (fail-open: we would rather let an edit proceed than block on a downed
-    service).
+    or answers a body this cannot read (fail-open: we would rather let an edit
+    proceed than block on a downed service).
     """
     url = f"{settings.reservations_service_url.rstrip('/')}/internal/by-topology/{topology_id}"
     headers = {"X-Internal-Token": settings.internal_api_token}
@@ -37,18 +38,21 @@ async def find_blocking_reservations(topology_id: uuid.UUID) -> list[dict]:
                     extra={"status": resp.status_code, "topology_id": str(topology_id)},
                 )
                 return []
-            items = resp.json()
-    except Exception:
-        logger.exception("reservation_guard_unreachable", extra={"topology_id": str(topology_id)})
+            blocking = [
+                item
+                for item in resp.json()
+                if str(item.get("topology_id") or "") == str(topology_id)
+                and str(item.get("status") or "").upper() in _BLOCKING_STATUSES
+            ]
+    except Exception as exc:
+        # The detail and the log carry the class name; a failure that is not the
+        # call's own (the body's parsing here) also logs its traceback.
+        logger.warning(
+            "reservation_guard_unreachable",
+            extra={"topology_id": str(topology_id), "error": type(exc).__name__},
+            exc_info=None if isinstance(exc, httpx.HTTPError) else exc,
+        )
         return []
-
-    blocking = []
-    for item in items:
-        if str(item.get("topology_id") or "") != str(topology_id):
-            continue
-        if str(item.get("status") or "").upper() not in _BLOCKING_STATUSES:
-            continue
-        blocking.append(item)
     return blocking
 
 
@@ -104,7 +108,7 @@ async def find_blocking_reservations_strict(topology_id: uuid.UUID) -> list[str]
         logger.error(
             "reservations service unreachable while checking topology %s for live reservations: %s",
             topology_id,
-            exc,
+            type(exc).__name__,
         )
         raise _topology_delete_unverifiable() from exc
 
@@ -117,9 +121,7 @@ async def find_blocking_reservations_strict(topology_id: uuid.UUID) -> list[str]
         raise _topology_delete_unverifiable()
 
     try:
-        items = resp.json()
-        if not isinstance(items, list):
-            raise TypeError("by-topology body must be a list")
+        items = read_json_body(resp, expect=list)
         blocking: list[str] = []
         for item in items:
             if not isinstance(item, dict):
@@ -134,11 +136,12 @@ async def find_blocking_reservations_strict(topology_id: uuid.UUID) -> list[str]
                 raise ValueError("by-topology item names another topology")
             if status.upper() in _BLOCKING_STATUSES:
                 blocking.append(rid)
-    except (ValueError, KeyError, TypeError) as exc:
+    except (UpstreamBodyUnusable, ValueError, KeyError, TypeError) as exc:
+        # The log carries the class name only.
         logger.error(
             "reservations service returned an unparseable by-topology body for topology %s: %s",
             topology_id,
-            exc,
+            type(exc).__name__,
         )
         raise _topology_delete_unverifiable() from exc
     return sorted(set(blocking))

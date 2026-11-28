@@ -1757,8 +1757,16 @@ async def test_a_null_or_absent_part_passes_the_shape_check(user_client, canvas)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edges",
-    ["e1", 1, {"e1": {}}, [1], [None], ["e1"], [{"id": "e1", "source": 1, "target": []}]],
+    ("edges", "reason"),
+    [
+        ("e1", "canvas.edges: must be a list"),
+        (1, "canvas.edges: must be a list"),
+        ({"e1": {}}, "canvas.edges: must be a list"),
+        ([1], "canvas.edges.0: must be an object"),
+        ([None], "canvas.edges.0: must be an object"),
+        (["e1"], "canvas.edges.0: must be an object"),
+        ([{"id": "e1", "source": 1, "target": []}], "canvas.edges.0.source: must be a string"),
+    ],
     ids=[
         "string",
         "int",
@@ -1769,14 +1777,18 @@ async def test_a_null_or_absent_part_passes_the_shape_check(user_client, canvas)
         "edge_ends_not_strings",
     ],
 )
-async def test_an_odd_edge_list_is_judged_by_the_row_not_a_500(user_client, edges):
-    """Edges are read only inside the row's own error handling, so the shape check
-    leaves them to it: the answer is a report, whatever the row's outcome."""
+async def test_an_edge_list_of_the_wrong_shape_is_a_rejected_row(user_client, edges, reason):
+    """Edges are held to the same shape check as nodes (canvas_shape): a rejected
+    row with a fixed reason, and the rest of the batch runs."""
     resp = await _import_json(
-        user_client, [{"name": "lab", "canvas": {"nodes": [], "edges": edges}}]
+        user_client,
+        [{"name": "lab", "canvas": {"nodes": [], "edges": edges}}, {"name": "lab-2"}],
     )
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()["rows"]) == 1
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "lab", reason),
+        ("create", "lab-2", None),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1864,10 +1876,62 @@ async def test_a_device_cell_past_the_field_limit_is_judged_not_a_500(user_clien
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dry_run", [True, False])
 async def test_a_topology_name_past_the_field_limit_is_read(user_client, dry_run):
+    """The reader reads the whole cell, and the row is then judged by its name's
+    length like any other (TOPO-BULK-10)."""
     name = "t" * (_DEFAULT_FIELD_LIMIT + 1)
-    resp = await _import_csv(user_client, f"{_CSV_HEADER}\n{name},,,,,\n", dry_run=dry_run)
+    resp = await _import_csv(
+        user_client, f"{_CSV_HEADER}\n{name},,,,,\nlab,,,,,\n", dry_run=dry_run
+    )
     assert resp.status_code == 200, resp.text
-    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", name)]
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", name, "name: must be at most 100 characters"),
+        ("create", "lab", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("n" * 100, None),
+        ("  " + "n" * 100 + "  ", None),
+        ("n" * 101, "name: must be at most 100 characters"),
+        ("m" * 255, "name: must be at most 100 characters"),
+        ("o" * 256, "name: must be at most 100 characters"),
+        ("a\x00b", "name: must not hold a NUL character"),
+        ("\x00", "name: must not hold a NUL character"),
+    ],
+    ids=["100", "100_padded", "101", "255", "256", "nul", "only_nul"],
+)
+async def test_a_topology_name_is_held_to_the_topology_routes_bound(user_client, name, reason):
+    """The import's name bound is `TopologyCreate`'s: at most 100 characters once
+    stripped, and no NUL; past it the row is rejected with a reason naming the
+    field, and the other rows import."""
+    resp = await _import_json(user_client, [{"name": name}, {"name": "other"}], dry_run="true")
+    assert resp.status_code == 200, resp.text
+    rows = [(r["action"], r["reason"]) for r in resp.json()["rows"]]
+    assert rows == [("create" if reason is None else "reject", reason), ("create", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", ["true", "false"])
+async def test_a_long_name_is_refused_even_when_it_names_an_existing_topology(user_client, dry_run):
+    """A topology stored with a name over the bound (before the routes held one) is
+    not updated through the import: the row naming it is rejected by its length,
+    and the stored row is left as it was."""
+    name = "n" * 150
+    seeded = {"nodes": [], "edges": [], "marker": "kept"}
+    tid = await _seed_topology(name, USER_ID, seeded)
+    resp = await _import_json(
+        user_client, [{"name": name, "canvas": {"nodes": [], "edges": []}}], dry_run=dry_run
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "name: must be at most 100 characters")
+    ]
+    async with TestSessionLocal() as session:
+        stored = await session.get(Topology, uuid.UUID(tid))
+        assert (stored.name, stored.canvas_data) == (name, seeded)
 
 
 @pytest.mark.asyncio
@@ -2046,6 +2110,45 @@ async def test_the_device_names_are_collected_with_the_parse(user_client):
         ("lab", "reject"),
         ("bad", "reject"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_each_record_is_judged_once_with_the_parse(user_client, monkeypatch):
+    """Each record's shape reason is computed once, on the parse's worker thread,
+    and the row loop rejects by that reason without judging the canvas again."""
+    from app.services import bulk_service
+
+    loop_thread = threading.get_ident()
+    calls: list[int] = []
+    real_reason = bulk_service._record_shape_reason
+    real_problem = bulk_service.canvas_problem
+
+    def recording_reason(rec):
+        calls.append(threading.get_ident())
+        return real_reason(rec)
+
+    def recording_problem(canvas):
+        calls.append(threading.get_ident())
+        return real_problem(canvas)
+
+    monkeypatch.setattr(bulk_service, "_record_shape_reason", recording_reason)
+    monkeypatch.setattr(bulk_service, "canvas_problem", recording_problem)
+    items = [
+        {"name": "lab", "canvas": {"nodes": [{"id": "n1"}], "edges": []}},
+        {"name": "bad", "canvas": {"nodes": "not-a-list"}},
+        {"name": "other"},
+    ]
+    with _resolver({}):
+        resp = await _import_json(user_client, items, dry_run="true")
+    assert resp.status_code == 200, resp.text
+    assert [(r["identity"], r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("lab", "create", None),
+        ("bad", "reject", "canvas.nodes: must be a list"),
+        ("other", "create", None),
+    ]
+    # One reason and one canvas check per record, none on the loop's thread.
+    assert len(calls) == 2 * len(items)
+    assert loop_thread not in calls
 
 
 class _RefusingExecutor(concurrent.futures.ThreadPoolExecutor):

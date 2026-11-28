@@ -104,7 +104,7 @@ async def _resolve_group_cache_for_batch(
             # confirmed-gone.
             logger.warning(
                 "device_group_guard_unexpected_error",
-                extra={"device_id": str(device_id), "error": str(result)},
+                extra={"device_id": str(device_id), "error": type(result).__name__},
             )
             cache[device_id] = None
         else:
