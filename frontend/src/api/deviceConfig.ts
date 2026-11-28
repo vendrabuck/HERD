@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import type { PaginatedResponse } from "@/types/pagination.types";
 import apiClient from "./client";
-import { fetchAllPages } from "./paging";
+import { fetchAllPages, uniqueById } from "./paging";
 
 export interface DeviceConfigVersion {
   id: string;
@@ -116,11 +116,14 @@ export function useDeviceConfigVersions(
 // Every config version of the device, newest first, across all pages (issue
 // #1590), for the configuration history, which lists them all. The key sits
 // under the "list" prefix that create and restore invalidate. The route orders
-// by version_number, unique per device (migration 0023), so the walk is exact.
+// by version_number, unique per device (migration 0023), so the order is
+// total; a version saved between two page reads repeats the boundary row on
+// the next page, and uniqueById drops the repeat.
 export function useAllDeviceConfigVersions(deviceId: string | undefined) {
   return useQuery({
     queryKey: ["devices", deviceId, "config-versions", "list", "all"],
-    queryFn: () => fetchAllPages((skip, limit) => fetchVersions(deviceId!, skip, limit)),
+    queryFn: async () =>
+      uniqueById(await fetchAllPages((skip, limit) => fetchVersions(deviceId!, skip, limit))),
     enabled: !!deviceId,
   });
 }

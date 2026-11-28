@@ -634,9 +634,10 @@ TOPO-TVER-5 (section 4).
   a save, or after a restore) keeps those rows and shows `Could not refresh versions.`
   with the reason and Retry above them, never `Failed to load versions.` beside them. By
   decision (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a
-  Load older control). \
-  Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
-  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `a restore through the editor's mutation walks the list again and shows the new version`, `View, Restore, and Compare reach the oldest version of a long history`)
+  Load older control). A version saved between two page reads, which repeats the boundary
+  version on the next page, still lists each version once. \
+  Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `a restore through the editor's mutation walks the list again and shows the new version`, `View, Restore, and Compare reach the oldest version of a long history`)
 
 **Out of scope.** Fork versions are section 8.12.
 

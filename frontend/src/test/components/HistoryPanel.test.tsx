@@ -113,6 +113,36 @@ describe("HistoryPanel lists every version (issue #1591)", () => {
     expect(asked).toEqual(["0:500", "500:500"]);
   });
 
+  it("a version saved between two page reads is listed once, not twice", async () => {
+    // Page 1 reads v501 to v2; v502 is saved; page 2 (skip 500) then starts at
+    // v2 again, since every older row moved down one place.
+    let saved = false;
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const url = new URL(request.url);
+        const skip = Number(url.searchParams.get("skip"));
+        const limit = Number(url.searchParams.get("limit"));
+        const count = saved ? 502 : 501;
+        const all = Array.from({ length: count }, (_, i) => version(count - i));
+        const body = { items: all.slice(skip, skip + limit), total: count, skip, limit };
+        saved = true;
+        return HttpResponse.json(body);
+      }),
+    );
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      renderPanel();
+      expect(await screen.findByText("v1")).toBeInTheDocument();
+      expect(screen.getAllByText("v2")).toHaveLength(1);
+      expect(rows()).toHaveLength(501);
+      expect(rows()[499]).toHaveAccessibleName("Select version 2");
+      expect(rows()[500]).toHaveAccessibleName("Select version 1");
+      expect(consoleError.mock.calls.flat().join(" ")).not.toMatch(/same key/);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("a failed second page shows the load error, never the first page alone", async () => {
     server.use(history(501, [], 500));
     renderPanel();

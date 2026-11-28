@@ -106,6 +106,32 @@ describe("DeviceConfigSection", () => {
     expect(asked).toEqual(["0:500", "500:500"]);
   });
 
+  it("a version saved between two page reads is listed once, not twice", async () => {
+    // Page 1 reads v501 to v2; v502 is saved; page 2 (skip 500) starts at v2 again.
+    let saved = false;
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const url = new URL(request.url);
+        const skip = Number(url.searchParams.get("skip"));
+        const limit = Number(url.searchParams.get("limit"));
+        const count = saved ? 502 : 501;
+        const all = Array.from({ length: count }, (_, i) =>
+          makeVersion({ id: `ver-${count - i}`, version_number: count - i }),
+        );
+        const body = { items: all.slice(skip, skip + limit), total: count, skip, limit };
+        saved = true;
+        return HttpResponse.json(body);
+      }),
+    );
+
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+
+    expect(await screen.findByText("v1")).toBeInTheDocument();
+    expect(screen.getAllByText("v2")).toHaveLength(1);
+    expect(screen.getByText("501 versions")).toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(502);
+  });
+
   it("a failed second page shows the load error, never the first page alone (issue #1590)", async () => {
     const first = Array.from({ length: 500 }, (_, i) =>
       makeVersion({ id: `ver-${501 - i}`, version_number: 501 - i }),

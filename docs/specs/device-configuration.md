@@ -1152,12 +1152,13 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
 
 - **CFG-UI-1.** The configuration section shows the version count and a table of every
   version with author and time, read across all pages of the list (500 a page, newest
-  first, issue #1590); `No config versions yet.` and the count need a successful answer,
+  first, issue #1590), each version once even when one is saved between two page reads;
+  `No config versions yet.` and the count need a successful answer,
   and a failed read of any page shows the shared load error (`Could not load config
   versions.` with Retry) and no rows, never the empty text; its buttons are shown to
   every viewer, and the server decides who may use them. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
-  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a failed second page shows the load error, never the first page alone (issue #1590)`, `a created version refreshes the whole list through the real create hook`, `a failed refresh keeps the rows under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone (issue #1590)`, `a created version refreshes the whole list through the real create hook`, `a failed refresh keeps the rows under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
 - **CFG-UI-2.** New version parses the text as JSON in the browser, an empty box being
   `{}`; a parse error is shown in the dialog and nothing is sent, and a server refusal
   shows the server's `detail`. \
