@@ -1040,9 +1040,12 @@ download, delete); routes under `/drivers`. The package format is in
   waits for a storage thread, so downloads held by a stalled store hold none. \
   Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`); `services/inventory/app/services/driver_service.py` (`download_driver`) \
   Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`)
-- **INV-DRV-23.** On MinIO, each request gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
-  (5) without progress on a connect or a body send, or `MINIO_READ_TIMEOUT_SECONDS`
-  (30) without the next bytes of an answer, and a request that fails that way or is
+- **INV-DRV-23.** On MinIO, a connect gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
+  (15), and a request is sent under the same timeout: over plain HTTP
+  (`MINIO_USE_SSL=false`, the default) a whole request body (one part, at most 5 MiB)
+  must be sent within it, about 341 KiB/s for a 5 MiB part however steadily the store
+  takes it, and over TLS it applies to each send. A wait for the next bytes of an
+  answer gives up after `MINIO_READ_TIMEOUT_SECONDS` (30), and a request that fails that way or is
   answered 500, 502, 503, or 504 is tried again at most `MINIO_RETRIES` (2) times,
   with no wait a Retry-After header names (issue #1416). Against a store that accepts
   connections and never answers, one storage call ends within about 136 s (three
@@ -1051,7 +1054,7 @@ download, delete); routes under `/drivers`. The package format is in
   named constants, not settings (the issue's triage). The failure answers as
   INV-DRV-20 and section 10 say. \
   Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`) \
-  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`)
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`)
 - **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
   create answers 500 and commits no row, and a storage failure on file replace answers
   500 and leaves the row naming the old archive, which is still stored and still

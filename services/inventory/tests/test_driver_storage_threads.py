@@ -13,7 +13,9 @@ every new database and NATS connection. These tests pin INV-DRV-22 and INV-DRV-2
   database connection, and each answers its own archive once released;
 - the MinIO client sends through a pool built with the named timeouts and retry
   count, and against a real socket that never answers, or that answers 503 with a
-  long Retry-After, a request gives up after exactly 1 + ``MINIO_RETRIES`` attempts.
+  long Retry-After, a request gives up after exactly 1 + ``MINIO_RETRIES`` attempts;
+- over plain HTTP a whole request body must be sent within the connect timeout,
+  however steadily a scripted store (``_FakeStore``) reads it.
 
 The only wall-clock bounds are escapes for the failure path (a deadlock or an
 honoured Retry-After), each far above what a passing run takes.
@@ -26,6 +28,7 @@ import socket
 import threading
 import time
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -232,8 +235,8 @@ def test_the_minio_client_sends_through_a_pool_with_the_named_bounds(reset_stora
     pool = minio_module.Minio.call_args.kwargs["http_client"]
     assert isinstance(pool, urllib3.PoolManager)
     kw = pool.connection_pool_kw
-    assert (storage.MINIO_CONNECT_TIMEOUT_SECONDS, storage.MINIO_READ_TIMEOUT_SECONDS) == (5, 30)
-    assert kw["timeout"].connect_timeout == 5
+    assert (storage.MINIO_CONNECT_TIMEOUT_SECONDS, storage.MINIO_READ_TIMEOUT_SECONDS) == (15, 30)
+    assert kw["timeout"].connect_timeout == 15
     assert kw["timeout"].read_timeout == 30
     retries = kw["retries"]
     assert retries.total == storage.MINIO_RETRIES == 2
@@ -311,7 +314,7 @@ def _init_against(port: int) -> tuple[BaseException | None, float]:
         started = time.monotonic()
         try:
             storage.init_storage()
-        except BaseException as exc:  # noqa: BLE001: the test inspects it
+        except BaseException as exc:  # noqa: BLE001 (the test inspects it)
             outcome["error"] = exc
         outcome["elapsed"] = time.monotonic() - started
 
@@ -328,7 +331,7 @@ def _init_against(port: int) -> tuple[BaseException | None, float]:
 
 
 def test_a_store_that_never_answers_is_given_up_after_the_retries(reset_storage, monkeypatch):
-    # Short timeouts stand in for the real 5 s and 30 s; the attempt count is real.
+    # Short timeouts stand in for the real 15 s and 30 s; the attempt count is real.
     monkeypatch.setattr(storage, "MINIO_CONNECT_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr(storage, "MINIO_READ_TIMEOUT_SECONDS", 0.3)
     with _server(_never_answer) as (port, accepted):
@@ -347,3 +350,210 @@ def test_a_long_retry_after_is_not_waited_out(reset_storage):
         assert error is not None
         assert len(_requests_answered_503) == 1 + storage.MINIO_RETRIES
     assert storage._backend == "none"
+
+
+# A scripted object store ---------------------------------------------------------
+
+_LOCATION_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    b"</LocationConstraint>"
+)
+_CREATED_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    b"<Bucket>herd-drivers</Bucket><Key>k</Key><UploadId>u1</UploadId>"
+    b"</InitiateMultipartUploadResult>"
+)
+_COMPLETED_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b'<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+    b"<Bucket>herd-drivers</Bucket><Key>k</Key><ETag>e</ETag>"
+    b"</CompleteMultipartUploadResult>"
+)
+
+
+class _Request:
+    """One request the store was sent: its kind, the body bytes it read, and when
+    each read of the body returned."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.received = 0
+        self.read_times: list[float] = [time.monotonic()]
+
+
+class _FakeStore:
+    """A minimal S3 endpoint on 127.0.0.1 for the real MinIO client. The bucket's
+    location lookup and HEAD are answered; every other request is recorded as a
+    _Request and answered as ``policy(kind)`` says: "ok", "never" (read the body,
+    then hold the request unanswered), or "stall-body" (a GET's headers and one byte
+    of a longer body, then nothing). The kinds are get, put, put-part, create,
+    complete, abort, and delete. ``read_rate`` (bytes per second) slows every body
+    read, and ``rcvbuf`` sets the store's socket receive buffer."""
+
+    def __init__(self, policy, *, read_rate: float | None = None, rcvbuf: int | None = None):
+        self.requests: list[_Request] = []
+        self.stop = threading.Event()
+        self._lock = threading.Lock()
+        store = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def _kind(self) -> str:
+                query = self.path.partition("?")[2]
+                if self.command == "GET" and "location" in query:
+                    return "location"
+                if self.command == "HEAD":
+                    return "head"
+                if self.command == "POST":
+                    return "create" if "uploads" in query else "complete"
+                if self.command == "PUT" and "partNumber" in query:
+                    return "put-part"
+                if self.command == "DELETE" and "uploadId" in query:
+                    return "abort"
+                return self.command.lower()
+
+            def _read_body(self, request: _Request) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                started = time.monotonic()
+                while request.received < length and not store.stop.is_set():
+                    data = self.rfile.read1(min(65536, length - request.received))
+                    if not data:
+                        return
+                    request.received += len(data)
+                    request.read_times.append(time.monotonic())
+                    if read_rate:
+                        ahead = request.received / read_rate - (time.monotonic() - started)
+                        if ahead > 0:
+                            time.sleep(ahead)
+
+            def _answer(self, status: int, body: bytes = b"", headers=()) -> None:
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _hold(self) -> None:
+                store.stop.wait(_ESCAPE_SECONDS)
+                self.close_connection = True
+
+            def handle_request(self) -> None:
+                kind = self._kind()
+                if kind == "location":
+                    return self._answer(200, _LOCATION_XML)
+                if kind == "head":
+                    return self._answer(200)
+                request = _Request(kind)
+                with store._lock:
+                    store.requests.append(request)
+                action = policy(kind)
+                self._read_body(request)
+                if action == "never":
+                    return self._hold()
+                if kind == "get" and action == "stall-body":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    return self._hold()
+                if kind == "create":
+                    return self._answer(200, _CREATED_XML)
+                if kind == "complete":
+                    return self._answer(200, _COMPLETED_XML)
+                if kind == "get":
+                    return self._answer(200, b"archive")
+                if kind in ("abort", "delete"):
+                    return self._answer(204)
+                return self._answer(200, headers=[("ETag", '"e"')])
+
+            do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = handle_request
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                pass  # a client that gave up resets its connection; expected here
+
+            def server_bind(self):
+                if rcvbuf:
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+                super().server_bind()
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+
+    def kinds(self) -> list[str]:
+        with self._lock:
+            return [r.kind for r in self.requests]
+
+    def __enter__(self) -> "_FakeStore":
+        threading.Thread(target=self._server.serve_forever, args=(0.05,), daemon=True).start()
+        with (
+            patch.object(storage.settings, "minio_endpoint", f"127.0.0.1:{self.port}"),
+            patch.object(storage.settings, "minio_use_ssl", False),
+        ):
+            storage.init_storage()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop.set()
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _timed(call) -> tuple[BaseException | None, float]:
+    """call() on a daemon thread: the error it raised and how long it took, or
+    (None, inf) when it never ended."""
+    outcome: dict = {}
+
+    def run():
+        started = time.monotonic()
+        try:
+            call()
+        except BaseException as exc:  # noqa: BLE001 (the test inspects it)
+            outcome["error"] = exc
+        outcome["elapsed"] = time.monotonic() - started
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(_ESCAPE_SECONDS)
+    if worker.is_alive():
+        return None, float("inf")
+    return outcome.get("error"), outcome["elapsed"]
+
+
+def test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout(
+    reset_storage, monkeypatch
+):
+    """urllib3 sends a request body in one sendall under the connect timeout, and over
+    plain HTTP the socket's timeout bounds that whole call, not each wait for
+    progress. Scaled: a 0.5 s connect timeout and a store that reads a 5 MiB part at
+    512 KiB/s, pausing at most about 0.13 s between reads. The socket buffers on both
+    sides hold well under the part, so the send needs seconds more than the timeout;
+    each attempt is given up while the store is still reading, as a broken connection
+    (not a read timeout, which is 5 s here), and the PUT is tried three times."""
+    monkeypatch.setattr(storage, "MINIO_CONNECT_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(storage, "MINIO_READ_TIMEOUT_SECONDS", 5)
+    part = 5 * 1024 * 1024
+    with _FakeStore(lambda kind: "ok", read_rate=512 * 1024, rcvbuf=65536) as store:
+        error, elapsed = _timed(lambda: storage.upload_object("pkg.zip", b"x" * part))
+        assert elapsed < _ESCAPE_SECONDS, "the body send was never given up"
+        assert isinstance(error, urllib3.exceptions.MaxRetryError)
+        assert isinstance(error.reason, urllib3.exceptions.ProtocolError)
+        # Each attempt ended on the send, before any wait for an answer could.
+        assert elapsed < storage.MINIO_READ_TIMEOUT_SECONDS
+        assert store.kinds() == ["put"] * (1 + storage.MINIO_RETRIES)
+        for request in store.requests:
+            assert 0 < request.received < part
+            first_window = [t for t in request.read_times if t - request.read_times[0] <= 0.5]
+            gaps = [b - a for a, b in zip(first_window, first_window[1:], strict=False)]
+            assert max(gaps) < storage.MINIO_CONNECT_TIMEOUT_SECONDS

@@ -20,18 +20,23 @@ runs, and one cancelled while it runs keeps its thread until it ends, so the bou
 holds whatever is cancelled. At most four package archives are read or written at once.
 
 The MinIO client's HTTP pool (``_minio_http_client``) replaces the library's defaults
-(a 5-minute connect and read timeout and 5 retries). A connect, and each send of a
-request body, gives up after ``MINIO_CONNECT_TIMEOUT_SECONDS`` (5) without progress; a
-wait for the next bytes of an answer gives up after ``MINIO_READ_TIMEOUT_SECONDS``
-(30). A request that fails that way, or is answered 500, 502, 503, or 504, is tried
-again at most ``MINIO_RETRIES`` (2) times, with backoffs of 0 s and then 0.4 s between
-the attempts and never a wait the store names in a Retry-After header. Against a
-store that accepts connections and never answers, one call therefore ends within three
-attempts of at most 35 s each, plus the 0.4 s backoff, plus, for a download whose body
-stops after its headers (a body read is not retried), one more 30 s read: about 136 s.
-These are bounds on each wait for progress, not on a whole transfer: a store that keeps
-sending or taking a few bytes at a time is not cut off by them, and the lookup of the
-store's host name (on the storage thread) is not bounded by the connect timeout.
+(a 5-minute connect and read timeout and 5 retries). A connect gives up after
+``MINIO_CONNECT_TIMEOUT_SECONDS`` (15), and the request is sent under the same
+timeout: urllib3 hands a request body (one part, at most 5 MiB) to one ``sendall``,
+so over plain HTTP (``MINIO_USE_SSL=false``, the compose default) the whole body must
+be sent within 15 s, about 341 KiB/s for a 5 MiB part, however steadily the store
+takes it; over TLS the timeout applies to each send. A wait for the next bytes of an
+answer gives up after ``MINIO_READ_TIMEOUT_SECONDS`` (30). A request that fails that
+way, or is answered 500, 502, 503, or 504, is tried again at most ``MINIO_RETRIES``
+(2) times, with backoffs of 0 s and then 0.4 s between the attempts and never a wait
+the store names in a Retry-After header. Against a store that accepts connections and
+never answers, one call therefore ends within three attempts of at most 35 s each,
+plus the 0.4 s backoff, plus, for a download whose body stops after its headers (a
+body read is not retried), one more 30 s read: about 136 s. Apart from a body send
+over plain HTTP, these are bounds on each wait for progress, not on a whole transfer:
+a store that keeps sending a few bytes at a time is not cut off by them, and the
+lookup of the store's host name (on the storage thread) is not bounded by the connect
+timeout.
 """
 
 import asyncio
@@ -57,7 +62,7 @@ DRIVER_STORAGE_THREADS = 4
 # The MinIO client's per-request bounds (issue #1416). Named constants rather than
 # settings, by the issue's triage: the values bound a failure, they do not tune a
 # deployment.
-MINIO_CONNECT_TIMEOUT_SECONDS = 5
+MINIO_CONNECT_TIMEOUT_SECONDS = 15
 MINIO_READ_TIMEOUT_SECONDS = 30
 MINIO_RETRIES = 2
 MINIO_RETRY_BACKOFF_FACTOR = 0.2
