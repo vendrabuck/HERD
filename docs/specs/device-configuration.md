@@ -1155,9 +1155,11 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   first, issue #1590), each version once even when one is saved between two page reads;
   `No config versions yet.` and the count need a successful answer,
   and a failed read of any page shows the shared load error (`Could not load config
-  versions.` with Retry) and no rows, never the empty text; its buttons are shown to
+  versions.` with Retry) and no rows, never the empty text; a failed refresh while the
+  table shows keeps the rows and the count and shows `Could not refresh config versions.`
+  with the reason and Retry above the table, with no alert; its buttons are shown to
   every viewer, and the server decides who may use them. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone (issue #1590)`, `a created version refreshes the whole list through the real create hook`, `a failed refresh keeps the rows under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
 - **CFG-UI-2.** New version parses the text as JSON in the browser, an empty box being
   `{}`; a parse error is shown in the dialog and nothing is sent, and a server refusal
@@ -1168,12 +1170,6 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   drops the earlier of the two. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`keeps Compare disabled until exactly two versions are selected`)
-- **CFG-UI-7.** A failed read behind View (`Could not load this config version.`) or
-  Compare (`Could not load the config diff.`), or an answer that is not a JSON object,
-  shows the shared load error with Retry as the dialog's body, never an empty dialog;
-  while a Retry's read is on its way the button reads `Retrying...` (issue #1590). \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`ViewVersionModal`, `DiffModal`) \
-  Pinned by: `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `a 200 JSON list shows the load error, never an empty dialog`, `the Retry button reads Retrying... until the read answers`)
 - **CFG-UI-4.** The Apply dialog applies now when its time is blank, showing
   `Apply failed: <error>` for a `failed` answer and `Applied (run <first 8 characters>)`
   otherwise, and schedules at the chosen local time when one is set. A refusal the server
@@ -1199,6 +1195,12 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   refused confirm shows the server's `detail`. \
   Enforced in: `frontend/src/components/reservations/AIApplyConfirmModal.tsx` (`AIApplyConfirmModal`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJob`, `TERMINAL_STATUSES`) \
   Pinned by: `frontend/src/test/components/AIApplyConfirmModal.test.tsx` (`renders the plan text`, `shows the transcript with simulated badges once the dry-run succeeds`, `disables Confirm until the dry-run succeeds`, `Confirm POSTs to the confirm endpoint and closes`, `Cancel button cancels the dry-run job and closes`, `Confirm endpoint 409 (failed dry-run) surfaces detail as toast`); `tests/e2e/test_device_config_apply_playwright.py` (`test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
+- **CFG-UI-7.** A failed read behind View (`Could not load this config version.`) or
+  Compare (`Could not load the config diff.`), or an answer that is not a JSON object,
+  shows the shared load error with Retry as the dialog's body, never an empty dialog;
+  while a Retry's read is on its way the button reads `Retrying...` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`ViewVersionModal`, `DiffModal`) \
+  Pinned by: `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `a 200 JSON list shows the load error, never an empty dialog`, `the Retry button reads Retrying... until the read answers`)
 
 **Out of scope.** When the assistant opens the review (`ai-features.md`); the rest of
 the device page (`inventory.md`).
