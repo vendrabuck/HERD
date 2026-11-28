@@ -24,6 +24,7 @@ from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.outbox import enqueue_event
 from herd_common.pagination import paginate
 from herd_common.retry import retry_with_backoff
+from herd_common.timeutil import to_utc_instant
 from herd_common.upstream_body import (
     WRONG_FIELD,
     UpstreamBodyUnusable,
@@ -47,7 +48,6 @@ from app.schemas.reservation import (
     ReservationCreate,
     ReservationUpdate,
     check_max_duration,
-    to_utc_instant,
 )
 from app.services.purpose_service import (
     stamp_purpose_classify_requested,

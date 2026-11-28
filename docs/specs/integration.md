@@ -735,7 +735,7 @@ matters, is cancelled, completes, fails, or is about to end.
   reads `unknown end`; a non-empty string that does not parse, or whose instant falls
   outside the years 1 to 9999 in UTC, is written unchanged. None of these raises, so the message is still delivered and
   acked. \
-  Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`) \
+  Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`); `services/common/herd_common/timeutil.py` (`to_utc_instant`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_format_end_time_renders_the_utc_instant`, `test_format_end_time_ignores_the_host_zone`, `test_format_end_time_returns_an_unusable_string_unchanged`, `test_format_end_time_missing_or_non_string_is_unknown_end`, `test_every_end_time_message_states_the_utc_instant`, `test_unusable_end_time_still_notifies`); `services/notifications/tests/test_functional_dispatch_path.py` (`test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack`)
 
 **Out of scope.** When reservations stages each event (`reservations.md`, section 6).
