@@ -113,6 +113,7 @@ REPO_DIRS = (
     "seedtools",
     "infra",
     "scripts",
+    "process",
     ".github",
 )
 ROOT_FILES = {
