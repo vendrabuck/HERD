@@ -180,7 +180,7 @@ describe("EditDevicesModal", () => {
       expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
       expect(
         screen.getByText(
-          "70 more matching devices are not listed. Type more of the name to narrow the list.",
+          "Matching devices not listed: 70. Type more of the name to narrow the list.",
         ),
       ).toBeInTheDocument();
       expect(asked.length).toBeGreaterThan(0);
@@ -200,7 +200,7 @@ describe("EditDevicesModal", () => {
       expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(47);
       expect(
         screen.getByText(
-          "70 more matching devices are not listed. Type more of the name to narrow the list.",
+          "Matching devices not listed: 70. Type more of the name to narrow the list.",
         ),
       ).toBeInTheDocument();
     });
@@ -242,13 +242,13 @@ describe("EditDevicesModal", () => {
         }),
       );
       renderModal();
-      expect(await screen.findByText(/^70 more matching devices are not listed\./)).toBeInTheDocument();
+      expect(await screen.findByText(/^Matching devices not listed: 70\./)).toBeInTheDocument();
 
       fireEvent.change(screen.getByRole("textbox", { name: "Search available devices" }), {
         target: { value: "lab-node-4" },
       });
       await waitFor(() =>
-        expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument(),
+        expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument(),
       );
       expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
     });
@@ -257,7 +257,7 @@ describe("EditDevicesModal", () => {
       server.use(cappedHandler(50, []));
       renderModal();
       expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
-      expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument();
     });
 
     it("a failed read shows the load error and no notice", async () => {
@@ -274,7 +274,7 @@ describe("EditDevicesModal", () => {
         "Could not load available devices. inventory is restarting",
       );
       expect(screen.queryByText("No available devices found")).not.toBeInTheDocument();
-      expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument();
     });
   });
 

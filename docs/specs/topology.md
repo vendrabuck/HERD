@@ -1662,7 +1662,7 @@ creating them in one batch, or one pair at a time.
   devices whose name contains the trimmed text and send no request for a shorter text.
   Until the first search answers they show nothing. Under the input they show the
   matching devices, and when the server's `total` is larger than the rows on the page,
-  `<total minus rows> more matching devices are not listed. Type more of the name to
+  `Matching devices not listed: <total minus rows>. Type more of the name to
   narrow the list.` While the search for new text is on its way they keep the previous
   search's rows and hide that line, whose count belongs to the previous text; a search
   that answered with no rows shows `No devices match`, and a failed search shows the

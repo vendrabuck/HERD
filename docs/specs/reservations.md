@@ -814,8 +814,8 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
 - **RES-PATCH-14.** The Edit devices dialog's Add list asks for one page of 50 candidates
   for its search text and hides the devices already selected; when the server's `total`
-  is larger than the page it returned, the dialog says `<total minus page rows> more
-  matching devices are not listed. Type more of the name to narrow the list.` under the
+  is larger than the page it returned, the dialog says `Matching devices not listed: <total minus page
+  rows>. Type more of the name to narrow the list.` under the
   list, counted against the page the server returned, so the number stays true however
   many of the page's rows are hidden as already selected. While the read for new search
   text is on its way the list keeps the previous rows and hides that line, whose count

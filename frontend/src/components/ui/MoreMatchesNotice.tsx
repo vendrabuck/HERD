@@ -3,9 +3,8 @@ import { hasRowsPastPage } from "@/lib/pageCap";
 
 /**
  * The line a search-capped result list shows when the server holds more
- * matches than the one page the list asked for (issue #1590): `<total minus
- * shown> more matching <noun> are not listed. Type more of the name to narrow
- * the list.` A list that shows one page of a search and lets the user type to
+ * matches than the one page the list asked for (issue #1590): `Matching <noun> not
+ * listed: <total minus shown>. Type more of the name to narrow the list.` A list that shows one page of a search and lets the user type to
  * narrow it places this under its rows, so a match past the page is never
  * silently missing: the line says how many exist past the page and how to
  * reach them. It counts against the page the server returned, not the rows the
@@ -31,7 +30,7 @@ export function MoreMatchesNotice({
   if (!hasRowsPastPage(shown, total)) return null;
   return (
     <p className={cn("text-xs text-gray-500", className)}>
-      {total - shown} more matching {noun} are not listed. Type more of the name to narrow the list.
+      Matching {noun} not listed: {total - shown}. Type more of the name to narrow the list.
     </p>
   );
 }
