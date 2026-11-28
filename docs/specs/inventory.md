@@ -174,7 +174,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8, INV-VIS-9 |
 | GET | `/device-groups/device/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-GRP-10 to INV-GRP-13, INV-VIS-6 |
 | GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-BULK-21, INV-CSV-1, INV-CSV-2 |
-| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-BULK-25, INV-BULK-26, INV-CSV-3 |
+| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-BULK-25, INV-BULK-26, INV-BULK-28, INV-CSV-3 |
 | `/devices/{id}/config-versions...`, `/devices/{id}/apply-jobs`, `/apply-jobs/...` | | see `device-configuration.md` | | none here |
 
 `GET /devices` takes `template_id`, `topology_type`, `status`, `dut_only`, `search`,
@@ -1165,7 +1165,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   template that does not exist is rejected with that reason, and so is a new device row
   without a topology type (`missing required field: topology_type`). A schema error
   rejects the row with each failing field and its message (`<field>: <message>`), never
-  the row's input values. \
+  the row's input values. No reason is the text of an exception (INV-BULK-28). \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_missing_name_is_rejected`, `test_one_bad_row_does_not_abort_batch`, `test_device_import_create_without_topology_type_names_the_field`, `test_device_import_schema_error_reason_names_field_and_omits_input`); `services/inventory/tests/test_bulk_service_unit.py` (`test_import_devices_missing_template_name_rejected`)
 - **INV-BULK-10.** A device row goes through the same create or update functions as the
@@ -1355,6 +1355,37 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   renders. \
   Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_read_device_import`, `_read_template_import`, `_decode_json_cells`, `_DecodedCell`, `_CellDecodeError`, `_coerce_json_cell`); `services/inventory/app/routers/bulk.py` (`_export_response`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `bulk_work_limiter`, `BULK_WORK_THREADS`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_a_csv_json_cell_is_decoded_off_the_loop`, `test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave`, `test_a_template_sections_cell_is_decoded_with_the_file`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`, `test_two_concurrent_csv_import_reads_with_long_cells_both_read`); `services/inventory/tests/test_bulk_service_unit.py` (`test_decode_json_cells_wraps_text_cells_and_leaves_the_rest`, `test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it`, `test_a_failed_cell_decode_leaves_no_reference_cycle`, `test_identical_failed_cells_share_one_reason_and_hold_no_exception`, `test_a_decoded_cell_is_not_an_empty_cell`); `services/common/tests/test_bulk_work.py` (`test_two_threads_at_most`, `test_anyio_is_handed_the_modules_own_worker_limiter`, `test_work_that_fails_after_its_caller_left_logs_nothing`, `test_the_work_runs_on_a_worker_thread_and_returns_its_result`, `test_an_exception_comes_back_unchanged`, `test_the_work_never_takes_the_default_executor`, `test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_a_cancelled_caller_keeps_its_slot_until_its_thread_ends`, `test_a_caller_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`)
+- **INV-BULK-28.** A rejected row's reason, device or template, CSV or JSON, committed
+  or dry run, is wording the importer chooses by the failure's class, never the text
+  of an exception, and so are its log lines. A refusal raised by the create or update
+  functions keeps its detail (section 9; one whose detail is not a string is `the row
+  could not be imported`), a schema error keeps INV-BULK-9's `<field>: <message>`, and
+  the JSON cell reasons of INV-BULK-22 and INV-BULK-24 are unchanged. A row the
+  database refuses is rejected `the database refused the row: ` followed by the
+  refusal's class, read from the SQLSTATE asyncpg gives or the extended error code
+  SQLite gives, never from the message: `a value that must be unique is already in
+  use` (23505), `a record the row refers to does not exist` (23503), `a required value
+  is missing` (23502), `a value is outside what the database allows` (23514), `a value
+  breaks a database constraint` (any other code of class 23), `a value is longer than
+  its column allows` (22001), `a number is out of range for its column` (22003), `a
+  value holds a character the database cannot store, such as a NUL` (22021, 22P05),
+  and `a value does not fit the type of its column` (any other code of class 22,
+  among them the 22000 asyncpg raises, before it sends, for an integer past a
+  column's range). A class 23 reason ends with ` (constraint <name>)` when Postgres
+  names the constraint and the name is 1 to 63 letters, digits, or underscores. Any
+  other code, or none, is `the database refused the row`; any other failure is `the
+  row could not be imported`. The service logs a warning naming the SQLSTATE for a
+  database refusal, and only the exception's class name for any other failure. In a
+  JSON import, a `template_name`, `driver_name`, or `hypervisor_name` that is present,
+  not null, and not a string (0 and false included, which were read as absent) is
+  rejected `<column>: must be a string`; a `field_data` or `sections` value that is a
+  number or a boolean, `a JSON cell must be an object, a list, or JSON text`; and in
+  either format a poll interval that `int` cannot read (text that is not an integer, a
+  list, an object, infinity, or NaN; a JSON number with a fraction is truncated),
+  `poll_interval_seconds: must be a whole number`. A refused row is rolled back and
+  the rows after it are judged on their own (INV-BULK-7). \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_sqlstate_of`, `_constraint_name_of`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `DATABASE_REFUSED_REASON`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
+  Pinned by: `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_device_rows_postgres_refuses_get_fixed_reasons`, `test_template_rows_postgres_refuses_get_fixed_reasons`, `test_a_template_whose_driver_goes_before_its_insert_gets_the_fixed_reason`, `test_a_device_name_taken_before_its_insert_gets_the_fixed_reason`); `services/inventory/tests/test_bulk_service_unit.py` (`test_a_refused_row_is_named_by_its_sqlstate`, `test_a_row_sqlite_refuses_is_named_by_its_error_code`, `test_a_row_that_fails_otherwise_keeps_no_text`, `test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason`, `test_a_json_cell_that_is_not_json_raises_the_fixed_reason`, `test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason`); `services/inventory/tests/test_bulk.py` (`test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route`, `test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason`, `test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason`, `test_an_unexpected_row_failure_is_reported_without_its_text`); `tests/integration/test_bulk_import_export.py` (`test_template_import_rows_the_database_refuses_get_fixed_reasons`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,
@@ -1609,7 +1640,7 @@ other error carries `detail` as a string or as the object shown.
 | 503 | `fault injection: simulated inventory status-update failure` | the test seam fired | INV-STATUS-6 |
 
 A rejected import row is not an HTTP error: it is a `reject` entry with a `reason` in a
-200 report (INV-BULK-7).
+200 report (INV-BULK-7), and its reason is chosen as INV-BULK-28 says.
 
 ## 10. Interactions with other services
 
@@ -1643,7 +1674,7 @@ The calls other services make to inventory are section 7.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
-| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites |
+| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |
 | Browser end-to-end | `tests/e2e/test_inventory_filters_playwright.py`, `test_inventory_expanded_playwright.py`, `test_inventory_saved_search_late_load_playwright.py`, `test_inventory_effects_playwright.py`, `test_templates_playwright.py`, `test_dynamic_template_authoring_playwright.py`, `test_device_groups.py`, `test_drivers.py`, `test_bulk_import_export.py`, `test_add_device_ui.py` | Nightly and the gates, not per-PR CI |

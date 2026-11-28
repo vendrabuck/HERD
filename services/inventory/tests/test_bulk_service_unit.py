@@ -9,6 +9,7 @@ import csv
 import gc
 import io
 import json
+import sqlite3
 import uuid
 import weakref
 
@@ -17,8 +18,11 @@ from app.database import Base
 from app.models.driver_package import DriverPackage
 from app.models.template import DeviceTemplate
 from app.services.bulk_service import (
+    JSON_CELL_NOT_JSON_REASON,
     NAME_NOT_A_STRING_REASON,
+    POLL_NOT_A_WHOLE_NUMBER_REASON,
     ROW_NOT_AN_OBJECT_REASON,
+    ROW_UNEXPECTED_REASON,
     _coerce_bool,
     _coerce_int,
     _coerce_json_cell,
@@ -27,6 +31,7 @@ from app.services.bulk_service import (
     _parse_csv,
     _parse_json,
     _row_shape_reason,
+    _RowReasonError,
     import_devices,
     import_templates,
     parse_import,
@@ -34,6 +39,7 @@ from app.services.bulk_service import (
 )
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy.exc import DBAPIError, IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -790,3 +796,225 @@ def test_a_decoded_cell_is_not_an_empty_cell():
     """The device update keeps a row's `field_data` only when the cell is neither
     None nor empty; a decoded cell stands for non-empty text."""
     assert _DecodedCell({}, None) not in (None, "")
+
+
+# Fixed reasons for a row that fails outside the schema checks -------------------
+
+_SENTINEL = "sentinel-3e9a6c1d0f7b4a52"
+_REFUSED = "the database refused the row"
+_NUL = "a value holds a character the database cannot store, such as a NUL"
+_UNIQUE = f"{_REFUSED}: a value that must be unique is already in use"
+
+
+class _DriverError(Exception):
+    """A driver error shaped like asyncpg's adapter error: a SQLSTATE on it, the
+    constraint name on the asyncpg exception it wraps, and row values in both texts."""
+
+    def __init__(self, sqlstate, constraint_name=None):
+        super().__init__(f"value {_SENTINEL} refused")
+        self.sqlstate = sqlstate
+        cause = Exception(f"DETAIL: Key (name)=({_SENTINEL}) already exists.")
+        cause.constraint_name = constraint_name
+        self.__cause__ = cause
+
+
+def _statement_error(orig, cls=None):
+    return (cls or DBAPIError)(
+        "INSERT INTO devices (name, field_data) VALUES ($1::VARCHAR, $2::JSON)",
+        ("d", json.dumps({"password": _SENTINEL})),
+        orig,
+    )
+
+
+_SQLSTATE_CASES = [
+    ("23505", "devices_name_key", f"{_UNIQUE} (constraint devices_name_key)"),
+    (
+        "23503",
+        "devices_template_id_fkey",
+        f"{_REFUSED}: a record the row refers to does not exist"
+        " (constraint devices_template_id_fkey)",
+    ),
+    ("23502", None, f"{_REFUSED}: a required value is missing"),
+    (
+        "23514",
+        "ck_poll",
+        f"{_REFUSED}: a value is outside what the database allows (constraint ck_poll)",
+    ),
+    ("23P01", None, f"{_REFUSED}: a value breaks a database constraint"),
+    ("23505", _SENTINEL, _UNIQUE),
+    ("23505", "a name; with spaces", _UNIQUE),
+    ("23505", "x" * 64, _UNIQUE),
+    (
+        "22001",
+        "not_added_outside_class_23",
+        f"{_REFUSED}: a value is longer than its column allows",
+    ),
+    ("22003", None, f"{_REFUSED}: a number is out of range for its column"),
+    ("22021", None, f"{_REFUSED}: {_NUL}"),
+    ("22P05", None, f"{_REFUSED}: {_NUL}"),
+    ("22000", None, f"{_REFUSED}: a value does not fit the type of its column"),
+    ("22P02", None, f"{_REFUSED}: a value does not fit the type of its column"),
+    ("40001", None, _REFUSED),
+    (None, None, _REFUSED),
+]
+
+
+async def _import_one_refused_row(importer: str, failure: Exception):
+    """One row whose create raises `failure`, then one that is created."""
+    from app.services import bulk_service
+
+    section = {"name": "S", "fields": [{"key": "k", "label": "K", "type": "password"}]}
+    async with TestSessionLocal() as db:
+        if importer == "devices":
+            await _seed_template(db, "Tpl")
+            real = bulk_service.create_device
+            base = {"template_name": "Tpl", "topology_type": "PHYSICAL", "field_data": {}}
+        else:
+            real = bulk_service.create_template
+            base = {"template_type": "port", "vendor": "V", "model": "M", "sections": [section]}
+        items = [{**base, "name": "bad"}, {**base, "name": "good"}]
+
+        async def refusing(session, data, **kwargs):
+            if data.name == "bad":
+                raise failure
+            return await real(session, data, **kwargs)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(bulk_service, f"create_{importer[:-1]}", refusing)
+            if importer == "devices":
+                return await import_devices(db, _json_bytes(items), "json", False, None, "a")
+            return await import_templates(db, _json_bytes(items), "json", False, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["devices", "templates"])
+@pytest.mark.parametrize("sqlstate, constraint, reason", _SQLSTATE_CASES)
+async def test_a_refused_row_is_named_by_its_sqlstate(
+    db_setup, importer, sqlstate, constraint, reason
+):
+    failure = _statement_error(_DriverError(sqlstate, constraint))
+    assert _SENTINEL in str(failure)  # the text the reason must not carry
+    report = await _import_one_refused_row(importer, failure)
+    assert [(r.identity, r.action, r.reason) for r in report.rows] == [
+        ("bad", "reject", reason),
+        ("good", "create", None),
+    ]
+    assert _SENTINEL not in report.model_dump_json()
+
+
+def _sqlite_refusal(statement: str) -> sqlite3.Error:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE TABLE t (u TEXT UNIQUE, n TEXT NOT NULL, c INTEGER CHECK (c > 0),"
+            " p INTEGER REFERENCES p (id))"
+        )
+        conn.execute(f"INSERT INTO t VALUES ('{_SENTINEL}', 'x', 1, NULL)")
+        try:
+            conn.execute(statement)
+        except sqlite3.Error as exc:
+            return exc
+    finally:
+        conn.close()
+    raise AssertionError("the statement was not refused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["devices", "templates"])
+@pytest.mark.parametrize(
+    "statement, reason",
+    [
+        (f"INSERT INTO t VALUES ('{_SENTINEL}', 'x', 1, NULL)", _UNIQUE),
+        (
+            f"INSERT INTO t VALUES ('{_SENTINEL}2', NULL, 1, NULL)",
+            f"{_REFUSED}: a required value is missing",
+        ),
+        (
+            f"INSERT INTO t VALUES ('{_SENTINEL}3', 'x', -1, NULL)",
+            f"{_REFUSED}: a value is outside what the database allows",
+        ),
+        (
+            f"INSERT INTO t VALUES ('{_SENTINEL}4', 'x', 1, 99)",
+            f"{_REFUSED}: a record the row refers to does not exist",
+        ),
+    ],
+    ids=["unique", "not-null", "check", "foreign-key"],
+)
+async def test_a_row_sqlite_refuses_is_named_by_its_error_code(
+    db_setup, importer, statement, reason
+):
+    """SQLite gives no SQLSTATE; its extended error code names the same classes."""
+    failure = _statement_error(_sqlite_refusal(statement), IntegrityError)
+    assert _SENTINEL in str(failure)
+    report = await _import_one_refused_row(importer, failure)
+    assert (report.rows[0].action, report.rows[0].reason) == ("reject", reason)
+    assert report.rows[1].action == "create"
+    assert _SENTINEL not in report.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["devices", "templates"])
+@pytest.mark.parametrize(
+    "make_failure, reason",
+    [
+        (lambda: RuntimeError(_SENTINEL), ROW_UNEXPECTED_REASON),
+        (lambda: KeyError(_SENTINEL), ROW_UNEXPECTED_REASON),
+        (lambda: TypeError(_SENTINEL), ROW_UNEXPECTED_REASON),
+        (lambda: ValueError(_SENTINEL), ROW_UNEXPECTED_REASON),
+        (lambda: AttributeError(_SENTINEL), ROW_UNEXPECTED_REASON),
+        (lambda: InvalidRequestError(f"Object {_SENTINEL} is not bound"), _REFUSED),
+        (lambda: HTTPException(status_code=409, detail={"v": _SENTINEL}), ROW_UNEXPECTED_REASON),
+    ],
+    ids=["runtime", "key", "type", "value", "attribute", "sqlalchemy", "http-detail-object"],
+)
+async def test_a_row_that_fails_otherwise_keeps_no_text(db_setup, importer, make_failure, reason):
+    report = await _import_one_refused_row(importer, make_failure())
+    assert (report.rows[0].action, report.rows[0].reason) == ("reject", reason)
+    assert report.rows[1].action == "create"
+    assert _SENTINEL not in report.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["abc", "1.5", "1e3", " ", _SENTINEL, "9" * 5000, [30], {"s": 30}, float("inf"), float("nan")],
+    ids=[
+        "word",
+        "fraction",
+        "exponent",
+        "blank",
+        "sentinel",
+        "digits",
+        "list",
+        "object",
+        "inf",
+        "nan",
+    ],
+)
+def test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason(value):
+    with pytest.raises(_RowReasonError) as exc:
+        _coerce_int(value)
+    assert str(exc.value) == POLL_NOT_A_WHOLE_NUMBER_REASON
+    assert exc.value.__cause__ is None
+
+
+@pytest.mark.parametrize("value", [5, 0, True, False, 1.5])
+def test_a_json_cell_that_is_not_json_raises_the_fixed_reason(value):
+    with pytest.raises(_RowReasonError) as exc:
+        _coerce_json_cell(value, {})
+    assert str(exc.value) == JSON_CELL_NOT_JSON_REASON
+
+
+def test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason(monkeypatch):
+    """A decode on the parse thread that raises anything else keeps the fixed reason
+    the row loop would choose, never the exception's text."""
+    from app.services import bulk_service
+
+    def failing(value, default):
+        raise RuntimeError(f"decoder state {_SENTINEL}")
+
+    monkeypatch.setattr(bulk_service, "_coerce_json_cell", failing)
+    rows = [{"field_data": '{"k": "v"}'}]
+    _decode_json_cells(rows, "field_data", {})
+    assert rows[0]["field_data"].reason == ROW_UNEXPECTED_REASON

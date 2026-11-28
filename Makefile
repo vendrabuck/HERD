@@ -1143,7 +1143,7 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 	$(SUBMAKE) seed-nos && \
 	HERD_TEST_NOS_REQUIRED=1 uv run pytest $(NOS_FEATURE_TESTS) -v
 
-# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty-three today,
+# Postgres-live suites: every services/*/tests/*_live_pg.py (twenty-four today,
 # in auth, common, cabling, execution, reservations, and inventory), each run
 # from its own service directory. They prove what the SQLite engine every unit
 # suite uses cannot: advisory locks, row locks and SKIP LOCKED, native enum and
@@ -1224,6 +1224,13 @@ nos-test-feature:  ## Run the NOS lab via-stack feature suites (needs a running 
 # reservations schema. It commits nothing: it inserts its rows, runs the
 # upgrade inside one REPEATABLE READ transaction, and rolls it back; the
 # upgrade row-locks any foreign row holding an unusable suggestion until then.
+# The inventory suite for the bulk importers' row reasons (INV-BULK-28) needs
+# the migrated inventory schema. It imports through the real routes with the
+# request session on that database, commits its own driver, templates, and
+# devices under a random tag plus a seeded foreign template and device (no poll
+# interval, so no health poll picks them up), asserts every template and device
+# it does not own unchanged, and deletes its own and its seeded rows in a
+# finally.
 # tests/unit/test_pg_live_gate_wiring.py fails if a new *_live_pg.py file is
 # written and then wired into nothing.
 _gate-pg-live-tests:
@@ -1279,7 +1286,9 @@ _gate-pg-live-tests:
 	(cd services/reservations && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
 		uv run pytest tests/test_purpose_suggestion_reset_live_pg.py -v) && \
 	(cd services/inventory && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
-		uv run pytest tests/test_config_apply_races_live_pg.py -v)
+		uv run pytest tests/test_config_apply_races_live_pg.py -v) && \
+	(cd services/inventory && HERD_TEST_PG_REQUIRED=1 HERD_TEST_PG_DSN="$$dsn" \
+		uv run pytest tests/test_bulk_import_reasons_live_pg.py -v)
 
 # Gate phase used by master and everything, run after test-e2e (issue #572):
 # proves the STACK, not just the directory, can authenticate against LDAP.
