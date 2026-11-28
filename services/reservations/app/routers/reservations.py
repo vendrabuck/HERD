@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
+from herd_common.timeutil import to_utc_instant
 from herd_common.upstream_body import UpstreamBodyUnusable, read_json_body
 from herd_common.validation_errors import (
     FORWARD_ENVELOPE_BYTES,
@@ -36,7 +37,6 @@ from app.schemas.reservation import (
     ReservationResponse,
     ReservationUpdate,
     UtilizationReport,
-    to_utc_instant,
 )
 from app.services.purpose_service import validate_purpose_category
 from app.services.reporting_service import (
