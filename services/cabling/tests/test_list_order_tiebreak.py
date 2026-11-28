@@ -104,7 +104,9 @@ def _connection(n: int, created: datetime, device_a: uuid.UUID) -> Connection:
     return Connection(
         id=_id(n),
         device_a_id=device_a,
-        port_a=f"eth{n}",
+        # Descending against the id number (4-digit, so strings sort like numbers):
+        # ordering by port_a instead of the id cannot pass.
+        port_a=f"eth{5000 - n}",
         device_b_id=uuid.uuid4(),
         port_b="eth0",
         created_by="admin",
@@ -151,7 +153,9 @@ async def test_templates_list_breaks_updated_at_ties_by_id(client, limit):
                     id=_id(n),
                     name=f"tie-template-{n}",
                     created_by=uuid.uuid4(),
-                    created_at=stamp,
+                    # created_at mirrors updated_at around TIE, so the two orders
+                    # differ: sorting by created_at instead of updated_at fails.
+                    created_at=TIE - (stamp - TIE),
                     updated_at=stamp,
                 )
             )

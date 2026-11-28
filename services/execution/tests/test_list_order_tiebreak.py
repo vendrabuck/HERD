@@ -24,7 +24,10 @@ from app.models.execution_run import ExecutionRun
 from app.routers.executions import _authorize_runs_list
 from app.routers.health import get_current_user_payload, require_admin
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session
 
 engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
 TestSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
@@ -116,3 +119,35 @@ async def test_device_health_list_breaks_ties_by_device_id(client, limit):
     order = [100, 1, 2, 3, 4, 5, 6, 7, 50] + [11, 12, 13, 14, 15, 16, 17]
     expected = [str(_key(n)) for n in order]
     assert await _walk(client, "/device-health", limit, len(expected), "device_id") == expected
+
+
+async def test_device_health_order_by_reads_nulls_last_on_postgres(client):
+    """`never-polled rows sort last` holds on Postgres only through `.nulls_last()`.
+
+    SQLite already sorts NULL last under DESC and Postgres sorts it first, so the
+    walk above passes on SQLite whatever the route says. This captures the list
+    statement from a real request and compiles it for the PostgreSQL dialect, so
+    the ORDER BY it reads is the one Postgres would run.
+    """
+    captured = []
+
+    def capture(orm_execute_state):
+        captured.append(orm_execute_state.statement)
+
+    event.listen(Session, "do_orm_execute", capture)
+    try:
+        resp = await client.get("/device-health", params={"skip": 0, "limit": 5})
+    finally:
+        event.remove(Session, "do_orm_execute", capture)
+    assert resp.status_code == 200, resp.text
+    ordered = [
+        str(stmt.compile(dialect=postgresql.dialect()))
+        for stmt in captured
+        if stmt._order_by_clause.clauses
+    ]
+    assert len(ordered) == 1, ordered
+    order_by = ordered[0].split("ORDER BY", 1)[1].split("LIMIT", 1)[0]
+    normalized = " ".join(order_by.split())
+    assert normalized == (
+        "device_health_status.last_polled_at DESC NULLS LAST, device_health_status.device_id"
+    )

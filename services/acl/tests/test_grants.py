@@ -1068,7 +1068,9 @@ async def test_list_grants_breaks_granted_at_ties_by_id(admin_client, limit):
                     id=_tie_id(n),
                     group_id=_group_id_1,
                     resource_type="device",
-                    resource_id=uuid.UUID(int=n),
+                    # Descending against the id number, so ordering by resource_id
+                    # instead of the id cannot pass.
+                    resource_id=uuid.UUID(int=1000 - n),
                     permission="view",
                     granted_at=granted,
                 )

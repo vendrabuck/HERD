@@ -55,8 +55,10 @@ async def test_bulk_created_cables_page_through_once_each_in_id_order(admin_clie
         resp = await admin_client.post("/cabling/connections/bulk", json={"items": items})
         assert resp.status_code == 200, resp.text
         report = resp.json()
+        # Assigned before any assert on the report, so a partial create (a rejected
+        # row has a null connection_id) still reaches the cleanup below.
+        created = [row["connection_id"] for row in report["rows"] if row["connection_id"]]
         assert report["created"] == BATCH, resp.text
-        created = [row["connection_id"] for row in report["rows"]]
 
         for device in (device_a, device_b):
             seen, totals = await _walk(admin_client, device["id"])

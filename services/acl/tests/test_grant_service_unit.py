@@ -103,43 +103,31 @@ async def test_create_grant_duplicate_raises_integrity_error(db):
 @pytest.mark.asyncio
 async def test_list_grants_orders_by_granted_at_ascending(db):
     """list_grants sorts oldest-first. The router exposes this verbatim, so the
-    ordering is part of the API contract."""
-    g1 = await create_grant(
-        db,
-        group_id=uuid.uuid4(),
-        resource_type="device",
-        resource_id=uuid.uuid4(),
-        permission="view",
-        granted_by=None,
-    )
-    g2 = await create_grant(
-        db,
-        group_id=uuid.uuid4(),
-        resource_type="device",
-        resource_id=uuid.uuid4(),
-        permission="view",
-        granted_by=None,
-    )
-    g3 = await create_grant(
-        db,
-        group_id=uuid.uuid4(),
-        resource_type="device",
-        resource_id=uuid.uuid4(),
-        permission="view",
-        granted_by=None,
-    )
-    # Explicit, distinct granted_at values, the LAST created the oldest (issue
-    # #1589). The three creates otherwise share SQLite's one-second
-    # CURRENT_TIMESTAMP, so the old expectation [g1, g2, g3] was a tie that
-    # insertion order happened to break, and the id tiebreak reorders it.
+    ordering is part of the API contract.
+
+    The ids and timestamps are fixed so the expected order, ids [2, 3, 1], matches
+    neither the id order (1, 2, 3), nor the insertion order (3, 1, 2), nor either
+    reverse: a query ordered by the id alone, by `granted_at` descending, or not at
+    all fails on every run, not on the runs a random uuid happens to sort
+    differently (issue #1589).
+    """
     base = datetime(2026, 3, 1, tzinfo=timezone.utc)
-    for grant, hours in ((g1, 2), (g2, 1), (g3, 0)):
-        grant.granted_at = base + timedelta(hours=hours)
+    # (id number, hours after base): inserted in this order.
+    for n, hours in ((3, 1), (1, 2), (2, 0)):
+        db.add(
+            ResourceGrant(
+                id=uuid.UUID(int=n),
+                group_id=uuid.uuid4(),
+                resource_type="device",
+                resource_id=uuid.uuid4(),
+                permission="view",
+                granted_at=base + timedelta(hours=hours),
+            )
+        )
     await db.commit()
     items, total = await list_grants(db, skip=0, limit=50)
     assert total == 3
-    ids_in_order = [item.id for item in items]
-    assert ids_in_order == [g3.id, g2.id, g1.id]
+    assert [item.id for item in items] == [uuid.UUID(int=n) for n in (2, 3, 1)]
 
 
 @pytest.mark.asyncio
