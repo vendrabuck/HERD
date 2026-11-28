@@ -1854,7 +1854,7 @@ interface in section 8.15.
   is gated by `require_admin`, the gate of execution's admin run retry: 401 without a
   valid token, 403 `Admin or superadmin role required` for a user, with nothing read or
   driven. It answers 200 with the outcomes (an empty list when no row qualifies), 409
-  (WIRE-RETRY-22), and 503 `Upstream service unavailable: <reason>` when an inventory
+  (WIRE-RETRY-22), and 503 `Upstream service unavailable` (fixed text) when an inventory
   read fails during the apply, and logs one line with the action
   `wiring_pinned_release_redrive`, the reservation, the caller's id, and the count of
   each outcome. Its driver runs are attributed to the nil UUID like every wiring run
@@ -2053,7 +2053,7 @@ validation errors (422) carry `detail` as a list.
 | 409 | `Reservation wiring is not frozen; pinned release rows are re-driven only after the reservation has ended` | the admin re-drive on a reservation whose wiring is not frozen | WIRE-RETRY-22 |
 | 422 | validation list | `reservation_id` is not a UUID | WIRE-STATUS-1 |
 | 500 | `Internal API token not configured` | `INTERNAL_API_TOKEN` empty in execution | WIRE-STATUS-6 |
-| 503 | `Upstream service unavailable: <reason>` | an inventory or cabling call failed while a manual retry or the admin re-drive applied rows | WIRE-RETRY-12, WIRE-RETRY-24 |
+| 503 | `Upstream service unavailable` | an inventory or cabling call failed while a manual retry or the admin re-drive applied rows | WIRE-RETRY-12, WIRE-RETRY-24 |
 
 Reservations relays these to the user as described in RES-FORK-18.
 

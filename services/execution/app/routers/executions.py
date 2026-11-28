@@ -65,6 +65,10 @@ logger = logging.getLogger(__name__)
 
 # The admin re-drive of pinned release rows (issue #1199) answers this on a
 # reservation whose wiring is not frozen (not ended, or unknown to execution).
+# One fixed 503 detail for the manual retry and the admin re-drive; the failing call is
+# named in the log by its class only.
+UPSTREAM_UNAVAILABLE_DETAIL = "Upstream service unavailable"
+
 REDRIVE_NOT_ENDED_DETAIL = (
     "Reservation wiring is not frozen; pinned release rows are re-driven only after "
     "the reservation has ended"
@@ -879,7 +883,12 @@ async def internal_wiring_retry(
             detail="Reservation wiring is frozen; retry is not allowed",
         )
     except TransientUpstreamError as exc:
-        raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {exc}")
+        logger.warning(
+            "wiring retry: an upstream read failed (%s) for reservation %s",
+            type(exc).__name__,
+            reservation_id,
+        )
+        raise HTTPException(status_code=503, detail=UPSTREAM_UNAVAILABLE_DETAIL)
 
 
 @router.post(
@@ -914,7 +923,12 @@ async def redrive_pinned_release_rows(
     except WiringReservationNotFrozen:
         raise HTTPException(status_code=409, detail=REDRIVE_NOT_ENDED_DETAIL)
     except TransientUpstreamError as exc:
-        raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {exc}")
+        logger.warning(
+            "wiring retry: an upstream read failed (%s) for reservation %s",
+            type(exc).__name__,
+            reservation_id,
+        )
+        raise HTTPException(status_code=503, detail=UPSTREAM_UNAVAILABLE_DETAIL)
     outcomes: dict[str, int] = {}
     for row in result["results"]:
         outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1

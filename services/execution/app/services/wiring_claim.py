@@ -190,9 +190,9 @@ def claim_budget(driver_actions: int = ROW_DRIVER_ACTIONS) -> timedelta:
 
     So the bound is actions * (install + attempts * timeout + backoff), rounded UP to
     the next whole minute strictly after it. Rounding up is what keeps the expiry
-    safely clear of a drive that is still running, and the whole-minute figure
-    matches the health scheduler's flat five-minute CLAIM_WINDOW, the same idiom one
-    layer up. Strictly after (issue #1482): a sum that is already a whole number of
+    safely clear of a drive that is still running, and a whole-minute figure
+    is the idiom of the health scheduler's flat five-minute CLAIM_WINDOW one layer
+    up. Strictly after (issue #1482): a sum that is already a whole number of
     minutes gets the next minute, because a claim whose stamp equals the drive's end is
     reclaimable at that instant (`unclaimed` is `claimed_until <= now`). The sum is
     exact, in whole milliseconds, so no float error decides which minute that is. For

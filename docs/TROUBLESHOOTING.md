@@ -607,7 +607,11 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   (`released`, `superseded`, `still_failed` when the package is still broken or the
   switch is now gone, or `in_progress` when another call is driving it); calling it again
   is safe. Every other pinned row, a switch that was not found in particular, is left
-  for the hand check below. Re-publishing the reservation's terminal
+  for the hand check below. The call drives the rows inside the request, so it can
+  take minutes. Before re-driving a route row that was pinned long ago, read the
+  switch's current routes: the re-drive removes the routes the row recorded and does
+  not check whether another reservation has since configured the same prefix in the
+  same table. Re-publishing the reservation's terminal
   event does not recover these rows either: the teardown pass reads `ACTIVE` rows and
   `FAILED` rows intended `ACTIVE` (on L1 and L2 only those with a retryable reason, since
   issue #1501), never a `FAILED` row intended `RELEASED` (`_teardown_from_ledgers`). Read the row with

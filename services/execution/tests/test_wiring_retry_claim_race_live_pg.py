@@ -2124,7 +2124,7 @@ async def test_two_concurrent_pinned_release_redrives_drive_the_row_once(session
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("layer", ["l1", "l3"])
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
 async def test_a_redrive_that_read_the_row_before_the_others_claim_loses_in_the_database(
     session_factory, layer
 ):

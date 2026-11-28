@@ -796,5 +796,5 @@ async def test_the_route_answers_503_when_an_inventory_read_fails():
             resp = await client.post(ROUTE, headers=_auth())
 
     assert resp.status_code == 503
-    assert resp.json()["detail"] == "Upstream service unavailable: inventory device: HTTP 503"
+    assert resp.json()["detail"] == "Upstream service unavailable"
     assert calls == []
