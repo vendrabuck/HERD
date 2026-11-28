@@ -921,14 +921,18 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_get_by_id_is_404`)
 - **RES-VIEW-3.** The detail modal's Inventory tab lists the booked devices; expanding
   one shows its ports and, for each port, the device and port it is cabled to, read from
-  every connection of the device across all pages. A failed ports read or a failed
-  connections read shows the shared load error (`Could not load this device's ports.` or
-  `Could not load this device's connections.`, with Retry) in place of the port table,
-  never `No ports` and never a column of `-` that reads as unconnected; `No ports` needs
-  a successful empty answer, and while either read is on its way the panel shows
-  `Loading ports...` (issue #1590). \
+  every connection of the device across all pages. A failed ports read shows the shared
+  load error (`Could not load this device's ports.` with Retry) in place of the port
+  table, never `No ports`, which needs a successful empty answer; a device whose ports
+  read answered empty shows `No ports` whatever its connections read did. For a device
+  with ports, a failed connections read shows `Could not load this device's
+  connections.` with Retry in place of the table, never a column of `-` that reads as
+  unconnected, and until both reads have answered the panel shows `Loading ports...`. A
+  failed connections refresh while the table shows keeps the peers and shows `Could not
+  refresh this device's connections.` with the reason and Retry above the table, with no
+  alert (issue #1590). \
   Enforced in: `frontend/src/components/reservations/ReservationInventoryTab.tsx` (`DevicePortsDetail`); `frontend/src/api/connections.ts` (`useDeviceConnections`) \
-  Pinned by: `frontend/src/test/components/ReservationInventoryTab.test.tsx` (`expanding a row loads its ports and shows the no-ports state`, `expanding a row renders ports and links connected peers`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `shows the port as unconnected only after the connections read answered`, `while the connections read is on its way, no port reads as unconnected`)
+  Pinned by: `frontend/src/test/components/ReservationInventoryTab.test.tsx` (`expanding a row loads its ports and shows the no-ports state`, `expanding a row renders ports and links connected peers`, `a device with no ports shows No ports even when its connections read fails`, `a failed connections refresh keeps the peers under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `shows the port as unconnected only after the connections read answered`, `while the connections read is on its way, no port reads as unconnected`)
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \

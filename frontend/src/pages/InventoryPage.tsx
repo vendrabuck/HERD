@@ -110,8 +110,6 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
     return map;
   }, [connections, device.id, deviceNameMap]);
 
-  const isLoading = portsState === "loading" || connectionsState === "loading";
-
   return (
     <tr className="bg-gray-50/50">
       <td colSpan={colSpan} className="px-8 py-3">
@@ -125,6 +123,11 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
                 onRetry={() => void portsQuery.refetch()}
                 retrying={portsQuery.isFetching}
               />
+            ) : portsState === "loading" ? (
+              <p className="text-sm text-gray-400">Loading ports...</p>
+            ) : !ports || portsState === "empty" ? (
+              // No ports: nothing to pair with a connection, whatever that read did.
+              <p className="text-sm text-gray-400">No ports configured</p>
             ) : connectionsState === "error" ? (
               <LoadError
                 what="this device's connections"
@@ -132,41 +135,47 @@ function ExpandedPortsRow({ device, deviceNameMap, colSpan }: {
                 onRetry={() => void connectionsQuery.refetch()}
                 retrying={connectionsQuery.isFetching}
               />
-            ) : isLoading ? (
+            ) : connectionsState === "loading" ? (
               <p className="text-sm text-gray-400">Loading ports...</p>
-            ) : !ports || portsState === "empty" ? (
-              <p className="text-sm text-gray-400">No ports configured</p>
             ) : (
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-xs text-gray-500 uppercase">
-                    <th className="text-left py-1 pr-4 font-medium">Port</th>
-                    <th className="text-left py-1 font-medium">Connected To</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ports.map((port) => {
-                    const conn = connectionMap.get(port.name);
-                    return (
-                      <tr key={port.id} className="border-t border-gray-100">
-                        <td className="py-1 pr-4 font-mono text-gray-900">{port.name}</td>
-                        <td className="py-1 text-gray-600">
-                          {conn ? (
-                            <Link
-                              to={`/inventory/${conn.deviceId}`}
-                              className="text-blue-600 hover:text-blue-800 hover:underline"
-                            >
-                              {conn.deviceName}, {conn.portName}
-                            </Link>
-                          ) : (
-                            <span className="text-gray-400">Not connected</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <>
+                {/* A failed connections refresh keeps the peers it already read. */}
+                <LoadErrorNotice
+                  what="this device's connections"
+                  query={connectionsQuery}
+                  className="mb-2"
+                />
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-gray-500 uppercase">
+                      <th className="text-left py-1 pr-4 font-medium">Port</th>
+                      <th className="text-left py-1 font-medium">Connected To</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ports.map((port) => {
+                      const conn = connectionMap.get(port.name);
+                      return (
+                        <tr key={port.id} className="border-t border-gray-100">
+                          <td className="py-1 pr-4 font-mono text-gray-900">{port.name}</td>
+                          <td className="py-1 text-gray-600">
+                            {conn ? (
+                              <Link
+                                to={`/inventory/${conn.deviceId}`}
+                                className="text-blue-600 hover:text-blue-800 hover:underline"
+                              >
+                                {conn.deviceName}, {conn.portName}
+                              </Link>
+                            ) : (
+                              <span className="text-gray-400">Not connected</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </>
             )}
           </div>
         </div>
