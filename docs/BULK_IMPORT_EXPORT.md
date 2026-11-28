@@ -103,10 +103,16 @@ Every import returns a `BulkImportReport`:
   rejected with `row is not an object`, and one whose `name` is not a string with
   `name: must be a string`. A topology item's `canvas` is held to the shape every
   canvas cabling stores must have (TOPO-SHAPE-1 to TOPO-SHAPE-3 in
-  `docs/specs/topology.md`): an object whose `nodes` and `edges` are lists of objects,
-  the node and edge fields cabling reads (ids, edge ends, device id and name, layer,
-  port names) strings, `data` and `data.device` objects, nested no deeper than 64
-  levels, with no `NaN` or infinite number. A canvas without that shape is rejected
+  `docs/specs/topology.md`): an object whose `nodes` and `edges` are lists of objects;
+  on a node, `id`, `data.label`, `data.topologyType`, the device's `id`, `name`,
+  `template_name`, `role`, `status`, `topology_type`, `template_icon`, and
+  `connection_type`, and the network element's `id`, `label`, and `element_type`
+  strings, and `data`, `data.device`, and `data.element` objects; on an edge, `id`,
+  `source`, `target`, `data.layer`, `data.source_port_name`, `data.target_port_name`,
+  `data.sourcePort`, and `data.targetPort` strings and `data` an object, with an edge
+  `id` of at most 255 characters and no NUL character; nested no deeper than 64
+  levels, with no `NaN` or infinite number, and no string or key holding a lone
+  surrogate. A canvas without that shape is rejected
   with its path, for example `canvas.nodes.2: must be an object`,
   `canvas.edges.0.source: must be a string`, or
   `canvas.nodes.0: is nested deeper than 64 levels`, even when the value is empty,

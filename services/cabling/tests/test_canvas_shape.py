@@ -452,8 +452,10 @@ def test_the_editor_canvas_passes():
 
 
 def test_the_seed_and_ai_commit_canvases_pass():
-    """`seedtools/topologies.py`'s `build_canvas` and ai-orchestrator's
-    `_build_canvas_data`, one node of each kind they write."""
+    """Copies of what `seedtools/topologies.py`'s `build_canvas` and
+    ai-orchestrator's `_build_canvas_data` write, one node of each kind; the real
+    builders are judged in `tests/unit/test_seed_canvas_shape.py` and
+    `services/ai-orchestrator/tests/test_committer_canvas_shape.py`."""
     seed = {
         "nodes": [
             {"id": "n0", "type": "deviceNode", "position": {"x": 100, "y": 100}, "data": {}},

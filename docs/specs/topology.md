@@ -1862,7 +1862,7 @@ sections 8.4 to 8.14.
   (`persistableCanvas`), the seed data's, the AI commit's, a CSV import's, and every
   canvas the cabling suite stores. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_the_editor_canvas_passes`, `test_the_seed_and_ai_commit_canvases_pass`, `test_a_csv_import_record_passes`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_good_canvas_is_still_stored_by_every_body_route`)
+  Pinned by: `tests/unit/test_seed_canvas_shape.py` (`test_every_kind_of_seed_node_and_edge_has_the_shape`, `test_the_check_loaded_here_refuses_what_it_refuses_in_cabling`), which calls the real `seedtools.topologies.build_canvas`; `services/ai-orchestrator/tests/test_committer_canvas_shape.py` (`test_every_kind_of_commit_node_and_edge_has_the_shape`, `test_the_check_loaded_here_refuses_what_it_refuses_in_cabling`), which calls the real `committer._build_canvas_data`, each judging with cabling's check loaded by path; `services/cabling/tests/test_canvas_shape.py` (`test_the_editor_canvas_passes`, a copy of a `persistableCanvas` canvas, `test_the_seed_and_ai_commit_canvases_pass`, copies of the two builders' output, `test_a_csv_import_record_passes`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_good_canvas_is_still_stored_by_every_body_route`)
 - **TOPO-SHAPE-5.** A topology PUT, a template create or update, and a fork canvas PUT
   or save whose `canvas_data` does not have the shape answer 422 with the one item
   `{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": "canvas_data.<path>:
