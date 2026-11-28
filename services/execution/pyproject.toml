@@ -4,7 +4,7 @@ version = "0.8.0.dev0"
 description = "HERD Execution Service"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.163.2",
+    "fastapi>=0.165.0",
     "uvicorn[standard]>=0.54.0",
     "sqlalchemy[asyncio]>=2.1.9",
     "asyncpg>=0.29.0",
