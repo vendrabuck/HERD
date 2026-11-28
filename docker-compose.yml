@@ -157,7 +157,7 @@ services:
   # constraint would match no container and take every route down.
   traefik:
     logging: *default-logging
-    image: traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635
+    image: traefik:v3.8.0@sha256:00c9734983e74ae35a1fc18eaee9e9da13f3dde95c4e45b3b8c3b60e0dbd2d17
     command:
       - "--api.dashboard=true"
       - "--api.insecure=true"
@@ -205,7 +205,7 @@ services:
   # --- PostgreSQL ---
   postgres:
     logging: *default-logging
-    image: postgres:16.15-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139
+    image: postgres:16.16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     # max_connections (issue #1352): the eleven database services hold at most
     # 11 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) = 11 x (5 + 10) = 165 connections with
     # the defaults; 200 leaves 35 for psql sessions, `make migrate`, and the
