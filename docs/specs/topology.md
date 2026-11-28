@@ -1914,10 +1914,20 @@ sections 8.4 to 8.14.
   number of lookups of its named parts. A canvas that costs at most
   `INLINE_CHECK_VALUES` (20,000) is judged there, in about 1 ms to about 10 ms on one
   core at that budget; once the charges pass it, the check stops and the canvas is
-  judged whole on a bulk worker thread (`run_bulk_work`, TOPO-BULK-23), whose slots it
-  shares with the import and the export. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `TEXT_CHARS_PER_VALUE`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`, `test_a_wide_top_level_is_judged_on_a_worker_thread`, `test_a_long_string_is_charged_by_its_length`)
+  judged whole on a worker thread: at most `STORED_CHECK_THREADS` (2) such checks run
+  at once in the process, on slots of their own (`stored_check_limiter`, through
+  `herd_common.bulk_work.run_limited_work`), never the import's and the export's
+  (TOPO-BULK-23), so a read never waits behind an import or an export. The request
+  keeps its database session, and any row lock it holds (a fork canvas PUT holds its
+  fork row's), while its check waits for a slot and runs; a cancelled request's check
+  runs on and keeps its slot until its thread ends. That wait is bounded: only these
+  checks take the slots; a request reaches its check after the query that loaded the
+  canvas, so each one waiting holds one of the process's pooled connections, and at
+  most `DB_POOL_SIZE` + `DB_MAX_OVERFLOW` (15 by default) checks wait or run at once;
+  and each check is one walk of one canvas, which on one core took about 1 s at most
+  for a 10 MiB canvas (the most an import file holds) of the costliest shape measured. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `TEXT_CHARS_PER_VALUE`, `STORED_CHECK_THREADS`, `stored_check_limiter`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/common/herd_common/bulk_work.py` (`run_limited_work`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`, `test_a_wide_top_level_is_judged_on_a_worker_thread`, `test_a_long_string_is_charged_by_its_length`, `test_at_most_two_checks_run_at_once_on_their_own_slots`, `test_a_check_never_waits_behind_bulk_work`, `test_a_check_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`, `test_a_cancelled_check_keeps_its_slot_until_its_thread_ends`, `test_a_check_raising_on_its_thread_gives_its_slot_back`); `services/common/tests/test_bulk_work.py` (`test_limited_work_takes_the_callers_limiters_never_the_bulk_ones`)
 - **TOPO-SHAPE-7.** Each stored canvas found without the shape is logged once per
   read, at warning: `stored_canvas_unreadable kind=<kind> id=<row id>
   problem=canvas_data.<path>: <message>`, and nothing of the canvas. \

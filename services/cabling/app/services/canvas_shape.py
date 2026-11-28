@@ -54,8 +54,8 @@ length bound. ``require_readable_canvas`` answers 409
 ``readable_canvas_or_none`` gives a reader that can do without the canvas None
 instead; both judge through ``stored_canvas_problem``, which keeps a canvas that
 costs more than ``INLINE_CHECK_VALUES`` (as the constant's comment counts) off the
-event loop, and both log one warning naming the row's kind, its id, and the problem,
-never any of the canvas.
+event loop, on worker threads of its own (``STORED_CHECK_THREADS``), and both log one
+warning naming the row's kind, its id, and the problem, never any of the canvas.
 """
 
 from __future__ import annotations
@@ -68,8 +68,9 @@ import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any
 
+import anyio
 from fastapi import HTTPException
-from herd_common.bulk_work import run_bulk_work
+from herd_common.bulk_work import run_limited_work
 from pydantic import AfterValidator
 from pydantic_core import PydanticCustomError
 
@@ -107,6 +108,35 @@ INLINE_CHECK_VALUES = 20_000
 # Searching 16 characters for a lone surrogate takes about as long as judging one
 # small value; a string of fewer costs only its place in its container.
 TEXT_CHARS_PER_VALUE = 16
+
+# At most this many stored canvas checks run on worker threads at once in the
+# process, on slots of their own, never the bulk import and export slots
+# (``run_bulk_work``), so a read never waits behind an import or an export. Each
+# check holds the GIL while it runs, so more threads add no throughput.
+STORED_CHECK_THREADS = 2
+
+# The slots a check takes before its thread starts, given back when the thread ends,
+# and the tokens handed to anyio for the thread itself; built on first use, as
+# ``herd_common.bulk_work`` builds its own.
+_check_slots: anyio.CapacityLimiter | None = None
+_check_workers: anyio.CapacityLimiter | None = None
+
+
+def stored_check_limiter() -> anyio.CapacityLimiter:
+    """The process-wide slots every stored canvas check on a worker thread takes
+    one of."""
+    global _check_slots
+    if _check_slots is None:
+        _check_slots = anyio.CapacityLimiter(STORED_CHECK_THREADS)
+    return _check_slots
+
+
+def _check_worker_limiter() -> anyio.CapacityLimiter:
+    global _check_workers
+    if _check_workers is None:
+        _check_workers = anyio.CapacityLimiter(STORED_CHECK_THREADS)
+    return _check_workers
+
 
 # The answer to a request that needs a stored canvas which fails the check.
 STORED_CANVAS_UNREADABLE_DETAIL = (
@@ -507,14 +537,22 @@ async def stored_canvas_problem(canvas: Any, *, as_written: bool = False) -> Can
     ``as_written``, ``canvas_problem`` for a reader that writes the canvas's edge
     ids to a column (fork create). The check starts on the event loop and stops
     there once the canvas has cost more than ``INLINE_CHECK_VALUES`` (as the
-    constant's comment counts); such a canvas is then judged whole on a bulk worker
-    thread (``herd_common.bulk_work.run_bulk_work``), so the loop is never held for
-    the whole check."""
+    constant's comment counts); such a canvas is then judged whole on a worker
+    thread under ``stored_check_limiter`` (``herd_common.bulk_work.run_limited_work``),
+    so the loop is never held for the whole check, and a read never waits for a bulk
+    slot. The caller keeps its database session, and whatever row lock it holds,
+    while the check waits for a slot and runs; a cancelled caller's thread keeps its
+    slot until it ends."""
     edge_structure = _written_edge_structure if as_written else _edge_structure
     try:
         return _judge(canvas, INLINE_CHECK_VALUES, edge_structure)
     except _Unfinished:
-        return await run_bulk_work(canvas_problem if as_written else stored_shape_problem, canvas)
+        return await run_limited_work(
+            stored_check_limiter(),
+            _check_worker_limiter(),
+            canvas_problem if as_written else stored_shape_problem,
+            canvas,
+        )
 
 
 def _check_canvas_data(value: dict[str, Any]) -> dict[str, Any]:
@@ -580,6 +618,7 @@ __all__ = [
     "MAX_CANVAS_DEPTH",
     "MAX_EDGE_ID_LENGTH",
     "STORED_CANVAS_UNREADABLE_DETAIL",
+    "STORED_CHECK_THREADS",
     "INLINE_CHECK_VALUES",
     "canvas_problem",
     "readable_canvas_or_none",
@@ -587,4 +626,5 @@ __all__ = [
     "stored_canvas_problem",
     "stored_shape_problem",
     "stored_canvas_readable",
+    "stored_check_limiter",
 ]

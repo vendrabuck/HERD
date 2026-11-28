@@ -8,6 +8,7 @@ docstring, not from the module's own tables, so a change to the module's tables
 fails here.
 """
 
+import asyncio
 import copy
 import json
 import math
@@ -20,6 +21,7 @@ from app.services.canvas_shape import (
     INLINE_CHECK_VALUES,
     MAX_CANVAS_DEPTH,
     STORED_CANVAS_UNREADABLE_DETAIL,
+    STORED_CHECK_THREADS,
     TEXT_CHARS_PER_VALUE,
     CanvasProblem,
     canvas_problem,
@@ -27,9 +29,12 @@ from app.services.canvas_shape import (
     require_readable_canvas,
     stored_canvas_problem,
     stored_canvas_readable,
+    stored_check_limiter,
     stored_shape_problem,
 )
 from fastapi import HTTPException
+from herd_common import bulk_work
+from herd_common.bulk_work import BULK_WORK_THREADS, bulk_work_limiter, run_bulk_work
 
 OBJECT = "must be an object"
 LIST = "must be a list"
@@ -703,3 +708,173 @@ async def test_a_long_string_is_charged_by_its_length(monkeypatch, position):
     assert seen == []
     assert await stored_canvas_problem(build("\u00e9" * (fits + 1))) is None
     assert len(seen) == 1 and seen[0] != threading.get_ident()
+
+
+# The stored check's own worker threads ----------------------------------------------------
+#
+# Every overlap is staged with events, never a sleep: a check blocks on a
+# `threading.Event` the test sets, and the test waits for a check's signal off the
+# loop. Every wait, the final gathers included, is bounded and fails the test when
+# it expires, so a slot that is never given back fails rather than hangs.
+
+_WAIT = 10.0
+
+# A canvas past the inline budget, so its check always runs on a worker thread.
+_PAST_THE_BUDGET = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
+
+
+async def _signalled(event: threading.Event) -> bool:
+    return await asyncio.to_thread(event.wait, _WAIT)
+
+
+async def _until(predicate) -> None:
+    """Yield to the loop until ``predicate()`` holds, failing after ``_WAIT``."""
+    async with asyncio.timeout(_WAIT):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
+@pytest.fixture
+def fresh_limiters(monkeypatch):
+    """Limiters of this test's own, so a slot one test holds never reaches another."""
+    monkeypatch.setattr(canvas_shape, "_check_slots", None)
+    monkeypatch.setattr(canvas_shape, "_check_workers", None)
+    monkeypatch.setattr(bulk_work, "_limiter", None)
+    monkeypatch.setattr(bulk_work, "_workers", None)
+
+
+def _held_checks(monkeypatch, count: int):
+    """Make each worker-thread check signal its entry and block until released."""
+    entered = [threading.Event() for _ in range(count)]
+    release = threading.Event()
+    calls: list[int] = []
+
+    def held(canvas):
+        index = len(calls)
+        calls.append(index)
+        entered[index].set()
+        assert release.wait(_WAIT), "never released"
+        return None
+
+    monkeypatch.setattr(canvas_shape, "stored_shape_problem", held)
+    return entered, release, calls
+
+
+def test_two_check_threads_at_most():
+    assert STORED_CHECK_THREADS == 2
+
+
+@pytest.mark.usefixtures("fresh_limiters")
+async def test_at_most_two_checks_run_at_once_on_their_own_slots(monkeypatch):
+    """A third check waits for one of the check's own slots, and the bulk slots
+    are never taken. Mutation-checked: judging on `run_bulk_work` fails this."""
+    entered, release, _ = _held_checks(monkeypatch, STORED_CHECK_THREADS + 1)
+    tasks = [
+        asyncio.create_task(stored_canvas_problem(_PAST_THE_BUDGET))
+        for _ in range(STORED_CHECK_THREADS + 1)
+    ]
+    try:
+        for index in range(STORED_CHECK_THREADS):
+            assert await _signalled(entered[index]), f"check {index} never started"
+        limiter = stored_check_limiter()
+        await _until(lambda: limiter.statistics().tasks_waiting == 1)
+        assert limiter.borrowed_tokens == STORED_CHECK_THREADS
+        assert not entered[STORED_CHECK_THREADS].is_set()
+        assert bulk_work_limiter().borrowed_tokens == 0
+    finally:
+        release.set()
+    async with asyncio.timeout(_WAIT):
+        assert await asyncio.gather(*tasks) == [None] * len(tasks)
+    assert entered[STORED_CHECK_THREADS].is_set()
+    assert stored_check_limiter().borrowed_tokens == 0
+
+
+@pytest.mark.usefixtures("fresh_limiters")
+async def test_a_check_never_waits_behind_bulk_work():
+    """With every bulk slot held by an import or an export, a stored canvas past
+    the budget is still judged, with its answer."""
+    entered = [threading.Event() for _ in range(BULK_WORK_THREADS)]
+    release = threading.Event()
+
+    def bulk(index):
+        entered[index].set()
+        assert release.wait(_WAIT), "never released"
+
+    holders = [asyncio.create_task(run_bulk_work(bulk, i)) for i in range(BULK_WORK_THREADS)]
+    try:
+        for event in entered:
+            assert await _signalled(event), "a bulk holder never started"
+        bad = {"edges": [*_PAST_THE_BUDGET["edges"], 1]}
+        async with asyncio.timeout(_WAIT):
+            assert await stored_canvas_problem(_PAST_THE_BUDGET) is None
+            assert await stored_canvas_problem(bad) == CanvasProblem(
+                ("edges", INLINE_CHECK_VALUES), OBJECT
+            )
+        assert bulk_work_limiter().borrowed_tokens == BULK_WORK_THREADS
+    finally:
+        release.set()
+    async with asyncio.timeout(_WAIT):
+        await asyncio.gather(*holders)
+
+
+@pytest.mark.usefixtures("fresh_limiters")
+async def test_a_check_cancelled_while_it_waits_takes_no_slot_and_runs_nothing(monkeypatch):
+    entered, release, calls = _held_checks(monkeypatch, STORED_CHECK_THREADS + 1)
+    holders = [
+        asyncio.create_task(stored_canvas_problem(_PAST_THE_BUDGET))
+        for _ in range(STORED_CHECK_THREADS)
+    ]
+    try:
+        for index in range(STORED_CHECK_THREADS):
+            assert await _signalled(entered[index]), "a holder never started"
+        waiter = asyncio.create_task(stored_canvas_problem(_PAST_THE_BUDGET))
+        limiter = stored_check_limiter()
+        await _until(lambda: limiter.statistics().tasks_waiting == 1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert limiter.statistics().tasks_waiting == 0
+        assert limiter.borrowed_tokens == STORED_CHECK_THREADS
+    finally:
+        release.set()
+    async with asyncio.timeout(_WAIT):
+        await asyncio.gather(*holders)
+    await _until(lambda: stored_check_limiter().borrowed_tokens == 0)
+    assert len(calls) == STORED_CHECK_THREADS
+
+
+@pytest.mark.usefixtures("fresh_limiters")
+async def test_a_cancelled_check_keeps_its_slot_until_its_thread_ends(monkeypatch):
+    """The caller sees its cancellation at once; the slot comes back only when the
+    thread ends, so the bound holds whatever is cancelled."""
+    entered, release, _ = _held_checks(monkeypatch, 1)
+    task = asyncio.create_task(stored_canvas_problem(_PAST_THE_BUDGET))
+    try:
+        assert await _signalled(entered[0]), "the check never started"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert stored_check_limiter().borrowed_tokens == 1
+    finally:
+        release.set()
+    await _until(lambda: stored_check_limiter().borrowed_tokens == 0)
+
+
+@pytest.mark.usefixtures("fresh_limiters")
+async def test_a_check_raising_on_its_thread_gives_its_slot_back(monkeypatch):
+    def failing(canvas):
+        raise RuntimeError("check failed")
+
+    monkeypatch.setattr(canvas_shape, "stored_shape_problem", failing)
+    with pytest.raises(RuntimeError):
+        async with asyncio.timeout(_WAIT):
+            await stored_canvas_problem(_PAST_THE_BUDGET)
+    await _until(lambda: stored_check_limiter().borrowed_tokens == 0)
+
+
+async def test_the_check_limiter_is_one_per_process(monkeypatch):
+    monkeypatch.setattr(canvas_shape, "_check_slots", None)
+    first = stored_check_limiter()
+    assert stored_check_limiter() is first
+    assert first.total_tokens == STORED_CHECK_THREADS
+    assert first is not bulk_work_limiter()
