@@ -9,6 +9,7 @@ import httpx
 from herd_common.csv_safety import csv_safe_cell
 from herd_common.enums import TopologyType
 from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.timeutil import to_utc_instant
 from herd_common.upstream_body import WRONG_FIELD, UpstreamBodyUnusable, read_json_body
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,19 +63,6 @@ class TransitGearUnavailable(RuntimeError):
     """
 
 
-def _as_utc(dt: datetime) -> datetime:
-    """Return ``dt`` as an aware datetime in UTC.
-
-    A naive value is taken to be UTC: SQLite (the test backend) drops tzinfo on
-    read, and the report routes accept a query datetime without an offset. An
-    aware value in any other offset is converted, so its date fields are UTC
-    date fields (issue #1523).
-    """
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, float]]:
     """Break [start, end) across UTC midnight boundaries.
 
@@ -85,8 +73,8 @@ def _split_hours_per_day(start: datetime, end: datetime) -> list[tuple[str, floa
     the date fields of a non-UTC value put the first midnight before the start
     and counted hours outside the window).
     """
-    start = _as_utc(start)
-    end = _as_utc(end)
+    start = to_utc_instant(start)
+    end = to_utc_instant(end)
     if end <= start:
         return []
     out: list[tuple[str, float]] = []
@@ -262,8 +250,8 @@ async def build_utilization_report(
     do not depend on the driver's or the host's local zone, and the report
     echoes the window in UTC (issue #1523).
     """
-    window_start = _as_utc(window_start)
-    window_end = _as_utc(window_end)
+    window_start = to_utc_instant(window_start)
+    window_end = to_utc_instant(window_end)
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
 
@@ -348,8 +336,8 @@ async def build_utilization_report(
     legacy_reservation_category: dict[uuid.UUID, str] = {}
 
     for r in reservations:
-        effective_start = max(_as_utc(r.start_time), window_start)
-        effective_end = min(_as_utc(r.end_time), window_end)
+        effective_start = max(to_utc_instant(r.start_time), window_start)
+        effective_end = min(to_utc_instant(r.end_time), window_end)
         hours = (effective_end - effective_start).total_seconds() / 3600.0
         if hours <= 0:
             continue
