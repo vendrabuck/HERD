@@ -64,9 +64,11 @@ one per area; all ten areas are written.
 - **Device and port templates** (Shipped): user-defined templates with typed custom
   fields (string, number, boolean, dropdown, password) and per-field defaults.
 - **Driver packages** (Shipped): standalone driver entities classified by connection
-  type (Management, Layer 1/2/3 Switch). All four contracts are live: the execution
-  service loads a user-authored Python package and invokes it at reservation
-  lifecycle events (see the Layer 3 section of [docs/DRIVERS.md](docs/DRIVERS.md)).
+  type (Management, Layer 1/2/3 Switch, and Hypervisor for dynamic resources). The
+  four physical-device contracts are live: the execution service loads a
+  user-authored Python package and invokes it at reservation lifecycle events, and
+  the Hypervisor contract runs the dynamic-resource create and teardown flow (see
+  [docs/DRIVERS.md](docs/DRIVERS.md#connection-types-and-their-driver-contracts)).
   A package declares capabilities in `driver_metadata.json` (for example
   `supports_dry_run` and `supports_vrf`) and either vendors its dependencies in
   `_deps/` or ships a `requirements.txt`, which is installed only when the operator
@@ -203,8 +205,8 @@ one per area; all ten areas are written.
   first, so a hidden device reports the same reason an unknown one does. Execution drives
   the intent-derived route set in precedence over the config-version fallback (see the
   Reservations section below), passing a route's `virtual_router` only to a driver whose
-  package declares `supports_vrf`; a switch whose driver does not declare it is
-  refused with `l3_vrf_unsupported` and no driver call. Pathfinding refuses a
+  package declares `supports_vrf`; a switch with a VRF route on a driver that does not
+  declare it is refused with `l3_vrf_unsupported` and no driver call. Pathfinding refuses a
   non-admin caller's hidden endpoint and redacts a hidden transit hop. See
   [docs/TOPOLOGY_EDITOR.md](docs/TOPOLOGY_EDITOR.md#layer-3-routing-intent-adr-0014-issue-34).
 
@@ -288,9 +290,9 @@ one per area; all ten areas are written.
   `include_transit` toggle to fall back to reserved-devices-only; see
   [docs/design/0013-lab-purpose-classification.md](docs/design/0013-lab-purpose-classification.md)
   (issue #646). The suggestions read the signals HERD already holds: the free-text
-  purpose, device names and templates, wiring shape, config-apply job names and counts,
-  fork version count, and duration, plus the reservation assistant's transcripts unless
-  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is false. The category rides every `reservation.*`
+  purpose, device names and templates, wiring shape, and, at reservation end, config-apply
+  job names and counts, fork version count, duration, and the reservation assistant's
+  transcripts unless `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is false. The category rides every `reservation.*`
   lifecycle event and the `/api/v1` facade.
 
 ## Dynamic resources
@@ -477,7 +479,7 @@ one per area; all ten areas are written.
   events are staged in a per-service transactional outbox in the same database
   transaction as the state change, then drained to NATS by a background relay that
   retries across a messaging outage and prunes old rows (it claims each row with
-  `FOR UPDATE SKIP LOCKED`, so several relay replicas never publish one row twice),
+  `FOR UPDATE SKIP LOCKED`, so two relay replicas never claim the same row at once),
   so an outage delays delivery
   instead of silently dropping a provisioning or notification event. Consumers dedupe
   on a stable per-event id, so a relay republish is recognized as a duplicate rather

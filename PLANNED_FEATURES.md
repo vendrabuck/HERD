@@ -33,7 +33,7 @@ Product direction:
 - **Multi-tenancy and team workspaces.** Organizational isolation so independent teams share one instance without seeing each other's resources, building on the shipped group-based access grants. It would add a tenant identifier to every service's schema and has no design yet.
 - **General extension system.** A broader surface for third-party or internal add-ons: custom validators, workflow automations, and integrations beyond device drivers. Webhooks, notification channels, and driver-published schemas have shipped; no first extension point has been chosen.
 - **Federated labs.** Connect several HERD instances into one searchable view. Its first dependency does not exist: the `/api/v1` facade serves reservations and webhooks only, with no inventory, calendar, or topology read.
-- **Mobile views.** Dedicated mobile layouts for the topology and reservation flows. Tables scroll horizontally instead of reflowing and the top menu opens on hover, so this is a project of its own and not a first issue.
+- **Mobile views.** Dedicated mobile layouts for the topology and reservation flows. Tables scroll horizontally instead of reflowing and the Administration menu is built for hover (it also opens on a tap), so this is a project of its own and not a first issue.
 
 ## How this maps to today
 

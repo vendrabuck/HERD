@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `TOPO` (used in rule identifiers, for example `TOPO-CONN-1`) |
-| Last full review | 2026-10-03 |
+| Last full review | 2026-10-05 |
 | Owning services | cabling (`services/cabling/`); the topology editor and its pages in `frontend/` |
 | Other services involved | inventory (device-group membership, device visibility, device names, device type and Layer 3 config), reservations (the reservation lookup behind the edit lock and the delete guard; the only caller of the fork write routes), execution (reads fork wiring, fabric membership), ai-orchestrator (pathfind, the user-facing validate route, fork reads), auth (JWT only) |
 | Design records | [ADR 0001](../design/0001-editable-reservation-topologies.md), [ADR 0006](../design/0006-fork-reconcile-and-as-built.md), [ADR 0012](../design/0012-network-element-objects.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md) |

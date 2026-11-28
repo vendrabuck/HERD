@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `AI` (used in rule identifiers, for example `AI-GEN-1`) |
-| Last full review | 2026-10-05 |
+| Last full review | 2026-10-06 |
 | Owning services | ai-orchestrator (`services/ai-orchestrator/`), and the frontend surfaces that call it |
 | Other services involved | inventory (templates, devices, ports, config versions, apply jobs), cabling (pathfinding, topologies, validation, forks), reservations (reservation reads, reservation create, the purpose sweep that calls this service), execution (`POST /execute`, execution runs, recipe package validation), auth (JWT only), the configured LLM provider (external) |
 | Design records | [ADR 0005](../design/0005-ai-recipe-authoring.md), [ADR 0012](../design/0012-network-element-objects.md), [ADR 0013](../design/0013-lab-purpose-classification.md), [ADR 0015](../design/0015-assistant-docs-lookup.md); ADR 0006 for port choice ([0006](../design/0006-fork-reconcile-and-as-built.md)) |

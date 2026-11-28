@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `DYN` (used in rule identifiers, for example `DYN-CREATE-1`) |
-| Last full review | 2026-10-05 |
+| Last full review | 2026-10-06 |
 | Owning services | execution (`services/execution/`: the `provision_requested` handler, the `dynamic_instances` ledger, teardown, the recipe result rules); the booking surfaces in `frontend/` |
 | Other services involved | reservations (the `reservation_dynamic_requests` rows, the `provision_requested` event, the provision-result callback, the timeout backstop), inventory (dynamic templates, the hypervisor registry, the internal device create and delete routes, recipe packages), secrets (the hypervisor credential), the Hypervisor recipe driver run in execution's sandbox |
 | Design records | [ADR 0004](../design/0004-dynamic-resources.md) |
