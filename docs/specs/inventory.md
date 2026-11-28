@@ -1064,7 +1064,7 @@ download, delete); routes under `/drivers`. The package format is in
   90.4 s), and about 120 s after its parts are stored when its completion goes
   unanswered (30 s, then the abort's 90.4 s). Apart from a body send over plain HTTP,
   the bounds are on each wait for progress, not on a whole transfer. These are
-  named constants, not settings (the issue's triage). The failure answers as
+  named constants, not settings. The failure answers as
   INV-DRV-20 and section 10 say. \
   Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`) \
   Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`, `test_each_request_of_a_storage_call_is_tried_as_its_method_allows`)

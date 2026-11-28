@@ -74,8 +74,7 @@ logger = logging.getLogger(__name__)
 DRIVER_STORAGE_THREADS = 4
 
 # The MinIO client's per-request bounds (issue #1416). Named constants rather than
-# settings, by the issue's triage: the values bound a failure, they do not tune a
-# deployment.
+# settings: the values bound a failure, they do not tune a deployment.
 MINIO_CONNECT_TIMEOUT_SECONDS = 15
 MINIO_READ_TIMEOUT_SECONDS = 30
 MINIO_RETRIES = 2
