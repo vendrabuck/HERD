@@ -1663,14 +1663,17 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`, `_build_fleet_section`) \
   Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fleet_section_math_and_idle_devices`, `test_fleet_pct_is_not_clamped_at_100`, `test_device_missing_from_inventory_stays_in_legacy_section_only`, `test_empty_inventory_yields_empty_fleet_section`, `test_fleet_devices_are_listed_busiest_first_then_by_name`, `test_fleet_order_compares_the_rounded_pct_and_keeps_inventory_order_on_a_full_tie`, `test_fetch_fleet_devices_paginates_past_500`, `test_fetch_fleet_devices_lists_every_device_inventory_returns`, `test_fetch_fleet_devices_takes_no_extra_request_at_a_multiple_of_500_in_total`, `test_fetch_fleet_devices_stops_once_the_devices_held_reach_an_integer_total`, `test_fetch_fleet_devices_stops_at_100_000_devices`, `test_the_200th_page_nulls_the_fleet_only_when_full_and_short_of_an_integer_total`, `test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_inventory`); `tests/integration/test_reporting.py` (`test_fleet_section_counts_active_and_lists_idle_devices`)
 - **OPS-REPORT-11.** When inventory cannot answer, the JSON report answers 200 with
-  `fleet` null. Known gap, see #1577. \
+  `fleet` null. Inventory cannot answer also when a page is a 200 whose body does not
+  parse (not JSON, not UTF-8, or nested deeper than the decoder's recursion limit) or
+  is not an object holding an `items` list; entries inside a well-formed list stay
+  lenient (OPS-REPORT-10) (issue #1577). \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_fleet_devices`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fetch_fleet_devices_none_on_non_200`, `test_fetch_fleet_devices_none_on_unreachable`, `test_report_route_fleet_null_when_inventory_unreachable`)
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_fetch_fleet_devices_none_on_non_200`, `test_fetch_fleet_devices_none_on_unreachable`, `test_report_route_fleet_null_when_inventory_unreachable`, `test_an_inventory_page_the_report_cannot_use_is_like_an_unreachable_inventory`)
 - **OPS-REPORT-12.** `execution_run_count` is the number of driver runs started in the
   window, read from execution with the caller's token, and null when execution cannot
-  answer. Known gap, see #1577. \
+  answer, a 200 whose body does not parse or is not an object included (issue #1577). \
   Enforced in: `services/reservations/app/services/reporting_service.py` (`fetch_execution_run_count`) \
-  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_fetch_execution_run_count_returns_total`, `test_fetch_execution_run_count_swallows_http_errors`, `test_fetch_execution_run_count_returns_none_on_non_200`)
+  Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_fetch_execution_run_count_returns_total`, `test_fetch_execution_run_count_swallows_http_errors`, `test_fetch_execution_run_count_returns_none_on_non_200`); `services/reservations/tests/test_fleet_report.py` (`test_an_execution_answer_the_report_cannot_use_is_a_null_run_count`)
 - **OPS-REPORT-13.** The CSV route serves one `section` (`user`, `device`, `fleet`,
   `purpose`, `user_purpose`, `device_purpose`, `purpose_suggested`; anything else is
   422) as `text/csv` with an attachment name dated with the UTC dates of `start` and
@@ -1678,9 +1681,10 @@ and `frontend/src/api/reporting.ts`. The purpose categories and suggestions it c
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`); `services/reservations/app/services/reporting_service.py` (`report_to_csv`) \
   Pinned by: `services/reservations/tests/test_reporting_service.py` (`test_report_to_csv_user_section`, `test_report_to_csv_device_section_carries_transit_columns`, `test_report_to_csv_purpose_suggested_section`, `test_report_to_csv_rejects_unknown_section`); `services/reservations/tests/test_report_utc_days.py` (`test_csv_route_reproduction_matches_json_and_names_utc_dates`); `tests/integration/test_reporting.py` (`test_utilization_report_csv_download`, `test_utilization_report_csv_rejects_unknown_section`)
 - **OPS-REPORT-14.** The `fleet` CSV is 503 `Inventory service is unreachable` when
-  inventory cannot answer; the other sections make no inventory call. Known gap, see #1577. \
+  inventory cannot answer (OPS-REPORT-11, a page that cannot be read included, issue
+  #1577); the other sections make no inventory call. \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_utilization_report_csv`) \
-  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_csv_route_fleet_503_when_inventory_unreachable`, `test_csv_route_other_sections_skip_inventory_fetch`, `test_csv_route_fleet_section`)
+  Pinned by: `services/reservations/tests/test_fleet_report.py` (`test_csv_route_fleet_503_when_inventory_unreachable`, `test_csv_route_other_sections_skip_inventory_fetch`, `test_csv_route_fleet_section`, `test_an_inventory_page_the_report_cannot_use_is_like_an_unreachable_inventory`)
 - **OPS-REPORT-15.** Free-text CSV cells (owner names, device names, and the browser's
   template names) are neutralized against spreadsheet formulas; numbers and enumerations
   are not. \
@@ -2404,16 +2408,7 @@ run against a stack; so were the large canvas save and the 1 MiB fork canvas sav
 
 ### Open defects
 
-- #1577 (OPS-REPORT-11, OPS-REPORT-12, OPS-REPORT-14): the utilization report reads
-  inventory's `GET /devices` and execution's `GET /runs` without a guarded parse, so a
-  200 whose body does not parse (not JSON, not UTF-8, or nested deeper than the
-  decoder's recursion limit), or is a list or a string, answers 500 on the JSON report
-  and, from inventory, on the `fleet` CSV, instead of `fleet` null,
-  `execution_run_count` null, or the CSV's 503; from execution a `null` answers 500
-  too, while from inventory a `null` or an `items` string gives a fleet of 0 devices
-  instead (issue #1577's run). A real
-  upstream cannot send these bodies while its response model holds. The reservations
-  sites of the same issue are listed in `reservations.md`.
+None at present. (#1577 is resolved by OPS-REPORT-11, OPS-REPORT-12, and OPS-REPORT-14.)
 
 ### Limits by decision
 
