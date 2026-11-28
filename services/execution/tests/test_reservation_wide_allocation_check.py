@@ -15,7 +15,8 @@ The release condition, per allocation A of reservation R
   - no ACTIVE membership references A;
   - no FAILED membership of R, of either direction, names A (a build's add may have
     landed on its number; a release's removal from it is pending);
-  - R is frozen, or R has no FAILED intended-ACTIVE membership at all;
+  - R is frozen, or R has no FAILED membership that is intended ACTIVE or owes the
+    removal of a lost join's add (JOIN_UNDO_PENDING_REMOVAL, issue #1413);
   - no FAILED intended-ACTIVE membership of R holds a live drive claim (a retry pass
     that claimed it before the freeze may still land its join; the teardown leaves
     such a row alone, WIRE-TEARDOWN-6).
@@ -26,7 +27,8 @@ What this file pins:
     reservation, through the tick and the manual channel (review finding 2);
   - the condition matrix {reconcile with delta, reconcile no-delta, teardown} x
     {frozen, not} x {FAILED join on A, on the nil allocation, on another allocation of
-    R; FAILED removal from A; none} x {ACTIVE member, none}, with another reservation's
+    R; FAILED removal from A; a row owing a lost join's removal; none} x {ACTIVE
+    member, none}, with another reservation's
     rows seeded (frozen, with a FAILED join, an orphaned ACTIVE allocation) and
     asserted untouched;
   - the guard inside the release's own UPDATE (a failed join committed after the
@@ -70,7 +72,7 @@ from app.services.nats_consumer import (
     process_reservation_message,
 )
 from app.services.vlan_service import _derive_vlan_id
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -479,7 +481,9 @@ PATHS = ("reconcile_delta", "reconcile_no_delta", "teardown")
 
 
 @pytest.mark.parametrize("member", [True, False], ids=["member", "no_member"])
-@pytest.mark.parametrize("failed", ["real", "nil", "other_real", "release_row", "absent"])
+@pytest.mark.parametrize(
+    "failed", ["real", "nil", "other_real", "release_row", "owed_row", "absent"]
+)
 @pytest.mark.parametrize("frozen", [True, False], ids=["frozen", "not_frozen"])
 @pytest.mark.parametrize("path", PATHS)
 async def test_the_check_releases_exactly_when_the_condition_holds(
@@ -489,10 +493,12 @@ async def test_the_check_releases_exactly_when_the_condition_holds(
     released by the check iff no ACTIVE membership references it and
     held_by_a_failed_membership is false: no FAILED row of R names A (`real`, a FAILED
     join on A; `release_row`, a FAILED removal from A), and either R is frozen or R has
-    no FAILED intended-ACTIVE membership (`nil`, a FAILED join on the nil allocation;
-    `other_real`, one on another allocation of R, which holds A only while R is not
-    frozen). The FAILED row, A's member, and the freeze are written just before the
-    check runs (module docstring). Another reservation's rows never change, and the
+    no FAILED membership that is intended ACTIVE or owes a lost join's removal (`nil`,
+    a FAILED join on the nil allocation; `other_real`, one on another allocation of R;
+    `owed_row`, a row of R owing the removal of a lost join's add from a RELEASED
+    allocation, JOIN_UNDO_PENDING_REMOVAL; each holds A only while R is not frozen).
+    The FAILED row, A's member, and the freeze are written just before the check runs
+    (module docstring). Another reservation's rows never change, and the
     per-pass check of the site's own work still runs (the delta's new allocation keeps
     its member; the teardown's removed allocation is released). The candidate read
     already applies the condition, so no release loses a race here (no
@@ -526,6 +532,22 @@ async def test_the_check_releases_exactly_when_the_condition_holds(
             await _add_membership(RES, other_alloc, S1, "0/0/7", status="FAILED")
         elif failed == "release_row":
             await _add_membership(RES, target, S1, "0/0/7", status="FAILED", intended="RELEASED")
+        elif failed == "owed_row":
+            from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL
+
+            released = await _add_allocation(RES, SEEDED_VLAN + 6, uuid.uuid4(), [S1])
+            async with TestSessionLocal() as s:
+                (await s.get(VlanAssignment, released)).status = "RELEASED"
+                await s.commit()
+            await _add_membership(
+                RES,
+                released,
+                S1,
+                "0/0/7",
+                status="FAILED",
+                intended="RELEASED",
+                last_error=JOIN_UNDO_PENDING_REMOVAL,
+            )
         if frozen:
             await _freeze()
         await real(reservation_id, ctx, get_db_session)
@@ -544,14 +566,15 @@ async def test_the_check_releases_exactly_when_the_condition_holds(
 
     assert seen == [RES_ID], "the site runs the reservation-wide check once"
     expect_released = not member and (
-        failed == "absent" or (frozen and failed in ("nil", "other_real"))
+        failed == "absent" or (frozen and failed in ("nil", "other_real", "owed_row"))
     )
     rows = await _allocations()
     assert rows[target].status == ("RELEASED" if expect_released else "ACTIVE")
     assert ((None, SEEDED_VLAN) in up.actions("delete_vlan")) is expect_released
     assert rows[target].defined_switch_ids == ([] if expect_released else [S1])
     if path == "reconcile_delta":
-        (new_id,) = {a for a in rows if a != target and rows[a].vlan_id != SEEDED_VLAN + 5}
+        seeded = (SEEDED_VLAN + 5, SEEDED_VLAN + 6)
+        (new_id,) = {a for a in rows if a != target and rows[a].vlan_id not in seeded}
         assert rows[new_id].status == "ACTIVE", "the delta's own join keeps its allocation"
     if path == "teardown":
         assert rows[worked].status == "RELEASED", "the per-pass check still runs"
@@ -675,6 +698,27 @@ async def test_an_expired_claim_holds_nothing_on_a_frozen_reservation():
     assert up.actions("delete_vlan") == [(None, SEEDED_VLAN)]
 
 
+async def test_a_claimed_release_row_holds_nothing_on_a_frozen_reservation():
+    """Clause 2 counts a live claim on a FAILED intended-ACTIVE row only. A release
+    retry holding its claim on a FAILED intended-RELEASED row of a frozen reservation
+    (here on an allocation already RELEASED) does not keep R's other memberless
+    allocation."""
+    from app.services.vlan_service import reservation_orphaned_allocations
+
+    orphan = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
+    released = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2])
+    async with TestSessionLocal() as s:
+        (await s.get(VlanAssignment, released)).status = "RELEASED"
+        await s.commit()
+    claim = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await _add_membership(
+        RES, released, S2, "0/0/7", status="FAILED", intended="RELEASED", claimed_until=claim
+    )
+    await _freeze()
+    async with TestSessionLocal() as s:
+        assert await reservation_orphaned_allocations(s, RES) == [orphan]
+
+
 async def test_a_live_claim_on_a_reservation_that_is_not_frozen_keeps_its_allocations():
     """Not frozen, any FAILED join keeps the allocations, claimed or not."""
     alloc = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
@@ -717,15 +761,26 @@ async def test_the_candidates_are_the_reservations_own_orphans_oldest_first():
     from app.services.vlan_service import reservation_orphaned_allocations
 
     await _seed_foreign()
-    first = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
-    second = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2])
+    # Inserted newest first, so the insertion order (what SQLite returns with no ORDER
+    # BY) is the reverse of the age order; two share a stamp, ordered by id.
+    newest = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
+    tied_a = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2])
+    tied_b = await _add_allocation(RES, SEEDED_VLAN + 3, uuid.uuid4(), [S1])
+    oldest = await _add_allocation(RES, SEEDED_VLAN + 4, uuid.uuid4(), [S2])
     held = await _add_allocation(RES, SEEDED_VLAN + 2, uuid.uuid4(), [S2])
     await _add_membership(RES, held, S2, "0/0/1")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    async with TestSessionLocal() as s:
+        for alloc, age in ((newest, 3), (tied_a, 2), (tied_b, 2), (oldest, 1)):
+            await s.execute(
+                update(VlanAssignment)
+                .where(VlanAssignment.id == alloc)
+                .values(created_at=base + timedelta(hours=age))
+            )
+        await s.commit()
     async with TestSessionLocal() as s:
         got = await reservation_orphaned_allocations(s, RES)
-    assert sorted(got) == sorted([first, second])
-    rows = await _allocations()
-    assert got == sorted(got, key=lambda a: (rows[a].created_at, a))
+    assert got == [oldest, *sorted([tied_a, tied_b]), newest]
 
 
 async def test_a_failed_candidate_read_releases_nothing():

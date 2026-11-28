@@ -888,3 +888,86 @@ async def test_a_teardown_against_a_reconcile_whose_first_join_is_in_flight(sess
         await _assert_invariants(session_factory, h, before)
     finally:
         await _cleanup(session_factory, h)
+
+
+async def test_a_live_reservation_keeps_another_allocation_while_its_row_owes_a_removal(
+    session_factory,
+):
+    """#1413's window 5, right after the owed write by key, on a live reservation: R's
+    row for the port is FAILED intended RELEASED on the RELEASED allocation N, owing the
+    removal of a lost join's add (JOIN_UNDO_PENDING_REMOVAL), and the port may still be
+    in R's other allocation N' (ACTIVE, defined on the switch, no member, no row naming
+    it). A full reconcile that still intends the port drives no add for it (the row
+    owes) and its reservation-wide check keeps N': the owed row counts as a join of a
+    live reservation (clause 1), so no delete_vlan runs. Then the retries converge: the
+    removal from N's number turns the row into a pending join, and the build retry
+    reuses N' and adds the port to it, so the row ends ACTIVE on N'."""
+    from app.services.l2_membership_service import JOIN_UNDO_PENDING_REMOVAL
+    from app.services.nats_consumer import _reconcile_l2_memberships
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    h = _Harness()
+    try:
+        await _seed(session_factory, h, own=False)
+        n_vlan, n_prime_vlan = await _free_vlan_numbers(session_factory, 2)
+        fabric = await h._fetch_fabric(h.switch)
+        async with session_factory() as s:
+            n = VlanAssignment(
+                reservation_id=h.reservation,
+                fabric_id=fabric,
+                vlan_id=n_vlan,
+                switch_device_ids=[h.switch],
+                defined_switch_ids=[],
+                status="RELEASED",
+            )
+            n_prime = VlanAssignment(
+                reservation_id=h.reservation,
+                fabric_id=fabric,
+                vlan_id=n_prime_vlan,
+                switch_device_ids=[h.switch],
+                defined_switch_ids=[h.switch],
+                status="ACTIVE",
+            )
+            s.add_all([n, n_prime])
+            await s.flush()
+            owed = _membership(
+                h.reservation, n.id, h.switch, "0/0/1", status="FAILED", intended="RELEASED"
+            )
+            owed.last_error = JOIN_UNDO_PENDING_REMOVAL
+            s.add(owed)
+            await s.commit()
+            n_id, n_prime_id, row_id = n.id, n_prime.id, owed.id
+        before = await _foreign_snapshot(session_factory, h)
+        h.wires = [h.wire("0/0/1")]
+
+        async def _retry():
+            async with session_factory() as s:
+                rows = [await s.get(L2PortAssignment, row_id)]
+            await _reattempt_l2_rows(rows, _session_ctx(session_factory))
+            await _hide_failed(session_factory, h)
+
+        with h.patches():
+            await _reconcile_l2_memberships(
+                str(h.reservation),
+                list(h.wires),
+                _FetchContext(None),
+                _session_ctx(session_factory),
+            )
+            assert h.calls == [], "no add for a port that owes, and no delete_vlan of N'"
+            kept = await _allocation(session_factory, n_prime_id)
+            assert (kept.status, kept.defined_switch_ids) == ("ACTIVE", [h.switch])
+
+            await _retry()
+            await _retry()
+
+        assert [(a, v) for a, _sid, v in h.calls if a not in ("login", "logout")] == [
+            ("remove_from_vlan", n_vlan),
+            ("add_to_vlan", n_prime_vlan),
+        ]
+        (row,) = await _own_memberships(session_factory, h)
+        assert (row.id, row.status, row.vlan_assignment_id) == (row_id, "ACTIVE", n_prime_id)
+        assert (await _allocation(session_factory, n_id)).status == "RELEASED"
+        assert (await _allocation(session_factory, n_prime_id)).status == "ACTIVE"
+        await _assert_invariants(session_factory, h, before)
+    finally:
+        await _cleanup(session_factory, h)

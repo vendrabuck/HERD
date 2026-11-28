@@ -3409,7 +3409,8 @@ async def _release_reservation_orphaned_allocations(
     An allocation is released when no ACTIVE membership references it and
     vlan_service.held_by_a_failed_membership is false: no FAILED membership of the
     reservation names it; on a reservation that is not frozen, the reservation has no
-    FAILED intended-ACTIVE membership at all; and none of its FAILED intended-ACTIVE
+    FAILED membership that is intended ACTIVE or owes the removal of a lost join's add
+    (JOIN_UNDO_PENDING_REMOVAL, issue #1413); and none of its FAILED intended-ACTIVE
     memberships holds a live drive claim (a retry pass that claimed it before the
     freeze may still land its join, the case the teardown leaves alone,
     WIRE-TEARDOWN-6). The candidates are one read

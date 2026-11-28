@@ -203,7 +203,10 @@ def held_by_a_failed_membership(now: datetime | None = None):
 
     True when any of three holds, each read for the allocation's own reservation:
 
-    1. The reservation is not frozen and has a FAILED intended-ACTIVE membership.
+    1. The reservation is not frozen and has a FAILED membership that is intended
+       ACTIVE (a pending join) or owes the removal of a lost join's add
+       (JOIN_UNDO_PENDING_REMOVAL, issue #1413, through #1413's own predicate
+       l2_membership_service._owes_undo).
     2. A FAILED intended-ACTIVE membership of the reservation holds a live drive claim
        (`claimed_until` after `now`), frozen or not.
     3. A FAILED membership of the reservation, intended ACTIVE or RELEASED, names this
@@ -213,10 +216,20 @@ def held_by_a_failed_membership(now: datetime | None = None):
     (WIRE-RETRY-8), so the failed row cannot say which allocation it will use, and any
     such row keeps every allocation of a live reservation. It is deliberately coarse: a
     join at the attempts cap, or one with a pinned reason, keeps every allocation of a
-    live reservation until the row is built, parked, or the reservation ends. It sees
-    only joins recorded FAILED. A join with no FAILED row at that moment is not seen: a
-    first join in flight (an allocation resolved, its `add_to_vlan` not yet recorded),
-    or a retry whose FAILED row a concurrent save released. Such a join loses to the
+    live reservation until the row is built, parked, or the reservation ends. A row that
+    owes a lost join's undo counts too: it is a join that will be redone once its
+    removal succeeds (settle_undone_join turns it into a pending join, and the build
+    retry re-allocates it, reusing the reservation's ACTIVE allocation in reach). While
+    it owes, the port may also sit in another allocation of the reservation that no row
+    names any more (the #1413 windows in the wiring specification's section 13: a
+    second add that landed, or an ACTIVE row the owed write by key moved off it), and
+    releasing that allocation would free a number the port may still be in. A row
+    parked by a frozen join (FROZEN_JOIN_PENDING_REMOVAL) needs no such term: it is
+    written only once the reservation is frozen, which is never undone, so this clause
+    never applies to its reservation. The clause sees only joins recorded FAILED. A
+    join with no FAILED row at that moment is not seen: a first join in flight (an
+    allocation resolved, its `add_to_vlan` not yet recorded), or a retry whose FAILED
+    row a concurrent save released. Such a join loses to the
     release at the allocation's row lock (WIRE-VLAN-4, issue #1413): its add is undone,
     or its removal is left owed, by record_l2_membership_active, and on a frozen
     reservation it is parked for removal (WIRE-LEDGER-4).
@@ -231,17 +244,19 @@ def held_by_a_failed_membership(now: datetime | None = None):
 
     Clause 3. A FAILED row's own allocation is kept whatever the freeze: a build row's
     add may have landed on that number (a driver call that timed out), and a release
-    row's removal from it has not succeeded yet. Such an allocation is released once no
-    FAILED row names it: by the per-pass check of WIRE-VLAN-4 when the row's removal
-    touches it, or by a later run of this check. A row that no pass drives keeps it
-    allocated: a build row left on a frozen reservation (one the
-    teardown did not park, WIRE-TEARDOWN-6) and a release row with a pinned reason
-    (#1199).
+    row's removal from it has not succeeded yet. The clause binds this check only. The
+    per-pass check of WIRE-VLAN-4 tests ACTIVE memberships alone, so it releases an
+    allocation its pass's removes touched once no ACTIVE membership is left, also when
+    a removal failed and its FAILED row still names the allocation. A row that no pass
+    drives keeps its allocation from this check for good: a build row left on a frozen
+    reservation (one the teardown did not park, WIRE-TEARDOWN-6) and a release row
+    with a pinned reason (#1199).
 
     The frozen fact is `wiring_due.reservation_frozen`, the correlated EXISTS the
     #1501 failure writers and the claim read, so it is evaluated inside the statement
     that uses it. Every part is an EXISTS, two-valued for every row.
     """
+    from app.services.l2_membership_service import _owes_undo
     from app.services.wiring_claim import unclaimed
 
     now = now or datetime.now(timezone.utc)
@@ -259,7 +274,10 @@ def held_by_a_failed_membership(now: datetime | None = None):
 
     pending_join = L2PortAssignment.intended == "ACTIVE"
     return or_(
-        and_(not_(reservation_frozen(VlanAssignment)), _failed_row(pending_join)),
+        and_(
+            not_(reservation_frozen(VlanAssignment)),
+            _failed_row(or_(pending_join, _owes_undo())),
+        ),
         _failed_row(pending_join, not_(unclaimed(L2PortAssignment, now))),
         _failed_row(L2PortAssignment.vlan_assignment_id == VlanAssignment.id),
     )
