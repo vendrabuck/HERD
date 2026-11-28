@@ -28,7 +28,10 @@ defined on.
 
 An allocation is written twice in its life, both here: the INSERT of an ACTIVE row in
 find_or_assign_allocation, and the ACTIVE to RELEASED compare-and-swap in
-release_allocation_if_orphaned (issue #1357). Nothing else sets its status.
+release_allocation_if_orphaned (issue #1357). Nothing else sets its status. The
+reservation-wide check (issue #1497, ADR 0018 D11) selects its candidates with
+reservation_orphaned_allocations and releases them through that same compare-and-swap,
+with the guard held_by_a_failed_membership added to its WHERE.
 
 The other side of that release (issue #1413) is here too: hold_active_allocation is
 the share lock a join takes before it writes an ACTIVE membership, and
@@ -44,7 +47,7 @@ from datetime import datetime, timezone
 
 import httpx
 from herd_common import advisory_lock
-from sqlalchemy import select, update
+from sqlalchemy import and_, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +55,7 @@ from app.config import settings
 from app.models.l2_port_assignment import L2PortAssignment
 from app.models.vlan_assignment import VlanAssignment
 from app.services.nats_consumer import PermanentEventError, TransientUpstreamError
+from app.services.wiring_due import reservation_frozen
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +197,135 @@ async def find_superseding_allocation(
     return None
 
 
-async def release_allocation_if_orphaned(db: AsyncSession, allocation_id: uuid.UUID) -> bool:
+def held_by_a_failed_membership(now: datetime | None = None):
+    """SQL, correlated with the `vlan_assignments` row of the enclosing statement: the
+    reservation-wide check (issue #1497, ADR 0018 D11) keeps this allocation.
+
+    True when any of three holds, each read for the allocation's own reservation:
+
+    1. The reservation is not frozen and has a FAILED membership that is intended
+       ACTIVE (a pending join) or owes the removal of a lost join's add
+       (JOIN_UNDO_PENDING_REMOVAL, issue #1413, through #1413's own predicate
+       l2_membership_service._owes_undo).
+    2. A FAILED intended-ACTIVE membership of the reservation holds a live drive claim
+       (`claimed_until` after `now`), frozen or not.
+    3. A FAILED membership of the reservation, intended ACTIVE or RELEASED, names this
+       allocation.
+
+    Clause 1. A failed join may carry a nil allocation until its retry resolves one
+    (WIRE-RETRY-8), so the failed row cannot say which allocation it will use, and any
+    such row keeps every allocation of a live reservation. It is deliberately coarse: a
+    join at the attempts cap, or one with a pinned reason, keeps every allocation of a
+    live reservation until the row is built, parked, or the reservation ends. A row that
+    owes a lost join's undo counts too: it is a join that will be redone once its
+    removal succeeds (settle_undone_join turns it into a pending join, and the build
+    retry re-allocates it, reusing the reservation's ACTIVE allocation in reach). While
+    it owes, the port may also sit in another allocation of the reservation that no row
+    names any more (the #1413 windows in the wiring specification's section 13: a
+    second add that landed, or an ACTIVE row the owed write by key moved off it), and
+    releasing that allocation would free a number the port may still be in. A row
+    parked by a frozen join (FROZEN_JOIN_PENDING_REMOVAL) needs no such term: it is
+    written only once the reservation is frozen, which is never undone, so this clause
+    never applies to its reservation. The clause sees only joins recorded FAILED. A
+    join with no FAILED row at that moment is not seen: a first join in flight (an
+    allocation resolved, its `add_to_vlan` not yet recorded), or a retry whose FAILED
+    row a concurrent save released. Such a join loses to the
+    release at the allocation's row lock (WIRE-VLAN-4, issue #1413): its add is undone,
+    or its removal is left owed, by record_l2_membership_active, and on a frozen
+    reservation it is parked for removal (WIRE-LEDGER-4).
+
+    Clause 2. On a frozen reservation the reconcile and both retry channels start no
+    new join, but a pass that read the reservation as not frozen before the freeze may
+    still be inside one: a retry pass that claimed a build row (its `add_to_vlan` may
+    still land, and the terminal teardown leaves that row alone, WIRE-TEARDOWN-6,
+    #1501), or a reconcile's join, which has no row and is the case above. While the
+    claim is live every allocation of the reservation is kept; an expired or cleared
+    claim holds nothing.
+
+    Clause 3. A FAILED row's own allocation is kept whatever the freeze: a build row's
+    add may have landed on that number (a driver call that timed out), and a release
+    row's removal from it has not succeeded yet. The clause binds this check only. The
+    per-pass check of WIRE-VLAN-4 tests ACTIVE memberships alone, so it releases an
+    allocation its pass's removes touched once no ACTIVE membership is left, also when
+    a removal failed and its FAILED row still names the allocation. A row that no pass
+    drives keeps its allocation from this check for good: a build row left on a frozen
+    reservation (one the teardown did not park, WIRE-TEARDOWN-6) and a release row
+    with a pinned reason (#1199).
+
+    The frozen fact is `wiring_due.reservation_frozen`, the correlated EXISTS the
+    #1501 failure writers and the claim read, so it is evaluated inside the statement
+    that uses it. Every part is an EXISTS, two-valued for every row.
+    """
+    from app.services.l2_membership_service import _owes_undo
+    from app.services.wiring_claim import unclaimed
+
+    now = now or datetime.now(timezone.utc)
+
+    def _failed_row(*extra):
+        return (
+            select(L2PortAssignment.id)
+            .where(
+                L2PortAssignment.reservation_id == VlanAssignment.reservation_id,
+                L2PortAssignment.status == "FAILED",
+                *extra,
+            )
+            .exists()
+        )
+
+    pending_join = L2PortAssignment.intended == "ACTIVE"
+    return or_(
+        and_(
+            not_(reservation_frozen(VlanAssignment)),
+            _failed_row(or_(pending_join, _owes_undo())),
+        ),
+        _failed_row(pending_join, not_(unclaimed(L2PortAssignment, now))),
+        _failed_row(L2PortAssignment.vlan_assignment_id == VlanAssignment.id),
+    )
+
+
+def _has_active_member():
+    """SQL, correlated with the enclosing `vlan_assignments` row: an ACTIVE membership
+    references it."""
+    return (
+        select(L2PortAssignment.id)
+        .where(
+            L2PortAssignment.vlan_assignment_id == VlanAssignment.id,
+            L2PortAssignment.status == "ACTIVE",
+        )
+        .exists()
+    )
+
+
+async def reservation_orphaned_allocations(
+    db: AsyncSession, reservation_id: uuid.UUID | str
+) -> list[uuid.UUID]:
+    """The reservation-wide check's candidates (issue #1497, ADR 0018 D11): the ids of
+    the reservation's ACTIVE allocations that no ACTIVE membership references and that
+    `held_by_a_failed_membership` does not hold, oldest first.
+
+    One read, the same predicate the guarded release then re-checks in its own UPDATE
+    (release_allocation_if_orphaned with reservation_wide=True). Another reservation's
+    rows are never returned. A failed read raises, so the caller releases nothing.
+    """
+    res_uuid = (
+        reservation_id if isinstance(reservation_id, uuid.UUID) else uuid.UUID(str(reservation_id))
+    )
+    result = await db.execute(
+        select(VlanAssignment.id)
+        .where(
+            VlanAssignment.reservation_id == res_uuid,
+            VlanAssignment.status == "ACTIVE",
+            not_(_has_active_member()),
+            not_(held_by_a_failed_membership()),
+        )
+        .order_by(VlanAssignment.created_at, VlanAssignment.id)
+    )
+    return list(result.scalars().all())
+
+
+async def release_allocation_if_orphaned(
+    db: AsyncSession, allocation_id: uuid.UUID, *, reservation_wide: bool = False
+) -> bool:
     """Release an orphaned allocation: the ONE ACTIVE to RELEASED write (issue #1357).
 
     A compare-and-swap, the discipline every ledger status write follows: one UPDATE
@@ -221,6 +353,13 @@ async def release_allocation_if_orphaned(db: AsyncSession, allocation_id: uuid.U
     the same lock, and the second UPDATE sees the committed RELEASED row, so exactly
     one wins. On SQLite (the unit-test database) the lock clause renders nothing.
 
+    `reservation_wide` (issue #1497, ADR 0018 D11) is passed only by the
+    reservation-wide check. It adds `not held_by_a_failed_membership` to the same WHERE, read
+    in the UPDATE's own snapshot, so a failed join committed after the caller's
+    candidate read keeps the allocation ACTIVE and the call returns False like any lost
+    race. The per-pass check of WIRE-VLAN-4 passes nothing and keeps the
+    membership test alone.
+
     Warning to callers: this function ends the caller's transaction either way. On a
     win it commits `db`, so anything the caller left pending in that session is
     committed with the release. On a loss it rolls `db` back, so anything the caller
@@ -238,13 +377,12 @@ async def release_allocation_if_orphaned(db: AsyncSession, allocation_id: uuid.U
         )
         .exists()
     )
+    guards = [VlanAssignment.id == allocation_id, VlanAssignment.status == "ACTIVE", ~live_member]
+    if reservation_wide:
+        guards.append(not_(held_by_a_failed_membership()))
     result = await db.execute(
         update(VlanAssignment)
-        .where(
-            VlanAssignment.id == allocation_id,
-            VlanAssignment.status == "ACTIVE",
-            ~live_member,
-        )
+        .where(*guards)
         .values(status="RELEASED", released_at=datetime.now(timezone.utc))
         .execution_options(synchronize_session=False)
     )

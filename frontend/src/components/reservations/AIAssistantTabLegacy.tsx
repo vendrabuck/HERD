@@ -90,6 +90,7 @@ export function AIAssistantTabLegacy({
         <textarea
           value={question}
           onChange={(e) => setQuestion(e.target.value.slice(0, MAX_QUESTION_LENGTH))}
+          aria-label="Question"
           placeholder="What devices are in my reservation and how are they connected?"
           rows={3}
           className="w-full text-sm px-2 py-1.5 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-gray-900"

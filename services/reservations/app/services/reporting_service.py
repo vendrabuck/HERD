@@ -9,6 +9,7 @@ import httpx
 from herd_common.csv_safety import csv_safe_cell
 from herd_common.enums import TopologyType
 from herd_common.internal_client import InternalTokenAuth, call_service
+from herd_common.upstream_body import WRONG_FIELD, UpstreamBodyUnusable, read_json_body
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -166,12 +167,12 @@ async def _fetch_transit_devices(
                 f"cabling /internal/forks/devices/batch returned {resp.status_code}"
             )
         try:
-            data = resp.json()
-        except (ValueError, RecursionError):
+            data = read_json_body(resp, expect=object)
+        except UpstreamBodyUnusable:
             # Not JSON (a json.JSONDecodeError or a UnicodeDecodeError, both
             # ValueErrors), or nested deeper than the decoder's recursion limit (a
-            # RecursionError, which is a RuntimeError): the same closed failure,
-            # raised from None so the decoder's text is not chained on.
+            # RecursionError, which is a RuntimeError): the same closed failure.
+            # The shared helper (issue #1577) chains nothing from the decoder.
             raise TransitGearUnavailable(
                 "cabling /internal/forks/devices/batch returned a body that does not parse"
             ) from None
@@ -619,7 +620,11 @@ def _build_fleet_section(
         try:
             device_id = uuid.UUID(str(d["id"]))
         except (KeyError, ValueError, TypeError):
-            logger.warning("fleet report skipping inventory device with unusable id: %r", d)
+            # Issue #1577: the entry's type only, never its text (an upstream value).
+            logger.warning(
+                "fleet report skipping inventory device with unusable id (a %s)",
+                type(d).__name__,
+            )
             continue
         hours = fleet_device_hours.get(device_id, 0.0)
         total_reserved += hours
@@ -653,7 +658,10 @@ async def fetch_fleet_devices(auth_header: str | None) -> list[dict] | None:
     Paginates GET /devices with the forwarded admin JWT (an admin caller sees
     every device). Returns None on any failure so the report degrades to
     fleet=null instead of failing outright, matching fetch_user_groups_map
-    and fetch_execution_run_count.
+    and fetch_execution_run_count. A 200 whose body does not parse, or is not
+    an object holding an `items` list (`PaginatedDeviceResponse`), is such a
+    failure (issue #1577); entries inside a well-formed list stay lenient
+    (`_build_fleet_section` skips one without a usable id).
     """
     if not auth_header:
         return None
@@ -674,8 +682,19 @@ async def fetch_fleet_devices(auth_header: str | None) -> list[dict] | None:
                         resp.status_code,
                     )
                     return None
-                data = resp.json() or {}
-                items = data.get("items") or []
+                try:
+                    data = read_json_body(resp, expect=dict)
+                    items = data.get("items")
+                    if not isinstance(items, list):
+                        raise UpstreamBodyUnusable(WRONG_FIELD)
+                except UpstreamBodyUnusable as exc:
+                    logger.warning(
+                        "inventory /devices answered a body that could not be read (%s) "
+                        "while building the fleet report",
+                        exc.reason,
+                        extra={"action": "fleet_inventory_answer_unusable", "reason": exc.reason},
+                    )
+                    return None
                 devices.extend(items)
                 total = data.get("total")
                 skip += limit
@@ -727,7 +746,16 @@ async def fetch_user_groups_map(
                 if resp.status_code != 200:
                     logger.warning("auth /groups/users/groups returned %s", resp.status_code)
                     return empty
-                data = resp.json() or {}
+                try:
+                    data = read_json_body(resp, expect=(dict, type(None))) or {}
+                except UpstreamBodyUnusable as exc:
+                    # Issue #1577: the same open answer as any other failure here
+                    # (OPS-REPORT-5), logged by its fixed reason only.
+                    logger.warning(
+                        "auth /groups/users/groups answered a body that could not be read (%s)",
+                        exc.reason,
+                    )
+                    return empty
                 for uid_str, groups in data.items():
                     out[uuid.UUID(uid_str)] = [
                         (uuid.UUID(g["id"]), g.get("name") or "") for g in (groups or [])
@@ -779,7 +807,8 @@ async def fetch_execution_run_count(
 ) -> int | None:
     """Query the execution service for the number of runs started in the window.
 
-    Returns None if the execution service is unreachable or responds with an error.
+    Returns None if the execution service is unreachable, responds with an error,
+    or answers a 200 whose body does not parse or is not an object (issue #1577).
     The report remains useful either way; the caller decides how to render a None.
     """
     if not auth_header:
@@ -801,7 +830,17 @@ async def fetch_execution_run_count(
     if resp.status_code != 200:
         logger.warning("execution run-count returned %s: %s", resp.status_code, resp.text[:200])
         return None
-    data = resp.json()
+    try:
+        data = read_json_body(resp, expect=dict)
+    except UpstreamBodyUnusable as exc:
+        # Issue #1577: a 200 that does not parse or is not an object is the same
+        # null as an execution that cannot answer (OPS-REPORT-12).
+        logger.warning(
+            "execution run-count answered a body that could not be read (%s)",
+            exc.reason,
+            extra={"action": "execution_run_count_unusable", "reason": exc.reason},
+        )
+        return None
     total = data.get("total")
     return int(total) if isinstance(total, int) else None
 

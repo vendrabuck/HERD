@@ -116,7 +116,9 @@ async def _insert_reservation(
 async def test_fetch_devices_success():
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"items": [{"id": str(DEVICE_A), "name": "dev-a"}]}
+    # A full device record (issue #1577: every field the create and PATCH checks
+    # read must be present and of its declared type).
+    mock_resp.json.return_value = {"items": [{**_make_device(DEVICE_A), "name": "dev-a"}]}
 
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp
@@ -160,7 +162,7 @@ async def test_fetch_devices_partial_batch_result_raises_value_error():
     whole call is rejected, not just the missing device (all-or-nothing)."""
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"items": [{"id": str(DEVICE_A), "name": "dev-a"}]}
+    mock_resp.json.return_value = {"items": [_make_device(DEVICE_A)]}
 
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp

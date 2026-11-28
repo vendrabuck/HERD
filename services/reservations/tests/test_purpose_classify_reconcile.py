@@ -27,6 +27,7 @@ from app.services.purpose_service import classify_purpose_one
 from app.tasks.expiration import _run_purpose_classify_reconcile
 from herd_common.internal_client import InternalTokenAuth
 from herd_common.internal_client import call_service as real_call_service
+from herd_common.upstream_body import UpstreamBodyUnusable, read_json_body
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests._purpose_classify_answers import (
@@ -770,16 +771,25 @@ UNUSABLE_200_IDS = [a.id for a in UNUSABLE_200]
 
 def _expected_reason(answer: Answer) -> str:
     """The fixed reason code each unusable 200 is logged with: nested too deep (for the
-    decoder, or past the store bound), not JSON (it does not parse, or holds a number
-    that is not finite), bad text (a NUL or an unpaired surrogate in a string or key), or
+    decoder, or past the store bound), not JSON (it does not parse, holds a number that
+    is not finite, or holds an unpaired surrogate in a string or key, which the shared
+    read refuses before the shape check, #1577), bad text (a NUL in a string or key), or
     the wrong shape (anything else)."""
-    if any(
-        answer.id.startswith(f"200-{t}-in-") for t in ("nul", "high-surrogate", "low-surrogate")
-    ):
+    if answer.id.startswith("200-nul-in-"):
         return "bad_text"
     if "deep" in answer.id or "store-bound" in answer.id:
         return "too_deep"
-    not_json = ("not-json", "empty-body", "html", "invalid-utf8", "nan", "infinity", "overflow")
+    not_json = (
+        "not-json",
+        "empty-body",
+        "html",
+        "invalid-utf8",
+        "nan",
+        "infinity",
+        "overflow",
+        "high-surrogate",
+        "low-surrogate",
+    )
     if any(word in answer.id for word in not_json):
         return "not_json"
     return "wrong_shape"
@@ -865,9 +875,10 @@ async def test_classify_one_logs_an_unusable_200_with_fixed_fields_only(answer, 
     assert record.action == "purpose_classify_bad_body"
     assert record.reservation_id == str(rid)
     assert record.reason == _expected_reason(answer)
+    # The parsed top-level type, or None when the shared read refuses the body.
     try:
-        expected_type = type(deliver(answer).json()).__name__
-    except (ValueError, RecursionError):
+        expected_type = type(read_json_body(deliver(answer), expect=object)).__name__
+    except UpstreamBodyUnusable:
         expected_type = None
     assert record.body_type == expected_type
     assert record.exc_info is None
