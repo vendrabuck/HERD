@@ -1820,9 +1820,14 @@ sections 8.4 to 8.14.
 **Rules.**
 
 - **TOPO-SHAPE-1.** A canvas is an object or null; its `nodes` and `edges` are lists,
-  and each item of either is an object. On a node, `id`, `data.label`, `data.device.id`,
-  `data.device.name`, `data.device.template_name`, and `data.device.role` are strings
-  and `data`, `data.device`, and `data.element` are objects; on an edge, `id`, `source`,
+  and each item of either is an object. On a node, `id`, `data.device.name`,
+  `data.device.id`, `data.device.template_name`, `data.device.role`,
+  `data.device.status`, `data.device.topology_type`, `data.device.template_icon`,
+  `data.device.connection_type`, `data.label`, `data.topologyType`, `data.element.id`,
+  `data.element.label`, and `data.element.element_type` are strings and `data`,
+  `data.device`, and `data.element` are objects (every one a field the editor renders
+  or indexes by; the editor, the seed data, the AI commit, templates, and the CSV
+  import write each as a string or null); on an edge, `id`, `source`,
   `target`, `data.layer`, `data.source_port_name`, `data.target_port_name`,
   `data.sourcePort`, and `data.targetPort` are strings and `data` is an object; an
   edge's `id`, which a fork save writes into each of its wiring rows

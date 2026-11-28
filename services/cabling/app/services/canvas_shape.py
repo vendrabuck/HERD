@@ -13,9 +13,12 @@ The shape:
 
 - the canvas is an object; ``nodes`` and ``edges`` are lists, and every item of
   either is an object;
-- on a node: ``id``, ``data.label``, ``data.device.id``, ``data.device.name``,
-  ``data.device.template_name``, and ``data.device.role`` are strings; ``data``,
-  ``data.device``, and ``data.element`` are objects;
+- on a node: ``id``, ``data.label``, ``data.topologyType``, ``data.device.id``,
+  ``data.device.name``, ``data.device.template_name``, ``data.device.role``,
+  ``data.device.status``, ``data.device.topology_type``, ``data.device.template_icon``,
+  ``data.device.connection_type``, ``data.element.id``, ``data.element.label``, and
+  ``data.element.element_type`` are strings; ``data``, ``data.device``, and
+  ``data.element`` are objects;
 - on an edge: ``id``, ``source``, ``target``, ``data.layer``,
   ``data.source_port_name``, ``data.target_port_name``, ``data.sourcePort``, and
   ``data.targetPort`` are strings; ``data`` is an object; and ``id``, which a fork
@@ -152,12 +155,19 @@ def _node_structure(node: dict, path: tuple[str | int, ...]) -> CanvasProblem | 
                 value = device.get(key)
                 if value is not None and type(value) is not str and not isinstance(value, str):
                     return CanvasProblem((*path, "data", "device", key), MUST_BE_A_STRING)
-    value = data.get("label")
-    if value is not None and type(value) is not str and not isinstance(value, str):
-        return CanvasProblem((*path, "data", "label"), MUST_BE_A_STRING)
-    value = data.get("element")
-    if value is not None and type(value) is not dict and not isinstance(value, dict):
+    for key in _NODE_DATA_TEXT:
+        value = data.get(key)
+        if value is not None and type(value) is not str and not isinstance(value, str):
+            return CanvasProblem((*path, "data", key), MUST_BE_A_STRING)
+    element = data.get("element")
+    if element is None:
+        return None
+    if type(element) is not dict and not isinstance(element, dict):
         return CanvasProblem((*path, "data", "element"), MUST_BE_AN_OBJECT)
+    for key in _ELEMENT_TEXT:
+        value = element.get(key)
+        if value is not None and type(value) is not str and not isinstance(value, str):
+            return CanvasProblem((*path, "data", "element", key), MUST_BE_A_STRING)
     return None
 
 
@@ -192,9 +202,21 @@ def _edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | 
     return None
 
 
-# The string parts checked on a node's `data.device`, on an edge after its `id`, and
-# on an edge's `data`, each in the order of the module docstring.
-_DEVICE_TEXT = ("name", "id", "template_name", "role")
+# The string parts checked on a node's `data.device`, its `data`, and its
+# `data.element`, on an edge after its `id`, and on an edge's `data`, each in the
+# order of the module docstring.
+_DEVICE_TEXT = (
+    "name",
+    "id",
+    "template_name",
+    "role",
+    "status",
+    "topology_type",
+    "template_icon",
+    "connection_type",
+)
+_NODE_DATA_TEXT = ("label", "topologyType")
+_ELEMENT_TEXT = ("id", "label", "element_type")
 _EDGE_ENDS = ("source", "target")
 _EDGE_DATA_TEXT = ("layer", "source_port_name", "target_port_name", "sourcePort", "targetPort")
 
