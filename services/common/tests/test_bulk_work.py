@@ -93,7 +93,8 @@ async def test_the_work_never_takes_the_default_executor():
 
 @pytest.mark.usefixtures("fresh_limiter")
 async def test_at_most_the_bound_runs_at_once_and_a_third_waits():
-    """Mutation-checked: dropping `limiter=` (anyio's default limiter of 40) fails this."""
+    """Mutation-checked: taking no slot and handing anyio its default limiter (40
+    threads) fails this."""
     entered = [threading.Event() for _ in range(BULK_WORK_THREADS + 1)]
     release = threading.Event()
 

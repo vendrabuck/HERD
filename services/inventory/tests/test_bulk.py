@@ -2247,11 +2247,13 @@ async def test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave(
 
 
 @pytest.mark.asyncio
-async def test_a_template_sections_cell_is_decoded_with_the_file(client):
-    """The template importer decodes its `sections` cells the same way: a good cell
-    creates, a bad one rejects only its row with the decoder's message.
+async def test_a_template_sections_cell_is_decoded_with_the_file(client, monkeypatch):
+    """The template importer decodes its `sections` cells the same way, off the loop:
+    a good cell creates, a bad one rejects only its row with the decoder's message.
     Mutation-checked: decoding `field_data` in `_read_template_import` in place of
-    `sections` fails this."""
+    `sections` fails this (the cells are decoded on the loop)."""
+    from app.services import bulk_service
+
     await _create_template(client, name="Firewall")
     driver_name = (await client.get("/drivers")).json()["items"][0]["name"]
     sections = json.dumps(TEMPLATE_PAYLOAD["sections"]).replace('"', '""')
@@ -2260,7 +2262,25 @@ async def test_a_template_sections_cell_is_decoded_with_the_file(client):
         f'T1,{driver_name},V,M,"{sections}"\n'
         f"T2,{driver_name},V,M,[nope\n"
     )
+    loop_thread = threading.get_ident()
+    loads_threads: list[int] = []
+    real_json = bulk_service.json
+
+    def recording_loads(text, *args, **kwargs):
+        loads_threads.append(threading.get_ident())
+        return real_json.loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(
+        bulk_service,
+        "json",
+        SimpleNamespace(
+            loads=recording_loads, dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError
+        ),
+    )
     resp = await _import_csv(client, "/templates/import", text)
+    monkeypatch.setattr(bulk_service, "json", real_json)
+    assert len(loads_threads) == 2
+    assert loop_thread not in loads_threads
     assert resp.status_code == 200, resp.text
     assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
         ("create", "T1", None),
