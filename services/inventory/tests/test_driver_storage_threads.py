@@ -19,7 +19,8 @@ every new database and NATS connection. These tests pin INV-DRV-22 and INV-DRV-2
 - against that store, each request of a download, delete, single-part upload, or
   multipart upload is tried as its method allows, in the sequence INV-DRV-23's
   figures count, and four multipart uploads at once never overflow the pool;
-- a create, like a download, holds no database connection while it waits on storage.
+- a create, like a download, holds no database connection while it waits on storage;
+- the lifespan shuts the pool down at app shutdown without waiting for a running call.
 
 The only wall-clock bounds are escapes for the failure path (a deadlock or an
 honoured Retry-After), each far above what a passing run takes.
@@ -34,7 +35,7 @@ import threading
 import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import urllib3
@@ -720,3 +721,43 @@ async def test_a_create_waiting_on_storage_holds_no_database_connection(client, 
             gate.release.set()
         resp = await create
     assert resp.status_code == 201, resp.text
+
+
+async def test_app_shutdown_cancels_queued_storage_calls_and_does_not_wait_for_running_ones():
+    """The lifespan shuts the storage pool down when the app stops: a call waiting
+    for a thread is cancelled and never runs, the shutdown returns while the four
+    running calls are still held, and the next storage call gets a new pool."""
+    from app import main
+
+    gate = _Gate()
+    ran_after_shutdown = threading.Event()
+    running = [
+        asyncio.ensure_future(storage.run_on_storage_thread(gate, i))
+        for i in range(storage.DRIVER_STORAGE_THREADS)
+    ]
+    try:
+        await _until(lambda: gate.entered == storage.DRIVER_STORAGE_THREADS)
+        old_pool = storage.storage_executor()
+        queued = asyncio.ensure_future(storage.run_on_storage_thread(ran_after_shutdown.set))
+        await _until(lambda: old_pool._work_queue.qsize() == 1)
+        with (
+            patch.object(main, "create_all_and_stamp", AsyncMock()),
+            patch.object(main, "_seed_no_pool", AsyncMock()),
+            patch.object(main, "init_storage", lambda: None),
+            patch.object(main.settings, "apply_scheduler_enabled", False),
+        ):
+            async with main.lifespan(main.app):
+                pass
+        # Returned with all four calls still held: the shutdown did not wait.
+        assert gate.running == storage.DRIVER_STORAGE_THREADS
+        assert storage._executor is None
+        assert old_pool._shutdown
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+    finally:
+        gate.release.set()
+    assert await asyncio.gather(*running) == list(range(storage.DRIVER_STORAGE_THREADS))
+    old_pool.shutdown(wait=True)
+    assert not ran_after_shutdown.is_set()
+    assert await storage.run_on_storage_thread(lambda: "after") == "after"
+    assert storage.storage_executor() is not old_pool

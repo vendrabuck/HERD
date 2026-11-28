@@ -1042,9 +1042,11 @@ download, delete); routes under `/drivers`. The package format is in
   resolution, the event loop, or any other worker thread. Replacements and deletes
   keep their pooled database connection while they wait on storage; create and
   download hold none (a download gives its connection back before it waits for a
-  storage thread). \
-  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`, `MINIO_PART_THREADS`); `services/inventory/app/services/driver_service.py` (`create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`) \
-  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`, `test_a_create_waiting_on_storage_holds_no_database_connection`)
+  storage thread). When the app stops, the pool is shut down: a call still waiting
+  for a thread is cancelled and never runs, and the shutdown does not wait for a
+  running call. \
+  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`, `shutdown_storage_executor`, `MINIO_PART_THREADS`); `services/inventory/app/services/driver_service.py` (`create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`); `services/inventory/app/main.py` (`lifespan`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`, `test_a_create_waiting_on_storage_holds_no_database_connection`, `test_app_shutdown_cancels_queued_storage_calls_and_does_not_wait_for_running_ones`)
 - **INV-DRV-23.** On MinIO, a connect gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
   (15), and a request is sent under the same timeout: over plain HTTP
   (`MINIO_USE_SSL=false`, the default) a whole request body (one part, at most 5 MiB)

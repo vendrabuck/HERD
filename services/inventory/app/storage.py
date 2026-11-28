@@ -6,7 +6,8 @@ or a local file read, write, or unlink of up to DRIVER_MAX_SIZE_BYTES).
 ``delete_object``, and runs each through ``run_on_storage_thread``, never on the event
 loop (issue #1327) and never on asyncio's default executor (issue #1416).
 ``init_storage`` is called once, from the lifespan in ``app/main.py``, before the app
-serves a request. Because reads and writes of one key can overlap, a local write
+serves a request, and ``shutdown_storage_executor`` once, from the same lifespan, when
+it stops. Because reads and writes of one key can overlap, a local write
 replaces the file atomically (``_write_local_atomically``).
 
 The storage threads (issue #1416). ``run_on_storage_thread`` runs a call on this
@@ -107,6 +108,18 @@ def storage_executor() -> ThreadPoolExecutor:
             max_workers=DRIVER_STORAGE_THREADS, thread_name_prefix="driver-storage"
         )
     return _executor
+
+
+def shutdown_storage_executor() -> None:
+    """Shut the storage pool down; the lifespan in ``app/main.py`` calls this at app
+    shutdown. Calls still waiting for a thread are cancelled and never run, and the
+    shutdown does not wait for a call that is running: a stalled store could hold it
+    until the MinIO bounds end it, and the interpreter's exit still joins that thread.
+    A later ``run_on_storage_thread`` builds a new pool."""
+    global _executor
+    executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 async def run_on_storage_thread(func: Callable[..., _T], *args: object) -> _T:

@@ -21,7 +21,7 @@ from app.routers.drivers import router as drivers_router
 from app.routers.hypervisors import router as hypervisors_router
 from app.routers.ports import router as ports_router
 from app.routers.templates import router as templates_router
-from app.storage import init_storage
+from app.storage import init_storage, shutdown_storage_executor
 
 setup_logging("inventory", level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -88,6 +88,8 @@ async def lifespan(app: FastAPI):
                 await scheduler_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Queued storage calls are cancelled; a running one is not waited for.
+        shutdown_storage_executor()
 
 
 app = FastAPI(
