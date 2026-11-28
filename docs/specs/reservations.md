@@ -813,13 +813,15 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
 - **RES-PATCH-14.** The Edit devices dialog's Add list asks for one page of 50 candidates
-  for its search text; when the server's `total` is larger, the dialog says `Showing
-  <rows> of <total> matching devices. Type more of the name to narrow the list.` under the
-  list. A failed read shows the shared load error (`Could not load available devices.`
+  for its search text and hides the devices already selected; when the server's `total`
+  is larger than the page it returned, the dialog says `<total minus page rows> more
+  matching devices are not listed. Type more of the name to narrow the list.` under the
+  list, counted against the page the server returned, so the number stays true however
+  many of the page's rows are hidden as already selected. A failed read shows the shared load error (`Could not load available devices.`
   with Retry) in place of the list, never `No available devices found`, which needs a
   successful empty answer (issue #1590). \
   Enforced in: `frontend/src/components/reservations/EditDevicesModal.tsx` (`EditDevicesModal`, `EDIT_DEVICES_PAGE_SIZE`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`) \
-  Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
+  Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `counts past the page the server returned, not the rows left after hiding selected ones`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
 
 **Out of scope.** The fork prune itself and the wiring release are cabling's and
 execution's (`provisioning-and-wiring.md`).

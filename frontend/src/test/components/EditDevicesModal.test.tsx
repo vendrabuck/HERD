@@ -180,7 +180,7 @@ describe("EditDevicesModal", () => {
       expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
       expect(
         screen.getByText(
-          "Showing 50 of 120 matching devices. Type more of the name to narrow the list.",
+          "70 more matching devices are not listed. Type more of the name to narrow the list.",
         ),
       ).toBeInTheDocument();
       expect(asked.length).toBeGreaterThan(0);
@@ -190,11 +190,26 @@ describe("EditDevicesModal", () => {
       }
     });
 
+    it("counts past the page the server returned, not the rows left after hiding selected ones", async () => {
+      // Three of the page's 50 are already selected, so the Add list draws 47;
+      // the notice still counts the 70 the server holds past its page of 50.
+      const selected = ["m-0", "m-1", "m-2"];
+      server.use(cappedHandler(120, []));
+      renderModal({ reservation: { ...RESERVATION, device_ids: selected } });
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(47);
+      expect(
+        screen.getByText(
+          "70 more matching devices are not listed. Type more of the name to narrow the list.",
+        ),
+      ).toBeInTheDocument();
+    });
+
     it("says nothing more when the page holds every match", async () => {
       server.use(cappedHandler(50, []));
       renderModal();
       expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
-      expect(screen.queryByText(/matching devices\. Type more/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument();
     });
 
     it("a failed read shows the load error and no notice", async () => {
@@ -211,7 +226,7 @@ describe("EditDevicesModal", () => {
         "Could not load available devices. inventory is restarting",
       );
       expect(screen.queryByText("No available devices found")).not.toBeInTheDocument();
-      expect(screen.queryByText(/matching devices\. Type more/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument();
     });
   });
 

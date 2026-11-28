@@ -24,7 +24,7 @@ import { DeviceSearchPicker } from "@/components/admin/connections/DeviceSearchP
 import { MoreMatchesNotice } from "@/components/ui/MoreMatchesNotice";
 import { ConnectionsPage } from "@/pages/admin/ConnectionsPage";
 
-const NOTICE = /^Showing \d+ of \d+ matching devices\. Type more of the name to narrow the list\.$/;
+const NOTICE = /^\d+ more matching devices are not listed\. Type more of the name to narrow the list\.$/;
 
 function device(i: number) {
   return { id: `dev-${i}`, name: `lab-node-${i}`, topology_type: "PHYSICAL" };
@@ -61,10 +61,10 @@ beforeEach(() => {
 });
 
 describe("MoreMatchesNotice (issue #1590)", () => {
-  it("names the shown count, the total, and the way to the rest", () => {
+  it("names how many matches are past the page, and the way to them", () => {
     render(<MoreMatchesNotice shown={20} total={35} noun="devices" />);
     expect(
-      screen.getByText("Showing 20 of 35 matching devices. Type more of the name to narrow the list."),
+      screen.getByText("15 more matching devices are not listed. Type more of the name to narrow the list."),
     ).toBeInTheDocument();
   });
 
@@ -81,7 +81,7 @@ describe("MoreMatchesNotice (issue #1590)", () => {
 
   it("speaks of the first match past the page", () => {
     render(<MoreMatchesNotice shown={20} total={21} noun="devices" />);
-    expect(screen.getByText(/^Showing 20 of 21 matching devices\./)).toBeInTheDocument();
+    expect(screen.getByText(/^1 more matching devices are not listed\./)).toBeInTheDocument();
   });
 });
 
@@ -100,7 +100,7 @@ describe("DeviceSearchPicker, more matches than one page (issue #1590)", () => {
     expect(await screen.findByRole("button", { name: "lab-node-19" })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^lab-node-/ })).toHaveLength(20);
     expect(
-      screen.getByText("Showing 20 of 35 matching devices. Type more of the name to narrow the list."),
+      screen.getByText("15 more matching devices are not listed. Type more of the name to narrow the list."),
     ).toBeInTheDocument();
     expect(asked.map((p) => [p.get("search"), p.get("skip"), p.get("limit")])).toEqual([
       ["lab", "0", "20"],
@@ -139,7 +139,7 @@ describe("ConnectionsPage typeaheads, more matches than one page (issue #1590)",
 
     expect(await screen.findByRole("button", { name: "lab-node-19" })).toBeInTheDocument();
     expect(
-      screen.getByText("Showing 20 of 64 matching devices. Type more of the name to narrow the list."),
+      screen.getByText("44 more matching devices are not listed. Type more of the name to narrow the list."),
     ).toBeInTheDocument();
     expect(asked.map((p) => [p.get("search"), p.get("limit")])).toEqual([["l", "20"]]);
   });
@@ -156,7 +156,7 @@ describe("ConnectionsPage typeaheads, more matches than one page (issue #1590)",
 
     expect(await screen.findByRole("button", { name: "lab-node-19" })).toBeInTheDocument();
     expect(
-      screen.getByText("Showing 20 of 21 matching devices. Type more of the name to narrow the list."),
+      screen.getByText("1 more matching devices are not listed. Type more of the name to narrow the list."),
     ).toBeInTheDocument();
   });
 });
