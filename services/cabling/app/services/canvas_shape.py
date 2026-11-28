@@ -18,7 +18,10 @@ The shape:
   ``data.device``, and ``data.element`` are objects;
 - on an edge: ``id``, ``source``, ``target``, ``data.layer``,
   ``data.source_port_name``, ``data.target_port_name``, ``data.sourcePort``, and
-  ``data.targetPort`` are strings; ``data`` is an object;
+  ``data.targetPort`` are strings; ``data`` is an object; and ``id``, which a fork
+  save writes into each of the edge's wiring rows (``fork_connections.edge_key``,
+  ``String(255)``), is at most ``MAX_EDGE_ID_LENGTH`` characters and holds no NUL
+  character;
 - JSON ``null`` and an absent key pass everywhere a part is named above, and a
   wrong type is refused even when it is empty, zero, or false;
 - no object or list is nested deeper than ``MAX_CANVAS_DEPTH`` levels, the canvas
@@ -78,6 +81,10 @@ MAX_CANVAS_DEPTH = 64
 MUST_BE_AN_OBJECT = "must be an object"
 MUST_BE_A_LIST = "must be a list"
 MUST_BE_A_STRING = "must be a string"
+# The width of the column an edge id is written to (``fork_connections.edge_key``).
+MAX_EDGE_ID_LENGTH = 255
+TOO_LONG_FOR_ITS_COLUMN = f"is longer than {MAX_EDGE_ID_LENGTH} characters"
+HOLDS_A_NUL = "holds a NUL character, which no database column takes"
 TOO_DEEP = f"is nested deeper than {MAX_CANVAS_DEPTH} levels"
 NOT_FINITE = "holds a number that is not finite"
 LONE_SURROGATE = "holds a lone surrogate escape, which is not valid text"
@@ -158,7 +165,15 @@ def _edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | 
     """The first named part of one edge with the wrong type, in the order of the
     module docstring, else None."""
     get = edge.get
-    for key in _EDGE_TEXT:
+    edge_id = get("id")
+    if edge_id is not None:
+        if type(edge_id) is not str and not isinstance(edge_id, str):
+            return CanvasProblem((*path, "id"), MUST_BE_A_STRING)
+        if len(edge_id) > MAX_EDGE_ID_LENGTH:
+            return CanvasProblem((*path, "id"), TOO_LONG_FOR_ITS_COLUMN)
+        if "\x00" in edge_id:
+            return CanvasProblem((*path, "id"), HOLDS_A_NUL)
+    for key in _EDGE_ENDS:
         value = get(key)
         if value is not None and type(value) is not str and not isinstance(value, str):
             return CanvasProblem((*path, key), MUST_BE_A_STRING)
@@ -177,10 +192,10 @@ def _edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | 
     return None
 
 
-# The string parts checked on a node's `data.device`, on an edge, and on an edge's
-# `data`, each in the order of the module docstring.
+# The string parts checked on a node's `data.device`, on an edge after its `id`, and
+# on an edge's `data`, each in the order of the module docstring.
 _DEVICE_TEXT = ("name", "id", "template_name", "role")
-_EDGE_TEXT = ("id", "source", "target")
+_EDGE_ENDS = ("source", "target")
 _EDGE_DATA_TEXT = ("layer", "source_port_name", "target_port_name", "sourcePort", "targetPort")
 
 
@@ -437,6 +452,7 @@ __all__ = [
     "CanvasData",
     "CanvasProblem",
     "MAX_CANVAS_DEPTH",
+    "MAX_EDGE_ID_LENGTH",
     "STORED_CANVAS_UNREADABLE_DETAIL",
     "INLINE_CHECK_VALUES",
     "canvas_problem",

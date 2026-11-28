@@ -298,6 +298,14 @@ def test_malformed_route_destination_too_long():
         parse_node_l3("n1", {"routes": [{"destination": "x" * 65, "interface": "eth0"}]})
 
 
+@pytest.mark.parametrize("field", ["destination", "interface", "next_hop", "virtual_router"])
+def test_malformed_route_field_holding_a_nul(field):
+    route = {"destination": "10.0.0.0/24", "interface": "eth0", field: "eth\x000"}
+    with pytest.raises(L3IntentMalformed) as exc:
+        parse_node_l3("n1", {"routes": [route]})
+    assert exc.value.message == f"'{field}' must not hold a NUL character"
+
+
 def test_malformed_route_interface_wrong_type():
     with pytest.raises(L3IntentMalformed):
         parse_node_l3("n1", {"routes": [{"destination": "10.0.0.0/24", "interface": 5}]})

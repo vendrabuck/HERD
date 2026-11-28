@@ -812,9 +812,10 @@ editor's Routing panel (section 8.16).
 - **TOPO-L3-1.** `data.l3` must be an object whose only key is `routes`, a list of
   objects with only `destination`, `next_hop`, `interface`, `virtual_router`;
   `destination` and `interface` are required non-empty strings, the other two optional
-  strings or null, all at most 64 characters. Anything else is malformed. \
+  strings or null, all at most 64 characters and none holding a NUL character (each is
+  written to a column of the fork's route rows). Anything else is malformed. \
   Enforced in: `services/cabling/app/services/l3_intent.py` (`_parse_node_l3_full`, `_require_string`, `_ALLOWED_ROUTE_KEYS`, `_MAX_FIELD_LENGTH`) \
-  Pinned by: `services/cabling/tests/test_l3_intent.py` (`test_malformed_l3_not_an_object`, `test_malformed_l3_extra_top_level_key`, `test_malformed_routes_not_a_list`, `test_malformed_route_unexpected_key`, `test_malformed_route_missing_destination`, `test_malformed_route_empty_destination`, `test_malformed_route_destination_too_long`, `test_malformed_route_interface_wrong_type`, `test_malformed_route_next_hop_null_is_allowed`)
+  Pinned by: `services/cabling/tests/test_l3_intent.py` (`test_malformed_route_field_holding_a_nul`, `test_malformed_l3_not_an_object`, `test_malformed_l3_extra_top_level_key`, `test_malformed_routes_not_a_list`, `test_malformed_route_unexpected_key`, `test_malformed_route_missing_destination`, `test_malformed_route_empty_destination`, `test_malformed_route_destination_too_long`, `test_malformed_route_interface_wrong_type`, `test_malformed_route_next_hop_null_is_allowed`)
 - **TOPO-L3-2.** An empty optional field is stored as null, and a parseable destination
   is rewritten to its canonical network; an unparseable one is kept as written. \
   Enforced in: `services/cabling/app/services/l3_intent.py` (`_require_string`, `_parse_node_l3_full`) \
@@ -1821,14 +1822,20 @@ sections 8.4 to 8.14.
   `data.device.name`, `data.device.template_name`, and `data.device.role` are strings
   and `data`, `data.device`, and `data.element` are objects; on an edge, `id`, `source`,
   `target`, `data.layer`, `data.source_port_name`, `data.target_port_name`,
-  `data.sourcePort`, and `data.targetPort` are strings and `data` is an object. A null
+  `data.sourcePort`, and `data.targetPort` are strings and `data` is an object; an
+  edge's `id`, which a fork save writes into each of its wiring rows
+  (`fork_connections.edge_key`, 255 characters), is at most `MAX_EDGE_ID_LENGTH` (255)
+  characters (`is longer than 255 characters`) and holds no NUL character (`holds a
+  NUL character, which no database column takes`), judged right after its type. No
+  other canvas string is copied into a column: a wiring row's ports come from the
+  physical connections, and an L3 route's fields are bounded by TOPO-L3-1. A null
   or absent part passes, a part under a null or absent parent is not judged, and a
   wrong type is refused even when it is empty, zero, or false. Every other key passes
   as it is; `data.l3` keeps its own parser (TOPO-L3-1). The first problem is named:
   nodes before edges, items in order, a node's or edge's parts in the order above, and
   only then the walk of TOPO-SHAPE-2 and TOPO-SHAPE-3. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `_judge_items`, `_node_structure`, `_edge_structure`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_an_edge_id_is_bounded_by_its_column`, `test_an_edge_id_holding_a_nul_is_refused`, `test_the_edge_id_is_judged_before_the_edge_ends`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
 - **TOPO-SHAPE-2.** No object or list in a canvas is nested deeper than
   `MAX_CANVAS_DEPTH`, 64 levels, the canvas itself being level 1, a node or edge level
   3. The check walks with a stack, so a canvas nested past the interpreter's recursion

@@ -160,6 +160,10 @@ def _require_string(node_id: str, value: Any, field_name: str, *, required: bool
         raise L3IntentMalformed(
             node_id, f"'{field_name}' must be at most {_MAX_FIELD_LENGTH} characters"
         )
+    if "\x00" in value:
+        # Each field is written to a column of the fork's route rows, and no
+        # database column takes a NUL character.
+        raise L3IntentMalformed(node_id, f"'{field_name}' must not hold a NUL character")
     if not required and not value:
         return None
     return value

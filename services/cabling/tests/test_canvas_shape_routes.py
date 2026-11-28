@@ -257,6 +257,14 @@ BAD_BODIES = {
         '{"viewport": {"zoom": 1e400}}',
         "canvas_data: holds a number that is not finite",
     ),
+    "edge_id_past_its_column": (
+        json.dumps({"edges": [{"id": "e" * 256, "source": "n1", "target": "n2"}]}),
+        "canvas_data.edges.0.id: is longer than 255 characters",
+    ),
+    "edge_id_with_a_nul": (
+        '{"edges": [{"id": "e\\u0000x", "source": "n1", "target": "n2"}]}',
+        "canvas_data.edges.0.id: holds a NUL character, which no database column takes",
+    ),
 }
 
 

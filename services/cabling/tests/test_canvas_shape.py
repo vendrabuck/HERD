@@ -220,6 +220,35 @@ def test_the_first_problem_in_canvas_order_is_named():
     )
 
 
+# Bounds of the columns a canvas string is written to ------------------------------------
+
+
+def test_an_edge_id_is_bounded_by_its_column():
+    """A fork save writes each edge's `id` into `fork_connections.edge_key`, a
+    String(255): 255 characters pass (a character outside the BMP counts as one,
+    as the column counts it), 256 do not."""
+    for edge_id in ("e" * 255, "\U0001f600" * 255, ""):
+        assert canvas_problem({"edges": [{"id": edge_id}]}) is None
+    problem = canvas_problem({"edges": [{"id": "marker-9f3c" + "e" * 245}]})
+    assert problem == CanvasProblem(("edges", 0, "id"), "is longer than 255 characters")
+    assert problem.text("canvas_data") == "canvas_data.edges.0.id: is longer than 255 characters"
+
+
+@pytest.mark.parametrize("edge_id", ["\x00", "e\x00", "\x00e", "a\x00b"])
+def test_an_edge_id_holding_a_nul_is_refused(edge_id):
+    problem = canvas_problem({"edges": [{"id": edge_id}]})
+    assert problem == CanvasProblem(
+        ("edges", 0, "id"), "holds a NUL character, which no database column takes"
+    )
+
+
+def test_the_edge_id_is_judged_before_the_edge_ends():
+    edge = {"source": 1, "id": "e" * 256}
+    assert canvas_problem({"edges": [edge]}) == CanvasProblem(
+        ("edges", 0, "id"), "is longer than 255 characters"
+    )
+
+
 # Depth ---------------------------------------------------------------------------
 
 
