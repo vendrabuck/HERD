@@ -39,6 +39,9 @@ from app.services.bulk_service import import_topologies, render_export
 
 router = APIRouter(prefix="/topologies", tags=["topology-bulk"])
 
+# The export's count of topologies left out (TOPO-BULK-24).
+EXPORT_SKIPPED_HEADER = "X-Export-Skipped"
+
 # The import file bound, and the extra the route declares for the request body
 # limit (issue #1466). It caps the file itself: `_read_capped` reads one byte
 # past it and refuses the rest, so unlike the envelope this cap does not grow
@@ -92,12 +95,17 @@ async def export_topologies(
     # them (a rollback would expire them, and the thread's reads would then try to
     # load them again), so their loaded `name` and `canvas_data` stay readable.
     await db.close()
-    body = await run_bulk_work(render_export, topologies, format)
+    body, skipped = await run_bulk_work(render_export, topologies, format)
     media, ext = ("text/csv", "csv") if format == "csv" else ("application/json", "json")
     return Response(
         content=body,
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="topologies.{ext}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="topologies.{ext}"',
+            # How many topologies were left out for a stored canvas that does not
+            # have the shape every reader assumes (bulk_service._readable_topologies).
+            EXPORT_SKIPPED_HEADER: str(skipped),
+        },
     )
 
 

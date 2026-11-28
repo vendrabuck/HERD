@@ -51,6 +51,10 @@ async def fetch_device_group_ids(device_id: uuid.UUID, bearer_token: str) -> set
             return {str(group["id"]) for group in resp.json()}
     except DeviceNotFoundError:
         raise
-    except Exception:
-        logger.exception("device_group_guard_unreachable", extra={"device_id": str(device_id)})
+    except Exception as exc:
+        # The class name only: an httpx error's text names the service address.
+        logger.warning(
+            "device_group_guard_unreachable",
+            extra={"device_id": str(device_id), "error": type(exc).__name__},
+        )
         return None

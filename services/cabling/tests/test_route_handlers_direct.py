@@ -1265,7 +1265,13 @@ def test_parse_json_items_not_a_list_raises_422():
         ),
         ({}, None),
         ({"name": None, "canvas": None}, None),
-        ({"name": "Lab", "canvas": {"nodes": None, "edges": "not read here"}}, None),
+        ({"name": "Lab", "canvas": {"nodes": None, "edges": None}}, None),
+        # The whole canvas is held to the one shape check (canvas_shape), edges too.
+        ({"name": "Lab", "canvas": {"nodes": None, "edges": "x"}}, "canvas.edges: must be a list"),
+        (
+            {"name": "Lab", "canvas": {"edges": [{"source": 1}]}},
+            "canvas.edges.0.source: must be a string",
+        ),
         ({"name": "Lab", "canvas": {"nodes": [{"data": {"device": {"name": "sw"}}}]}}, None),
     ],
 )
@@ -1415,11 +1421,17 @@ async def test_import_resolver_failure_raises_503():
     async with TestSession() as db:
         with patch(
             "app.services.bulk_service.resolve_device_names",
-            new=AsyncMock(side_effect=RuntimeError("inventory down")),
+            new=AsyncMock(side_effect=RuntimeError("http://inventory:8000/devices/resolve")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await import_topologies(db, raw, "json", True, USER_ID, "viewer")
     assert exc.value.status_code == 503
+    # Fixed wording: the exception's text (here, a service address) is not answered,
+    # and is not chained for a handler to render either.
+    assert exc.value.detail == (
+        "Could not resolve device names; the import was not processed. Retry the request."
+    )
+    assert exc.value.__cause__ is None
 
 
 @pytest.mark.asyncio
@@ -1478,7 +1490,10 @@ async def test_import_unexpected_exception_rejects_row():
                     db, raw, "json", False, USER_ID, "viewer"
                 )
     assert report.rejected == 1
-    assert "kaboom" in report.rows[0].reason
+    # The class name only: an exception's text can hold a statement, a parameter, or
+    # another service's address, and the reason is answered to the caller.
+    assert report.rows[0].reason == "row could not be imported: RuntimeError"
+    assert "kaboom" not in report.model_dump_json()
 
 
 @pytest.mark.asyncio

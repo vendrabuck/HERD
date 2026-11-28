@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any
 
 from app.schemas._types import UUIDStr
+from app.services.canvas_shape import CanvasData
 from pydantic import BaseModel, Field
 
 
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 class TemplateCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=2000)
-    canvas_data: dict[str, Any] | None = None
+    canvas_data: CanvasData | None = None
 
 
 class TemplateFromTopologyRequest(BaseModel):
@@ -21,7 +22,7 @@ class TemplateFromTopologyRequest(BaseModel):
 class TemplateUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=2000)
-    canvas_data: dict[str, Any] | None = None
+    canvas_data: CanvasData | None = None
 
 
 class TemplateResponse(BaseModel):

@@ -69,11 +69,12 @@ async def fetch_visible_device_ids(caller_id: uuid.UUID, authorization: str) -> 
             auth=ForwardedAuth(authorization=authorization),
         )
     except httpx.HTTPError as exc:
+        # The class name only: an httpx error's text names the service address.
         logger.warning(
             "visible_devices_unreachable",
-            extra={"caller_id": str(caller_id), "error": str(exc)},
+            extra={"caller_id": str(caller_id), "error": type(exc).__name__},
         )
-        raise VisibleDevicesUnavailableError(str(exc)) from exc
+        raise VisibleDevicesUnavailableError(type(exc).__name__) from exc
     if resp.status_code != 200:
         logger.warning(
             "visible_devices_bad_response",

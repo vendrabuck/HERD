@@ -58,6 +58,7 @@ from app.schemas.fork import (
     SkippedConstrainedEdgeResponse,
 )
 from app.services.canvas_nodes import strip_device_nodes
+from app.services.canvas_shape import readable_canvas_or_none, require_readable_canvas
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
@@ -491,7 +492,11 @@ async def get_fork_internal(
         parent_topology_id=fork.parent_topology_id,
         parent_version_id=fork.parent_version_id,
         status=fork.status,
-        canvas_data=strip_device_nodes(fork.canvas_data),
+        # A draft that fails the shape check is answered as null, not refused: the
+        # wiring, versions, and routes beside it are what execution reads.
+        canvas_data=strip_device_nodes(
+            readable_canvas_or_none(fork.canvas_data, kind="fork", row_id=fork.id)
+        ),
         draft_restored_from_id=fork.draft_restored_from_id,
         created_at=fork.created_at,
         updated_at=fork.updated_at,
@@ -528,6 +533,7 @@ async def get_fork_version_internal(
     _check_internal_token(x_internal_token)
     fork = await _load_fork(db, reservation_id)
     version = await _load_fork_version(db, fork.id, version_id)
+    require_readable_canvas(version.canvas_data, kind="fork_version", row_id=version.id)
 
     # Read-side strip (belt and braces, see get_fork_internal above).
     return ForkVersionDetailResponse(
@@ -585,6 +591,7 @@ async def restore_fork_version_internal(
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
     version = await _load_fork_version(db, fork.id, version_id)
+    require_readable_canvas(version.canvas_data, kind="fork_version", row_id=version.id)
 
     # version.canvas_data was already stripped when that version was written;
     # strip again anyway (cheap, idempotent) since this copies it onto the

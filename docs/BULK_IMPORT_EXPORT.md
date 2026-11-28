@@ -101,14 +101,16 @@ Every import returns a `BulkImportReport`:
   processed. Import is per-row transactional: a rejected row is rolled back and
   leaves no partial write. In a JSON import, an item that is not an object is
   rejected with `row is not an object`, and one whose `name` is not a string with
-  `name: must be a string`. A topology item is also checked along one chain of its
-  canvas: `canvas` must be an object, `canvas.nodes` a list, each node an object,
-  each node's `data` and `data.device` objects, and the device `name` a string. A
-  part of that chain with the wrong type is rejected with its path, for example
-  `canvas.nodes.2: must be an object` or `canvas.nodes.0.data.device.name: must be a
-  string`, even when the value is empty, zero, or false; a null or absent part passes,
-  except a null node. Other parts of the canvas, such as `edges`, are judged with the
-  row.
+  `name: must be a string`. A topology item's `canvas` is held to the shape every
+  canvas cabling stores must have (TOPO-SHAPE-1 to TOPO-SHAPE-3 in
+  `docs/specs/topology.md`): an object whose `nodes` and `edges` are lists of objects,
+  the node and edge fields cabling reads (ids, edge ends, device id and name, layer,
+  port names) strings, `data` and `data.device` objects, nested no deeper than 64
+  levels, with no `NaN` or infinite number. A canvas without that shape is rejected
+  with its path, for example `canvas.nodes.2: must be an object`,
+  `canvas.edges.0.source: must be a string`, or
+  `canvas.nodes.0: is nested deeper than 64 levels`, even when the value is empty,
+  zero, or false; a null or absent part passes, except a null node or edge.
 
 With `dry_run=true`, nothing is written and the same report shape is returned.
 For all three importers, a dry run is a full rehearsal (issue #1017 for devices
@@ -243,7 +245,9 @@ the hypervisor on the target instance first.
 JSON is the lossless round-trip format. Each item is a topology `name` plus its
 `canvas` (the React Flow nodes and edges). On export, each node's
 `data.device.id` is replaced by the device `name` under `data.device.name`; on
-import, that name resolves back to a local device id.
+import, that name resolves back to a local device id. A topology whose stored canvas
+does not have the shape above is left out of the export, JSON or CSV, and the
+response header `X-Export-Skipped` says how many were left out (`0` when none was).
 
 Topology import is update-by-name, matching devices and templates: a row whose
 `name` already exists updates that topology in place (rewriting its canvas and

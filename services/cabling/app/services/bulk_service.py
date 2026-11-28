@@ -53,6 +53,7 @@ import copy
 import csv
 import io
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -68,10 +69,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.topology import Topology, TopologyVersion
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
+from app.services.canvas_shape import canvas_problem, stored_canvas_readable
 from app.services.device_resolver import resolve_device_names
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 from app.services.visible_devices import resolve_caller_visibility
+
+logger = logging.getLogger(__name__)
 
 # A JSON import file holding a lone surrogate (an escape such as \ud800 with no pair):
 # a value no response, database write, or later read can encode.
@@ -93,57 +97,45 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
 )
 
 # A JSON import item the importer cannot read (issue #1573): an item that is not an
-# object, a `name` that is not a string, or a canvas whose parts the device-name pass
-# reads are the wrong type (TOPO-BULK-21 lists which of these answered 500 before and
-# which were read as absent). Such an item is a rejected row with a fixed reason,
-# `<field>: <message>` naming the path and never a value, and the other rows are
-# judged on their own. A CSV import builds every record itself, so it never meets one.
+# object, a `name` that is not a string, or a canvas that does not have the shape
+# every canvas reader assumes (`canvas_shape.canvas_problem`; TOPO-BULK-21 lists which
+# of these answered 500 before and which were read as absent). Such an item is a
+# rejected row with a fixed reason, `<field>: <message>` naming the path and never a
+# value, and the other rows are judged on their own. A CSV import builds every record
+# itself, so it never meets one.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
+
+# A row whose handling raised something other than an HTTPException: the reason names
+# the exception's class and nothing it carries, since its text can hold a statement,
+# a parameter, or another service's address.
+ROW_FAILED_REASON_PREFIX = "row could not be imported: "
+
+# The resolve-by-name call to inventory failed (TOPO-BULK-9): a fixed answer, with the
+# exception's class in the log line and nothing of its text, which names the service
+# address.
+IMPORT_RESOLVE_UNAVAILABLE_DETAIL = (
+    "Could not resolve device names; the import was not processed. Retry the request."
+)
 
 
 def _record_shape_reason(rec: Any) -> str | None:
     """The fixed reject reason for a record the importer cannot read, else None.
 
-    Checked before anything reads the record. The item must be an object; its `name`
-    a string; its `canvas` an object; `canvas.nodes` a list; each node an object, with
-    an object `data`, an object `data.device`, and a string `data.device.name`. A
-    null or absent `name`, `canvas`, `canvas.nodes`, `data`, `data.device`, or device
-    `name` passes; a null item or node does not. Nothing else in the canvas is read
-    outside the row's own error handling, so nothing else is checked here.
+    Checked before anything reads the record. The item must be an object and its
+    `name` a string; its `canvas` must have the shape `canvas_shape.canvas_problem`
+    checks, the one every canvas write is held to, reported as
+    `canvas.<path>: <message>`. A null or absent `name` or `canvas` passes; a null
+    item does not.
     """
     if not isinstance(rec, dict):
         return ROW_NOT_AN_OBJECT_REASON
     name = rec.get("name")
     if name is not None and not isinstance(name, str):
         return NAME_NOT_A_STRING_REASON
-    canvas = rec.get("canvas")
-    if canvas is None:
-        return None
-    if not isinstance(canvas, dict):
-        return "canvas: must be an object"
-    nodes = canvas.get("nodes")
-    if nodes is None:
-        return None
-    if not isinstance(nodes, list):
-        return "canvas.nodes: must be a list"
-    for index, node in enumerate(nodes):
-        path = f"canvas.nodes.{index}"
-        if not isinstance(node, dict):
-            return f"{path}: must be an object"
-        data = node.get("data")
-        if data is None:
-            continue
-        if not isinstance(data, dict):
-            return f"{path}.data: must be an object"
-        device = data.get("device")
-        if device is None:
-            continue
-        if not isinstance(device, dict):
-            return f"{path}.data.device: must be an object"
-        device_name = device.get("name")
-        if device_name is not None and not isinstance(device_name, str):
-            return f"{path}.data.device.name: must be a string"
+    problem = canvas_problem(rec.get("canvas"))
+    if problem is not None:
+        return problem.text("canvas")
     return None
 
 
@@ -227,6 +219,16 @@ def canvas_ids_to_names(canvas: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _readable_topologies(topologies: list[Topology]) -> tuple[list[Topology], int]:
+    """The topologies whose stored canvas has the shape every reader assumes, and
+    how many were left out (TOPO-BULK-24). Each one left out is logged once (its id
+    and the problem, never its canvas)."""
+    kept = [
+        t for t in topologies if stored_canvas_readable(t.canvas_data, kind="topology", row_id=t.id)
+    ]
+    return kept, len(topologies) - len(kept)
+
+
 def topology_to_record(topology: Topology) -> dict[str, Any]:
     # Belt and braces (defense in depth): the stored canvas_data was already
     # reduced to the allowlist when it was written, but export is the one
@@ -303,13 +305,16 @@ def records_to_csv(topologies: list[Topology]) -> str:
     return out.getvalue()
 
 
-def render_export(topologies: list[Topology], fmt: str) -> str:
-    """The export body for ``fmt`` ("csv" or "json"). Run on a bulk worker thread
-    (issue #1417): it reads only each topology's ``name`` and ``canvas_data``, column
-    values the route's query already loaded, so it issues no query."""
+def render_export(topologies: list[Topology], fmt: str) -> tuple[str, int]:
+    """The export body for ``fmt`` ("csv" or "json"), and how many topologies it
+    left out because their stored canvas does not have the shape
+    (``_readable_topologies``). Run on a bulk worker thread (issue #1417): it reads
+    only each topology's ``id``, ``name``, and ``canvas_data``, column values the
+    route's query already loaded, so it issues no query."""
+    kept, skipped = _readable_topologies(topologies)
     if fmt == "csv":
-        return records_to_csv(topologies)
-    return records_to_json([topology_to_record(t) for t in topologies])
+        return records_to_csv(kept), skipped
+    return records_to_json([topology_to_record(t) for t in kept]), skipped
 
 
 # Import parsing -------------------------------------------------------------
@@ -518,9 +523,8 @@ async def import_topologies(
     try:
         name_to_id = await resolve_device_names(sorted(all_names)) if all_names else {}
     except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail=f"could not resolve device names via inventory: {exc}"
-        ) from exc
+        logger.warning("import_device_name_resolve_failed error=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail=IMPORT_RESOLVE_UNAVAILABLE_DETAIL) from None
 
     is_admin = actor_role in ("admin", "superadmin")
     rows_args = (records, name_to_id, visible_ids, actor_id, actor_name, is_admin)
@@ -607,6 +611,21 @@ async def _import_topology_rows(
                 # route does (issue #763), so it reports the existing
                 # `missing_device` reason and never reaches the L3 pass.
                 rewritten = redact_invisible_device_nodes(rewritten, visible_ids)
+
+            # The canvas about to be stored, device ids now the ones inventory
+            # answered, is held to the shape check once more, as every canvas
+            # write is (TOPO-SHAPE-5).
+            stored_problem = canvas_problem(rewritten)
+            if stored_problem is not None:
+                report.rows.append(
+                    RowResult(
+                        row=index,
+                        action="reject",
+                        identity=name,
+                        reason=stored_problem.text("canvas"),
+                    )
+                )
+                continue
 
             # Run the existing full validator (edges + L3) against the rewritten
             # canvas before any write; it is read-only, reading connections (and,
@@ -759,8 +778,14 @@ async def _import_topology_rows(
             )
         except Exception as exc:
             await db.rollback()
+            logger.warning("import_row_failed row=%s error=%s", index, type(exc).__name__)
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=ROW_FAILED_REASON_PREFIX + type(exc).__name__,
+                )
             )
 
     return _tally(report)

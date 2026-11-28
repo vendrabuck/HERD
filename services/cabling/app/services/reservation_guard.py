@@ -38,8 +38,12 @@ async def find_blocking_reservations(topology_id: uuid.UUID) -> list[dict]:
                 )
                 return []
             items = resp.json()
-    except Exception:
-        logger.exception("reservation_guard_unreachable", extra={"topology_id": str(topology_id)})
+    except Exception as exc:
+        # The class name only: an httpx error's text names the service address.
+        logger.warning(
+            "reservation_guard_unreachable",
+            extra={"topology_id": str(topology_id), "error": type(exc).__name__},
+        )
         return []
 
     blocking = []
@@ -104,7 +108,7 @@ async def find_blocking_reservations_strict(topology_id: uuid.UUID) -> list[str]
         logger.error(
             "reservations service unreachable while checking topology %s for live reservations: %s",
             topology_id,
-            exc,
+            type(exc).__name__,
         )
         raise _topology_delete_unverifiable() from exc
 
@@ -135,10 +139,11 @@ async def find_blocking_reservations_strict(topology_id: uuid.UUID) -> list[str]
             if status.upper() in _BLOCKING_STATUSES:
                 blocking.append(rid)
     except (ValueError, KeyError, TypeError) as exc:
+        # The class name only: the message can quote a value from the body.
         logger.error(
             "reservations service returned an unparseable by-topology body for topology %s: %s",
             topology_id,
-            exc,
+            type(exc).__name__,
         )
         raise _topology_delete_unverifiable() from exc
     return sorted(set(blocking))

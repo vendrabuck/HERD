@@ -1757,8 +1757,16 @@ async def test_a_null_or_absent_part_passes_the_shape_check(user_client, canvas)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edges",
-    ["e1", 1, {"e1": {}}, [1], [None], ["e1"], [{"id": "e1", "source": 1, "target": []}]],
+    ("edges", "reason"),
+    [
+        ("e1", "canvas.edges: must be a list"),
+        (1, "canvas.edges: must be a list"),
+        ({"e1": {}}, "canvas.edges: must be a list"),
+        ([1], "canvas.edges.0: must be an object"),
+        ([None], "canvas.edges.0: must be an object"),
+        (["e1"], "canvas.edges.0: must be an object"),
+        ([{"id": "e1", "source": 1, "target": []}], "canvas.edges.0.source: must be a string"),
+    ],
     ids=[
         "string",
         "int",
@@ -1769,14 +1777,18 @@ async def test_a_null_or_absent_part_passes_the_shape_check(user_client, canvas)
         "edge_ends_not_strings",
     ],
 )
-async def test_an_odd_edge_list_is_judged_by_the_row_not_a_500(user_client, edges):
-    """Edges are read only inside the row's own error handling, so the shape check
-    leaves them to it: the answer is a report, whatever the row's outcome."""
+async def test_an_edge_list_of_the_wrong_shape_is_a_rejected_row(user_client, edges, reason):
+    """Edges are held to the same shape check as nodes (canvas_shape): a rejected
+    row with a fixed reason, and the rest of the batch runs."""
     resp = await _import_json(
-        user_client, [{"name": "lab", "canvas": {"nodes": [], "edges": edges}}]
+        user_client,
+        [{"name": "lab", "canvas": {"nodes": [], "edges": edges}}, {"name": "lab-2"}],
     )
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()["rows"]) == 1
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "lab", reason),
+        ("create", "lab-2", None),
+    ]
 
 
 @pytest.mark.asyncio

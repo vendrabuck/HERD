@@ -181,24 +181,24 @@ writer's row lock.
 | POST | `/pathfind/batch` | any signed-in user; a non-admin's hidden pairs are refused per pair | 200 | TOPO-PATH-7, TOPO-PATH-10, TOPO-PATH-11 |
 | GET | `/topologies` | any signed-in user | 200 | TOPO-LIST-1 to TOPO-LIST-6 |
 | POST | `/topologies` | any signed-in user | 201 | TOPO-CRUD-1, TOPO-TVER-2 |
-| GET | `/topologies/{id}` | any signed-in user | 200 | TOPO-CRUD-2, TOPO-STRIP-3 |
-| PUT | `/topologies/{id}` | creator, or any admin | 200 | TOPO-EDIT-1 to TOPO-EDIT-6, TOPO-TVER-1, TOPO-STRIP-2, TOPO-STRIP-4 |
+| GET | `/topologies/{id}` | any signed-in user | 200 | TOPO-CRUD-2, TOPO-STRIP-3, TOPO-SHAPE-6 |
+| PUT | `/topologies/{id}` | creator, or any admin | 200 | TOPO-EDIT-1 to TOPO-EDIT-6, TOPO-TVER-1, TOPO-STRIP-2, TOPO-STRIP-4, TOPO-SHAPE-5, TOPO-SHAPE-6 |
 | DELETE | `/topologies/{id}` | creator, or any admin | 204 | TOPO-DEL-1, TOPO-DEL-2, TOPO-DEL-3, TOPO-TVER-5 |
-| POST | `/topologies/{id}/clone` | any signed-in user | 201 | TOPO-CLONE-1, TOPO-TVER-2 |
-| POST | `/topologies/{id}/validate` | creator, or any admin | 200 | TOPO-VAL-1 to TOPO-VAL-11, TOPO-VAL-13 |
+| POST | `/topologies/{id}/clone` | any signed-in user | 201 | TOPO-CLONE-1, TOPO-TVER-2, TOPO-SHAPE-6 |
+| POST | `/topologies/{id}/validate` | creator, or any admin | 200 | TOPO-VAL-1 to TOPO-VAL-11, TOPO-VAL-13, TOPO-SHAPE-6 |
 | GET | `/topologies/{id}/versions` | any signed-in user | 200 | TOPO-VER-1 |
-| GET | `/topologies/{id}/versions/diff?a&b` | any signed-in user | 200 | TOPO-VER-3, TOPO-STRIP-3 |
-| GET | `/topologies/{id}/versions/{vid}` | any signed-in user | 200 | TOPO-VER-2, TOPO-STRIP-3 |
-| POST | `/topologies/{id}/versions/{vid}/restore` | creator, or any admin | 200 | TOPO-VER-4, TOPO-VER-5, TOPO-TVER-3 |
-| GET | `/topologies/export?format` | any signed-in user | 200 | TOPO-BULK-1 to TOPO-BULK-5 |
+| GET | `/topologies/{id}/versions/diff?a&b` | any signed-in user | 200 | TOPO-VER-3, TOPO-STRIP-3, TOPO-SHAPE-6 |
+| GET | `/topologies/{id}/versions/{vid}` | any signed-in user | 200 | TOPO-VER-2, TOPO-STRIP-3, TOPO-SHAPE-6 |
+| POST | `/topologies/{id}/versions/{vid}/restore` | creator, or any admin | 200 | TOPO-VER-4, TOPO-VER-5, TOPO-TVER-3, TOPO-SHAPE-6 |
+| GET | `/topologies/export?format` | any signed-in user | 200 | TOPO-BULK-1 to TOPO-BULK-5, TOPO-BULK-24 |
 | POST | `/topologies/import?format&dry_run` | any signed-in user; updates creator or admin per row | 200 | TOPO-BULK-5 to TOPO-BULK-19, TOPO-BULK-21, TOPO-BULK-22 |
 | GET | `/templates` | any signed-in user | 200 | TOPO-TMPL-1 |
-| POST | `/templates` | any signed-in user | 201 | TOPO-TMPL-2, TOPO-TMPL-3 |
-| POST | `/templates/from-topology/{topology_id}` | any signed-in user | 201 | TOPO-TMPL-5, TOPO-TMPL-6, TOPO-TMPL-7 |
-| GET | `/templates/{id}` | any signed-in user | 200 | TOPO-TMPL-1, TOPO-STRIP-3 |
-| PUT | `/templates/{id}` | creator, or any admin | 200 | TOPO-TMPL-4 |
+| POST | `/templates` | any signed-in user | 201 | TOPO-TMPL-2, TOPO-TMPL-3, TOPO-SHAPE-5 |
+| POST | `/templates/from-topology/{topology_id}` | any signed-in user | 201 | TOPO-TMPL-5, TOPO-TMPL-6, TOPO-TMPL-7, TOPO-SHAPE-6 |
+| GET | `/templates/{id}` | any signed-in user | 200 | TOPO-TMPL-1, TOPO-STRIP-3, TOPO-SHAPE-6 |
+| PUT | `/templates/{id}` | creator, or any admin | 200 | TOPO-TMPL-4, TOPO-SHAPE-5, TOPO-SHAPE-6 |
 | DELETE | `/templates/{id}` | creator, or any admin | 204 | TOPO-TMPL-4 |
-| POST | `/templates/{id}/instantiate` | any signed-in user | 201 | TOPO-TMPL-8, TOPO-TMPL-9, TOPO-TVER-2 |
+| POST | `/templates/{id}/instantiate` | any signed-in user | 201 | TOPO-TMPL-8, TOPO-TMPL-9, TOPO-TVER-2, TOPO-SHAPE-6 |
 
 `/topologies/export` and `/topologies/import` are declared before `/topologies/{id}`, so
 the literal paths are never read as an id. `GET /connections` and the version list take
@@ -220,17 +220,17 @@ Every row is guarded by `X-Internal-Token` (TOPO-FORK-1).
 | GET | `/connections/internal` | `X-Internal-Token` | no caller in `services/` today | the unfiltered connection page | TOPO-CONNINT-1 |
 | GET | `/connections/internal/by-port?device_id&port_name` | `X-Internal-Token` | inventory (port delete and rename guard) | `{connection_count, connection_ids}` | TOPO-CONNINT-2 |
 | GET | `/fabric/internal?device_id` | `X-Internal-Token` | execution (VLAN allocation scope) | `{device_id, fabric_id, component_size}` | TOPO-FABRIC-1 |
-| POST | `/topologies/{id}/validate/internal?l3` | `X-Internal-Token` | reservations (create and device-set PATCH) | `TopologyValidationResponse` | TOPO-VAL-12, TOPO-VAL-14 |
-| POST | `/internal/forks` | `X-Internal-Token` | reservations (activation, sweep backstop, lazy read) | `{fork_id, version_number}` (201) | TOPO-FSTATE-1, TOPO-FVER-1, TOPO-FORK-2 to TOPO-FORK-8 |
+| POST | `/topologies/{id}/validate/internal?l3` | `X-Internal-Token` | reservations (create and device-set PATCH) | `TopologyValidationResponse` | TOPO-VAL-12, TOPO-VAL-14, TOPO-SHAPE-6 |
+| POST | `/internal/forks` | `X-Internal-Token` | reservations (activation, sweep backstop, lazy read) | `{fork_id, version_number}` (201) | TOPO-FSTATE-1, TOPO-FVER-1, TOPO-FORK-2 to TOPO-FORK-8, TOPO-SHAPE-8 |
 | GET | `/internal/forks?skip&limit` | `X-Internal-Token` | reservations (archive reconcile, wiring heal) | `{reservation_ids, forks, total, skip, limit}` | TOPO-LISTF-1 |
 | GET | `/internal/forks/by-device/{device_id}` | `X-Internal-Token` | inventory (device delete guard) | `{reservation_ids, connection_count, connection_ids}` | TOPO-BYDEV-1, TOPO-BYDEV-2 |
 | POST | `/internal/forks/devices/batch` | `X-Internal-Token` | reservations (utilization report) | `{devices: {reservation_id: [device_id]}}` | TOPO-DEVB-1 |
-| GET | `/internal/forks/{reservation_id}` | `X-Internal-Token` | reservations (fork read), execution (intended wiring), ai-orchestrator (purpose signals) | fork detail | TOPO-FORK-9, TOPO-FORK-25 |
-| GET | `/internal/forks/{reservation_id}/versions/{version_id}` | `X-Internal-Token` | reservations | one fork version with its canvas | TOPO-FORK-10 |
-| POST | `/internal/forks/{reservation_id}/versions/{version_id}/restore` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges, draft_restored_from_id}` | TOPO-FORK-12, TOPO-MARKER-1, TOPO-FVER-3, TOPO-FSTATE-3 |
-| PUT | `/internal/forks/{reservation_id}/canvas` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges}` | TOPO-FORK-11, TOPO-FVER-3, TOPO-FSTATE-3 |
-| POST | `/internal/forks/{reservation_id}/save` | `X-Internal-Token` | reservations | `ForkSaveResponse` | TOPO-FORK-13 to TOPO-FORK-24, TOPO-CLAIM-1 to TOPO-CLAIM-4, TOPO-FVER-2, TOPO-MARKER-2, TOPO-FSTATE-4 |
-| POST | `/internal/forks/{reservation_id}/prune-devices` | `X-Internal-Token` | reservations (device removal) | `{fork_id, version_number, changed, released}` | TOPO-PRUNE-1 to TOPO-PRUNE-4, TOPO-FVER-4 |
+| GET | `/internal/forks/{reservation_id}` | `X-Internal-Token` | reservations (fork read), execution (intended wiring), ai-orchestrator (purpose signals) | fork detail | TOPO-FORK-9, TOPO-FORK-25, TOPO-SHAPE-8 |
+| GET | `/internal/forks/{reservation_id}/versions/{version_id}` | `X-Internal-Token` | reservations | one fork version with its canvas | TOPO-FORK-10, TOPO-SHAPE-8 |
+| POST | `/internal/forks/{reservation_id}/versions/{version_id}/restore` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges, draft_restored_from_id}` | TOPO-FORK-12, TOPO-MARKER-1, TOPO-FVER-3, TOPO-FSTATE-3, TOPO-SHAPE-8 |
+| PUT | `/internal/forks/{reservation_id}/canvas` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges}` | TOPO-FORK-11, TOPO-FVER-3, TOPO-FSTATE-3, TOPO-SHAPE-5 |
+| POST | `/internal/forks/{reservation_id}/save` | `X-Internal-Token` | reservations | `ForkSaveResponse` | TOPO-FORK-13 to TOPO-FORK-24, TOPO-CLAIM-1 to TOPO-CLAIM-4, TOPO-FVER-2, TOPO-MARKER-2, TOPO-FSTATE-4, TOPO-SHAPE-5 |
+| POST | `/internal/forks/{reservation_id}/prune-devices` | `X-Internal-Token` | reservations (device removal) | `{fork_id, version_number, changed, released}` | TOPO-PRUNE-1 to TOPO-PRUNE-4, TOPO-FVER-4, TOPO-SHAPE-8 |
 | POST | `/internal/forks/{reservation_id}/archive` | `X-Internal-Token` | reservations (terminal transitions, sweep) | `{fork_id, reservation_id, status}` or 204 | TOPO-FSTATE-2 |
 
 ## 8. Features
@@ -1240,10 +1240,12 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`) \
   Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_groups_rows_into_topologies`, `test_parse_csv_merges_same_name_topology_rows`); `services/cabling/tests/test_bulk.py` (`test_import_csv_roundtrip`)
 - **TOPO-BULK-9.** All device names in the file are resolved in one inventory call with
-  the internal token (10 s); a failure of that call is 503 for the whole request before
-  any row is processed. \
-  Enforced in: `services/cabling/app/services/device_resolver.py` (`resolve_device_names`); `services/cabling/app/services/bulk_service.py` (`import_topologies`) \
-  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_import_resolver_failure_raises_503`, `test_device_resolver_returns_resolved_map`, `test_device_resolver_raises_on_transport_failure`, `test_device_resolver_empty_names_short_circuits`)
+  the internal token (10 s); a failure of that call is 503 `Could not resolve device
+  names; the import was not processed. Retry the request.` for the whole request before
+  any row is processed. The answer names nothing of the failure; the warning logged for
+  it names the exception's class only. \
+  Enforced in: `services/cabling/app/services/device_resolver.py` (`resolve_device_names`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `IMPORT_RESOLVE_UNAVAILABLE_DETAIL`) \
+  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_import_resolver_failure_raises_503`, `test_device_resolver_returns_resolved_map`, `test_device_resolver_raises_on_transport_failure`, `test_device_resolver_empty_names_short_circuits`); `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`)
 - **TOPO-BULK-10.** A row with no name is rejected `missing required field: name`; a row
   naming devices that did not resolve is rejected `unresolved device names: <names>`. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`) \
@@ -1286,9 +1288,11 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_update_blocked_by_other_users_active_reservation`, `test_update_allowed_when_reservation_is_own`, `test_admin_bypasses_reservation_lock`)
 - **TOPO-BULK-18.** Each row commits on its own; any other error rejects only that row,
   rolled back, and the batch continues; the report counts `created`, `updated`,
-  `skipped`, and `rejected`. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_tally`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_one_bad_topology_does_not_abort_batch`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_unexpected_exception_rejects_row`, `test_import_http_exception_inside_loop_rejects_row`)
+  `skipped`, and `rejected`. A row whose handling raised something other than an
+  `HTTPException` is rejected `row could not be imported: <class>`, the exception's class
+  name and nothing it carries, and logged at warning with the row's index and the class. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_tally`, `ROW_FAILED_REASON_PREFIX`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_one_bad_topology_does_not_abort_batch`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_unexpected_exception_rejects_row`, `test_import_http_exception_inside_loop_rejects_row`); `services/cabling/tests/test_failure_wording.py` (`test_an_unexpected_row_failure_is_reported_by_class_only`)
 - **TOPO-BULK-19.** A file, CSV or JSON, that is not valid UTF-8 (a Latin-1 file, or a
   surrogate written as raw bytes) answers 422 `Import file must be UTF-8 encoded; re-save
   it as UTF-8 and retry`, the wording inventory's importers use (INV-BULK-20 in
@@ -1325,20 +1329,21 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   a fixed reason, `<field>: <message>` naming a path and never a value, and the rest of
   the batch runs (TOPO-BULK-18): an item that is not an object (a list, string, number,
   boolean, or null) is `row is not an object`; a `name` present, not null, and not a
-  string is `name: must be a string`; then `canvas: must be an object`,
+  string is `name: must be a string`; then a `canvas` that does not have the shape
+  of TOPO-SHAPE-1 to TOPO-SHAPE-3 is rejected `canvas.<path>: <message>` with that
+  rule's path and message, for example `canvas: must be an object`,
   `canvas.nodes: must be a list`, `canvas.nodes.<i>: must be an object`,
-  `canvas.nodes.<i>.data: must be an object`, `canvas.nodes.<i>.data.device: must be an
-  object`, and `canvas.nodes.<i>.data.device.name: must be a string`, where `<i>` is the
-  node's index. A null or absent `canvas`, `canvas.nodes`, node `data`, `data.device`,
-  or device name passes; a null node does not. A value of the wrong type is rejected
-  even when it is empty, zero, or false (`0`, `false`, `""`, `[]`, or `{}`, whichever
-  is the wrong type for that part). The row carries the trimmed name as its identity
-  when the name is a string that is not blank, else none. Such a record is checked
-  before the one pass that collects every record's device names for TOPO-BULK-9, and
-  that pass leaves it out, so none of its names is sent to inventory. Edges and every
-  other part of the canvas are read only inside the row's own handling and are not
-  checked here. The same reasons for an item and its name are inventory's (INV-BULK-26
-  in `inventory.md`). Before issue #1573, to any signed-in user: an item that is not an
+  `canvas.nodes.<i>.data.device.name: must be a string`,
+  `canvas.edges.<i>.source: must be a string`, or
+  `canvas.nodes.<i>: is nested deeper than 64 levels`, where `<i>` is the node's or
+  edge's index. A null or absent `canvas`, and a null or absent part TOPO-SHAPE-1 names,
+  passes; a null node or edge does not. A value of the wrong type is rejected even when
+  it is empty, zero, or false (`0`, `false`, `""`, `[]`, or `{}`, whichever is the wrong
+  type for that part). The row carries the trimmed name as its identity when the name
+  is a string that is not blank, else none. Such a record is checked before the one pass
+  that collects every record's device names for TOPO-BULK-9, and that pass leaves it
+  out, so none of its names is sent to inventory. The same reasons for an item and its
+  name are inventory's (INV-BULK-26 in `inventory.md`). Before issue #1573, to any signed-in user: an item that is not an
   object, a node that is not an object, a device name that is a non-empty list or
   object, or a `canvas`, `canvas.nodes`, node `data`, or `data.device` of the wrong
   type that is not empty, zero, or false answered 500 from the device-name pass, before
@@ -1350,8 +1355,8 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   `data.device`, or device name that is empty, zero, or false was read as absent and the
   topology imported, and a `name` of `0`, `false`, `[]`, or `{}` was rejected `missing
   required field: name`; each of those is now rejected with the reason above. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`_record_shape_reason`, `import_topologies`, `_import_topology_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row`, `test_a_rejected_record_is_left_out_of_the_name_resolution`, `test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row`, `test_a_null_or_absent_part_passes_the_shape_check`, `test_an_odd_edge_list_is_judged_by_the_row_not_a_500`, `test_a_committing_import_reports_the_topology_before_a_bad_item`); `services/cabling/tests/test_route_handlers_direct.py` (`test_record_shape_reason`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin`)
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`_record_shape_reason`, `import_topologies`, `_import_topology_rows`, `ROW_NOT_AN_OBJECT_REASON`, `NAME_NOT_A_STRING_REASON`); `services/cabling/app/services/canvas_shape.py` (`canvas_problem`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_an_item_that_is_not_an_object_is_a_rejected_row`, `test_an_item_whose_name_is_not_a_string_is_a_rejected_row`, `test_a_canvas_the_name_pass_cannot_read_is_a_rejected_row`, `test_a_rejected_record_is_left_out_of_the_name_resolution`, `test_a_non_admin_with_a_visibility_filter_gets_the_same_rejected_row`, `test_a_null_or_absent_part_passes_the_shape_check`, `test_an_edge_list_of_the_wrong_shape_is_a_rejected_row`, `test_a_committing_import_reports_the_topology_before_a_bad_item`); `services/cabling/tests/test_route_handlers_direct.py` (`test_record_shape_reason`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_an_import_row_with_a_bad_canvas_is_rejected_and_the_rest_imports`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_a_non_admin`)
 - **TOPO-BULK-22.** A CSV import is read through the shared reader `read_csv_rows`, the
   one inventory's importers use (INV-BULK-25 in `inventory.md`), before any row is
   grouped: `\n`, `\r\n`, and bare `\r` line endings are all read, a bare `\r` in an
@@ -1379,6 +1384,13 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   interactive topology save's do, so every row's outcome and reason are unchanged. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_read_import`, `render_export`); `services/cabling/app/routes/bulk.py` (`export_topologies`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `BULK_WORK_THREADS`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
+- **TOPO-BULK-24.** The export leaves out every topology whose stored canvas does not
+  have the shape of TOPO-SHAPE-1 to TOPO-SHAPE-3, logs each one as TOPO-SHAPE-7
+  describes, and exports every other topology; the response carries
+  `X-Export-Skipped: <n>`, the number left out (`0` when none is), for JSON and CSV
+  alike. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`render_export`, `_readable_topologies`); `services/cabling/app/routes/bulk.py` (`export_topologies`, `EXPORT_SKIPPED_HEADER`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_one_users_bad_stored_canvas_leaves_another_users_export_whole`, `test_an_export_with_nothing_bad_skips_nothing`, `test_a_skipped_topology_is_logged_by_id_and_problem_only`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 
@@ -1788,6 +1800,94 @@ problems against.
 
 **Out of scope.** Switch configuration versions are `device-configuration.md`.
 
+### 8.22 Canvas shape
+
+**What it does.** Every canvas cabling stores (a topology's, a template's, a fork's
+draft, and the versions of each) has the shape its readers expect. A canvas stored
+before this check that does not have the shape is answered by the routes that need it
+with a fixed answer, the export leaves it out, and its owner can replace it or delete
+it.
+
+**Surfaces.** `services/cabling/app/services/canvas_shape.py` (the one check); the
+request schemas that carry a canvas; the topology import; every canvas read in
+sections 8.4 to 8.14.
+
+**Rules.**
+
+- **TOPO-SHAPE-1.** A canvas is an object or null; its `nodes` and `edges` are lists,
+  and each item of either is an object. On a node, `id`, `data.label`, `data.device.id`,
+  `data.device.name`, `data.device.template_name`, and `data.device.role` are strings
+  and `data`, `data.device`, and `data.element` are objects; on an edge, `id`, `source`,
+  `target`, `data.layer`, `data.source_port_name`, `data.target_port_name`,
+  `data.sourcePort`, and `data.targetPort` are strings and `data` is an object. A null
+  or absent part passes, a part under a null or absent parent is not judged, and a
+  wrong type is refused even when it is empty, zero, or false. Every other key passes
+  as it is; `data.l3` keeps its own parser (TOPO-L3-1). The first problem is named:
+  nodes before edges, items in order, a node's or edge's parts in the order above, and
+  only then the walk of TOPO-SHAPE-2 and TOPO-SHAPE-3. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `_structure_problem`, `_NODE_FIELDS`, `_EDGE_FIELDS`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
+- **TOPO-SHAPE-2.** No object or list in a canvas is nested deeper than
+  `MAX_CANVAS_DEPTH`, 64 levels, the canvas itself being level 1, a node or edge level
+  3. The check walks with a stack, so a canvas nested past the interpreter's recursion
+  limit is judged, not raised on. By decision (the constant's comment in
+  `canvas_shape.py`): what HERD writes nests about seven levels, and 64 stays far below
+  the response models' serialization limit and the recursion limit. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`MAX_CANVAS_DEPTH`, `_content_problem`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_the_bound_is_what_the_docstring_says`, `test_a_node_at_the_bound_passes_and_one_past_it_is_refused`, `test_lists_count_as_levels_like_objects`, `test_another_top_level_key_is_judged_and_never_named`, `test_a_canvas_past_the_recursion_limit_is_judged_not_raised_on`)
+- **TOPO-SHAPE-3.** No number in a canvas is `NaN` or infinite (a literal such as `1e400`
+  reads as infinity), and no string or key holds a lone surrogate. A problem of
+  TOPO-SHAPE-2 or TOPO-SHAPE-3 is named by the node or edge that holds it
+  (`nodes.<i>`, `edges.<i>`), or by the canvas for any other top-level key, whose name
+  is never in the path. No message holds a key or a value from the canvas. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`_content_problem`, `canvas_problem`, `CanvasProblem`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_a_number_that_is_not_finite_is_refused`, `test_finite_numbers_of_every_kind_pass`, `test_a_lone_surrogate_is_refused`, `test_a_character_outside_the_bmp_is_not_a_lone_surrogate`, `test_no_message_holds_a_submitted_value`)
+- **TOPO-SHAPE-4.** Every canvas HERD itself writes has the shape: the editor's
+  (`persistableCanvas`), the seed data's, the AI commit's, a CSV import's, and every
+  canvas the cabling suite stores. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_the_editor_canvas_passes`, `test_the_seed_and_ai_commit_canvases_pass`, `test_a_csv_import_record_passes`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_good_canvas_is_still_stored_by_every_body_route`)
+- **TOPO-SHAPE-5.** A topology PUT, a template create or update, and a fork canvas PUT
+  or save whose `canvas_data` does not have the shape answer 422 with the one item
+  `{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": "canvas_data.<path>:
+  <message>"}` and store nothing. The import holds each record's canvas to the same
+  check (TOPO-BULK-21), and once more the canvas it is about to store, whose device ids
+  are the ones inventory answered, rejecting the row with `canvas.<path>: <message>`;
+  every other canvas write builds its canvas from a stored one that TOPO-SHAPE-6 or
+  TOPO-SHAPE-8 has already judged. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`CanvasData`, `_check_canvas_data`); `services/cabling/app/schemas/topology.py` (`TopologyUpdate`); `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`); `services/cabling/app/schemas/fork.py` (`ForkCanvasUpdate`, `ForkSaveRequest`); `services/cabling/app/services/bulk_service.py` (`_import_topology_rows`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_topology_put_refuses_a_bad_canvas_and_stores_nothing`, `test_a_template_create_and_update_refuse_a_bad_canvas`, `test_a_fork_canvas_put_and_save_refuse_a_bad_canvas`, `test_an_import_row_is_checked_again_after_its_names_are_resolved`); `tests/integration/test_bulk_import_export.py` (`test_a_canvas_without_the_shape_is_a_422_and_the_export_still_answers`)
+- **TOPO-SHAPE-6.** A stored topology, topology version, or template canvas that does
+  not have the shape answers 409 `Stored canvas cannot be read; save a new canvas to
+  replace it, or delete it` on every route that reads it: the topology GET, clone, both
+  validate routes, from-topology, the version GET, diff, and restore, the template GET
+  and instantiate, and a topology or template PUT that carries no canvas (its answer
+  would carry the stored one). Nothing is written. The lists, the version list,
+  delete, and a PUT that carries a canvas work as for any row, after their own 404 and
+  403, so the owner replaces it or deletes it. By decision (the module docstring of
+  `canvas_shape.py`), as stored data no reader can render is answered elsewhere
+  (OPS-SECRET-19 in `operations-and-observability.md`), and so the editor never opens a
+  drawing it could not load as an empty one. No stored row is rewritten. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`)
+- **TOPO-SHAPE-7.** Each stored canvas found without the shape is logged once per
+  read, at warning: `stored_canvas_unreadable kind=<kind> id=<row id>
+  problem=canvas_data.<path>: <message>`, and nothing of the canvas. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`stored_canvas_readable`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one`, `test_readable_canvas_or_none_gives_none_for_a_bad_canvas`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_skipped_topology_is_logged_by_id_and_problem_only`)
+- **TOPO-SHAPE-8.** On a fork: the fork read answers a draft without the shape as
+  `canvas_data` null, with its wiring, versions, and routes as stored, since execution
+  reads the wiring there; the fork version read and the version restore answer the 409
+  of TOPO-SHAPE-6 for a version without the shape; fork create answers it for a parent
+  canvas without the shape and writes nothing; and a prune reads a saved canvas without
+  the shape as none (every row touching a removed device releases, and the appended
+  version's canvas is null) and leaves a draft without the shape as it is. \
+  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `get_fork_version_internal`, `restore_fork_version_internal`); `services/cabling/app/services/fork_service.py` (`create_fork`); `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`); `services/cabling/app/services/canvas_shape.py` (`readable_canvas_or_none`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_with_a_null_draft`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
+
+**Out of scope.** The editor's own handling of a canvas it loads is sections 8.17 and
+8.20.
+
 ## 9. Errors
 
 FastAPI validation errors (422) carry `detail` as a list of `{loc, msg, type}`; every
@@ -1817,6 +1917,7 @@ other error carries `detail` as a string or the object shown.
 | 409 | `{"error": "fork_device_not_member", "device_ids": [...]}` | fork create or save naming a device outside the reservation | TOPO-FORK-3, TOPO-FORK-13 |
 | 409 | `{message, conflicts: [{reservation_id, device_id, port}]}` | fork create or save claiming a port another active fork holds | TOPO-CLAIM-1 |
 | 409 | `{"error": "l3_intent_invalid", "invalid_routes": [...]}` | fork save whose changed routing intent fails validation | TOPO-FORK-21 |
+| 409 | `Stored canvas cannot be read; save a new canvas to replace it, or delete it` | a route that reads a stored canvas without the shape | TOPO-SHAPE-6, TOPO-SHAPE-8 |
 | 422 | `Cannot connect a port to itself` | a connection from a port to itself; per row in bulk | TOPO-CONN-3 |
 | 422 | `Device <id> does not exist` | inventory answers 404 for a device being cabled; per row in bulk | TOPO-BOUND-2 |
 | 422 | `Devices belong to different device groups and share none; cross-group cabling is disabled.` | cabling across disjoint device groups; per row in bulk | TOPO-BOUND-1 |
@@ -1826,13 +1927,14 @@ other error carries `detail` as a string or the object shown.
 | 422 | `Import file must be UTF-8 encoded; re-save it as UTF-8 and retry`, `Import file holds a lone surrogate escape, which is not valid text; fix it and retry` | an import file that is not UTF-8, or a JSON import holding a lone surrogate | TOPO-BULK-19 |
 | 422 | `Invalid CSV: line <n> could not be read; fix it and retry` | a CSV import the csv module refuses | TOPO-BULK-22 |
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
+| 422 | validation list, one item of type `canvas_shape` | a canvas body without the shape | TOPO-SHAPE-5 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |
 | 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-CONN-9, TOPO-FORK-25, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
 | 503 | `Could not verify device-group membership for one or more devices in this batch; no connections were created. Retry the request.` | bulk create with an unverifiable device | TOPO-BOUND-4 |
 | 503 | `Could not verify topology is not in use` | delete guard could not read reservations | TOPO-DEL-3 |
 | 503 | `{"error": "l3_config_unavailable"}` | the routing pass could not read inventory in time | TOPO-L3-11, TOPO-BULK-13 |
-| 503 | `could not resolve device names via inventory: <error>` | import name resolution failed | TOPO-BULK-9 |
+| 503 | `Could not resolve device names; the import was not processed. Retry the request.` | import name resolution failed | TOPO-BULK-9 |
 
 Import reports a refused row inside a 200 report, never as an error status, except the
 503s above.
@@ -1850,6 +1952,13 @@ Calls into this area are in section 7. Cabling publishes no event.
 | Out | inventory | `GET /devices/{id}/config-versions/latest/internal` (internal token, 4 s per call) | latest switch config for the routing pass | A 404 means unconfigured; anything else fails closed with 503 (TOPO-L3-7, TOPO-L3-11) |
 | Out | reservations | `GET /internal/by-topology/{topology_id}` (internal token, 5 s) | edit lock on PUT, version restore, and import | Fail open: treated as no reservation (TOPO-EDIT-6) |
 | Out | reservations | `GET /internal/by-topology/{topology_id}` (internal token, 5 s) | delete guard | Fail closed: 503, nothing deleted (TOPO-DEL-3) |
+
+- **TOPO-CALL-1.** When one of these calls fails, the answer and every log line name the
+  exception's class and fixed wording only, never its text (which can name the service
+  address) or a value from the answer: the visibility, device-group, edit lock, delete
+  guard, name resolution, and routing-pass lookups, and an import row that raised. \
+  Enforced in: `services/cabling/app/services/visible_devices.py` (`fetch_visible_device_ids`); `services/cabling/app/services/device_group_guard.py` (`fetch_device_group_ids`); `services/cabling/app/services/connection_service.py` (`_resolve_group_cache_for_batch`); `services/cabling/app/services/reservation_guard.py` (`find_blocking_reservations`, `find_blocking_reservations_strict`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`); `services/cabling/app/services/l3_validation.py` (`L3InventoryContext`) \
+  Pinned by: `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`, `test_an_unexpected_row_failure_is_reported_by_class_only`, `test_the_visibility_lookup_logs_and_raises_the_class_only`, `test_the_edit_lock_lookup_logs_the_class_only`, `test_the_delete_guard_logs_the_class_only`, `test_the_delete_guard_logs_an_unreadable_body_by_class_only`, `test_the_device_group_lookup_logs_the_class_only`, `test_the_bulk_device_group_lookup_logs_the_class_only`, `test_the_routing_pass_failure_carries_the_class_only`)
 
 ## 11. Configuration
 
@@ -1872,14 +1981,15 @@ reservation ids per devices batch; 10 connection ids in the by-device sample; ac
 listing `limit` up to 1000 (default 200); 5 s for inventory group and visibility calls and
 for the reservations lookup; 10 s for name resolution; 4 s per routing-pass inventory call,
 12 s for the whole pass, 500 devices per type batch, 8 concurrent config reads; 64
-characters per route field; editor draft autosave after 2000 ms.
+characters per route field; 64 levels of nesting per canvas (TOPO-SHAPE-2); editor draft
+autosave after 2000 ms.
 
 ## 12. Test coverage map
 
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/cabling/tests/` (in-memory SQLite, direct handler calls in `test_route_handlers_direct.py`); `services/common/tests/test_l3_validation.py`; `frontend/src/test/lib/`, `frontend/src/test/components/`, `frontend/src/test/stores/topologyStore.test.ts`, `frontend/src/test/hooks/` | Advisory locks and `FOR UPDATE` are no-ops on SQLite, so concurrency is proven only by the live-Postgres suites |
-| Functional (through the service API) | `services/cabling/tests/test_topologies.py`, `test_connections.py`, `test_connections_bulk.py`, `test_pathfind.py`, `test_bulk.py`, `test_forks.py`, `test_fork_versions.py`, `test_fork_l3_routes.py`, `test_topology_list_controls.py`, `test_visibility_oracle.py` (httpx against the app); the live-Postgres suites `test_fork_restore_save_race_live_pg.py`, `test_fork_port_claim_race_live_pg.py`, `test_l3_route_key_width_live_pg.py`, `test_topology_list_order_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Functional (through the service API) | `services/cabling/tests/test_topologies.py`, `test_connections.py`, `test_connections_bulk.py`, `test_pathfind.py`, `test_bulk.py`, `test_forks.py`, `test_fork_versions.py`, `test_fork_l3_routes.py`, `test_topology_list_controls.py`, `test_visibility_oracle.py`, `test_canvas_shape_routes.py`, `test_failure_wording.py` (httpx against the app); the live-Postgres suites `test_fork_restore_save_race_live_pg.py`, `test_fork_port_claim_race_live_pg.py`, `test_l3_route_key_width_live_pg.py`, `test_topology_list_order_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
 | Integration (running stack) | `tests/integration/test_pathfinding.py`, `test_cabling_group_boundary.py`, `test_connection_device_existence.py`, `test_bulk_import_export.py`, `test_topology_validate_gate.py`, `test_topology_delete_guard.py`, `test_topology_list_controls.py`, `test_reservation_fork_flow.py`, `test_fork_save_port_resolution.py`, `test_live_edit_topology.py`, `test_l3_intent_validate_and_fork.py`, `test_template_identity.py`, `test_device_group_visibility.py` | Advisory job on pull requests; nightly |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser` topology list with search and sort, `BulkExporter` export, `RoutedTopologyValidator` create, PUT, validate, delete, `BulkConnectionAdmin` bulk create and delete) | No load test covers pathfind batch, fork save, import, or the delete guard |
 | Browser end-to-end | `tests/e2e/test_topology_editor.py`, `test_topologies_list_playwright.py`, `test_topology_clone.py`, `test_topology_delete_in_use_playwright.py`, `test_topology_validator.py`, `test_wiring_dialog_playwright.py`, `test_network_elements_playwright.py`, `test_l3_routing_playwright.py`, `test_fork_live_edit.py`, `test_live_edit_reservation_topology.py`, `test_topology_templates_ui.py`, `test_bulk_import_export.py`, `test_connections_playwright.py`, `test_connections_bulk_playwright.py` | Nightly and in the `make master` and `make everything` gates, not per pull request |

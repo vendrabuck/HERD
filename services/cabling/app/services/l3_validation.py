@@ -140,7 +140,9 @@ class L3InventoryContext:
                 auth=InternalTokenAuth(token=settings.internal_api_token),
             )
         except (httpx.HTTPError, RuntimeError) as exc:
-            raise L3ConfigUnavailable(f"inventory device batch fetch failed: {exc}") from exc
+            raise L3ConfigUnavailable(
+                f"inventory device batch fetch failed: {type(exc).__name__}"
+            ) from exc
         if resp.status_code >= 400:
             raise L3ConfigUnavailable(f"inventory device batch fetch returned {resp.status_code}")
         found: set[uuid.UUID] = set()
@@ -185,7 +187,9 @@ class L3InventoryContext:
                 auth=InternalTokenAuth(token=settings.internal_api_token),
             )
         except (httpx.HTTPError, RuntimeError) as exc:
-            raise L3ConfigUnavailable(f"inventory config fetch failed: {exc}") from exc
+            raise L3ConfigUnavailable(
+                f"inventory config fetch failed: {type(exc).__name__}"
+            ) from exc
         if resp.status_code == 404:
             return None, None
         if resp.status_code >= 400:

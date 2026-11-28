@@ -1,0 +1,509 @@
+"""Unit tests for the one canvas shape check (`app.services.canvas_shape`).
+
+The space is enumerated rather than sampled: every JSON type (an object, a list, a
+string, an integer, a float, true, false, null, and the empty, zero, and false
+forms) in every position the check names, the canvas itself included. The expected
+answer for each comes from the table in this file, written from the module
+docstring, not from the module's own tables, so a change to the module's tables
+fails here.
+"""
+
+import copy
+import json
+import math
+
+import pytest
+from app.services.bulk_service import parse_csv_topologies
+from app.services.canvas_shape import (
+    MAX_CANVAS_DEPTH,
+    STORED_CANVAS_UNREADABLE_DETAIL,
+    CanvasProblem,
+    canvas_problem,
+    readable_canvas_or_none,
+    require_readable_canvas,
+)
+from fastapi import HTTPException
+
+OBJECT = "must be an object"
+LIST = "must be a list"
+STRING = "must be a string"
+
+# One value of each JSON type, and the empty, zero, and false forms, keyed by a
+# readable id.
+VALUES = {
+    "object": {},
+    "object_with_a_key": {"k": "v"},
+    "list": [],
+    "string": "x",
+    "empty_string": "",
+    "int": 1,
+    "zero": 0,
+    "float": 1.5,
+    "true": True,
+    "false": False,
+    "null": None,
+}
+_TYPE_OF = {
+    "object": dict,
+    "object_with_a_key": dict,
+    "list": list,
+    "string": str,
+    "empty_string": str,
+}
+
+# Every position the check names, with the type it must have there.
+POSITIONS = {
+    ("nodes",): list,
+    ("nodes", 0): dict,
+    ("nodes", 0, "id"): str,
+    ("nodes", 0, "data"): dict,
+    ("nodes", 0, "data", "label"): str,
+    ("nodes", 0, "data", "device"): dict,
+    ("nodes", 0, "data", "device", "id"): str,
+    ("nodes", 0, "data", "device", "name"): str,
+    ("nodes", 0, "data", "device", "template_name"): str,
+    ("nodes", 0, "data", "device", "role"): str,
+    ("nodes", 0, "data", "element"): dict,
+    ("edges",): list,
+    ("edges", 0): dict,
+    ("edges", 0, "id"): str,
+    ("edges", 0, "source"): str,
+    ("edges", 0, "target"): str,
+    ("edges", 0, "data"): dict,
+    ("edges", 0, "data", "layer"): str,
+    ("edges", 0, "data", "source_port_name"): str,
+    ("edges", 0, "data", "target_port_name"): str,
+    ("edges", 0, "data", "sourcePort"): str,
+    ("edges", 0, "data", "targetPort"): str,
+}
+_MESSAGE = {dict: OBJECT, list: LIST, str: STRING}
+
+# A list item may not be null: only a named field may.
+_ITEM_POSITIONS = {("nodes", 0), ("edges", 0)}
+
+
+def _base() -> dict:
+    """A canvas with every named position present and of the right type."""
+    return {
+        "nodes": [
+            {
+                "id": "n1",
+                "type": "deviceNode",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "label": "sw-1",
+                    "device": {
+                        "id": "8d1e7a8e-4b8f-4b39-8d0a-1c5d2c8f6a01",
+                        "name": "sw-1",
+                        "template_name": "Generic Switch",
+                        "role": "switch-1",
+                    },
+                    "element": {"id": "e-1"},
+                },
+            }
+        ],
+        "edges": [
+            {
+                "id": "e1",
+                "source": "n1",
+                "target": "n1",
+                "data": {
+                    "layer": "L1",
+                    "source_port_name": "eth0",
+                    "target_port_name": "eth1",
+                    "sourcePort": "eth0",
+                    "targetPort": "eth1",
+                },
+            }
+        ],
+    }
+
+
+def _set(canvas: dict, path: tuple, value) -> dict:
+    out = copy.deepcopy(canvas)
+    parent = out
+    for part in path[:-1]:
+        parent = parent[part]
+    parent[path[-1]] = value
+    return out
+
+
+def _cases():
+    for path, expected in POSITIONS.items():
+        for value_id, value in VALUES.items():
+            if value is None:
+                answer = None if path not in _ITEM_POSITIONS else OBJECT
+            elif _TYPE_OF.get(value_id) is expected:
+                answer = None
+            else:
+                answer = _MESSAGE[expected]
+            yield pytest.param(
+                path, value, answer, id=".".join(str(p) for p in path) + "=" + value_id
+            )
+
+
+def test_the_base_canvas_has_the_shape():
+    assert canvas_problem(_base()) is None
+
+
+@pytest.mark.parametrize(("path", "value", "message"), list(_cases()))
+def test_each_json_type_in_each_position(path, value, message):
+    canvas = _set(_base(), path, value)
+    problem = canvas_problem(canvas)
+    if message is None:
+        assert problem is None
+        return
+    assert problem == CanvasProblem(path, message)
+    assert problem.text("canvas_data") == (
+        "canvas_data." + ".".join(str(p) for p in path) + ": " + message
+    )
+
+
+@pytest.mark.parametrize(
+    "value_id", [k for k in VALUES if k not in ("object", "object_with_a_key")]
+)
+def test_the_canvas_itself_must_be_an_object(value_id):
+    value = VALUES[value_id]
+    if value is None:
+        # No canvas at all is a canvas with nothing on it.
+        assert canvas_problem(None) is None
+        return
+    problem = canvas_problem(value)
+    assert problem == CanvasProblem((), OBJECT)
+    assert problem.text("canvas_data") == "canvas_data: must be an object"
+
+
+@pytest.mark.parametrize(
+    "canvas",
+    [{}, {"nodes": None, "edges": None}, {"nodes": [], "edges": []}, {"viewport": {"x": 1}}],
+)
+def test_an_empty_canvas_has_the_shape(canvas):
+    assert canvas_problem(canvas) is None
+
+
+def test_a_missing_parent_leaves_its_children_unjudged():
+    """With `data` absent, null, or `{}`, nothing under it is judged, and with
+    `data.device` absent the device's fields are not either."""
+    for data in (None, {}):
+        assert canvas_problem({"nodes": [{"id": "n1", "data": data}]}) is None
+    assert canvas_problem({"nodes": [{"id": "n1"}]}) is None
+    assert canvas_problem({"nodes": [{"data": {"label": "x"}}]}) is None
+
+
+def test_a_list_item_must_be_an_object_whatever_it_is():
+    for collection in ("nodes", "edges"):
+        for value in VALUES.values():
+            if isinstance(value, dict):
+                continue
+            problem = canvas_problem({collection: [value]})
+            assert problem == CanvasProblem((collection, 0), OBJECT)
+
+
+def test_the_first_problem_in_canvas_order_is_named():
+    """Nodes before edges, items in order, a node's fields in the documented order
+    (data before data.device before data.device.name), then the content walk."""
+    canvas = {
+        "nodes": [{"id": "n1"}, {"id": "n2", "data": {"device": {"name": 1}, "label": 2}}, 1],
+        "edges": [1],
+    }
+    assert canvas_problem(canvas) == CanvasProblem(("nodes", 1, "data", "device", "name"), STRING)
+    assert canvas_problem({"nodes": [{"data": 1, "id": 2}]}) == CanvasProblem(
+        ("nodes", 0, "id"), STRING
+    )
+    # A structural problem anywhere is named before a content problem anywhere.
+    assert canvas_problem({"nodes": [{"x": math.nan}], "edges": [1]}) == CanvasProblem(
+        ("edges", 0), OBJECT
+    )
+
+
+# Depth ---------------------------------------------------------------------------
+
+
+def _nested(levels: int, leaf=None) -> dict:
+    """`levels` objects nested inside each other (the outermost is one level)."""
+    value: object = leaf if leaf is not None else {}
+    for _ in range(levels - 1):
+        value = {"k": value}
+    return value  # type: ignore[return-value]
+
+
+def test_the_bound_is_what_the_docstring_says():
+    assert MAX_CANVAS_DEPTH == 64
+
+
+def test_a_node_at_the_bound_passes_and_one_past_it_is_refused():
+    # The canvas is level 1, `nodes` 2, the node 3, `data` 4.
+    at_bound = {"nodes": [{"id": "n1", "data": _nested(MAX_CANVAS_DEPTH - 3)}]}
+    assert canvas_problem(at_bound) is None
+    past = {"nodes": [{"id": "n1", "data": _nested(MAX_CANVAS_DEPTH - 2)}]}
+    problem = canvas_problem(past)
+    assert problem == CanvasProblem(("nodes", 0), "is nested deeper than 64 levels")
+    assert problem.text("canvas_data") == "canvas_data.nodes.0: is nested deeper than 64 levels"
+
+
+def test_lists_count_as_levels_like_objects():
+    # The edge is level 3, so `extra` is level 4 and its innermost list level 64.
+    value: object = []
+    for _ in range(MAX_CANVAS_DEPTH - 4):
+        value = [value]
+    assert canvas_problem({"edges": [{"id": "e1", "extra": value}]}) is None
+    assert canvas_problem({"edges": [{"id": "e1", "extra": [value]}]}) == CanvasProblem(
+        ("edges", 0), "is nested deeper than 64 levels"
+    )
+
+
+def test_another_top_level_key_is_judged_and_never_named():
+    """`viewport` is level 2; a key the caller chose is never in the path."""
+    assert canvas_problem({"caller-chosen-key": _nested(MAX_CANVAS_DEPTH - 1)}) is None
+    problem = canvas_problem({"caller-chosen-key": _nested(MAX_CANVAS_DEPTH)})
+    assert problem == CanvasProblem((), "is nested deeper than 64 levels")
+    assert "caller-chosen-key" not in problem.text("canvas_data")
+
+
+def test_a_canvas_past_the_recursion_limit_is_judged_not_raised_on():
+    """Two hundred thousand levels: far past every interpreter's recursion limit and
+    the JSON encoder's, so a recursive check would raise."""
+    deep = {"nodes": [{"id": "n1", "data": _nested(200_000)}]}
+    with pytest.raises(RecursionError):
+        json.dumps(deep)
+    assert canvas_problem(deep) == CanvasProblem(("nodes", 0), "is nested deeper than 64 levels")
+
+
+# Numbers and text --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("number", [math.nan, math.inf, -math.inf], ids=["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    ("canvas_of", "path"),
+    [
+        (lambda v: {"nodes": [{"id": "n1", "position": {"x": v, "y": 0}}]}, ("nodes", 0)),
+        (lambda v: {"edges": [{"id": "e1", "data": {"weight": [v]}}]}, ("edges", 0)),
+        (lambda v: {"viewport": {"zoom": v}}, ()),
+        (lambda v: {"zoom": v}, ()),
+    ],
+    ids=["node", "edge", "other_key", "top_level_value"],
+)
+def test_a_number_that_is_not_finite_is_refused(number, canvas_of, path):
+    assert canvas_problem(canvas_of(number)) == CanvasProblem(
+        path, "holds a number that is not finite"
+    )
+
+
+def test_finite_numbers_of_every_kind_pass():
+    canvas = {"nodes": [{"id": "n1", "position": {"x": 1e308, "y": -0.0, "z": 10**30}}]}
+    assert canvas_problem(canvas) is None
+
+
+@pytest.mark.parametrize(
+    ("canvas", "path"),
+    [
+        ({"nodes": [{"id": "n1", "data": {"label": "a\ud800b"}}]}, ("nodes", 0)),
+        ({"nodes": [{"id": "n1", "data": {"attrs": {"k\udc00": 1}}}]}, ("nodes", 0)),
+        ({"edges": [{"id": "e1", "data": {"note": ["\udfff"]}}]}, ("edges", 0)),
+        ({"viewport": {"name": "\ud800"}}, ()),
+        ({"key\ud800": 1}, ()),
+    ],
+    ids=["node_value", "node_key", "edge_value", "other_key_value", "top_level_key"],
+)
+def test_a_lone_surrogate_is_refused(canvas, path):
+    message = "holds a lone surrogate escape, which is not valid text"
+    assert canvas_problem(canvas) == CanvasProblem(path, message)
+
+
+def test_a_character_outside_the_bmp_is_not_a_lone_surrogate():
+    assert canvas_problem({"nodes": [{"id": "n1", "data": {"label": "\U0001f600"}}]}) is None
+
+
+def test_no_message_holds_a_submitted_value():
+    """Each refusal's text is built from the field names and indexes alone."""
+    marker = "marker-value-9f3c"
+    canvases = [
+        {"nodes": [{"id": [marker]}]},
+        {"nodes": [{"id": "n1", "data": marker}]},
+        {"edges": [{"id": "e1", "source": {marker: marker}}]},
+        {"nodes": [{"id": "n1", "data": {marker: _nested(80)}}]},
+        {marker: {"x": math.nan}},
+        {marker: "\ud800"},
+    ]
+    for canvas in canvases:
+        problem = canvas_problem(canvas)
+        assert problem is not None
+        assert marker not in problem.text("canvas_data")
+
+
+# What HERD itself writes passes --------------------------------------------------------
+
+
+def test_the_editor_canvas_passes():
+    """The shape `persistableCanvas` in TopologyEditorPage.tsx sends: React Flow nodes
+    and edges, a device node with its allowlisted device and routing intent, an
+    element node, an edge with chosen ports, and `selectedEdgeLayer`."""
+    canvas = {
+        "nodes": [
+            {
+                "id": "dnd-1",
+                "type": "deviceNode",
+                "position": {"x": 10.5, "y": 20},
+                "measured": {"width": 180, "height": 60},
+                "selected": False,
+                "data": {
+                    "device": {
+                        "id": "8d1e7a8e-4b8f-4b39-8d0a-1c5d2c8f6a01",
+                        "name": "l3-sw-1",
+                        "topology_type": "PHYSICAL",
+                        "connection_type": "Layer 3 Switch",
+                        "status": "AVAILABLE",
+                        "template_name": "Generic L3",
+                        "template_icon": None,
+                    },
+                    "label": "l3-sw-1",
+                    "topologyType": "PHYSICAL",
+                    "l3": {
+                        "routes": [
+                            {
+                                "destination": "10.0.0.0/24",
+                                "next_hop": None,
+                                "interface": "eth1",
+                                "virtual_router": None,
+                            }
+                        ]
+                    },
+                },
+            },
+            {
+                "id": "el-1",
+                "type": "networkElementNode",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "element": {
+                        "id": "4f1c",
+                        "element_type": "vlan_segment",
+                        "label": "VLAN 10",
+                        "attrs": {"vlan": 10},
+                    }
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "xy-edge__dnd-1right-el-1left",
+                "source": "dnd-1",
+                "target": "el-1",
+                "sourceHandle": "right",
+                "targetHandle": None,
+                "type": "layer",
+                "data": {
+                    "layer": "L2",
+                    "source_port_id": "p-1",
+                    "source_port_name": "eth1",
+                    "isProposal": False,
+                },
+            }
+        ],
+        "selectedEdgeLayer": "L2",
+    }
+    assert canvas_problem(canvas) is None
+
+
+def test_the_seed_and_ai_commit_canvases_pass():
+    """`seedtools/topologies.py`'s `build_canvas` and ai-orchestrator's
+    `_build_canvas_data`, one node of each kind they write."""
+    seed = {
+        "nodes": [
+            {"id": "n0", "type": "deviceNode", "position": {"x": 100, "y": 100}, "data": {}},
+            {
+                "id": "n1",
+                "type": "deviceNode",
+                "position": {"x": 300, "y": 100},
+                "data": {"device": {"id": "8d1e7a8e-4b8f-4b39-8d0a-1c5d2c8f6a01"}},
+            },
+            {
+                "id": "n2",
+                "type": "deviceNode",
+                "position": {"x": 500, "y": 100},
+                "data": {
+                    "device": {"id": "x", "name": "", "template_name": None, "status": "AVAILABLE"},
+                    "label": "",
+                    "topologyType": "PHYSICAL",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "e0",
+                "source": "n0",
+                "target": "n1",
+                "data": {"layer": "L1", "isProposal": False},
+            }
+        ],
+    }
+    ai = {
+        "nodes": [
+            {
+                "id": "c1",
+                "type": "networkElementNode",
+                "position": {"x": 200, "y": 420},
+                "data": {
+                    "element": {
+                        "id": "e",
+                        "element_type": "subnet",
+                        "label": "mgmt",
+                        "attrs": {"cidr": "10.0.0.0/24", "tags": ["a", {"b": 1}]},
+                    }
+                },
+            }
+        ],
+        "edges": [
+            {
+                "id": "x",
+                "source": "c0",
+                "target": "c1",
+                "data": {"layer": "L2", "source_port_id": "p", "source_port_name": "eth0"},
+            }
+        ],
+        "selectedEdgeLayer": "L2",
+    }
+    assert canvas_problem(seed) is None
+    assert canvas_problem(ai) is None
+
+
+def test_a_csv_import_record_passes():
+    raw = (
+        "topology_name,source_device,source_port,target_device,target_port,layer\n"
+        "lab,sw-a,eth0,sw-b,,L1\n"
+    ).encode()
+    (record,) = parse_csv_topologies(raw)
+    assert canvas_problem(record["canvas"]) is None
+
+
+# The read-side helpers -------------------------------------------------------------------
+
+
+def test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one(caplog):
+    good = _base()
+    assert require_readable_canvas(good, kind="topology", row_id=None) is good
+    assert require_readable_canvas(None, kind="topology", row_id=None) is None
+    with pytest.raises(HTTPException) as exc:
+        require_readable_canvas({"nodes": ["marker-9f3c"]}, kind="topology", row_id=None)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == STORED_CANVAS_UNREADABLE_DETAIL
+    assert exc.value.detail == (
+        "Stored canvas cannot be read; save a new canvas to replace it, or delete it"
+    )
+    messages = [r.getMessage() for r in caplog.records if r.name == "app.services.canvas_shape"]
+    assert messages == [
+        "stored_canvas_unreadable kind=topology id=None problem=canvas_data.nodes.0: "
+        "must be an object"
+    ]
+    assert all("marker-9f3c" not in m for m in messages)
+
+
+def test_readable_canvas_or_none_gives_none_for_a_bad_canvas(caplog):
+    good = _base()
+    assert readable_canvas_or_none(good, kind="fork", row_id=None) is good
+    assert readable_canvas_or_none({"edges": "x"}, kind="fork", row_id=None) is None
+    assert any(
+        "stored_canvas_unreadable kind=fork" in r.getMessage()
+        and "canvas_data.edges: must be a list" in r.getMessage()
+        for r in caplog.records
+    )

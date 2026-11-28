@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any
 
 from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
+from app.services.canvas_shape import CanvasData
 from pydantic import BaseModel, Field
 
 
@@ -15,7 +16,7 @@ class TopologyClone(BaseModel):
 
 class TopologyUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    canvas_data: dict[str, Any] | None = None
+    canvas_data: CanvasData | None = None
     description: str | None = Field(default=None, max_length=2000)
 
 
