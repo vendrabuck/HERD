@@ -632,10 +632,10 @@ TOPO-TVER-5 (section 4).
   any list has arrived, shows `Failed to load versions.` and no rows, never the newest
   page alone. A failed refresh while the rows are shown (a refetch on window focus, after
   a save, or after a restore) keeps those rows and shows `Could not refresh versions.`
-  with the reason and Retry above them, never `Failed to load versions.` beside them. By
-  decision (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a
-  Load older control). A version saved between two page reads, which repeats the boundary
-  version on the next page, still lists each version once. \
+  with the reason and Retry above them, never `Failed to load versions.` beside them. A
+  version saved between two page reads, which repeats the boundary version on the next
+  page, still lists each version once. By decision (issue #1591, owner option 1 of
+  2026-11-28: walk every page rather than add a Load older control). \
   Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`) \
   Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone`, `a failed refresh keeps the rows under a refresh notice, never the load error beside them`, `a restore through the editor's mutation walks the list again and shows the new version`, `View, Restore, and Compare reach the oldest version of a long history`)
 
@@ -1665,9 +1665,9 @@ creating them in one batch, or one pair at a time.
   `<total minus rows> more matching devices are not listed. Type more of the name to
   narrow the list.` While the search for new text is on its way they keep the previous
   search's rows and hide that line, whose count belongs to the previous text; a search
-  that answered with no rows shows `No devices match`, and a
-  failed search shows the shared load error (`Could not load matching devices.` with
-  Retry), never nothing (issue #1590). \
+  that answered with no rows shows `No devices match`, and a failed search shows the
+  shared load error (`Could not load matching devices.` with Retry), never nothing
+  (issue #1590). \
   Enforced in: `frontend/src/components/devices/DeviceSearchResults.tsx` (`DeviceSearchResults`); `frontend/src/api/inventory.ts` (`useDeviceSearch`, `DEVICE_SEARCH_LIMIT`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`); `frontend/src/components/admin/connections/DeviceSearchPicker.tsx` (`DeviceSearchPicker`); `frontend/src/pages/admin/ConnectionsPage.tsx` (`ConnectionsPage`) \
   Pinned by: `frontend/src/test/components/DeviceSearchResults.test.tsx` (`asks for one page of DEVICE_SEARCH_LIMIT and says how many more match`, `says nothing more when the page holds every match`, `a one-character search sends no request and shows nothing`, `a search still on its way shows nothing, never No devices match`, `searches for the trimmed text`, `while a new term is on its way, the previous rows stay and the notice is hidden`, `the device filter says how many more match`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `only a successful empty answer shows the empty text, with no alert`)
 

@@ -819,11 +819,11 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   list, counted against the page the server returned, so the number stays true however
   many of the page's rows are hidden as already selected. While the read for new search
   text is on its way the list keeps the previous rows and hides that line, whose count
-  belongs to the previous text. A failed read shows the shared
-  load error (`Could not load available devices.` with Retry) in place of the list, never
-  `No available devices found`, which needs a successful empty answer; a failed refresh
-  while the list shows rows keeps them and shows `Could not refresh available devices.`
-  with the reason and Retry above the list, with no alert (issue #1590). \
+  belongs to the previous text. A failed read shows the shared load error (`Could not
+  load available devices.` with Retry) in place of the list, never `No available devices
+  found`, which needs a successful empty answer; a failed refresh while the list shows
+  rows keeps them and shows `Could not refresh available devices.` with the reason and
+  Retry above the list, with no alert (issue #1590). \
   Enforced in: `frontend/src/components/reservations/EditDevicesModal.tsx` (`EditDevicesModal`, `EDIT_DEVICES_PAGE_SIZE`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`) \
   Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `counts past the page the server returned, not the rows left after hiding selected ones`, `while a new search is on its way, the previous rows stay and the notice is hidden`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `a failed refresh keeps the rows under a refresh notice, with no alert`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
 
