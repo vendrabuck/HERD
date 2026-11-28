@@ -1248,9 +1248,11 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   Enforced in: `services/cabling/app/services/device_resolver.py` (`resolve_device_names`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `IMPORT_RESOLVE_UNAVAILABLE_DETAIL`) \
   Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_import_resolver_failure_raises_503`, `test_device_resolver_returns_resolved_map`, `test_device_resolver_raises_on_transport_failure`, `test_device_resolver_empty_names_short_circuits`); `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`)
 - **TOPO-BULK-10.** A row with no name is rejected `missing required field: name`; a row
-  naming devices that did not resolve is rejected `unresolved device names: <names>`. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`)
+  naming devices that did not resolve is rejected `unresolved device names: <names>`. A
+  device name longer than 255 characters or holding a NUL character cannot name a
+  device, so it is never sent to inventory and its row is rejected so. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`); `services/cabling/app/services/device_resolver.py` (`name_batches`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup`)
 - **TOPO-BULK-11.** For a non-admin, visibility is read once per request (503 and nothing
   processed when it fails); a name resolving to a hidden device is reported exactly like
   an unknown name, and a device node carrying a raw id with no name is redacted before

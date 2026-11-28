@@ -2945,6 +2945,37 @@ def test_device_resolver_drops_a_name_no_device_can_have():
 
     too_long = "x" * (device_resolver.DEVICE_NAME_MAX_LENGTH + 1)
     assert device_resolver.name_batches([too_long, "", "a"]) == [["a"]]
+    # No device name holds a NUL character: inventory's lookup cannot take one.
+    assert device_resolver.name_batches(["\x00", "sw\x00", "\x00sw", "s\x00w", "a"]) == [["a"]]
+
+
+@pytest.mark.asyncio
+async def test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup():
+    """The name is never sent, so the row is rejected as unresolved and the rest of
+    the import goes on, instead of the whole request failing on the lookup."""
+    import json
+
+    from app.services import device_resolver
+    from app.services.bulk_service import import_topologies
+
+    raw = json.dumps(
+        [
+            {
+                "name": "Lab",
+                "canvas": {"nodes": [{"id": "n1", "data": {"device": {"name": "sw\x00"}}}]},
+            },
+            {"name": "Other"},
+        ]
+    ).encode()
+    factory, client, _ = _mock_httpx_client(json_data={"resolved": {}})
+    async with TestSession() as db:
+        with patch.object(device_resolver.httpx, "AsyncClient", factory):
+            report = await import_topologies(db, raw, "json", True, USER_ID, "viewer", "admin")
+    client.post.assert_not_awaited()
+    assert [(r.identity, r.action, r.reason) for r in report.rows] == [
+        ("Lab", "reject", "unresolved device names: sw\x00"),
+        ("Other", "create", None),
+    ]
 
 
 @pytest.mark.asyncio
