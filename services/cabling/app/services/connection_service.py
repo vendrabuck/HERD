@@ -335,7 +335,10 @@ async def list_connections(
     total = (await db.execute(count_query)).scalar() or 0
 
     result = await db.execute(
-        query.order_by(Connection.created_at.desc()).offset(skip).limit(limit)
+        # Newest first, then id ascending (issue #1589): a bulk create inserts up to
+        # 200 connections in one transaction, so they share created_at, and offset
+        # pages over that tie have no defined order without the id.
+        query.order_by(Connection.created_at.desc(), Connection.id).offset(skip).limit(limit)
     )
     return list(result.scalars().all()), total
 

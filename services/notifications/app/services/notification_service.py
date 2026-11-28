@@ -27,7 +27,9 @@ async def list_for_user(
     page_stmt = base
     if unread_only:
         page_stmt = page_stmt.where(Notification.read_at.is_(None))
-    page_stmt = page_stmt.order_by(Notification.created_at.desc())
+    # Newest first, then id ascending (issue #1589): notifications written in one
+    # transaction share created_at, and offset pages need a total order.
+    page_stmt = page_stmt.order_by(Notification.created_at.desc(), Notification.id)
 
     unread_q = select(func.count()).select_from(
         select(Notification)

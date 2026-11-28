@@ -245,7 +245,8 @@ async def list_execution_runs(
     total = (await db.execute(count_query)).scalar() or 0
 
     result = await db.execute(
-        query.order_by(ExecutionRun.created_at.desc()).offset(skip).limit(limit)
+        # Newest first, then id ascending (issue #1589), so offset pages are disjoint.
+        query.order_by(ExecutionRun.created_at.desc(), ExecutionRun.id).offset(skip).limit(limit)
     )
     return list(result.scalars().all()), total
 

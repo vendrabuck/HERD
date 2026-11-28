@@ -73,7 +73,8 @@ async def validate_device_group_exists(db: AsyncSession, device_group_id: uuid.U
 async def list_hypervisors(
     db: AsyncSession, skip: int = 0, limit: int = 50
 ) -> tuple[list[Hypervisor], int]:
-    query = select(Hypervisor).order_by(Hypervisor.created_at.desc())
+    # Newest first, then id ascending (issue #1589), so offset pages are disjoint.
+    query = select(Hypervisor).order_by(Hypervisor.created_at.desc(), Hypervisor.id)
     count_query = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_query)).scalar() or 0
     query = query.offset(skip).limit(limit)

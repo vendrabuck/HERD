@@ -132,7 +132,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
-| GET | `/devices` | any signed-in user (non-admins: visible DUTs only) | 200 | INV-AUTH-1, INV-LIST-1 to INV-LIST-4, INV-VIS-1 to INV-VIS-5, INV-RED-1 to INV-RED-4 |
+| GET | `/devices` | any signed-in user (non-admins: visible DUTs only) | 200 | INV-AUTH-1, INV-LIST-1 to INV-LIST-4, INV-LIST-17, INV-VIS-1 to INV-VIS-5, INV-RED-1 to INV-RED-4 |
 | POST | `/devices` | admin | 201 | INV-AUTH-2, INV-DEV-1 to INV-DEV-7, INV-FIELD-1 to INV-FIELD-7, INV-STATUS-1, INV-STATUS-8, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
 | POST | `/devices/batch` | any signed-in user (non-admins: visible devices only) | 200 | INV-AUTH-1, INV-BATCH-1 to INV-BATCH-5, INV-RED-1 |
 | GET | `/devices/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-AUTH-1, INV-VIS-6, INV-VIS-7, INV-RED-1 |
@@ -144,7 +144,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/ports/{id}` | any signed-in user (non-admins: ports of visible devices only) | 200 | INV-AUTH-1, INV-PORT-2, INV-RED-1 |
 | PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10, INV-COL-1 to INV-COL-3 |
 | DELETE | `/ports/{id}` | admin | 204 | INV-AUTH-2, INV-PORT-8 |
-| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
+| GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-TPL-27, INV-RED-5 |
 | GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
 | POST | `/templates` | admin | 201 | INV-AUTH-2, INV-TPL-2 to INV-TPL-14, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
 | PUT | `/templates/{id}` | admin | 200 | INV-AUTH-2, INV-TPL-15 to INV-TPL-18, INV-TPL-24, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
@@ -157,7 +157,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | PUT | `/drivers/{id}/file` (multipart) | admin | 200 | INV-AUTH-2, INV-DRV-3, INV-DRV-4, INV-DRV-12, INV-DRV-18, INV-DRV-20 |
 | DELETE | `/drivers/{id}` | admin | 204 | INV-AUTH-2, INV-DRV-13 |
 | GET | `/drivers/{id}/config-schema` | any signed-in user | 200 | none here; belongs to `device-configuration.md` |
-| GET | `/hypervisors` | admin | 200 | INV-HYP-1 |
+| GET | `/hypervisors` | admin | 200 | INV-HYP-1, INV-HYP-13 |
 | GET | `/hypervisors/{id}` | admin | 200 | INV-HYP-1 |
 | POST | `/hypervisors` | admin | 201 | INV-HYP-1 to INV-HYP-4, INV-HYP-11, INV-HYP-12, INV-COL-1, INV-COL-2 |
 | PUT | `/hypervisors/{id}` | admin | 200 | INV-HYP-1, INV-HYP-2, INV-HYP-5, INV-HYP-6, INV-HYP-11, INV-HYP-12, INV-COL-1, INV-COL-2 |
@@ -179,11 +179,13 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 
 `GET /devices` takes `template_id`, `topology_type`, `status`, `dut_only`, `search`,
 `skip` (default 0), and `limit` (1 to 500, default 50), orders by `created_at`
-descending, and answers `{items, total, skip, limit}`. `GET /templates` takes
-`template_type` (not validated; an unknown value matches nothing), `skip`, and `limit`
-(same bounds) and orders by `created_at` descending. `GET /drivers` orders by name, `GET /hypervisors` by `created_at`
-descending, and `GET /device-groups` by name; each takes `skip` and `limit` with the
-same bounds. A device response carries the template's name, icon, vendor, model, part
+descending, then id ascending (INV-LIST-17), and answers `{items, total, skip, limit}`.
+`GET /templates` takes `template_type` (not validated; an unknown value matches
+nothing), `skip`, and `limit` (same bounds) and orders by `created_at` descending, then
+id ascending (INV-TPL-27). `GET /drivers` orders by name, `GET /hypervisors` by
+`created_at` descending, then id ascending (INV-HYP-13), and `GET /device-groups` by
+name (driver and group names are unique, so both orders are total); each takes `skip`
+and `limit` with the same bounds. A device response carries the template's name, icon, vendor, model, part
 number, the driver's id, name, SHA256, filename, and connection type, the template's
 exclusive flag, the audit fields, `poll_interval_seconds`, and
 `resolved_poll_interval_seconds`.
@@ -255,6 +257,11 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   when given. \
   Enforced in: `services/inventory/app/routers/templates.py` (`get_templates`, `get_template_by_id`); `services/inventory/app/services/template_service.py` (`list_templates`) \
   Pinned by: `services/inventory/tests/test_templates.py` (`test_user_can_list_templates`, `test_user_can_get_template`, `test_list_templates_filter_by_type`)
+- **INV-TPL-27.** The template list is ordered newest first by `created_at`, and
+  templates created at the same instant by id ascending, so `skip` and `limit` pages
+  never overlap or skip (issue #1589). \
+  Enforced in: `services/inventory/app/services/template_service.py` (`list_templates`) \
+  Pinned by: `services/inventory/tests/test_list_order_tiebreak.py` (`test_templates_list_breaks_created_at_ties_by_id`)
 - **INV-TPL-2.** `template_type` is `device`, `port`, or `dynamic` and defaults to
   `device`. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateCreate`) \
@@ -645,6 +652,11 @@ filter pages through the device templates instead of stopping at the first 500
   counts every matching device, not just the page. \
   Enforced in: `services/inventory/app/routers/devices.py` (`get_devices`); `services/inventory/app/services/inventory_service.py` (`list_devices`) \
   Pinned by: `services/inventory/tests/test_devices.py` (`test_pagination_limit`, `test_pagination_skip`, `test_pagination_skip_exceeds_total`); `services/inventory/tests/test_inventory_service_unit.py` (`test_list_devices_pagination`)
+- **INV-LIST-17.** `GET /devices` is ordered newest first by `created_at`, and devices
+  created at the same instant by id ascending, so `skip` and `limit` pages never overlap
+  or skip (issue #1589). \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`list_devices`) \
+  Pinned by: `services/inventory/tests/test_list_order_tiebreak.py` (`test_devices_list_breaks_created_at_ties_by_id`)
 - **INV-LIST-5.** The page sends no parameter for a filter at All, one parameter per set
   filter, the search with them in the same request, and goes back to the first page on
   any filter change. \
@@ -1047,6 +1059,11 @@ under `/hypervisors`.
 - **INV-HYP-1.** Every user-facing hypervisor route, reads included, is admin-only. \
   Enforced in: `services/inventory/app/routers/hypervisors.py` (`get_hypervisors`) \
   Pinned by: `services/inventory/tests/test_hypervisors.py` (`test_user_cannot_list_hypervisors`, `test_user_cannot_create_hypervisor`)
+- **INV-HYP-13.** The hypervisor list is ordered newest first by `created_at`, and
+  hypervisors created at the same instant by id ascending, so `skip` and `limit` pages
+  never overlap or skip (issue #1589). \
+  Enforced in: `services/inventory/app/services/hypervisor_service.py` (`list_hypervisors`) \
+  Pinned by: `services/inventory/tests/test_list_order_tiebreak.py` (`test_hypervisors_list_breaks_created_at_ties_by_id`)
 - **INV-HYP-2.** A hypervisor name is unique (409
   `Hypervisor with name '<name>' already exists`); the type is free text. \
   Enforced in: `services/inventory/app/services/hypervisor_service.py` (`create_hypervisor`, `update_hypervisor`) \
