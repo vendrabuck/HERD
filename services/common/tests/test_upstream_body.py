@@ -97,13 +97,55 @@ def test_the_reasons_are_the_four_fixed_codes_and_no_other_is_accepted():
 
 
 def test_it_parses_through_the_responses_own_json_method():
-    """A stub that defines only `json()` works, as the services' unit tests use."""
+    """A stub that defines only `json(**kwargs)` works, as the services' unit tests
+    use (MagicMock included); the helper passes its `parse_constant` hook."""
+    seen: dict = {}
 
     class Stub:
-        def json(self):
+        def json(self, **kwargs):
+            seen.update(kwargs)
             return {"ok": True}
 
     assert read_json_body(Stub(), expect=dict) == {"ok": True}
+    assert set(seen) == {"parse_constant", "parse_float"}
+
+
+# Bodies the decoder accepts that no response can render again (`allow_nan=False`,
+# then UTF-8): each is not_json for every expect.
+UNRENDERABLE = {
+    "nan": b'{"a": NaN}',
+    "infinity": b"[Infinity]",
+    "minus_infinity": b"-Infinity",
+    "nested_nan": b'{"a": [1, {"b": NaN}]}',
+    "overflowing_float": b'{"a": 1e400}',
+    "overflowing_negative_float": b"[-1.5e999]",
+    "lone_high_surrogate": b'{"a": "\\ud800"}',
+    "lone_low_surrogate": b'"\\udfff"',
+    "lone_surrogate_key": b'{"\\udc00": 1}',
+    "nested_lone_surrogate": b'[[{"a": ["x\\ud800y"]}]]',
+}
+
+
+@pytest.mark.parametrize("expect_name", ADMITS)
+@pytest.mark.parametrize("body", UNRENDERABLE.values(), ids=UNRENDERABLE.keys())
+def test_a_non_finite_constant_or_a_lone_surrogate_is_not_json(body, expect_name):
+    with pytest.raises(UpstreamBodyUnusable) as caught:
+        read_json_body(_response(body), expect=ADMITS[expect_name][0])
+    assert caught.value.reason == NOT_JSON
+    _assert_carries_nothing(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "value"),
+    [
+        (b'{"a": "\\ud83d\\ude00"}', {"a": "\U0001f600"}),
+        (b'{"a": 1e308, "b": -0.0, "c": "NaN"}', {"a": 1e308, "b": -0.0, "c": "NaN"}),
+    ],
+    ids=["surrogate_pair", "finite_numbers_and_the_text_nan"],
+)
+def test_a_surrogate_pair_and_finite_numbers_are_honest(body, value):
+    """The honest neighbours of the table above are returned as parsed."""
+    assert read_json_body(_response(body), expect=dict) == value
 
 
 def test_the_table_is_not_vacuous():

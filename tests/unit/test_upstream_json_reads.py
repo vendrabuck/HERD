@@ -12,18 +12,29 @@ Pure AST, no imports of the scanned code: the scan reads every `*.py` file under
 `services/reservations/app/` and fails on
 
 - any attribute named `json`, called or not (`resp.json()`, `getter = resp.json`);
-- a call of `loads` or `load` on the `json` module imported under any name
-  (`import json as j` then `j.loads(...)`), or of either imported from it bare or
-  under an alias (`from json import loads as parse`).
+- an attribute `loads` or `load` of a name an import statement in the file binds to
+  the `json` module: `import json`, `import json as j`, or `import json.decoder`
+  (which binds `json` itself), so `json.loads(...)` and `j.load(...)` are flagged;
+- a call, by its bare name, of `loads` or `load` imported from `json`, bare or under
+  an alias (`from json import loads as parse` then `parse(...)`).
+
+An import anywhere in the file binds the name for the whole file, a function-local
+one included.
 
 Limits. The scan reads the source; it does not run it:
 
-- another JSON library (`orjson`, `ujson`, `simplejson`), `json.JSONDecoder`,
-  `json.decoder.scanstring`, and pydantic's `model_validate_json` or
-  `TypeAdapter.validate_json` are not looked for;
-- an attribute reached through `getattr(resp, "json")` or a string built at run
-  time is not seen;
-- a star import (`from json import *`) binds no name the scan follows;
+- not caught: `__import__("json").loads(...)` or `importlib.import_module("json")`;
+  `import json.decoder as d` then `d.scanstring(...)` (only `loads` and `load` are
+  looked for, and only on the `json` module itself); an alias of an imported
+  function that is passed or stored rather than called by its bare name
+  (`reader = parse`); `ast.literal_eval(resp.text)`; an attribute reached through
+  `getattr(resp, "json")`; a star import (`from json import *`);
+- not looked for: another JSON library (`orjson`, `ujson`, `simplejson`),
+  `json.JSONDecoder`, and pydantic's `model_validate_json` or
+  `TypeAdapter.validate_json`;
+- a false positive: an attribute named `json` that is not an upstream answer, such
+  as an honest `await request.json()` on the incoming request, is flagged too (no
+  route in reservations reads its body that way today);
 - only reservations is scanned: the other services' sites move to the helper later
   (the recommended option on #1577), and `herd_common` itself is not scanned.
 """
@@ -45,6 +56,9 @@ def _violations(source: str) -> list[tuple[int, str]]:
             for alias in node.names:
                 if alias.name == "json":
                     module_names.add(alias.asname or "json")
+                elif alias.asname is None and alias.name.startswith("json."):
+                    # `import json.decoder` binds `json` itself.
+                    module_names.add("json")
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "json":
             for alias in node.names:
                 if alias.name in PARSE_FUNCTIONS:
@@ -92,15 +106,32 @@ def test_the_scan_finds_each_form_and_passes_the_helper_call():
         "getter = resp.json": 1,
         "import json\njson.loads(resp.content)": 1,
         "import json as j\nj.load(fh)": 1,
+        "import json.decoder\njson.loads(b)": 1,
+        "import json.decoder as d\nimport json\njson.loads(b)": 1,
         "from json import loads\nloads(b)": 1,
         "from json import load as parse\nparse(fh)": 1,
         "x = client.get(u).json()['items']": 1,
+        "def f():\n    import json\n\ndef g(b):\n    return json.loads(b)": 1,
+        # The documented false positive: the incoming request's own body.
+        "async def route(request):\n    return await request.json()": 1,
     }
     for source, count in flagged.items():
         assert len(_violations(source)) == count, source
+    # The documented limits: each is a read the scan does not see.
+    missed = [
+        "__import__('json').loads(b)",
+        "import json.decoder as d\nd.scanstring(b, 0)",
+        "from json import loads as parse\nreader = parse",
+        "import ast\nast.literal_eval(resp.text)",
+        "getattr(resp, 'json')()",
+        "from json import *\nloads(b)",
+    ]
+    for source in missed:
+        assert _violations(source) == [], source
     clean = [
         "body = read_json_body(resp, expect=dict)",
         "import json\njson.dumps({})",
+        "import json.decoder as d\njson.loads(b)",
         "from json import dumps\ndumps({})",
         "loads(b)",
         "other.loads(b)",

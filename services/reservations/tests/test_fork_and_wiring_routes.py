@@ -528,6 +528,21 @@ async def test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 204], ids=["empty_200", "no_content_204"])
+@EVERY_UPSTREAM_ROUTE
+async def test_an_upstream_204_or_empty_2xx_relays_as_null(network, method, route, status):
+    """RES-FORK-10 and RES-FORK-18: a 2xx with no body is not "a body that does not
+    parse"; it relays as null with 200, the route's own status."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(return_value=httpx.Response(status, content=b""))
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == 200
+    assert resp.json() is None
+    assert network.calls.call_count == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("body", NOT_AN_OBJECT.values(), ids=NOT_AN_OBJECT.keys())
 @EVERY_UPSTREAM_ROUTE
 async def test_an_upstream_2xx_of_another_json_type_relays_unchanged(

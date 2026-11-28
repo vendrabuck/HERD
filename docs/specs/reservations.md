@@ -756,9 +756,11 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   Pinned by: `services/reservations/tests/test_reservations.py` (`test_update_reservation_non_admin_invisible_device_rejected`, `test_patch_device_ids_precheck_runs_for_a_non_admin_only`, `test_patch_without_device_ids_never_runs_the_visibility_precheck`, `test_patch_visibility_precheck_answers_before_the_owner_and_status_checks`)
 - **RES-PATCH-8.** On a topology-backed reservation, a device-set change re-runs
   cabling's validation for connectivity and membership with the routing pass skipped
-  (`l3=0`). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`) \
-  Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`, `test_patch_topology_membership_break_is_400_with_the_structured_body`)
+  (`l3=0`). A validation answer that cannot be read is RES-TOPO-6's 503 `Cabling
+  validation returned an answer that could not be read`, and the reservation is left
+  unchanged (issue #1577). \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`, `_validate_topology_connectivity`, `_usable_validation_answer`) \
+  Pinned by: `services/reservations/tests/test_upstream_answer_unusable.py` (`test_patch_devices_on_a_topology_answers_503_for_a_validation_it_cannot_use`); `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_device_change_revalidates_topology`); `services/reservations/tests/test_reservations.py` (`test_update_reservation_device_change_breaks_topology_rejected`, `test_patch_topology_membership_break_is_400_with_the_structured_body`)
 - **RES-PATCH-9.** An added exclusive device must not conflict over
   `[max(now, start), end)`, its bounds UTC instants whatever the process time zone (the
   end is the new end when the same PATCH sets one), checked by the same refusal create
@@ -994,7 +996,9 @@ routes in section 5; background work `purpose_classify_loop` every
   breaks any part of the rule above. It is logged as one WARNING with the fixed action
   `purpose_classify_bad_body`, a fixed `reason` (`not_json`, `too_deep`, `wrong_shape`,
   or `bad_text`), and the parsed top-level type's name as `body_type`, never body or
-  exception text. \
+  exception text. The shared read of issue #1577 refuses a number that is not finite
+  and an unpaired surrogate before the shape check, so those two are logged `not_json`
+  with `body_type` null; `bad_text` is a NUL. \
   Enforced in: `services/reservations/app/services/purpose_service.py` (`classify_purpose_one`, `_read_classify_body`, `_suggestion_refusal`, `_unstorable_text`, `_bump_purpose_classify_attempts`) \
   Pinned by: `services/reservations/tests/test_purpose_classify_reconcile.py` (`test_reconcile_timeout_bumps_attempts_and_does_not_end_tick`, `test_reconcile_500_increments_attempts`, `test_classify_one_maps_each_answer_to_its_outcome`, `test_reconcile_ends_or_continues_the_tick_by_answer`, `test_reconcile_unusable_200_reaches_the_attempt_cap_without_stalling`, `test_classify_one_logs_an_unusable_200_with_fixed_fields_only`, `test_the_unusable_200_table_covers_every_json_type_and_reason`)
 - **RES-PURPOSE-8.** A 200 whose body is a usable suggestion (RES-PURPOSE-7) stores it
@@ -1122,15 +1126,17 @@ reconcile on the expiration loop.
 - **RES-FORK-10.** A cabling 4xx is relayed with its status and unwrapped detail; a 5xx
   becomes 503 carrying cabling's JSON detail when there is one, else `Cabling service is
   unavailable`; a transport failure is 503. An error body that does not parse (not JSON,
-  not UTF-8, or nested deeper than the decoder's recursion limit) has no JSON detail: a
-  4xx relays its text, a 5xx is `Cabling service is unavailable`. A 2xx whose body does
-  not parse is 503 `Cabling service is unavailable`, except on save, where cabling most
-  likely committed: 503 `Cabling answered the save, but its answer could not be read;
-  reload the fork to see whether the save was applied`, and the sweep's wiring heal
-  (RES-FORK-13) stages the version. A 2xx that parses to any JSON value is relayed
-  unchanged, and an empty 2xx relays as null (issue #1577). \
+  not UTF-8, nested deeper than the decoder's recursion limit, or holding `NaN`,
+  `Infinity`, or a string or key with a lone surrogate, which no response can render
+  again) has no JSON detail: a 4xx relays its text, a 5xx is `Cabling service is
+  unavailable`. A 2xx whose body does not parse in the same sense is 503 `Cabling
+  service is unavailable`, except on save, where cabling most likely committed: 503
+  `Cabling answered the save, but its answer could not be read; reload the fork to see
+  whether the save was applied`, and the sweep's wiring heal (RES-FORK-13) stages the
+  version. A 2xx that parses to any other JSON value is relayed unchanged, and a 204 or
+  an empty 2xx relays as null (issue #1577). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`_relay_cabling_fork_response`, `_relay_success_body`, `_cabling_detail`, `FORK_SAVE_ANSWER_UNREADABLE`) \
-  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`, `test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording`, `test_an_upstream_2xx_of_another_json_type_relays_unchanged`, `test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_parse`)
+  Pinned by: `services/reservations/tests/test_fork_endpoints.py` (`test_save_port_conflict_409_structured_passthrough`, `test_get_fork_cabling_5xx_with_structured_json_relays_detail`, `test_get_fork_cabling_5xx_with_non_json_body_keeps_generic_message`, `test_get_fork_cabling_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_a_cabling_5xx_without_a_json_body_is_503_cabling_service_is_unavailable`, `test_an_upstream_transport_error_is_503_failed_to_contact`, `test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording`, `test_an_upstream_2xx_of_another_json_type_relays_unchanged`, `test_an_upstream_204_or_empty_2xx_relays_as_null`, `test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_parse`)
 - **RES-FORK-11.** Every transition into `COMPLETED`, `CANCELLED`, or `FAILED` except
   the create-path flip failure and the elapsed-window failure asks cabling to archive the
   fork, three attempts, after the commit; failure is logged and never undoes the
@@ -1154,9 +1160,13 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_wiring_changed_staging.py` (`test_sweep_creates_missing_fork_and_stages_initial_wiring`); `services/reservations/tests/test_fork_backstop_giveup.py` (`test_backs_off_after_cap`)
 - **RES-FORK-15.** When cabling's active-fork listing fails, the whole fork reconcile
   (archive, heal, backstop) is skipped for that tick, a 200 whose body does not parse
-  or is not an object included (issue #1577). \
-  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`); `services/reservations/app/services/reservation_service.py` (`_fetch_active_forks`) \
-  Pinned by: `services/reservations/tests/test_fork_archive_reconcile.py` (`test_reconcile_survives_fetch_failure`); `services/reservations/tests/test_upstream_answer_unusable.py` (`test_an_active_fork_listing_it_cannot_use_skips_the_tick_reconcile`)
+  or is not the declared shape included: an object whose `forks`, when present, is a
+  list of objects each with a UUID string `reservation_id` and an integer
+  `latest_fork_version`, and whose `total`, when present, is an integer. A wrong field
+  is refused before it is converted, so its text never reaches the failure's log line
+  (issue #1577). \
+  Enforced in: `services/reservations/app/tasks/expiration.py` (`_run_fork_archive_reconcile`); `services/reservations/app/services/reservation_service.py` (`_fetch_active_forks`, `_usable_active_fork_entry`) \
+  Pinned by: `services/reservations/tests/test_fork_archive_reconcile.py` (`test_reconcile_survives_fetch_failure`); `services/reservations/tests/test_upstream_answer_unusable.py` (`test_an_active_fork_listing_it_cannot_use_skips_the_tick_reconcile`, `test_an_honest_active_fork_listing_is_read`)
 - **RES-FORK-16.** The removed-device prune stages cabling's `released` delta; a 404
   keeps the marker only while a fork can still appear (ACTIVE with a topology), a 409
   (archived) clears it, and a 5xx or transport error keeps it. So does a 2xx whose
@@ -1203,11 +1213,13 @@ reconcile on the expiration loop.
   Pinned by: `services/reservations/tests/test_pending_fork_prune.py` (`test_every_emptying_path_stores_sql_null_and_is_never_selected`, `test_union_during_an_inflight_prune_keeps_a_list_then_clears_to_sql_null`, `test_a_new_marker_is_pruned_behind_more_than_a_batch_of_emptied_rows`, `test_a_non_actionable_marker_is_healed_and_the_rows_behind_it_still_run`, `test_a_corrupt_marker_is_logged_at_error_by_type_only`, `test_a_real_marker_written_between_the_select_and_the_heal_survives`, `test_the_heal_leaves_sql_null_and_real_markers_unwritten`); `services/reservations/tests/test_pending_fork_prune_sql_null_migration.py` (`test_upgrade_leaves_exactly_sql_null_or_a_non_empty_list_and_runs_twice`, `test_upgrade_honours_db_schema`); `services/reservations/tests/test_pending_fork_prune_live_pg.py` (`test_every_orm_emptying_write_stores_sql_null_on_postgres`, `test_the_heal_stores_sql_null_for_json_null_and_a_corrupt_marker_on_postgres`, `test_the_heal_holds_the_row_lock_from_its_re_read_to_its_update`, `test_migration_0018_rewrites_empty_markers_to_sql_null_on_postgres`)
 - **RES-FORK-18.** Wiring status is readable in any status; wiring retry is refused with
   409 on `PENDING` and `PENDING_PROVISION`; execution's 4xx is relayed and its 5xx or
-  absence is 503. A 2xx whose body does not parse (not JSON, not UTF-8, or nested
-  deeper than the decoder's recursion limit) is 503 `Execution service is unavailable`;
-  a 2xx that parses to any JSON value is relayed unchanged (issue #1577). \
+  absence is 503. A 2xx whose body does not parse (not JSON, not UTF-8, nested deeper
+  than the decoder's recursion limit, or holding `NaN`, `Infinity`, or a string or key
+  with a lone surrogate) is 503 `Execution service is unavailable`; a 2xx that parses
+  to any other JSON value is relayed unchanged, and a 204 or an empty 2xx relays as
+  null (issue #1577). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_wiring_status`, `retry_reservation_wiring`, `_relay_execution_response`, `_relay_success_body`) \
-  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`, `test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording`, `test_an_upstream_2xx_of_another_json_type_relays_unchanged`)
+  Pinned by: `services/reservations/tests/test_wiring_proxy_endpoints.py` (`test_status_allowed_for_completed_reservation`, `test_retry_pre_provision_409_pinned_wording`, `test_retry_execution_frozen_409_passthrough`, `test_retry_execution_unreachable_maps_to_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_4xx_is_relayed_with_its_status_and_unwrapped_detail`, `test_an_upstream_5xx_is_503`, `test_an_upstream_transport_error_is_503_failed_to_contact`, `test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording`, `test_an_upstream_2xx_of_another_json_type_relays_unchanged`, `test_an_upstream_204_or_empty_2xx_relays_as_null`)
 - **RES-FORK-19.** The detail modal offers Edit topology (an `ACTIVE` reservation) and
   View as-built (an ended one) only to the owner, and only when the reservation has a
   `topology_id`; an admin who does not own the reservation sees neither, although the
@@ -1417,7 +1429,7 @@ sweep, and event delivery never return an error to a caller.
 | 503 | `Could not verify device visibility; reservations were not returned. Retry the request.` | non-admin calendar while the visibility lookup cannot be answered | RES-CAL-3 |
 | 503 | `Failed to reserve devices in inventory after retries: ...` | the create-path inventory flip exhausted its attempts | RES-CREATE-15 |
 | 503 | `Cabling validation returned <status>: ...` or `Failed to contact cabling service: ...` | topology validation failed on create or PATCH | RES-TOPO-6, RES-PATCH-8 |
-| 503 | `Cabling validation returned an answer that could not be read` | cabling answered topology validation with a 200 whose body does not parse or is not the declared shape | RES-TOPO-6 |
+| 503 | `Cabling validation returned an answer that could not be read` | cabling answered topology validation on create or PATCH with a 200 whose body does not parse or is not the declared shape | RES-TOPO-6, RES-PATCH-8 |
 | 503 | `{"error": "purpose_classification_disabled"}` | Classify now with the feature off | RES-PURPOSE-13 |
 | 503 | cabling's JSON detail, or `Cabling service is unavailable` | cabling answered 5xx to a forwarded fork call, or a 2xx whose body does not parse (the latter is always the fixed wording) | RES-FORK-10 |
 | 503 | `Cabling answered the save, but its answer could not be read; reload the fork to see whether the save was applied` | cabling answered a save with a 2xx whose body does not parse | RES-FORK-10 |
@@ -1436,8 +1448,9 @@ Calls into this area are in section 7; events are in section 6.
 
 Every body read from a peer goes through `herd_common.upstream_body.read_json_body`
 (issue #1577). In the "On failure" column, a 200 that cannot be read means one whose
-body does not parse (not JSON, not UTF-8, or nested deeper than the decoder's recursion
-limit) or is not the declared shape the row's rule names; it takes the same answer as
+body does not parse (not JSON, not UTF-8, nested deeper than the decoder's recursion
+limit, or holding `NaN`, `Infinity`, or a lone surrogate) or is not the declared shape
+the row's rule names; it takes the same answer as
 the row's other failures unless the row says otherwise.
 
 | Direction | Peer | Call | Purpose | On failure |

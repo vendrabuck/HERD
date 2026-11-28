@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests._upstream_bodies import (
     EVERY_BAD_BODY,
+    MARKER,
     UNPARSEABLE,
     answer,
     assert_nothing_leaked,
@@ -224,12 +225,51 @@ async def test_create_answers_503_for_a_device_batch_it_cannot_use(network, capl
     assert_nothing_leaked(resp.text, caplog.text)
 
 
+def _inventory_device_response(**overrides) -> dict:
+    """A record shaped like inventory's full `DeviceResponse`, extra fields included:
+    the honest answer the field checks must accept."""
+    record = {
+        **_device(),
+        "template_id": str(uuid.uuid4()),
+        "template_name": "Switch",
+        "template_icon": None,
+        "template_vendor": "Acme",
+        "template_model": "S1",
+        "template_part_number": None,
+        "field_data": {"rack": "A1", "nested": {"slot": 3}},
+        "driver_id": None,
+        "driver_name": None,
+        "driver_filename": None,
+        "connection_type": "ssh",
+        "created_at": "2026-11-01T00:00:00Z",
+        "updated_at": "2026-11-01T00:00:00Z",
+        "created_by": str(uuid.uuid4()),
+        "created_by_name": "admin",
+        "modified_by": None,
+        "modified_by_name": None,
+        "poll_interval_seconds": None,
+        "resolved_poll_interval_seconds": 60,
+    }
+    record.update(overrides)
+    return record
+
+
+_WITHOUT_EXCLUSIVE = {k: v for k, v in _inventory_device_response().items() if k != "exclusive"}
+HONEST_BATCHES = {
+    "full_record": {"items": [_inventory_device_response()], "total": 1},
+    "non_exclusive": {"items": [_inventory_device_response(exclusive=False)]},
+    # `exclusive` is defaulted in DeviceResponse; a record without it reads as exclusive.
+    "no_exclusive_field": {"items": [_WITHOUT_EXCLUSIVE]},
+    "cloud": {"items": [_inventory_device_response(topology_type="CLOUD")]},
+}
+
+
 @pytest.mark.asyncio
-async def test_create_books_with_a_usable_device_batch(network):
-    """The control for the table above: the same booking with a usable answer."""
-    network.post(f"{INV}/devices/batch").mock(
-        return_value=httpx.Response(200, json={"items": [_device()]})
-    )
+@pytest.mark.parametrize("batch", HONEST_BATCHES.values(), ids=HONEST_BATCHES.keys())
+async def test_create_books_with_a_usable_device_batch(network, batch):
+    """The control for the table above: honest answers book, a record without
+    `exclusive` included."""
+    network.post(f"{INV}/devices/batch").mock(return_value=httpx.Response(200, json=batch))
     async with _client() as ac:
         resp = await ac.post("/", json=_booking())
     assert resp.status_code == 201, resp.text
@@ -293,6 +333,36 @@ async def test_create_with_a_topology_answers_503_for_a_validation_it_cannot_use
     assert resp.status_code == 503
     assert resp.json() == {"detail": CABLING_VALIDATION_ANSWER_UNUSABLE}
     assert await _rows() == []
+    assert_nothing_leaked(resp.text, caplog.text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", BAD_VALIDATIONS.values(), ids=BAD_VALIDATIONS.keys())
+async def test_patch_devices_on_a_topology_answers_503_for_a_validation_it_cannot_use(
+    network, caplog, body
+):
+    """RES-PATCH-8: the same fixed 503 on a device-set PATCH, and the row unchanged."""
+    rid = await _insert(
+        ReservationStatus.PENDING,
+        start=NOW + timedelta(days=1),
+        end=NOW + timedelta(days=1, hours=2),
+        topology_id=TOPOLOGY,
+    )
+    other = uuid.uuid4()
+    network.post(f"{INV}/devices/batch").mock(
+        return_value=httpx.Response(200, json={"items": [_device(), _device(other)]})
+    )
+    validate = network.post(f"{CAB}/topologies/{TOPOLOGY}/validate/internal").mock(
+        return_value=answer(200, body)
+    )
+    caplog.set_level(logging.DEBUG)
+    async with _client() as ac:
+        resp = await ac.patch(f"/{rid}", json={"device_ids": [str(DEVICE), str(other)]})
+    assert validate.call_count == 1
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": CABLING_VALIDATION_ANSWER_UNUSABLE}
+    (row,) = await _rows()
+    assert [str(d) for d in row.device_ids] == [str(DEVICE)]
     assert_nothing_leaked(resp.text, caplog.text)
 
 
@@ -621,17 +691,62 @@ async def test_a_prune_answer_it_cannot_use_keeps_the_marker_and_logs_a_fixed_ac
     assert_nothing_leaked(caplog.text)
 
 
+_FORK_ID = str(uuid.uuid4())
+BAD_FORK_LISTINGS = {
+    **EVERY_BAD_BODY,
+    **objects(
+        {"forks": "x"},
+        {"forks": {"reservation_id": _FORK_ID}},
+        {"forks": [MARKER]},
+        {"forks": [{"reservation_id": MARKER, "latest_fork_version": 1}]},
+        {"forks": [{"reservation_id": 5, "latest_fork_version": 1}]},
+        {"forks": [{"latest_fork_version": 1}]},
+        {"forks": [{"reservation_id": _FORK_ID, "latest_fork_version": MARKER}]},
+        {"forks": [{"reservation_id": _FORK_ID, "latest_fork_version": "3"}]},
+        {"forks": [{"reservation_id": _FORK_ID, "latest_fork_version": 2.7}]},
+        {"forks": [{"reservation_id": _FORK_ID, "latest_fork_version": True}]},
+        {"forks": [{"reservation_id": _FORK_ID}]},
+        {"forks": [], "total": MARKER},
+        {"forks": [], "total": 1.5},
+    ),
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body", EVERY_BAD_BODY.values(), ids=EVERY_BAD_BODY.keys())
-async def test_an_active_fork_listing_it_cannot_use_skips_the_tick_reconcile(network, body):
+@pytest.mark.parametrize("body", BAD_FORK_LISTINGS.values(), ids=BAD_FORK_LISTINGS.keys())
+async def test_an_active_fork_listing_it_cannot_use_skips_the_tick_reconcile(network, caplog, body):
     """RES-FORK-15: the listing raises the helper's one type, and the reconcile skips
-    the tick (no archive, no heal, no create)."""
+    the tick (no archive, no heal, no create). A field that would have been converted
+    unchecked (`int("<text>")` quotes the text into the caller's exc_info log) is
+    refused before it is converted, so nothing it held reaches the log, and a float
+    or a boolean is no longer taken as a version."""
     network.get(f"{CAB}/internal/forks").mock(return_value=answer(200, body))
     other = network.route(method="POST").mock(return_value=httpx.Response(200, json={}))
+    caplog.set_level(logging.DEBUG)
     with pytest.raises(UpstreamBodyUnusable):
         await _fetch_active_forks()
     await _run_fork_archive_reconcile()
     assert other.call_count == 0
+    assert "fork_reconcile_fetch_failed" in [r.__dict__.get("action") for r in caplog.records]
+    assert_nothing_leaked(caplog.text)
+
+
+@pytest.mark.asyncio
+async def test_an_honest_active_fork_listing_is_read(network):
+    """The control: the declared shape, with an extra field and an explicit total."""
+    network.get(f"{CAB}/internal/forks").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "forks": [
+                    {"reservation_id": _FORK_ID, "latest_fork_version": 4, "status": "ACTIVE"}
+                ],
+                "reservation_ids": [_FORK_ID],
+                "total": 1,
+            },
+        )
+    )
+    assert await _fetch_active_forks() == [(uuid.UUID(_FORK_ID), 4)]
 
 
 def test_the_tables_cover_every_unparseable_kind_and_every_json_type():
@@ -643,6 +758,10 @@ def test_the_tables_cover_every_unparseable_kind_and_every_json_type():
         "huge_integer",
         "deep_array",
         "deep_object",
+        "nan",
+        "infinity",
+        "lone_surrogate",
+        "lone_surrogate_key",
     }
     parsed_types = set()
     for name, body in EVERY_BAD_BODY.items():

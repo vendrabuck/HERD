@@ -753,10 +753,12 @@ async def _create_reservation_fork_best_effort(
     the bench; the fork is created lazily on first edit.
 
     Returns True unless the create itself exhausted its retries (the genuine
-    failure case), so a caller that wants to notice repeated failure, like the
-    expiration sweep's fork backstop, can (issue #448 item 1). A null topology_id
+    failure case) or answered a 2xx it cannot read, so a caller that wants to
+    notice repeated failure, like the expiration sweep's fork backstop, can (issue
+    #448 item 1). A null topology_id
     (Decision 3 Case A) is a deliberate skip, not a failure, and still returns
-    True; only the retry-exhausted except branch returns False. The best-effort
+    True; only two branches return False: the retry-exhausted except branch, and a
+    2xx whose answer cannot be read (UpstreamBodyUnusable, issue #1577). The best-effort
     wiring_changed staging that follows a successful create is itself independently
     best-effort and does not affect this return value.
 
@@ -1423,6 +1425,16 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
         )
 
 
+def _usable_active_fork_entry(entry: object) -> bool:
+    """Whether one entry of cabling's active-fork listing is an object with a UUID
+    string `reservation_id` and a JSON integer `latest_fork_version` (issue #1577)."""
+    return (
+        isinstance(entry, dict)
+        and _is_uuid_text(entry.get("reservation_id"))
+        and _is_json_integer(entry.get("latest_fork_version"))
+    )
+
+
 async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
     """Return (reservation_id, latest_fork_version) for every ACTIVE fork, paging fully.
 
@@ -1457,13 +1469,23 @@ async def _fetch_active_forks() -> list[tuple[uuid.UUID, int]]:
             resp.raise_for_status()
             # Issue #1577: an unusable body raises; the caller skips the tick's
             # fork reconcile (RES-FORK-15), as for any other failure here.
+            # Every field is checked before it is converted, so a wrong one raises
+            # the helper's fixed-text exception, never a conversion error that
+            # quotes the value into the caller's exc_info log.
             body = read_json_body(resp, expect=dict)
+            entries = body.get("forks", [])
+            if not isinstance(entries, list) or not all(
+                _usable_active_fork_entry(entry) for entry in entries
+            ):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
             page = [
-                (uuid.UUID(str(entry["reservation_id"])), int(entry["latest_fork_version"]))
-                for entry in body.get("forks", [])
+                (uuid.UUID(entry["reservation_id"]), entry["latest_fork_version"])
+                for entry in entries
             ]
             forks.extend(page)
             total = body.get("total", len(forks))
+            if not _is_json_integer(total):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
             skip += limit
             if not page or len(page) < limit or skip >= total:
                 break

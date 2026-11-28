@@ -5,11 +5,12 @@ Every upstream answer the reservations service reads goes through
 site cannot use, as raw bytes served with `content-type: application/json` (what a
 proxy, a sidecar, or a misdirected service URL could answer in a sibling's place).
 
-- `UNPARSEABLE`: bodies the decoder refuses: empty, not JSON, not UTF-8, an
-  integer past Python's digit limit (all `ValueError`), and an array and an object
-  nested far past every interpreter's recursion limit (`RecursionError`; the depth
-  at which the decoder raises differs between 3.12 and 3.14, #1487, so 100,000 is
-  used).
+- `UNPARSEABLE`: bodies the helper refuses as not parsing: empty, not JSON, not
+  UTF-8, an integer past Python's digit limit (all `ValueError`), an array and an
+  object nested far past every interpreter's recursion limit (`RecursionError`; the
+  depth at which the decoder raises differs between 3.12 and 3.14, #1487, so 100,000
+  is used), and `NaN`, `Infinity`, and a lone surrogate in a string or a key, which
+  the decoder accepts but no response can render again.
 - `NOT_AN_OBJECT`: bodies that parse to something other than a JSON object.
 
 Each body that holds text carries `MARKER`, so a test can assert that nothing the
@@ -32,6 +33,12 @@ UNPARSEABLE: dict[str, bytes] = {
     "huge_integer": b"9" * 5_000,
     "deep_array": b"[" * DEPTH + b"]" * DEPTH,
     "deep_object": b'{"a":' * DEPTH + b"1" + b"}" * DEPTH,
+    # Python's decoder accepts these, but no response can render them again
+    # (`allow_nan=False`, UTF-8), so the helper refuses them as `not_json`.
+    "nan": b'{"a": NaN}',
+    "infinity": b"[-Infinity]",
+    "lone_surrogate": b'{"a": "\\ud800"}',
+    "lone_surrogate_key": b'{"\\udc00": 1}',
 }
 
 NOT_AN_OBJECT: dict[str, bytes] = {

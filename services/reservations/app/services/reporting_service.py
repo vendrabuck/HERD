@@ -620,7 +620,11 @@ def _build_fleet_section(
         try:
             device_id = uuid.UUID(str(d["id"]))
         except (KeyError, ValueError, TypeError):
-            logger.warning("fleet report skipping inventory device with unusable id: %r", d)
+            # Issue #1577: the entry's type only, never its text (an upstream value).
+            logger.warning(
+                "fleet report skipping inventory device with unusable id (a %s)",
+                type(d).__name__,
+            )
             continue
         hours = fleet_device_hours.get(device_id, 0.0)
         total_reserved += hours
