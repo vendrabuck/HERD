@@ -626,6 +626,14 @@ TOPO-TVER-5 (section 4).
   restore is blocked while a reservation still references the topology). \
   Enforced in: `services/cabling/app/routes/versions.py` (`restore_version`); `services/cabling/app/services/reservation_guard.py` (`find_blocking_reservations`) \
   Pinned by: `services/cabling/tests/test_topology_versions.py` (`test_restore_blocked_by_active_reservation`); `services/cabling/tests/test_route_handlers_direct.py` (`test_versions_restore_blocked_by_active_reservation`)
+- **TOPO-VER-6.** The editor's History panel lists every version of the topology, newest
+  first, read across all pages of the list route (500 a page), so the oldest version of
+  a long history can be viewed, compared, and restored; a failed read of any page shows
+  `Failed to load versions.` and no rows, never the newest page alone. By decision
+  (issue #1591, owner option 1 of 2026-11-28: walk every page rather than add a Load
+  older control). \
+  Enforced in: `frontend/src/components/topology-editor/HistoryPanel.tsx` (`HistoryPanel`); `frontend/src/api/topologies.ts` (`useAllTopologyVersions`) \
+  Pinned by: `frontend/src/test/components/HistoryPanel.test.tsx` (`a short history is one request and lists every version`, `201 versions, past the old 200 cap, list version 1 and version 201`, `501 versions, past one page, walk two pages and list the oldest and the newest`, `a failed second page shows the load error, never the first page alone`, `View, Restore, and Compare reach the oldest version of a long history`)
 
 **Out of scope.** Fork versions are section 8.12.
 

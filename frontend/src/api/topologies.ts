@@ -13,6 +13,7 @@ import type {
 import type { PaginatedResponse } from "@/types/pagination.types";
 import type { TopologyOwnerFilter, TopologySortField } from "@/lib/topologyFilters";
 import apiClient from "./client";
+import { fetchAllPages } from "./paging";
 import { errorDetail, formatTopologyInUse, topologyInUseDetail } from "@/lib/errors";
 
 // The list controls the Topologies page sends (issue #958). Every field is
@@ -220,6 +221,19 @@ export function useTopologyVersions(topologyId: string | undefined, skip = 0, li
     queryFn: () => fetchVersions(topologyId!, skip, limit),
     enabled: !!topologyId,
     placeholderData: keepPreviousData,
+  });
+}
+
+// Every version of the topology, newest first, across all pages (issue
+// #1591), for the History panel, which lists them all: nothing prunes
+// versions, so a long-lived topology passes any one page. Under the
+// ["topologies", id, "versions"] prefix that restore invalidates. The route
+// orders by version_number, unique per topology, so the walk is exact.
+export function useAllTopologyVersions(topologyId: string | undefined) {
+  return useQuery({
+    queryKey: ["topologies", topologyId, "versions", "all"],
+    queryFn: () => fetchAllPages((skip, limit) => fetchVersions(topologyId!, skip, limit)),
+    enabled: !!topologyId,
   });
 }
 
