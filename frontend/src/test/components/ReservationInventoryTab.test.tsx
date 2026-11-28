@@ -1,11 +1,13 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
 import { describe, it, expect, beforeEach } from "vitest";
 
 import { server } from "../mocks/server";
+import { tabTo } from "../rowNavigationHarness";
 import { ReservationInventoryTab } from "@/components/reservations/ReservationInventoryTab";
 
 function renderWithProviders(node: ReactNode) {
@@ -128,6 +130,49 @@ describe("ReservationInventoryTab", () => {
     expect(link).toHaveAttribute("href", `/inventory/${DEVICE_B.id}`);
     // The unconnected port (eth1/2) renders without a link.
     expect(screen.getByText("eth1/2")).toBeInTheDocument();
+  });
+
+  describe("keyboard disclosure (issue #1405)", () => {
+    // One activation flips the state once; a second handler firing on the same
+    // key would flip it back, so each expected state also proves one toggle.
+    it.each([
+      ["Enter", "{Enter}"],
+      ["Space", " "],
+    ])("Tab reaches the device header and %s toggles it, aria-expanded following", async (_label, key) => {
+      const user = userEvent.setup();
+      renderWithProviders(<ReservationInventoryTab deviceIds={[DEVICE_A.id]} />);
+      await screen.findByText("fw-edge-1");
+      const header = screen.getByRole("button", { name: /^fw-edge-1/ });
+      expect(header).toHaveAttribute("aria-expanded", "false");
+      const panelId = header.getAttribute("aria-controls");
+      expect(panelId).toBeTruthy();
+      const panel = document.getElementById(panelId as string);
+      expect(panel).not.toBeNull();
+
+      await tabTo(user, header);
+      await user.keyboard(key);
+      expect(header).toHaveAttribute("aria-expanded", "true");
+      // The ports detail mounts inside the panel the header controls.
+      expect(await within(panel as HTMLElement).findByText("No ports")).toBeInTheDocument();
+
+      await user.keyboard(key);
+      expect(header).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByText("No ports")).not.toBeInTheDocument();
+    });
+
+    it("gives each device its own header with its own panel", async () => {
+      renderWithProviders(
+        <ReservationInventoryTab deviceIds={[DEVICE_A.id, DEVICE_B.id]} />,
+      );
+      await screen.findByText("sw-core-1");
+      const a = screen.getByRole("button", { name: /^fw-edge-1/ });
+      const b = screen.getByRole("button", { name: /^sw-core-1/ });
+      expect(a.getAttribute("aria-controls")).not.toBe(b.getAttribute("aria-controls"));
+
+      fireEvent.click(a);
+      expect(a).toHaveAttribute("aria-expanded", "true");
+      expect(b).toHaveAttribute("aria-expanded", "false");
+    });
   });
 
   it("falls back to a truncated id when the device lookup is missing", async () => {

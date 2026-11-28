@@ -1,4 +1,5 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect, useId } from "react";
+import type { MouseEvent } from "react";
 import { Modal } from "@/components/ui/Modal";
 import { useUpdateReservation } from "@/api/reservations";
 import { usePaginatedDevices, useAllDeviceNames } from "@/api/inventory";
@@ -60,6 +61,42 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
     });
   };
 
+  // Focus after an Add or Remove (issue #1405, WCAG 2.4.3). The activated
+  // button leaves its list, so focus would fall back to the dialog and the next
+  // Tab would start at the top again. Instead it moves to the control that
+  // takes its place in the same list: the next one, else the previous one,
+  // else the search box. Only a button that held focus hands it on, so a
+  // mouse click where the browser does not focus buttons moves nothing.
+  const addListRef = useRef<HTMLDivElement>(null);
+  const selectedListRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  // The request is state, not a ref, so the click handler touches no ref (the
+  // react-hooks/refs rule, see WiringDialog); each activation sets a new
+  // object, so the effect runs once per request, after the toggle committed.
+  const [focusRequest, setFocusRequest] = useState<{
+    list: "add" | "selected";
+    index: number;
+  } | null>(null);
+  const rowIdBase = useId();
+
+  const activate = (
+    e: MouseEvent<HTMLButtonElement>,
+    id: string,
+    list: "add" | "selected",
+    index: number,
+  ) => {
+    if (document.activeElement === e.currentTarget) setFocusRequest({ list, index });
+    handleToggle(id);
+  };
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    const container = focusRequest.list === "add" ? addListRef.current : selectedListRef.current;
+    const buttons = container?.querySelectorAll<HTMLButtonElement>("button") ?? [];
+    const target = buttons[Math.min(focusRequest.index, buttons.length - 1)] ?? searchRef.current;
+    target?.focus();
+  }, [focusRequest]);
+
   const handleSave = async () => {
     if (selectedIds.size === 0) {
       toast.error("At least one device must be selected");
@@ -93,13 +130,17 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
         {/* Current devices */}
         <div>
           <h4 className="text-xs font-medium text-gray-500 uppercase mb-2">
-            Selected Devices ({selectedIds.size})
+            {/* A polite status region, the list pages' selection-count pattern:
+                an add or remove is announced by the new count. */}
+            <span role="status" aria-live="polite">
+              Selected Devices ({selectedIds.size})
+            </span>
           </h4>
-          <div className="border border-gray-200 rounded max-h-40 overflow-y-auto">
+          <div ref={selectedListRef} className="border border-gray-200 rounded max-h-40 overflow-y-auto">
             {selectedIds.size === 0 ? (
               <p className="text-sm text-gray-400 text-center py-3">No devices selected</p>
             ) : (
-              Array.from(selectedIds).map((id) => (
+              Array.from(selectedIds).map((id, index) => (
                 <div
                   key={id}
                   className="flex items-center justify-between px-3 py-1.5 border-b border-gray-100 last:border-b-0"
@@ -108,7 +149,8 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
                     {currentDeviceNames.get(id) ?? id.slice(0, 8) + "..."}
                   </span>
                   <button
-                    onClick={() => handleToggle(id)}
+                    type="button"
+                    onClick={(e) => activate(e, id, "selected", index)}
                     className="text-xs text-red-500 hover:text-red-700 px-1.5 py-0.5"
                   >
                     Remove
@@ -123,13 +165,15 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
         <div>
           <h4 className="text-xs font-medium text-gray-500 uppercase mb-2">Add Devices</h4>
           <input
+            ref={searchRef}
             type="text"
             placeholder="Search available devices..."
+            aria-label="Search available devices"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm mb-2"
           />
-          <div className="border border-gray-200 rounded max-h-48 overflow-y-auto">
+          <div ref={addListRef} className="border border-gray-200 rounded max-h-48 overflow-y-auto">
             {isLoading && (
               <p className="text-sm text-gray-400 text-center py-3">Loading...</p>
             )}
@@ -138,18 +182,28 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
             )}
             {availableDevices
               .filter((d) => !selectedIds.has(d.id))
-              .map((d) => (
-                <div
+              .map((d, index) => (
+                // The whole row is one native button (issue #1405), so Tab
+                // reaches it and Enter or Space adds the device; there is no
+                // second click handler on a wrapper to fire twice. The name
+                // replaces the visible content, so the template, which sighted
+                // users see, is carried as the description.
+                <button
                   key={d.id}
-                  className="flex items-center justify-between px-3 py-1.5 border-b border-gray-100 last:border-b-0 hover:bg-gray-50 cursor-pointer"
-                  onClick={() => handleToggle(d.id)}
+                  type="button"
+                  aria-label={`Add ${d.name}`}
+                  aria-describedby={d.template_name ? `${rowIdBase}-template-${d.id}` : undefined}
+                  className="w-full flex items-center justify-between px-3 py-1.5 text-left border-b border-gray-100 last:border-b-0 hover:bg-gray-50 cursor-pointer focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500"
+                  onClick={(e) => activate(e, d.id, "add", index)}
                 >
-                  <div>
+                  <span>
                     <span className="text-sm text-gray-700">{d.name}</span>
-                    <span className="text-xs text-gray-400 ml-2">{d.template_name}</span>
-                  </div>
+                    <span id={`${rowIdBase}-template-${d.id}`} className="text-xs text-gray-400 ml-2">
+                      {d.template_name}
+                    </span>
+                  </span>
                   <span className="text-xs text-blue-600">Add</span>
-                </div>
+                </button>
               ))}
           </div>
         </div>

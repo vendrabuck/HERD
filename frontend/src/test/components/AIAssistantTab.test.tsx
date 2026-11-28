@@ -210,6 +210,14 @@ describe("AIAssistantTab", () => {
     expect(screen.getByRole("button", { name: "Ask" })).toBeDisabled();
   });
 
+  it("names the question box (issue #1405)", () => {
+    renderWithProviders(<Harness />);
+    expect(screen.getByRole("textbox", { name: "Question" })).toHaveAttribute(
+      "placeholder",
+      "What devices are in my reservation and how are they connected?",
+    );
+  });
+
   it("toasts on 503 and clears the prior answer", async () => {
     server.use(
       http.post("/api/ai/reservations/res-1/assistant", () =>
@@ -341,6 +349,14 @@ describe("AIAssistantChat (Branch 3, streaming)", () => {
       // ignore
     }
     toastError.mockClear();
+  });
+
+  it("names the chat question box (issue #1405)", () => {
+    renderWithProviders(<ChatHarness />);
+    expect(screen.getByRole("textbox", { name: "Question" })).toHaveAttribute(
+      "data-testid",
+      "assistant-input",
+    );
   });
 
   it("streams tokens then appends the final assistant message on send", async () => {
