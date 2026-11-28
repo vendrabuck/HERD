@@ -1364,18 +1364,21 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
   Enforced in: `services/cabling/app/services/bulk_service.py` (`parse_csv_topologies`); `services/common/herd_common/csv_import.py` (`read_csv_rows`, `CSV_UNREADABLE_DETAIL`, `_FIELD_LIMIT_LOCK`) \
   Pinned by: `services/cabling/tests/test_bulk.py` (`test_a_device_cell_past_the_field_limit_is_judged_not_a_500`, `test_a_topology_name_past_the_field_limit_is_read`, `test_every_line_ending_imports_the_same_topologies`, `test_a_cr_only_csv_with_edges_imports_its_wiring`, `test_a_bare_cr_in_an_unquoted_cell_ends_the_line`, `test_csv_the_module_reads_leniently_is_judged_not_a_500`, `test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing`); `services/cabling/tests/test_route_handlers_direct.py` (`test_parse_csv_reads_a_cr_only_file`, `test_parse_csv_a_csv_error_is_the_fixed_422`); `tests/integration/test_bulk_import_export.py` (`test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin`); `services/common/tests/test_csv_import.py` (`test_two_overlapping_reads_never_put_the_limit_back_under_each_other`)
 - **TOPO-BULK-23.** The import's file work and the export's rendering run off the
-  event loop, so the service answers other requests while they run. The decode, the
+  event loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
+  whole-file JSON decode and the lone surrogate scan's serialization of the parsed
+  document (on one core, about 60 ms and about 50 ms for a 10 MiB file). The decode, the
   CSV or JSON parse, the lone surrogate scan, the shape check of every record, and the
   collection of the device names to resolve run on a worker thread before the
   visibility lookup and the first query; the export builds its records and its body
   the same way, reading only each topology's `name` and `canvas_data`, which its query
-  loaded. The threads are the shared `run_bulk_work`'s, the ones inventory's importers
+  loaded; the route closes its database session first, so it holds no pooled
+  connection while it waits for a slot or renders. The threads are the shared `run_bulk_work`'s, the ones inventory's importers
   use (INV-BULK-27 in `inventory.md`): never asyncio's default executor, and at most
   two bulk parses or renders at once in the process. Each row's canvas rewrite,
   validation, and writes stay on the event loop in the request's session, as an
   interactive topology save's do, so every row's outcome and reason are unchanged. \
   Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_read_import`, `render_export`); `services/cabling/app/routes/bulk.py` (`export_topologies`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `BULK_WORK_THREADS`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_the_device_names_are_collected_with_the_parse`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`); `services/common/tests/test_bulk_work.py` (`test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_the_work_never_takes_the_default_executor`)
 
 **Out of scope.** Device and inventory template import is `inventory.md`.
 

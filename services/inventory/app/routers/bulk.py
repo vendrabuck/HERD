@@ -80,9 +80,12 @@ _CSV_MEDIA = "text/csv"
 _JSON_MEDIA = "application/json"
 
 
-async def _export_response(records, columns, resource, fmt, text_columns=None):
+async def _export_response(db, records, columns, resource, fmt, text_columns=None):
     """The export file. The records are plain dicts built on the event loop; their
-    rendering into one body runs on a bulk worker thread (issue #1417)."""
+    rendering into one body runs on a bulk worker thread (issue #1417). The session
+    is closed first, so the request holds no pooled database connection while it
+    waits for a bulk slot or renders; nothing after this reads the database."""
+    await db.close()
     if fmt == "json":
         body = await run_bulk_work(records_to_json, records, resource)
         media = _JSON_MEDIA
@@ -115,7 +118,7 @@ async def export_devices(
     devices = (await db.execute(stmt)).unique().scalars().all()
     records = [device_to_record(d) for d in devices]
     return await _export_response(
-        records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS
+        db, records, DEVICE_CSV_COLUMNS, "devices", format, DEVICE_CSV_TEXT_COLUMNS
     )
 
 
@@ -156,7 +159,7 @@ async def export_templates(
     }
     records = [template_to_record(t, hypervisor_names) for t in templates]
     return await _export_response(
-        records, TEMPLATE_CSV_COLUMNS, "templates", format, TEMPLATE_CSV_TEXT_COLUMNS
+        db, records, TEMPLATE_CSV_COLUMNS, "templates", format, TEMPLATE_CSV_TEXT_COLUMNS
     )
 
 

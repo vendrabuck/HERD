@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import threading
 
 import pytest
@@ -168,6 +169,57 @@ async def test_a_caller_cancelled_while_it_waits_takes_no_slot_and_runs_nothing(
     await asyncio.gather(*holders)
     await _until(lambda: bulk_work_limiter().borrowed_tokens == 0)
     assert ran == []
+
+
+@pytest.mark.usefixtures("fresh_limiter")
+async def test_anyio_is_handed_the_modules_own_worker_limiter(monkeypatch):
+    """Never anyio's shared default limiter (40 threads, also Starlette's).
+    Mutation-checked: `limiter=None` fails this."""
+    handed: list[object] = []
+    real_run_sync = bulk_work.anyio.to_thread.run_sync
+
+    async def recording(func, *args, limiter=None, **kwargs):
+        handed.append(limiter)
+        return await real_run_sync(func, *args, limiter=limiter, **kwargs)
+
+    monkeypatch.setattr(bulk_work.anyio.to_thread, "run_sync", recording)
+    assert await run_bulk_work(lambda: 1) == 1
+    assert handed == [bulk_work._worker_limiter()]
+    assert handed[0] is not bulk_work.anyio.to_thread.current_default_thread_limiter()
+
+
+@pytest.mark.usefixtures("fresh_limiter")
+async def test_work_that_fails_after_its_caller_left_logs_nothing():
+    """The done callback retrieves the work's exception, so asyncio never reports
+    it as never retrieved. Mutation-checked: dropping `done.exception()` fails this."""
+    loop = asyncio.get_running_loop()
+    reported: list[dict] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def work():
+        entered.set()
+        assert release.wait(_WAIT), "never released"
+        raise RuntimeError("after the caller left")
+
+    try:
+        task = asyncio.create_task(run_bulk_work(work))
+        assert await _signalled(entered), "the worker never started"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        await _until(lambda: bulk_work_limiter().borrowed_tokens == 0)
+        del task
+        gc.collect()
+        for _ in range(3):
+            await asyncio.sleep(0)
+    finally:
+        release.set()
+        loop.set_exception_handler(previous)
+    assert [c.get("message") for c in reported] == []
 
 
 async def test_the_limiter_is_one_per_process(monkeypatch):

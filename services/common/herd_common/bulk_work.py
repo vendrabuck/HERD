@@ -5,8 +5,9 @@ uploaded file of up to 10 MiB, parse it as CSV or JSON, and scan it for lone
 surrogates before any row is judged; their exports render every record into one
 CSV or JSON body. Each is pure CPU work with no database access, and on the event
 loop it held the loop for as long as it ran (measured on one core: about 120 ms for
-a 10 MiB JSON file and about 300 ms for a 10 MiB CSV file of small rows), so every
-other request the service had in flight waited behind it.
+a 10 MiB JSON file, and from about 0.3 s to about 1.4 s for a 10 MiB CSV file, more
+the shorter and more numerous its rows), so every other request the service had in
+flight waited behind it.
 
 ``run_bulk_work(func, *args)`` runs ``func(*args)`` on a worker thread and returns
 its result, or raises what it raised (an ``HTTPException`` included, unchanged). The
@@ -28,9 +29,13 @@ threads:
   start beside one still running, and the bound holds whatever is cancelled. A
   request cancelled while it waits for a slot takes none, and its work never runs.
 
-The work still holds the GIL while it runs; the event loop gets the interpreter back
-at every switch interval (5 ms by default), so other requests are served
-concurrently, at some cost in latency, instead of waiting for the whole parse.
+The work still holds the GIL while it runs. The event loop gets the interpreter back
+at a switch interval (5 ms by default) only between bytecodes, never inside one C
+call: Python-level work (the CSV reader's rows, each JSON cell, rendering a CSV)
+lets other requests run between its steps, but a single C call holds the loop for
+its whole length. So each whole-file JSON decode (one ``json.loads``) and the lone
+surrogate scan (one ``json.dumps`` of the parsed document) still stall the loop for
+as long as they take: on one core, about 60 ms and about 50 ms for a 10 MiB file.
 
 The limiters are built on first use and are process-wide: each service runs one uvicorn
 process with one event loop. Database work stays on the event loop in the request's
@@ -88,14 +93,30 @@ async def run_bulk_work(func: Callable[..., _T], *args: object) -> _T:
         slots.release_on_behalf_of(borrower)
         raise
 
+    # The caller waits on its own future, never on the work: a cancelled caller
+    # cancels only this future, and the work runs on. (`asyncio.shield` would do the
+    # same, but on Python 3.14 it logs an error for work that fails after its caller
+    # left.)
+    outcome: asyncio.Future = asyncio.get_running_loop().create_future()
+
     def finished(done: asyncio.Future) -> None:
         slots.release_on_behalf_of(borrower)
-        # Retrieved here, so work whose caller was cancelled logs nothing.
-        if not done.cancelled():
-            done.exception()
+        if done.cancelled():
+            if not outcome.done():
+                outcome.cancel()
+            return
+        # Retrieved here, whether or not the caller still waits, so work whose
+        # caller was cancelled is never reported as an exception never retrieved.
+        error = done.exception()
+        if outcome.done():
+            return
+        if error is not None:
+            outcome.set_exception(error)
+        else:
+            outcome.set_result(done.result())
 
     work.add_done_callback(finished)
-    return await asyncio.shield(work)
+    return await outcome
 
 
 __all__ = ["BULK_WORK_THREADS", "bulk_work_limiter", "run_bulk_work"]

@@ -2486,12 +2486,20 @@ run against a stack; so were the large canvas save and the 1 MiB fork canvas sav
   form) can still be refused by the service it is forwarded to, which answers 413 and
   the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
   that growth. Recorded in issue #1466.
-- A bulk import's file work runs off the event loop (INV-BULK-27, TOPO-BULK-23), but
-  its row loop does not: each row's schema checks and writes on inventory, and each
-  topology's canvas rewrite and validation on cabling, run on the event loop between
-  that row's queries, so a single row as large as the file holds the loop for that
-  row's work, as an interactive save of that size does. Recorded in INV-BULK-27 and
-  TOPO-BULK-23.
+- A bulk import's file work runs off the event loop (INV-BULK-27, TOPO-BULK-23), except
+  each single C call within it (the whole-file JSON decode and the surrogate scan's
+  serialization, about 60 ms and 50 ms for a 10 MiB file on one core), but its row
+  loop does not. Each row's schema checks and writes on inventory, and each topology's
+  canvas rewrite and validation on cabling, run on the event loop between that row's
+  queries, so a single row as large as the file holds the loop for that row's work, as
+  an interactive save of that size does. Rows rejected before any query (an unknown
+  template or a missing name on inventory; a missing name or unresolved device names on
+  cabling) run with no await between them, and so does building and serializing the
+  report, so a file of many such rows holds the loop for all of them. The longest stall
+  measured on one core, the same before and after issue #1417: about 1.1 s on
+  inventory; on cabling about 1.7 s for rows with no name imported by a non-admin,
+  about 0.8 s for rows with unresolved device names, and about 0.59 s for one canvas as
+  large as the file. Recorded in INV-BULK-27 and TOPO-BULK-23.
 - A multipart upload that the body limit refuses part way through its read (sent
   chunked, or declaring less than it sends) leaves the temporary file Starlette spooled
   it to open until the object is freed, not when the 413 is sent: Starlette's parser

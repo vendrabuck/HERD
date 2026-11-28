@@ -1327,7 +1327,9 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   Enforced in: `services/inventory/app/routers/bulk.py` (`IMPORT_UPLOAD_BYTES`, `_read_capped`); `services/cabling/app/routes/bulk.py` (`_read_capped`); `services/common/herd_common/validation_errors.py` (`LimitRequestBody`, `extends_body_limit`) \
   Pinned by: `services/inventory/tests/test_bulk.py` (`test_a_bulk_upload_over_the_bound_is_refused_before_any_parse`, `test_an_upload_at_the_bound_is_accepted`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_templates_import_is_held_to_the_same_bound`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`, `test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound`); `services/inventory/tests/test_request_body_limit.py` (`test_an_upload_route_takes_its_own_limit`, `test_an_import_body_over_its_limit_is_413_however_it_is_sent`, `test_a_raw_form_body_over_an_import_limit_is_413_and_read_no_further`, `test_a_raw_body_that_is_not_a_form_is_never_read`); `services/cabling/tests/test_bulk.py` (`test_a_topology_upload_over_the_bound_is_a_413`, `test_the_bound_is_exact_one_byte_over_is_refused`, `test_the_read_asks_for_exactly_one_byte_past_the_bound`)
 - **INV-BULK-27.** An import's file work and an export's rendering run off the event
-  loop, so the service answers other requests while they run. The decode, the CSV or
+  loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
+  whole-file JSON decode and the lone surrogate scan's serialization of the parsed
+  document (on one core, about 60 ms and about 50 ms for a 10 MiB file). The decode, the CSV or
   JSON parse, the lone surrogate scan, and the decode of each row's JSON text cell
   (`field_data` for a device, `sections` for a template) run on a worker thread before
   the import's first query; an export renders its records into one body the same way.
@@ -1338,13 +1340,18 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   on the wait. A request cancelled while its work runs gives its slot back only when
   the thread ends; one cancelled while it waits takes none and runs nothing. The row
   loop, each row's schema checks and create or update, and every database call stay on
-  the event loop in the request's session. A cell's decode, its value or the
-  decoder's error, is applied where the row loop reads the cell, so every row's
-  outcome and reason are the ones an on-loop decode gave (INV-BULK-9, INV-BULK-24).
+  the event loop in the request's session. A cell's decode, its value or the text of
+  the decoder's error (the text alone, never the exception, which would keep the
+  whole upload alive in a reference cycle), is applied where the row loop reads the
+  cell, so every row's outcome and reason are the ones an on-loop decode gave
+  (INV-BULK-9, INV-BULK-24).
   Before issue #1417 all of this ran on the event loop: measured on one core, a 10 MiB
-  JSON file held it about 120 ms and a 10 MiB CSV file of small rows about 300 ms. \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_read_device_import`, `_read_template_import`, `_decode_json_cells`, `_DecodedCell`, `_coerce_json_cell`); `services/inventory/app/routers/bulk.py` (`_export_response`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `bulk_work_limiter`, `BULK_WORK_THREADS`) \
-  Pinned by: `services/inventory/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_a_csv_json_cell_is_decoded_off_the_loop`, `test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave`, `test_a_template_sections_cell_is_decoded_with_the_file`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_two_concurrent_csv_import_reads_with_long_cells_both_read`); `services/inventory/tests/test_bulk_service_unit.py` (`test_decode_json_cells_wraps_text_cells_and_leaves_the_rest`, `test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it`, `test_a_decoded_cell_is_not_an_empty_cell`); `services/common/tests/test_bulk_work.py` (`test_two_threads_at_most`, `test_the_work_runs_on_a_worker_thread_and_returns_its_result`, `test_an_exception_comes_back_unchanged`, `test_the_work_never_takes_the_default_executor`, `test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_a_cancelled_caller_keeps_its_slot_until_its_thread_ends`, `test_a_caller_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`)
+  JSON file held it about 120 ms, and a 10 MiB CSV file from about 0.3 s to about 1.4 s,
+  more the shorter and more numerous its rows. An export closes its database session
+  before it waits for a slot, so it holds no pooled connection while it waits or
+  renders. \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`import_devices`, `import_templates`, `_read_device_import`, `_read_template_import`, `_decode_json_cells`, `_DecodedCell`, `_CellDecodeError`, `_coerce_json_cell`); `services/inventory/app/routers/bulk.py` (`_export_response`); `services/common/herd_common/bulk_work.py` (`run_bulk_work`, `bulk_work_limiter`, `BULK_WORK_THREADS`) \
+  Pinned by: `services/inventory/tests/test_bulk.py` (`test_another_request_is_served_while_an_import_parse_is_held`, `test_a_csv_json_cell_is_decoded_off_the_loop`, `test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave`, `test_a_template_sections_cell_is_decoded_with_the_file`, `test_the_import_never_takes_the_default_executor`, `test_an_export_is_rendered_off_the_loop`, `test_an_export_holds_no_connection_while_it_renders`, `test_two_concurrent_csv_import_reads_with_long_cells_both_read`); `services/inventory/tests/test_bulk_service_unit.py` (`test_decode_json_cells_wraps_text_cells_and_leaves_the_rest`, `test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it`, `test_a_failed_cell_decode_leaves_no_reference_cycle`, `test_identical_failed_cells_share_one_reason_and_hold_no_exception`, `test_a_decoded_cell_is_not_an_empty_cell`); `services/common/tests/test_bulk_work.py` (`test_two_threads_at_most`, `test_anyio_is_handed_the_modules_own_worker_limiter`, `test_work_that_fails_after_its_caller_left_logs_nothing`, `test_the_work_runs_on_a_worker_thread_and_returns_its_result`, `test_an_exception_comes_back_unchanged`, `test_the_work_never_takes_the_default_executor`, `test_at_most_the_bound_runs_at_once_and_a_third_waits`, `test_a_cancelled_caller_keeps_its_slot_until_its_thread_ends`, `test_a_caller_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,

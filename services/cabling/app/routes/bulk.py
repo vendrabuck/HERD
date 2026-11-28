@@ -86,7 +86,12 @@ async def export_topologies(
     carry isolated nodes.
     """
     topologies = list((await db.execute(select(Topology).order_by(Topology.name))).scalars().all())
-    # Issue #1417: the records and the body are built on a bulk worker thread.
+    # Issue #1417: the records and the body are built on a bulk worker thread. The
+    # session is closed first, so the request holds no pooled connection while it
+    # waits for a slot or renders. `close()` expunges the topologies without expiring
+    # them (a rollback would expire them, and the thread's reads would then try to
+    # load them again), so their loaded `name` and `canvas_data` stay readable.
+    await db.close()
     body = await run_bulk_work(render_export, topologies, format)
     media, ext = ("text/csv", "csv") if format == "csv" else ("application/json", "json")
     return Response(

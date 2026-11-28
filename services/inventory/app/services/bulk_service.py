@@ -310,17 +310,28 @@ def parse_import(
 
 
 class _DecodedCell:
-    """A JSON cell already decoded on the parse thread (issue #1417): what
-    `_coerce_json_cell` returned for it there, or the exception it raised, which
-    `_coerce_json_cell` hands back or raises again when the row loop reaches the
-    cell, so the row's outcome and reason are the ones an on-loop decode gave. It
-    equals neither None nor "", as the non-empty text it stands for does not."""
+    """A JSON cell already decoded on the parse thread (issue #1417): the value
+    `_coerce_json_cell` returned for it there, or the text of the exception it
+    raised. `_coerce_json_cell` hands the value back, or raises `_CellDecodeError`
+    with that text, when the row loop reaches the cell, so the row's outcome and
+    reason are the ones an on-loop decode gave. It keeps the text, never the
+    exception: an exception's traceback holds the decoding frame, which holds every
+    row, so each failed cell would keep the whole upload alive in a reference cycle
+    until the garbage collector found it. It equals neither None nor "", as the
+    non-empty text it stands for does not."""
 
-    __slots__ = ("error", "value")
+    __slots__ = ("reason", "value")
 
-    def __init__(self, value: Any, error: Exception | None) -> None:
+    def __init__(self, value: Any, reason: str | None) -> None:
         self.value = value
-        self.error = error
+        self.reason = reason
+
+
+class _CellDecodeError(ValueError):
+    """Raised where the row loop reads a cell whose decode failed on the parse
+    thread. Its text is that decode's exception text, and the row loop rejects the
+    row with it as it rejected the original (any exception that is neither an
+    `HTTPException` nor a pydantic `ValidationError` lands in the same branch)."""
 
 
 def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
@@ -328,7 +339,10 @@ def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
     `_DecodedCell` (issue #1417). Runs on the parse thread with the file parse, so a
     cell as large as the file is not decoded on the event loop. Any other value
     (absent, null, empty, a native object or list, a number) is left for the row
-    loop, which reads it without a parse."""
+    loop, which reads it without a parse. A failed decode keeps only its text, one
+    string object for each distinct text, so a file of identical bad cells holds one
+    reason, not one per row."""
+    reasons: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -337,8 +351,9 @@ def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
             continue
         try:
             row[column] = _DecodedCell(_coerce_json_cell(value, default), None)
-        except Exception as exc:  # raised again, unchanged, where the loop reads it
-            row[column] = _DecodedCell(None, exc)
+        except Exception as exc:  # its text is raised again where the loop reads it
+            reason = str(exc)
+            row[column] = _DecodedCell(None, reasons.setdefault(reason, reason))
 
 
 def _coerce_json_cell(value: Any, default: Any) -> Any:
@@ -350,11 +365,11 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
     JSON_CELL_UNREADABLE_REASON (issue #1511); a syntax error keeps the decoder's
     own message, which names a position, never the cell's content. A cell already
     decoded on the parse thread (`_DecodedCell`, issue #1417) gives back that
-    decode's value, or raises its exception.
+    decode's value, or raises `_CellDecodeError` with its exception's text.
     """
     if isinstance(value, _DecodedCell):
-        if value.error is not None:
-            raise value.error
+        if value.reason is not None:
+            raise _CellDecodeError(value.reason)
         return value.value
     if value is None or value == "":
         return default

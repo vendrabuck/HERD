@@ -6,9 +6,11 @@ session or HTTP transport.
 """
 
 import csv
+import gc
 import io
 import json
 import uuid
+import weakref
 
 import pytest
 from app.database import Base
@@ -31,6 +33,7 @@ from app.services.bulk_service import (
     records_to_csv,
 )
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -728,17 +731,58 @@ def test_decode_json_cells_wraps_text_cells_and_leaves_the_rest():
 
 
 def test_a_decoded_cell_raises_what_the_decode_raised_where_the_row_reads_it():
+    """The text is the original exception's; the exception is a fresh one, raised
+    where the row loop reads the cell, which rejects the row with that text."""
     rows = [{"field_data": "{not json"}, {"field_data": '"\\ud800"'}]
     _decode_json_cells(rows, "field_data", {})
-    with pytest.raises(json.JSONDecodeError) as syntax:
+    with pytest.raises(ValueError) as syntax:
         _coerce_json_cell(rows[0]["field_data"], {})
     with pytest.raises(json.JSONDecodeError) as direct:
         _coerce_json_cell("{not json", {})
     assert str(syntax.value) == str(direct.value)
+    assert not isinstance(syntax.value, ValidationError)
     with pytest.raises(ValueError) as surrogate:
         _coerce_json_cell(rows[1]["field_data"], {})
     assert str(surrogate.value) == (
         "a JSON cell holds a lone surrogate escape, which is not valid text"
+    )
+
+
+class _Marker:
+    """A weakly referenceable object riding on a row, to see when the rows die."""
+
+
+def test_a_failed_cell_decode_leaves_no_reference_cycle():
+    """A failed cell keeps its text, never the exception: an exception's traceback
+    holds the decoding frame, which holds every row, so the rows would outlive their
+    last reference until the garbage collector ran. With the collector off, the rows
+    die the moment the last reference goes. Mutation-checked: storing the exception
+    itself on the cell fails this."""
+    marker = _Marker()
+    alive = weakref.ref(marker)
+    rows = [{"field_data": "{not json", "marker": marker}, {"field_data": "[nope"}]
+    del marker
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        _decode_json_cells(rows, "field_data", {})
+        del rows
+        assert alive() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_identical_failed_cells_share_one_reason_and_hold_no_exception():
+    """A file of identical bad cells holds one reason string, however many rows, and
+    no exception object. Mutation-checked: dropping the `setdefault` dedup fails this."""
+    rows = [{"field_data": "{x"} for _ in range(1000)]
+    _decode_json_cells(rows, "field_data", {})
+    cells = [row["field_data"] for row in rows]
+    assert len({id(cell.reason) for cell in cells}) == 1
+    assert all(cell.value is None for cell in cells)
+    assert not any(
+        isinstance(ref, BaseException) for cell in cells for ref in gc.get_referents(cell)
     )
 
 

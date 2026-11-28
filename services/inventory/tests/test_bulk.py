@@ -7,6 +7,7 @@ resolution by template name / driver name, and RBAC (admin-only).
 
 import asyncio
 import concurrent.futures
+import contextlib
 import csv
 import functools
 import io
@@ -28,6 +29,7 @@ from app.services.bulk_service import (
 )
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -2353,6 +2355,64 @@ async def test_an_export_is_rendered_off_the_loop(client, monkeypatch, path, fmt
     assert resp.content == expected.content
     assert resp.headers["content-disposition"] == expected.headers["content-disposition"]
     assert render_threads and render_threads[0] != loop_thread
+
+
+@contextlib.contextmanager
+def _connections_checked_out(pooled_engine):
+    """A live count of the engine's pooled connections checked out and not back."""
+    count = {"out": 0, "seen": 0}
+
+    def checkout(*_args):
+        count["out"] += 1
+        count["seen"] += 1
+
+    def checkin(*_args):
+        count["out"] -= 1
+
+    pool = pooled_engine.sync_engine.pool
+    event.listen(pool, "checkout", checkout)
+    event.listen(pool, "checkin", checkin)
+    try:
+        yield count
+    finally:
+        event.remove(pool, "checkout", checkout)
+        event.remove(pool, "checkin", checkin)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/export", "/templates/export"])
+async def test_an_export_holds_no_connection_while_it_renders(client, monkeypatch, path):
+    """While the render is held on its thread, the request has given its pooled
+    connection back, and the body is still the one the render gives. Mutation-checked:
+    removing the `await db.close()` from `_export_response` fails this."""
+    from app.routers import bulk as bulk_router
+
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"])
+    expected = await client.get(path, params={"format": "json"})
+    assert expected.status_code == 200
+    entered = threading.Event()
+    release = threading.Event()
+    real = bulk_router.records_to_json
+
+    def held(*args):
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the render was never released"
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, "records_to_json", held)
+    with _connections_checked_out(engine) as count:
+        exporting = asyncio.create_task(client.get(path, params={"format": "json"}))
+        try:
+            assert await _signalled(entered), "the render never started"
+            held_out = count["out"]
+        finally:
+            release.set()
+        resp = await exporting
+    assert count["seen"] > 0  # the export did take a connection, and gave it back
+    assert held_out == 0
+    assert resp.status_code == 200
+    assert resp.content == expected.content
 
 
 @pytest.mark.asyncio

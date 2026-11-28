@@ -2098,6 +2098,60 @@ async def test_an_export_is_rendered_off_the_loop(admin_client, monkeypatch, fmt
     assert "lab" in resp.text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "json"])
+async def test_an_export_holds_no_connection_while_it_renders(admin_client, monkeypatch, fmt):
+    """While the render is held on its thread, the request has given its pooled
+    connection back, the topologies it renders are still readable (closed, not
+    expired), and the body is the one the render gives. Mutation-checked: removing
+    the `await db.close()` from `export_topologies` fails this."""
+    from app.routes import bulk as bulk_router
+    from sqlalchemy import event
+
+    await _seed_topology("lab", ADMIN_ID, _canvas_with_ids())
+    expected = await admin_client.get("/topologies/export", params={"format": fmt})
+    assert expected.status_code == 200
+    entered = threading.Event()
+    release = threading.Event()
+    real = bulk_router.render_export
+    count = {"out": 0, "seen": 0}
+
+    def checkout(*_args):
+        count["out"] += 1
+        count["seen"] += 1
+
+    def checkin(*_args):
+        count["out"] -= 1
+
+    def held(*args):
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the render was never released"
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, "render_export", held)
+    pool = test_engine.sync_engine.pool
+    event.listen(pool, "checkout", checkout)
+    event.listen(pool, "checkin", checkin)
+    try:
+        exporting = asyncio.create_task(
+            admin_client.get("/topologies/export", params={"format": fmt})
+        )
+        try:
+            assert await _signalled(entered), "the render never started"
+            held_out = count["out"]
+        finally:
+            release.set()
+        resp = await exporting
+    finally:
+        event.remove(pool, "checkout", checkout)
+        event.remove(pool, "checkin", checkin)
+    assert count["seen"] > 0
+    assert held_out == 0
+    assert resp.status_code == 200
+    assert resp.content == expected.content
+    assert "lab" in resp.text
+
+
 # However the upload is sent, the file bound holds (issue #1417) ------------------------
 
 
