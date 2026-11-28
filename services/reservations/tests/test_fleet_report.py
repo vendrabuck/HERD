@@ -33,6 +33,8 @@ from herd_common.enums import TopologyType
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from tests._upstream_bodies import EVERY_BAD_BODY, answer, assert_nothing_leaked, objects
+
 NOW = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
 WINDOW_START = NOW - timedelta(hours=24)
 WINDOW_END = NOW
@@ -877,3 +879,79 @@ async def test_a_fleet_past_the_200_page_cap_is_null_like_an_unreachable_invento
     else:
         assert resp.status_code == 503
         assert resp.json()["detail"] == "Inventory service is unreachable"
+
+
+# --- Issue #1577: a 200 whose body the report cannot use -----------------------------
+
+EXECUTION_RUNS_URL = f"{settings.execution_service_url}/runs"
+
+# Inventory bodies that are not an object holding an `items` list
+# (`PaginatedDeviceResponse`): each was a 500, or a fleet of 0 devices (`null`, an
+# `items` string), before #1577.
+BAD_FLEET_PAGES = {
+    **EVERY_BAD_BODY,
+    **objects({}, {"items": None}, {"items": "ab"}, {"items": 5}, {"items": {"id": "x"}}),
+}
+# Execution bodies that are not an object: each was a 500 before #1577.
+BAD_RUN_COUNTS = EVERY_BAD_BODY
+
+
+async def _report(admin_client, route: str):
+    if route == "json":
+        return await admin_client.get(
+            "/reports/utilization",
+            params=_window_params(),
+            headers={"Authorization": CALLER_BEARER},
+        )
+    return await admin_client.get(
+        "/reports/utilization.csv",
+        params=_window_params(section="fleet"),
+        headers={"Authorization": CALLER_BEARER},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["json", "csv"])
+@pytest.mark.parametrize("body", BAD_FLEET_PAGES.values(), ids=BAD_FLEET_PAGES.keys())
+async def test_an_inventory_page_the_report_cannot_use_is_like_an_unreachable_inventory(
+    admin_client, caplog, route, body
+):
+    """OPS-REPORT-11 and OPS-REPORT-14: the JSON report answers 200 with `fleet` null
+    and the fleet CSV answers 503 `Inventory service is unreachable`."""
+    caplog.set_level("DEBUG")
+    with respx.mock(assert_all_called=False) as router:
+        inventory = router.get(url__startswith=INVENTORY_DEVICES_URL).mock(
+            return_value=answer(200, body)
+        )
+        router.get(url__startswith=EXECUTION_RUNS_URL).mock(
+            return_value=httpx.Response(200, json={"total": 3})
+        )
+        resp = await _report(admin_client, route)
+    assert inventory.call_count == 1
+    if route == "json":
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["fleet"] is None
+        assert resp.json()["execution_run_count"] == 3
+    else:
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "Inventory service is unreachable"
+    assert_nothing_leaked(resp.text, caplog.text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", BAD_RUN_COUNTS.values(), ids=BAD_RUN_COUNTS.keys())
+async def test_an_execution_answer_the_report_cannot_use_is_a_null_run_count(
+    admin_client, caplog, body
+):
+    """OPS-REPORT-12: `execution_run_count` is null, and the rest of the report,
+    the fleet included, is unaffected."""
+    caplog.set_level("DEBUG")
+    with respx.mock(assert_all_called=False) as router:
+        _fake_inventory(router, [_inventory_device(DEVICE_X, "sw-a")], 1)
+        runs = router.get(url__startswith=EXECUTION_RUNS_URL).mock(return_value=answer(200, body))
+        resp = await _report(admin_client, "json")
+    assert runs.call_count == 1
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["execution_run_count"] is None
+    assert resp.json()["fleet"]["device_count"] == 1
+    assert_nothing_leaked(resp.text, caplog.text)

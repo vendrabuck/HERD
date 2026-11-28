@@ -47,6 +47,7 @@ import httpx
 from herd_common.error_details import unknown_value_detail
 from herd_common.internal_client import InternalTokenAuth, call_service
 from herd_common.pagination import paginate
+from herd_common.upstream_body import UpstreamBodyUnusable, read_json_body
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -177,14 +178,14 @@ def _read_classify_body(resp) -> tuple[object, str | None]:
     The reason is a fixed code, never body text: "not_json" for a body that is not
     JSON or not UTF-8 (both `ValueError`), "too_deep" for one nested past the
     decoder's recursion limit (`RecursionError`, which is a `RuntimeError`, not a
-    `ValueError`; issue #1577). No exception is chained or logged here.
+    `ValueError`; issue #1577). No exception is chained or logged here. The parse
+    is the shared `herd_common.upstream_body.read_json_body`, whose reason codes
+    these are; any parsed value is returned, and the caller judges its shape.
     """
     try:
-        return resp.json(), None
-    except ValueError:
-        return None, "not_json"
-    except RecursionError:
-        return None, "too_deep"
+        return read_json_body(resp, expect=object), None
+    except UpstreamBodyUnusable as exc:
+        return None, exc.reason
 
 
 def _unstorable_text(text: str) -> bool:

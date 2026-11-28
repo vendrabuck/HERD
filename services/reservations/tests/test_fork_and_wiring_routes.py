@@ -52,13 +52,18 @@ from app.config import settings
 from app.database import get_db
 from app.dependencies.auth import get_current_user_payload
 from app.main import app
+from app.models.fork_wiring_ledger import ForkWiringLedger
+from app.models.outbox import OutboxEvent
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import ForkCanvasBody, ForkSaveBody, bearer_scheme
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
 from tests._route_table import otherwise_valid_request, path_segments, routes_where
+from tests._upstream_bodies import NOT_AN_OBJECT, UNPARSEABLE, assert_nothing_leaked
+from tests._upstream_bodies import answer as bad_answer
 
 OWNER_ID = str(uuid.uuid4())
 OTHER_ID = str(uuid.uuid4())
@@ -478,3 +483,132 @@ async def test_an_upstream_transport_error_is_503_failed_to_contact(network, met
     assert resp.status_code == 503
     assert resp.json()["detail"].startswith(f"Failed to contact {service} service: ")
     assert network.calls.call_count == 1
+
+
+# --- Issue #1577: an upstream body the relay cannot read -----------------------------
+
+# The 2xx a relay cannot parse answers 503 with fixed wording: the RES-FORK-10 answer
+# for a cabling 5xx, the RES-FORK-18 one for execution, and on save its own wording,
+# since a 2xx save most likely committed (the sweep's wiring heal stages it).
+UNREADABLE_2XX_DETAIL = {
+    "cabling": "Cabling service is unavailable",
+    "execution": "Execution service is unavailable",
+}
+SAVE_ROUTE = ("POST", "/{reservation_id}/fork/save")
+UNREADABLE_SAVE_DETAIL = (
+    "Cabling answered the save, but its answer could not be read; "
+    "reload the fork to see whether the save was applied"
+)
+UNREADABLE_BODIES = {name: body for name, body in UNPARSEABLE.items() if name != "empty"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", UNREADABLE_BODIES.values(), ids=UNREADABLE_BODIES.keys())
+@EVERY_UPSTREAM_ROUTE
+async def test_an_upstream_2xx_that_does_not_parse_is_503_with_fixed_wording(
+    network, caplog, method, route, body
+):
+    """Not JSON, not UTF-8, an integer past the digit limit, or nested past the
+    decoder's recursion limit: a 500 before #1577. An empty 2xx is not here: it
+    relays as null, the 204 path."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    service = _upstream_of(method, route)[0]
+    network.route().mock(return_value=bad_answer(200, body))
+    caplog.set_level("DEBUG")
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == 503
+    if (method, route.path) == SAVE_ROUTE:
+        expected = UNREADABLE_SAVE_DETAIL
+    else:
+        expected = UNREADABLE_2XX_DETAIL[service]
+    assert resp.json() == {"detail": expected}
+    assert network.calls.call_count == 1
+    assert_nothing_leaked(resp.text, caplog.text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", NOT_AN_OBJECT.values(), ids=NOT_AN_OBJECT.keys())
+@EVERY_UPSTREAM_ROUTE
+async def test_an_upstream_2xx_of_another_json_type_relays_unchanged(
+    network, caplog, method, route, body
+):
+    """The proxy routes declare no response model, so a parsed body of any JSON type
+    passes through (the recommended option on #1577). On save it stages nothing and
+    logs the fixed action with no body text."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(return_value=bad_answer(200, body))
+    caplog.set_level("DEBUG")
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == 200
+    assert resp.json() == json.loads(body)
+    if (method, route.path) == SAVE_ROUTE:
+        actions = [r.__dict__.get("action") for r in caplog.records]
+        assert "wiring_changed_stage_failed" in actions
+        assert_nothing_leaked(caplog.text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer_body",
+    [
+        {"version_number": "2", "released": [], "built": []},
+        {"version_number": True, "released": [], "built": []},
+        {"version_number": 2, "released": "x", "built": []},
+        {"version_number": 2, "released": [], "built": [1]},
+        {"released": [], "built": []},
+    ],
+)
+async def test_a_save_answer_of_the_wrong_shape_relays_and_stages_nothing(network, answer_body):
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(return_value=httpx.Response(200, json=answer_body))
+    route = next(r for m, r in _UPSTREAM_ROUTES if (m, r.path) == SAVE_ROUTE)
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request("POST", **_request_for(route, target.id))
+    assert resp.status_code == 200
+    assert resp.json() == answer_body
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(OutboxEvent))).scalars().all() == []
+        assert await db.get(ForkWiringLedger, target.id) is None
+
+
+@pytest.mark.asyncio
+async def test_a_save_answer_of_the_declared_shape_stages_its_version(network):
+    """The control for the table above."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    answer_body = {"version_number": 2, "released": [], "built": []}
+    network.route().mock(return_value=httpx.Response(200, json=answer_body))
+    route = next(r for m, r in _UPSTREAM_ROUTES if (m, r.path) == SAVE_ROUTE)
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request("POST", **_request_for(route, target.id))
+    assert resp.status_code == 200
+    async with TestSessionLocal() as db:
+        assert len((await db.execute(select(OutboxEvent))).scalars().all()) == 1
+        assert (await db.get(ForkWiringLedger, target.id)).last_staged_fork_version == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [409, 502])
+@pytest.mark.parametrize(
+    "body",
+    [UNPARSEABLE["deep_array"], UNPARSEABLE["deep_object"]],
+    ids=["deep_array", "deep_object"],
+)
+@EVERY_CABLING_ROUTE
+async def test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_parse(
+    network, method, route, body, status
+):
+    """RES-FORK-10 for a body nested past the recursion limit, a 500 before #1577: a
+    4xx keeps its status and relays its text, as any other 4xx body that does not
+    parse does; a 5xx is 503 `Cabling service is unavailable`."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(return_value=bad_answer(status, body))
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    if status == 502:
+        assert resp.status_code == 503
+        assert resp.json() == {"detail": "Cabling service is unavailable"}
+    else:
+        assert resp.status_code == 409
+        assert resp.json() == {"detail": body.decode()}

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from herd_common.internal_auth import internal_token_matches
+from herd_common.upstream_body import UpstreamBodyUnusable, read_json_body
 from herd_common.validation_errors import (
     FORWARD_ENVELOPE_BYTES,
     LARGE_JSON_BODY_BYTES,
@@ -910,7 +911,38 @@ async def _load_owned_or_admin(
     return reservation
 
 
-def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
+CABLING_UNAVAILABLE = "Cabling service is unavailable"
+EXECUTION_UNAVAILABLE = "Execution service is unavailable"
+
+# Issue #1577: cabling answered a save with 2xx, so the save most likely committed,
+# but its answer could not be read. Not "the save failed": the sweep's wiring heal
+# (RES-FORK-13) stages what the save changed.
+FORK_SAVE_ANSWER_UNREADABLE = (
+    "Cabling answered the save, but its answer could not be read; "
+    "reload the fork to see whether the save was applied"
+)
+
+
+def _relay_success_body(resp: httpx.Response, *, unreadable_detail: str) -> Any:
+    """The JSON of a relayed 2xx, or 503 `unreadable_detail` when it does not parse
+    (issue #1577). Any parsed JSON value passes through unchanged: the proxy routes
+    declare no response model."""
+    if resp.status_code == 204 or not resp.content:
+        return None
+    try:
+        return read_json_body(resp, expect=object)
+    except UpstreamBodyUnusable as exc:
+        logger.warning(
+            "A relayed 2xx answer could not be read (%s)",
+            exc.reason,
+            extra={"action": "relayed_answer_unusable", "reason": exc.reason},
+        )
+        raise HTTPException(status_code=503, detail=unreadable_detail) from None
+
+
+def _relay_cabling_fork_response(
+    resp: httpx.Response, *, unreadable_detail: str = CABLING_UNAVAILABLE
+) -> Any:
     """Return a cabling fork response's JSON, or raise the mapped user-facing error.
 
     5xx maps to 503 (the issue #131 upstream-error convention; a transport failure
@@ -923,22 +955,24 @@ def _relay_cabling_fork_response(resp: httpx.Response) -> Any:
     detail instead of the generic message, so the client can distinguish "cabling
     is down" from "cabling is up but can't verify routing intent right now"; the
     generic "Cabling service is unavailable" is kept ONLY when the 5xx body is not
-    valid JSON at all (a raw proxy error page, an empty body).
+    valid JSON at all (a raw proxy error page, an empty body, or one nested deeper
+    than the decoder's recursion limit, issue #1577).
+
+    A 2xx whose body does not parse answers 503 `unreadable_detail` (issue #1577);
+    the save route passes its own wording, since its save most likely committed.
     """
     if resp.status_code >= 500:
         detail = _cabling_detail(resp, fallback=None)
         raise HTTPException(
             status_code=503,
-            detail=detail if detail is not None else "Cabling service is unavailable",
+            detail=detail if detail is not None else CABLING_UNAVAILABLE,
         )
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=resp.status_code,
             detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
         )
-    if resp.status_code == 204 or not resp.content:
-        return None
-    return resp.json()
+    return _relay_success_body(resp, unreadable_detail=unreadable_detail)
 
 
 def _relay_execution_response(resp: httpx.Response) -> Any:
@@ -946,18 +980,17 @@ def _relay_execution_response(resp: httpx.Response) -> Any:
 
     Same discipline as _relay_cabling_fork_response (ADR 0007 Decision 6): 5xx maps to
     503; a 4xx (execution's 409 frozen refusal, its 503-mapped upstream) relays verbatim
-    so the structured detail reaches the user unchanged.
+    so the structured detail reaches the user unchanged. A 2xx whose body does not
+    parse answers 503 `Execution service is unavailable` (issue #1577).
     """
     if resp.status_code >= 500:
-        raise HTTPException(status_code=503, detail="Execution service is unavailable")
+        raise HTTPException(status_code=503, detail=EXECUTION_UNAVAILABLE)
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=resp.status_code,
             detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
         )
-    if resp.status_code == 204 or not resp.content:
-        return None
-    return resp.json()
+    return _relay_success_body(resp, unreadable_detail=EXECUTION_UNAVAILABLE)
 
 
 def _cabling_detail(resp: httpx.Response, *, fallback: Any = "Cabling request failed") -> Any:
@@ -969,11 +1002,12 @@ def _cabling_detail(resp: httpx.Response, *, fallback: Any = "Cabling request fa
     non-JSON 4xx body still surfaces something; the 5xx relay passes
     ``fallback=None`` so it can keep its own generic "Cabling service is
     unavailable" message instead of surfacing a raw proxy error page as if it
-    were a structured detail.
+    were a structured detail. A body nested deeper than the decoder's recursion
+    limit is "not valid JSON" here too (issue #1577).
     """
     try:
-        body = resp.json()
-    except ValueError:
+        body = read_json_body(resp, expect=object)
+    except UpstreamBodyUnusable:
         return fallback
     if isinstance(body, dict) and "detail" in body:
         return body["detail"]
@@ -1073,6 +1107,24 @@ async def update_reservation_fork_canvas(
     return _relay_cabling_fork_response(resp)
 
 
+def _usable_save_answer(data: Any) -> bool:
+    """Whether a parsed save answer can drive the staging (issue #1577): an object
+    with an integer `version_number` (not a boolean) and `released` and `built`
+    each absent, null, or a list of objects (`ForkSaveResponse`)."""
+    if not isinstance(data, dict):
+        return False
+    version = data.get("version_number")
+    if not isinstance(version, int) or isinstance(version, bool):
+        return False
+    for key in ("released", "built"):
+        delta = data.get(key)
+        if delta is not None and (
+            not isinstance(delta, list) or not all(isinstance(d, dict) for d in delta)
+        ):
+            return False
+    return True
+
+
 @router.post("/{reservation_id}/fork/save")
 # A canvas: a large JSON body (issue #1484).
 @extends_body_limit(lambda: LARGE_JSON_BODY_BYTES)
@@ -1120,7 +1172,7 @@ async def save_reservation_fork(
     # Relay first: this raises the mapped user-facing error on a cabling 4xx/5xx (the
     # ARCHIVED 409, a port-conflict 409, or a 503), so nothing is staged when the save
     # did not commit (ADR 0007 Decision 2; the archive/409 path stages nothing).
-    data = _relay_cabling_fork_response(resp)
+    data = _relay_cabling_fork_response(resp, unreadable_detail=FORK_SAVE_ANSWER_UNREADABLE)
 
     # Save succeeded cabling-side: stage reservation.wiring_changed and advance the
     # fork_wiring_ledger in one commit (ADR 0007 Decision 2 and 3). released/built are
@@ -1129,6 +1181,21 @@ async def save_reservation_fork(
     # version, and the standing sweeper heals it on a later tick, so it must never turn
     # a durable save into a user-facing error. The user-facing save response (`data`)
     # is returned unchanged either way.
+    if not _usable_save_answer(data):
+        # Issue #1577: a parsed answer of the wrong shape stages nothing (its delta
+        # cannot be trusted) and is relayed unchanged; the sweep heal stages a
+        # delta-less reconcile for the version cabling committed.
+        logger.warning(
+            "wiring_changed staging skipped for reservation %s: the save answer is "
+            "not the declared shape; sweeper will heal",
+            reservation_id,
+            extra={
+                "action": "wiring_changed_stage_failed",
+                "reservation_id": str(reservation_id),
+                "reason": "wrong_shape",
+            },
+        )
+        return data
     try:
         await stage_wiring_changed(
             db,
@@ -1326,8 +1393,8 @@ async def _fetch_visible_device_ids_strict(user_id: uuid.UUID, token: str) -> se
         logger.warning("visible-devices returned %s for user %s", resp.status_code, user_id)
         raise VisibleDevicesUnavailable(f"status {resp.status_code}")
     try:
-        data = resp.json()
-    except Exception as exc:
+        data = read_json_body(resp, expect=object)
+    except UpstreamBodyUnusable as exc:
         logger.warning("visible-devices returned a non-JSON body for user %s", user_id)
         raise VisibleDevicesUnavailable("unparseable body") from exc
     ids = data.get("device_ids") if isinstance(data, dict) else None
