@@ -14,9 +14,9 @@ exception's text, and in an address with userinfo), answers an error status with
 configured URL with `user:<USERINFO_MARKER>@` userinfo. It asserts that none of them
 reaches the answer, the rows, the outbox payloads, or any log record at any level
 (its message, its traceback, and every attribute), while the fixed wording, the class
-name, and the status do. The one record left out is the request line httpx logs
-itself (logger `httpx`), which `herd_common.logging.setup_logging` configures and
-this service does not word. One test is narrower, and says
+name, and the status do. That includes the HTTP client's own loggers: httpx's
+per-request INFO line is held back by `herd_common.logging.setup_logging` (it holds
+`httpx` at WARNING), so no record is left out. One test is narrower, and says
 why: a background fork call that raised logs a traceback that chains the httpx
 exception itself, so only the line's message and the exception it logs are checked
 there. Nothing between the route (or the background function) and the network is
@@ -233,8 +233,9 @@ async def _stored_text() -> str:
 
 
 def _records(caplog) -> list[logging.LogRecord]:
-    """Every record but httpx's own request line (see the module docstring)."""
-    return [r for r in caplog.records if r.name not in ("httpx", "httpcore")]
+    """Every record the test captured, the HTTP client loggers' included (see the
+    module docstring)."""
+    return list(caplog.records)
 
 
 def _assert_absent(caplog, *texts: str) -> None:

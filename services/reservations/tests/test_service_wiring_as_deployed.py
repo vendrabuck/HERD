@@ -242,9 +242,9 @@ def test_every_request_logs_one_access_line_through_the_json_handler(probe):
     405, and a 401 included, writes exactly one `herd.access` line, a JSON object
     carrying `timestamp`, `level`, `service`, `logger`, and `message`, with `method`,
     `path` (no query string), `status_code`, and a numeric `duration_ms`. No header,
-    query value, or body appears in any line the process wrote, except the lines of
-    the `httpx` logger, which belong to the probe's own client (it logs each URL it
-    requests at INFO) and are left out of that check."""
+    query value, or body appears in any line the process wrote, the probe's own
+    client's included: `setup_logging` holds the `httpx` logger at WARNING, so its
+    per-request INFO line is not written."""
     answers, lines = probe("INFO")
     assert [status for status, _ in answers] == [status for *_, status in _REQUESTS]
 
@@ -257,9 +257,8 @@ def test_every_request_logs_one_access_line_through_the_json_handler(probe):
         assert isinstance(record["duration_ms"], int | float)
         assert record["duration_ms"] >= 0
 
-    not_the_client = [line for line in lines if (_as_record(line) or {}).get("logger") != "httpx"]
     for sentinel in (_QUERY, _HEADER, _BODY):
-        assert not _lines_holding(not_the_client, sentinel), sentinel
+        assert not _lines_holding(lines, sentinel), sentinel
 
 
 def test_the_root_logger_is_the_json_handler_at_log_level(probe):

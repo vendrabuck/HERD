@@ -907,9 +907,7 @@ async def test_a_refusal_on_an_oidc_accounts_email_captures_a_candidate(
     ]
     formatter = JSONFormatter("auth")
     for record in caplog.records:
-        if record.name in ("aiosqlite",) or (
-            record.name == "httpx" and " http://test/" in record.getMessage()
-        ):
+        if record.name == "aiosqlite":
             continue
         assert REISSUED not in formatter.format(record)
 

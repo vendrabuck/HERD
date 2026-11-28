@@ -1434,11 +1434,13 @@ def test_an_unreadable_ca_bundle_is_unavailable(idp, monkeypatch, tmp_path, capl
 
 
 async def test_the_success_path_logs_no_secret_and_the_check_sees_its_records(idp, caplog):
+    # setup_logging holds httpx at WARNING (OPS-LOG-8); lowered here, httpx logs one
+    # line per request, so the check below reads real records of every call.
+    caplog.set_level(logging.INFO, logger="httpx")
     idp.use_token()
     await oidc_service.build_authorization_request()
     await redeem()
     formatted = [JSONFormatter("auth").format(r) for r in caplog.records]
-    # httpx logs one line per request, so the check below reads real records.
     assert len(formatted) >= 3
     assert secret_findings(formatted, [idp.id_token]) == []
 

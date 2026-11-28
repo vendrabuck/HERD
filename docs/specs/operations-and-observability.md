@@ -371,9 +371,12 @@ name looks like a credential.
   Pinned by: `services/common/tests/test_logging.py` (`test_request_logging_middleware_emits_access_record`); `services/secrets/tests/test_api.py` (`test_plaintext_never_hits_the_logs`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_every_request_logs_one_access_line_through_the_json_handler`)
 - **OPS-LOG-8.** `setup_logging` installs the one JSON handler on the root logger at
   `LOG_LEVEL` (INFO when the name is unknown) and holds `uvicorn.access`,
-  `uvicorn.error`, and `sqlalchemy.engine` at WARNING. \
-  Enforced in: `services/common/herd_common/logging.py` (`setup_logging`) \
-  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
+  `uvicorn.error`, `sqlalchemy.engine`, and the HTTP client loggers `httpx` and `httpx2`
+  at WARNING, so an outbound request writes no line of the client's own at any
+  `LOG_LEVEL`; the transport loggers `httpcore` and `httpcore2`, which log only at
+  DEBUG, are held at INFO. \
+  Enforced in: `services/common/herd_common/logging.py` (`setup_logging`, `QUIET_LOGGERS`, `HTTP_TRANSPORT_LOGGERS`) \
+  Pinned by: `services/common/tests/test_logging.py` (`test_setup_logging_configures_root_logger`, `test_setup_logging_keeps_httpcore_debug_lines_out_even_at_debug_level`, `test_an_outbound_request_writes_no_client_line_to_the_service_log`, `test_an_async_outbound_request_writes_no_client_line_to_the_service_log`, `test_the_client_line_is_what_the_quiet_level_holds_back`); `services/ai-orchestrator/tests/test_sdk_client_logging.py` (`test_an_sdk_client_request_writes_no_client_line_to_the_service_log`, `test_the_sdk_client_line_is_what_the_quiet_level_holds_back`); `services/reservations/tests/test_service_wiring_as_deployed.py` (`test_the_root_logger_is_the_json_handler_at_log_level`); `tests/unit/test_schema_placement_and_logging_wiring.py` (`test_the_root_logger_is_the_json_handler_at_log_level`)
 - **OPS-LOG-9.** The config service does not use this formatter: it logs through the
   standard library with no handler of its own, so its lines are plain text and its INFO
   lines are not emitted. `FEATURES.md` and `docs/ENV_VARS.md` (`LOG_LEVEL`) say so. \
