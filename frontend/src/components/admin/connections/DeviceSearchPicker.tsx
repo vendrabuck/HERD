@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { usePaginatedDevices } from "@/api/inventory";
+import { useDeviceSearch } from "@/api/inventory";
+import { DeviceSearchResults } from "@/components/devices/DeviceSearchResults";
 import type { TopologyType } from "@/types/device.types";
 
 export interface PickedDevice {
@@ -24,8 +25,7 @@ export interface DeviceSearchPickerProps {
  */
 export function DeviceSearchPicker({ label, device, onSelect, onClear }: DeviceSearchPickerProps) {
   const [search, setSearch] = useState("");
-  const term = search.trim();
-  const { data: results } = usePaginatedDevices(term.length >= 2 ? { search: term } : undefined, 0, 20);
+  const { active, query: results } = useDeviceSearch(search);
 
   if (device) {
     return (
@@ -55,22 +55,16 @@ export function DeviceSearchPicker({ label, device, onSelect, onClear }: DeviceS
         aria-label={`Search ${label}`}
         className="w-full h-[30px] px-2 rounded-md border border-gray-300 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500"
       />
-      {term.length >= 2 && results?.items && results.items.length > 0 && (
-        <div className="absolute z-20 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
-          {results.items.map((d) => (
-            <button
-              key={d.id}
-              type="button"
-              onClick={() => {
-                setSearch("");
-                onSelect({ id: d.id, name: d.name, topologyType: d.topology_type });
-              }}
-              className="block w-full text-left px-2 py-1.5 text-xs hover:bg-gray-100"
-            >
-              {d.name}
-            </button>
-          ))}
-        </div>
+      {active && (
+        <DeviceSearchResults
+          query={results}
+          onPick={(d) => {
+            setSearch("");
+            onSelect({ id: d.id, name: d.name, topologyType: d.topology_type });
+          }}
+          className="max-h-40"
+          itemClassName="px-2 py-1.5 text-xs"
+        />
       )}
     </div>
   );

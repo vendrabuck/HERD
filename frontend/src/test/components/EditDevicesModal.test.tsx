@@ -156,6 +156,65 @@ describe("EditDevicesModal", () => {
     );
   });
 
+  describe("more candidates than one page (issue #1590)", () => {
+    // The server holds 120 candidates for the search; the modal asks for one
+    // page of 50 and says the rest exist, and how to reach them.
+    const MANY = Array.from({ length: 50 }, (_, i) => makeDevice(`m-${i}`, `lab-node-${i}`, "tpl"));
+
+    function cappedHandler(total: number, asked: URLSearchParams[]) {
+      return http.get("/api/inventory/devices", ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        if (params.get("limit") === "500") {
+          return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+        }
+        asked.push(params);
+        return HttpResponse.json({ items: MANY, total, skip: 0, limit: 50 });
+      });
+    }
+
+    it("lists the page and says how many more match, asking for one page of 50", async () => {
+      const asked: URLSearchParams[] = [];
+      server.use(cappedHandler(120, asked));
+      renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+      expect(
+        screen.getByText(
+          "Showing 50 of 120 matching devices. Type more of the name to narrow the list.",
+        ),
+      ).toBeInTheDocument();
+      expect(asked.length).toBeGreaterThan(0);
+      for (const params of asked) {
+        expect(params.get("skip")).toBe("0");
+        expect(params.get("limit")).toBe("50");
+      }
+    });
+
+    it("says nothing more when the page holds every match", async () => {
+      server.use(cappedHandler(50, []));
+      renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.queryByText(/matching devices\. Type more/)).not.toBeInTheDocument();
+    });
+
+    it("a failed read shows the load error and no notice", async () => {
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          if (new URL(request.url).searchParams.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          return HttpResponse.json({ detail: "inventory is restarting" }, { status: 500 });
+        }),
+      );
+      renderModal();
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Could not load available devices. inventory is restarting",
+      );
+      expect(screen.queryByText("No available devices found")).not.toBeInTheDocument();
+      expect(screen.queryByText(/matching devices\. Type more/)).not.toBeInTheDocument();
+    });
+  });
+
   it("disables Save until the selection changes", async () => {
     renderModal();
     await waitFor(() => expect(screen.getByText("router-alpha")).toBeInTheDocument());

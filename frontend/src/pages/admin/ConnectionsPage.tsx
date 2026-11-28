@@ -6,12 +6,13 @@ import {
   useCreateConnectionsBulk,
   useDeleteConnection,
 } from "@/api/connections";
-import { usePaginatedDevices, useAllDeviceNames } from "@/api/inventory";
+import { useAllDeviceNames, useDeviceSearch } from "@/api/inventory";
 import { usePorts } from "@/api/ports";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectDialog";
+import { DeviceSearchResults } from "@/components/devices/DeviceSearchResults";
 import { cn } from "@/lib/cn";
 import type { ConnectionCreate } from "@/types/connection.types";
 import { errorDetail } from "@/lib/errors";
@@ -40,11 +41,7 @@ export function ConnectionsPage() {
 
   // Filter device search results
   const [filterSearchInput, setFilterSearchInput] = useState("");
-  const { data: filterDevices } = usePaginatedDevices(
-    filterSearchInput.trim() ? { search: filterSearchInput.trim() } : undefined,
-    0,
-    20,
-  );
+  const { active: filterSearchActive, query: filterDevices } = useDeviceSearch(filterSearchInput, 1);
 
   const createConnection = useCreateConnection();
   const createConnectionsBulk = useCreateConnectionsBulk();
@@ -69,16 +66,8 @@ export function ConnectionsPage() {
   const [notes, setNotes] = useState("");
 
   // Device search for create modal
-  const { data: deviceAResults } = usePaginatedDevices(
-    deviceASearch.trim().length >= 2 ? { search: deviceASearch.trim() } : undefined,
-    0,
-    20,
-  );
-  const { data: deviceBResults } = usePaginatedDevices(
-    deviceBSearch.trim().length >= 2 ? { search: deviceBSearch.trim() } : undefined,
-    0,
-    20,
-  );
+  const { active: deviceASearchActive, query: deviceAResults } = useDeviceSearch(deviceASearch);
+  const { active: deviceBSearchActive, query: deviceBResults } = useDeviceSearch(deviceBSearch);
 
   // Port fetching for selected devices
   const portsAQuery = usePorts(deviceAId || undefined);
@@ -252,18 +241,13 @@ export function ConnectionsPage() {
               </button>
             )}
           </div>
-          {filterSearchInput.trim() && !filterDeviceId && filterDevices?.items && filterDevices.items.length > 0 && (
-            <div className="absolute z-10 mt-1 w-full max-w-sm bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
-              {filterDevices.items.map((d) => (
-                <button
-                  key={d.id}
-                  onClick={() => handleFilterDevice(d.id, d.name)}
-                  className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100"
-                >
-                  {d.name}
-                </button>
-              ))}
-            </div>
+          {filterSearchActive && !filterDeviceId && (
+            <DeviceSearchResults
+              query={filterDevices}
+              onPick={(d) => handleFilterDevice(d.id, d.name)}
+              className="z-10 max-w-sm max-h-48"
+              itemClassName="px-3 py-2 text-sm"
+            />
           )}
         </div>
 
@@ -367,18 +351,13 @@ export function ConnectionsPage() {
                   onChange={(e) => setDeviceASearch(e.target.value)}
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
-                {deviceASearch.trim().length >= 2 && deviceAResults?.items && deviceAResults.items.length > 0 && (
-                  <div className="absolute z-10 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
-                    {deviceAResults.items.map((d) => (
-                      <button
-                        key={d.id}
-                        onClick={() => selectDeviceA(d.id, d.name)}
-                        className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100"
-                      >
-                        {d.name}
-                      </button>
-                    ))}
-                  </div>
+                {deviceASearchActive && (
+                  <DeviceSearchResults
+                    query={deviceAResults}
+                    onPick={(d) => selectDeviceA(d.id, d.name)}
+                    className="z-10 max-h-40"
+                    itemClassName="px-3 py-2 text-sm"
+                  />
                 )}
               </div>
             )}
@@ -436,18 +415,13 @@ export function ConnectionsPage() {
                   onChange={(e) => setDeviceBSearch(e.target.value)}
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
-                {deviceBSearch.trim().length >= 2 && deviceBResults?.items && deviceBResults.items.length > 0 && (
-                  <div className="absolute z-10 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-40 overflow-y-auto">
-                    {deviceBResults.items.map((d) => (
-                      <button
-                        key={d.id}
-                        onClick={() => selectDeviceB(d.id, d.name)}
-                        className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100"
-                      >
-                        {d.name}
-                      </button>
-                    ))}
-                  </div>
+                {deviceBSearchActive && (
+                  <DeviceSearchResults
+                    query={deviceBResults}
+                    onPick={(d) => selectDeviceB(d.id, d.name)}
+                    className="z-10 max-h-40"
+                    itemClassName="px-3 py-2 text-sm"
+                  />
                 )}
               </div>
             )}

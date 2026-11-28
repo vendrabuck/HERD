@@ -1618,7 +1618,9 @@ creating them in one batch, or one pair at a time.
 
 **Surfaces.** `frontend/src/pages/admin/ConnectionsPage.tsx`,
 `frontend/src/components/admin/connections/MultiConnectDialog.tsx`,
-`frontend/src/components/admin/connections/bulkStaging.ts`; routes
+`frontend/src/components/admin/connections/bulkStaging.ts`,
+`frontend/src/components/admin/connections/DeviceSearchPicker.tsx`,
+`frontend/src/components/devices/DeviceSearchResults.tsx`; routes
 `POST /connections/bulk`, `POST /connections`, `DELETE /connections/{id}`.
 
 **Rules.**
@@ -1642,6 +1644,17 @@ creating them in one batch, or one pair at a time.
   stay with the server's reason, and a line with no answer row stays staged. \
   Enforced in: `frontend/src/components/admin/connections/bulkStaging.ts` (`applyBulkResult`) \
   Pinned by: `frontend/src/test/components/bulkStaging.test.ts` (`keeps only the rejected line, carrying the server reason`, `keeps a line whose index has NO row: an absent row is not evidence of creation`); `frontend/src/test/components/MultiConnectDialog.test.tsx` (`PARTIAL SUCCESS is never reported as success: rejected rows stay staged with their reason`)
+- **TOPO-ADMINUI-6.** The page's device searches (the filter above the table, which
+  searches from one character, and the single-pair form's Device A and Device B, and the
+  multi-line dialog's two device pickers, which search from two) ask for the first 20
+  devices whose name contains the text and send no request for a shorter text. Under the
+  input they show the matching devices, and when the server's `total` is larger,
+  `Showing <rows> of <total> matching devices. Type more of the name to narrow the
+  list.`; a search that answered with no rows shows `No devices match`, and a failed
+  search shows the shared load error (`Could not load matching devices.` with Retry),
+  never nothing (issue #1590). \
+  Enforced in: `frontend/src/components/devices/DeviceSearchResults.tsx` (`DeviceSearchResults`); `frontend/src/api/inventory.ts` (`useDeviceSearch`, `DEVICE_SEARCH_LIMIT`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`); `frontend/src/components/admin/connections/DeviceSearchPicker.tsx` (`DeviceSearchPicker`); `frontend/src/pages/admin/ConnectionsPage.tsx` (`ConnectionsPage`) \
+  Pinned by: `frontend/src/test/components/DeviceSearchResults.test.tsx` (`asks for one page of DEVICE_SEARCH_LIMIT and says how many more match`, `says nothing more when the page holds every match`, `a one-character search sends no request and shows nothing`, `the device filter says how many more match`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `only a successful empty answer shows the empty text, with no alert`)
 
 **Out of scope.** Inventory's device and port pages.
 

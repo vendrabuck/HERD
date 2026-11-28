@@ -73,7 +73,58 @@ describe("DeviceConfigSection", () => {
 
     renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
 
-    expect(await screen.findByText("Failed to load versions")).toBeInTheDocument();
+    // The shared load error (issue #1590), and never the empty text with it.
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load config versions. The server answered with HTTP 500.",
+    );
+    expect(screen.queryByText("No config versions yet.")).not.toBeInTheDocument();
+  });
+
+  it("lists every version past one page, walking the pages in order (issue #1590)", async () => {
+    // 501 versions, newest first: the walker asks for 500, then the last one.
+    const all = Array.from({ length: 501 }, (_, i) =>
+      makeVersion({ id: `ver-${501 - i}`, version_number: 501 - i }),
+    );
+    const asked: string[] = [];
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const url = new URL(request.url);
+        const skip = Number(url.searchParams.get("skip"));
+        const limit = Number(url.searchParams.get("limit"));
+        asked.push(`${skip}:${limit}`);
+        return HttpResponse.json({ items: all.slice(skip, skip + limit), total: all.length, skip, limit });
+      }),
+    );
+
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+
+    expect(await screen.findByText("v1")).toBeInTheDocument();
+    expect(screen.getByText("v501")).toBeInTheDocument();
+    expect(screen.getByText("501 versions")).toBeInTheDocument();
+    // Header row plus one row per version.
+    expect(screen.getAllByRole("row")).toHaveLength(502);
+    expect(asked).toEqual(["0:500", "500:500"]);
+  });
+
+  it("a failed second page shows the load error, never the first page alone (issue #1590)", async () => {
+    const first = Array.from({ length: 500 }, (_, i) =>
+      makeVersion({ id: `ver-${501 - i}`, version_number: 501 - i }),
+    );
+    server.use(
+      http.get(VERSIONS_URL, ({ request }) => {
+        const skip = Number(new URL(request.url).searchParams.get("skip"));
+        if (skip === 0) return HttpResponse.json({ items: first, total: 501, skip: 0, limit: 500 });
+        return HttpResponse.json({ detail: "inventory is restarting" }, { status: 503 });
+      }),
+    );
+
+    renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load config versions. inventory is restarting",
+    );
+    expect(screen.queryByText("v501")).not.toBeInTheDocument();
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 
   it("renders a populated version table with author and singular count", async () => {

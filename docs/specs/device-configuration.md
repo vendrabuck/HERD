@@ -1150,11 +1150,14 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
 
 **Rules.**
 
-- **CFG-UI-1.** The configuration section shows the version count, a table of versions
-  with author and time, an empty state, and an error line when the list fails; its
-  buttons are shown to every viewer, and the server decides who may use them. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
-  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`)
+- **CFG-UI-1.** The configuration section shows the version count and a table of every
+  version with author and time, read across all pages of the list (500 a page, newest
+  first, issue #1590); `No config versions yet.` and the count need a successful answer,
+  and a failed read of any page shows the shared load error (`Could not load config
+  versions.` with Retry) and no rows, never the empty text; its buttons are shown to
+  every viewer, and the server decides who may use them. \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a failed second page shows the load error, never the first page alone (issue #1590)`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
 - **CFG-UI-2.** New version parses the text as JSON in the browser, an empty box being
   `{}`; a parse error is shown in the dialog and nothing is sent, and a server refusal
   shows the server's `detail`. \
@@ -1164,6 +1167,11 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   drops the earlier of the two. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`keeps Compare disabled until exactly two versions are selected`)
+- **CFG-UI-7.** A failed read behind View (`Could not load this config version.`) or
+  Compare (`Could not load the config diff.`) shows the shared load error with Retry as
+  the dialog's body, never an empty dialog (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`ViewVersionModal`, `DiffModal`) \
+  Pinned by: `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`)
 - **CFG-UI-4.** The Apply dialog applies now when its time is blank, showing
   `Apply failed: <error>` for a `failed` answer and `Applied (run <first 8 characters>)`
   otherwise, and schedules at the chosen local time when one is set. A refusal the server

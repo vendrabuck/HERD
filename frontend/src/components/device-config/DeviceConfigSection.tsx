@@ -3,7 +3,7 @@ import toast from "react-hot-toast";
 import { Modal } from "@/components/ui/Modal";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
-  useDeviceConfigVersions,
+  useAllDeviceConfigVersions,
   useDeviceConfigVersion,
   useDeviceConfigDiff,
   useCreateDeviceConfigVersion,
@@ -14,15 +14,21 @@ import { useScheduleApplyJob } from "@/api/deviceConfigJobs";
 import { configApplyErrorText, configRestoreErrorText, errorDetail } from "@/lib/errors";
 import type { DeviceConfigVersion } from "@/api/deviceConfig";
 import { ApplyJobsPanel } from "./ApplyJobsPanel";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState, noEntries } from "@/lib/loadState";
 
 interface Props {
   deviceId: string;
 }
 
 export function DeviceConfigSection({ deviceId }: Props) {
-  const { data, isLoading, isError } = useDeviceConfigVersions(deviceId);
-  const versions = data?.items ?? [];
-  const total = data?.total ?? 0;
+  // Every version, across all pages (issue #1590): the history is one list,
+  // and a failed read (any page of it) is LoadError, never "No config versions yet.".
+  const versionsQuery = useAllDeviceConfigVersions(deviceId);
+  const versionsState = loadState(versionsQuery, noEntries);
+  const versions =
+    versionsState === "loaded" || versionsState === "empty" ? (versionsQuery.data ?? []) : [];
+  const total = versions.length;
 
   const createVersion = useCreateDeviceConfigVersion(deviceId);
   const restoreVersion = useRestoreDeviceConfigVersion(deviceId);
@@ -79,7 +85,9 @@ export function DeviceConfigSection({ deviceId }: Props) {
       <div className="flex items-center justify-between mb-3">
         <div>
           <h3 className="text-sm font-medium text-gray-900">Configuration history</h3>
-          <p className="text-xs text-gray-500">{total} version{total === 1 ? "" : "s"}</p>
+          {(versionsState === "loaded" || versionsState === "empty") && (
+            <p className="text-xs text-gray-500">{total} version{total === 1 ? "" : "s"}</p>
+          )}
         </div>
         <div className="flex gap-2">
           <button
@@ -100,9 +108,22 @@ export function DeviceConfigSection({ deviceId }: Props) {
         </div>
       </div>
 
-      {isLoading && <p className="text-xs text-gray-400">Loading versions...</p>}
-      {isError && <p className="text-xs text-red-600">Failed to load versions</p>}
-      {!isLoading && versions.length === 0 && (
+      <LoadErrorNotice
+        what="config versions"
+        query={versionsQuery}
+        isEmpty={noEntries}
+        className="mb-3"
+      />
+      {versionsState === "loading" && <p className="text-xs text-gray-400">Loading versions...</p>}
+      {versionsState === "error" && (
+        <LoadError
+          what="config versions"
+          error={versionsQuery.error}
+          onRetry={() => void versionsQuery.refetch()}
+          retrying={versionsQuery.isFetching}
+        />
+      )}
+      {versionsState === "empty" && (
         <p className="text-xs text-gray-400">No config versions yet.</p>
       )}
       {versions.length > 0 && (
@@ -373,10 +394,20 @@ function ViewVersionModal({
   versionId: string;
   onClose: () => void;
 }) {
-  const { data, isLoading } = useDeviceConfigVersion(deviceId, versionId);
+  const query = useDeviceConfigVersion(deviceId, versionId);
+  const state = loadState(query, undefined, isPlainObject);
+  const data = state === "loaded" ? query.data : undefined;
   return (
     <Modal open onClose={onClose} title={data ? `Config v${data.version_number}` : "Config"}>
-      {isLoading && <p className="text-xs text-gray-400">Loading...</p>}
+      {state === "loading" && <p className="text-xs text-gray-400">Loading...</p>}
+      {state === "error" && (
+        <LoadError
+          what="this config version"
+          error={query.error}
+          onRetry={() => void query.refetch()}
+          retrying={query.isFetching}
+        />
+      )}
       {data && (
         <pre className="bg-gray-50 border border-gray-200 rounded p-3 text-xs font-mono whitespace-pre-wrap break-all max-h-96 overflow-auto">
           {JSON.stringify(data.config, null, 2)}
@@ -406,10 +437,20 @@ function DiffModal({
   to: string;
   onClose: () => void;
 }) {
-  const { data, isLoading } = useDeviceConfigDiff(deviceId, from, to);
+  const query = useDeviceConfigDiff(deviceId, from, to);
+  const state = loadState(query, undefined, isPlainObject);
+  const data = state === "loaded" ? query.data : undefined;
   return (
     <Modal open onClose={onClose} title="Config diff">
-      {isLoading && <p className="text-xs text-gray-400">Computing...</p>}
+      {state === "loading" && <p className="text-xs text-gray-400">Computing...</p>}
+      {state === "error" && (
+        <LoadError
+          what="the config diff"
+          error={query.error}
+          onRetry={() => void query.refetch()}
+          retrying={query.isFetching}
+        />
+      )}
       {data && (
         <pre className="bg-gray-50 border border-gray-200 rounded p-3 text-xs font-mono whitespace-pre-wrap break-all max-h-96 overflow-auto">
           {data.diff || "(no changes)"}

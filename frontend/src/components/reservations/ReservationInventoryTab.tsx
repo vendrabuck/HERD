@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import { useDevice, useAllDeviceNames } from "@/api/inventory";
 import { usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noEntries } from "@/lib/loadState";
 
 interface Props {
   deviceIds: string[];
@@ -30,8 +32,15 @@ function DevicePortsDetail({
   deviceId: string;
   deviceNameMap: Map<string, string> | undefined;
 }) {
-  const { data: ports, isLoading: portsLoading } = usePorts(deviceId);
-  const { data: connections } = useDeviceConnections(deviceId);
+  const portsQuery = usePorts(deviceId);
+  const { data: ports } = portsQuery;
+  const portsState = loadState(portsQuery, noEntries);
+  const connectionsQuery = useDeviceConnections(deviceId);
+  const { data: connections } = connectionsQuery;
+  // The Inventory page's expanded row, the same way (issue #1590): a failed
+  // ports read is never "No ports", and a failed connections read fails the
+  // panel, since every port would otherwise read "-", unconnected.
+  const connectionsState = loadState(connectionsQuery, noEntries);
 
   const connectionMap = useMemo(() => {
     const map = new Map<string, { deviceId: string; deviceName: string; portName: string }>();
@@ -47,11 +56,35 @@ function DevicePortsDetail({
     return map;
   }, [connections, deviceId, deviceNameMap]);
 
-  if (portsLoading) {
+  if (portsState === "error") {
+    return (
+      <LoadError
+        what="this device's ports"
+        error={portsQuery.error}
+        onRetry={() => void portsQuery.refetch()}
+        retrying={portsQuery.isFetching}
+        className="mx-4 my-2"
+      />
+    );
+  }
+
+  if (connectionsState === "error") {
+    return (
+      <LoadError
+        what="this device's connections"
+        error={connectionsQuery.error}
+        onRetry={() => void connectionsQuery.refetch()}
+        retrying={connectionsQuery.isFetching}
+        className="mx-4 my-2"
+      />
+    );
+  }
+
+  if (portsState === "loading" || connectionsState === "loading") {
     return <p className="text-xs text-gray-400 px-4 py-2">Loading ports...</p>;
   }
 
-  if (!ports || ports.length === 0) {
+  if (!ports || portsState === "empty") {
     return <p className="text-xs text-gray-400 px-4 py-2">No ports</p>;
   }
 
