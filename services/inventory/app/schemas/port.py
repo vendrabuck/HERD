@@ -4,23 +4,27 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.column_bounds import JsonObject, column_string
+
+# Matches the ports.name column width (String(255), app/models/port.py).
 PORT_NAME_MAX_LENGTH = 255
+PortName = column_string(PORT_NAME_MAX_LENGTH, min_length=1)
 
 
 class PortCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=PORT_NAME_MAX_LENGTH)
+    name: PortName
     template_id: uuid.UUID
-    field_data: dict[str, Any] = {}
+    field_data: JsonObject = {}
 
 
 class BulkPortCreate(BaseModel):
     # The final port name is name_prefix + index, so cap the prefix below the
     # 255 column width to leave room for the suffix.
-    name_prefix: str = Field(..., min_length=1, max_length=200)
+    name_prefix: column_string(200, min_length=1)
     starting_index: int = Field(..., ge=0)
     instances: int = Field(..., ge=1, le=200)
     template_id: uuid.UUID
-    field_data: dict[str, Any] = {}
+    field_data: JsonObject = {}
 
     @model_validator(mode="after")
     def _final_names_fit_column(self) -> "BulkPortCreate":
@@ -38,8 +42,8 @@ class BulkPortCreate(BaseModel):
 
 
 class PortUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=PORT_NAME_MAX_LENGTH)
-    field_data: dict[str, Any] | None = None
+    name: PortName | None = None
+    field_data: JsonObject | None = None
 
 
 class PortResponse(BaseModel):

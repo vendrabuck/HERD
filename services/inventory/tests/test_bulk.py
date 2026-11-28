@@ -25,6 +25,7 @@ from app.services.bulk_service import (
     IMPORT_JSON_UNREADABLE_DETAIL,
     JSON_CELL_UNREADABLE_REASON,
     _coerce_json_cell,
+    _RowReasonError,
     parse_import,
 )
 from fastapi import HTTPException
@@ -1527,7 +1528,8 @@ def test_parse_import_keeps_the_decoder_position_for_a_syntax_error():
 def test_a_json_cell_the_parser_refuses_raises_the_fixed_reason(cell):
     with pytest.raises(ValueError) as exc:
         _coerce_json_cell(cell(_parser_depth_bound()), {})
-    assert type(exc.value) is ValueError
+    # The module's fixed-reason error, never the decoder's or Python's own.
+    assert type(exc.value) is _RowReasonError
     assert str(exc.value) == _CELL_UNREADABLE
 
 
@@ -2493,3 +2495,225 @@ async def test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound(
             }
         ]
     }
+
+
+# Fixed row reasons for failures that are not schema errors ---------------------
+
+_ROW_SENTINEL = "sentinel-7c1f0e5a9b2d4e88"
+
+
+class _RefusingDriverError(Exception):
+    """Stands in for the driver error a refused statement wraps: a SQLSTATE on it,
+    a constraint name on its cause, and the test's marker value in both texts. The
+    reason is exactly the fixed text and the report carries no text from the
+    error."""
+
+    def __init__(self, sqlstate, constraint_name=None):
+        super().__init__(f"refused: {_ROW_SENTINEL}")
+        self.sqlstate = sqlstate
+        cause = Exception(f"Key (name)=({_ROW_SENTINEL}) already exists")
+        cause.constraint_name = constraint_name
+        self.__cause__ = cause
+
+
+def _refused_statement(sqlstate, constraint_name=None):
+    from sqlalchemy.exc import DBAPIError
+
+    return DBAPIError(
+        "INSERT INTO devices (name, field_data) VALUES ($1::VARCHAR, $2::JSON)",
+        ("bad", json.dumps({"rack": _ROW_SENTINEL})),
+        _RefusingDriverError(sqlstate, constraint_name),
+    )
+
+
+def _assert_nothing_of_the_row_or_statement(text: str) -> None:
+    assert _ROW_SENTINEL not in text
+    assert "INSERT" not in text
+    assert "[parameters" not in text
+    assert "sqlalche.me" not in text
+
+
+async def _post_resource_rows(client, resource: str, items: list, dry_run: bool = False):
+    return await client.post(
+        f"/{resource}/import",
+        params={"format": "json", "dry_run": str(dry_run).lower()},
+        files={"file": ("f.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True], ids=["commit", "dry_run"])
+@pytest.mark.parametrize(
+    "resource, service_function",
+    [
+        ("devices", "create_device"),
+        ("devices", "update_device"),
+        ("templates", "create_template"),
+        ("templates", "update_template"),
+    ],
+)
+@pytest.mark.parametrize(
+    "sqlstate, reason",
+    [
+        ("23505", "the database refused the row: a value that must be unique is already in use"),
+        ("40001", "the database was unavailable or busy; run the import again"),
+    ],
+    ids=["23505", "40001"],
+)
+async def test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route(
+    client, monkeypatch, caplog, resource, service_function, dry_run, sqlstate, reason
+):
+    """A refusal raised out of the create or update function: the reason is exactly
+    the fixed text for its SQLSTATE, the report and the log carry no text from the
+    error, and the next row is judged on its own."""
+    from app.services import bulk_service
+
+    template = await _create_template(client, name="Firewall")
+    updating = service_function.startswith("update")
+    if resource == "devices":
+        if updating:
+            await _create_device(client, template["id"], name="bad")
+        base = {"template_name": "Firewall", "topology_type": "PHYSICAL"}
+        items = [
+            {**base, "name": "bad", "field_data": {"model": "M", "rack": _ROW_SENTINEL}},
+            {**base, "name": "good", "field_data": {"model": "M"}},
+        ]
+    else:
+        if updating:
+            await _create_template(client, name="bad")
+        driver_name = (await client.get("/drivers")).json()["items"][0]["name"]
+        base = {
+            "template_type": "device",
+            "driver_name": driver_name,
+            "vendor": "V",
+            "model": "M",
+            "sections": TEMPLATE_PAYLOAD["sections"],
+        }
+        items = [
+            {**base, "name": "bad", "description": _ROW_SENTINEL},
+            {**base, "name": "good"},
+        ]
+    real = getattr(bulk_service, service_function)
+
+    async def refusing(db, *args, **kwargs):
+        # The schema object is the last positional argument of all four.
+        if args[-1].name == "bad":
+            raise _refused_statement(sqlstate, "devices_name_key")
+        return await real(db, *args, **kwargs)
+
+    monkeypatch.setattr(bulk_service, service_function, refusing)
+    caplog.set_level("INFO")
+    resp = await _post_resource_rows(client, resource, items, dry_run)
+    assert resp.status_code == 200, resp.text
+    _assert_nothing_of_the_row_or_statement(resp.text)
+    _assert_nothing_of_the_row_or_statement(caplog.text)
+    rows = resp.json()["rows"]
+    assert (rows[0]["action"], rows[0]["identity"]) == ("reject", "bad")
+    assert rows[0]["reason"] == reason
+    assert "devices_name_key" not in resp.text
+    assert (rows[1]["action"], rows[1]["identity"], rows[1]["reason"]) == ("create", "good", None)
+    assert f"sqlstate={sqlstate}" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource, item, reason",
+    [
+        (
+            "devices",
+            {"template_name": 5, "topology_type": "PHYSICAL"},
+            "template_name: must be a string",
+        ),
+        (
+            "devices",
+            {"template_name": "Firewall", "topology_type": "PHYSICAL", "field_data": 5},
+            "a JSON cell must be an object, a list, or JSON text",
+        ),
+        (
+            "devices",
+            {
+                "template_name": "Firewall",
+                "topology_type": "PHYSICAL",
+                "poll_interval_seconds": _ROW_SENTINEL,
+            },
+            "poll_interval_seconds: must be a whole number",
+        ),
+        (
+            "devices",
+            {
+                "template_name": "Firewall",
+                "topology_type": "PHYSICAL",
+                "poll_interval_seconds": [_ROW_SENTINEL],
+            },
+            "poll_interval_seconds: must be a whole number",
+        ),
+        ("templates", {"driver_name": [_ROW_SENTINEL]}, "driver_name: must be a string"),
+        ("templates", {"hypervisor_name": {"x": 1}}, "hypervisor_name: must be a string"),
+        (
+            "templates",
+            {"sections": True, "vendor": "V", "model": "M"},
+            "a JSON cell must be an object, a list, or JSON text",
+        ),
+        (
+            "templates",
+            {"sections": [], "poll_interval_seconds": "1e3" + _ROW_SENTINEL},
+            "poll_interval_seconds: must be a whole number",
+        ),
+    ],
+    ids=[
+        "device-template-name-number",
+        "device-field-data-number",
+        "device-poll-text",
+        "device-poll-list",
+        "template-driver-name-list",
+        "template-hypervisor-name-object",
+        "template-sections-boolean",
+        "template-poll-text",
+    ],
+)
+async def test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason(
+    client, resource, item, reason
+):
+    """Each reason names the column, never its value or Python's own message."""
+    await _create_template(client, name="Firewall")
+    resp = await _post_resource_rows(client, resource, [{"name": "row-0", **item}])
+    assert resp.status_code == 200, resp.text
+    row = resp.json()["rows"][0]
+    assert (row["action"], row["identity"], row["reason"]) == ("reject", "row-0", reason)
+    assert _ROW_SENTINEL not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason(client):
+    await _create_template(client, name="Firewall")
+    body = (
+        "name,template_name,topology_type,field_data,poll_interval_seconds\n"
+        f'd1,Firewall,PHYSICAL,"{{""model"": ""M""}}",{_ROW_SENTINEL}\n'
+        'd2,Firewall,PHYSICAL,"{""model"": ""M""}",60\n'
+    ).encode()
+    report = await _import(client, body, "csv")
+    assert [(r["action"], r["reason"]) for r in report["rows"]] == [
+        ("reject", "poll_interval_seconds: must be a whole number"),
+        ("create", None),
+    ]
+    assert _ROW_SENTINEL not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_row_failure_is_reported_without_its_text(client, monkeypatch, caplog):
+    """A failure of no known class keeps only the fact, and the log only its class."""
+    from app.services import bulk_service
+
+    await _create_template(client, name="Firewall")
+
+    async def failing(*args, **kwargs):
+        raise RuntimeError(f"unexpected {_ROW_SENTINEL}")
+
+    monkeypatch.setattr(bulk_service, "create_device", failing)
+    caplog.set_level("INFO")
+    items = [{"name": "d1", "template_name": "Firewall", "topology_type": "PHYSICAL"}]
+    report = await _import(client, json.dumps(items).encode(), "json")
+    assert report["rows"][0]["reason"] == "the row could not be imported"
+    assert _ROW_SENTINEL not in json.dumps(report)
+    assert _ROW_SENTINEL not in caplog.text
+    assert "bulk import row failed: RuntimeError" in caplog.text

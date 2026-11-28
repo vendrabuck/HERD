@@ -3,6 +3,16 @@ from datetime import datetime
 
 from pydantic import BaseModel, field_validator
 
+from app.schemas.column_bounds import ColumnText, column_string
+
+# The hypervisors columns' widths (app/models/hypervisor.py).
+HYPERVISOR_NAME_MAX_LENGTH = 255
+HYPERVISOR_ENDPOINT_MAX_LENGTH = 512
+HYPERVISOR_TYPE_MAX_LENGTH = 50
+HypervisorName = column_string(HYPERVISOR_NAME_MAX_LENGTH)
+HypervisorEndpoint = column_string(HYPERVISOR_ENDPOINT_MAX_LENGTH)
+HypervisorType = column_string(HYPERVISOR_TYPE_MAX_LENGTH)
+
 
 def _reject_blank(v: str | None, label: str) -> str | None:
     if v is None:
@@ -13,10 +23,10 @@ def _reject_blank(v: str | None, label: str) -> str | None:
 
 
 class HypervisorCreate(BaseModel):
-    name: str
-    description: str | None = None
-    endpoint: str
-    hypervisor_type: str
+    name: HypervisorName
+    description: ColumnText | None = None
+    endpoint: HypervisorEndpoint
+    hypervisor_type: HypervisorType
     secret_id: uuid.UUID
     enabled: bool = True
     device_group_id: uuid.UUID | None = None
@@ -30,10 +40,10 @@ class HypervisorCreate(BaseModel):
 
 
 class HypervisorUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-    endpoint: str | None = None
-    hypervisor_type: str | None = None
+    name: HypervisorName | None = None
+    description: ColumnText | None = None
+    endpoint: HypervisorEndpoint | None = None
+    hypervisor_type: HypervisorType | None = None
     secret_id: uuid.UUID | None = None
     enabled: bool | None = None
     device_group_id: uuid.UUID | None = None

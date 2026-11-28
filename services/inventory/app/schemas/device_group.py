@@ -3,15 +3,24 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.schemas.column_bounds import column_string
+
+# Matches the device_groups.name column width (String(100), app/models/device_group.py).
+DEVICE_GROUP_NAME_MAX_LENGTH = 100
+DeviceGroupName = column_string(DEVICE_GROUP_NAME_MAX_LENGTH, min_length=1)
+# The description column is Text; 2000 characters is the product's own bound
+# (INV-GRP-2).
+DeviceGroupDescription = column_string(2000)
+
 
 class DeviceGroupCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=2000)
+    name: DeviceGroupName
+    description: DeviceGroupDescription | None = None
 
 
 class DeviceGroupUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = Field(default=None, max_length=2000)
+    name: DeviceGroupName | None = None
+    description: DeviceGroupDescription | None = None
 
 
 class DeviceGroupDeviceResponse(BaseModel):
