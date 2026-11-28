@@ -737,10 +737,12 @@ usual (IAM-UI-9 in `identity-and-access.md`).
   `errors` entry: `Cannot reach the restart service: <ClassName>` (no answer within
   720 seconds, a refused connection, an unresolvable name), `A restart is already in
   progress` (a 409), `The restart service answered HTTP <status>` (any other status),
-  or `The restart service answered an unexpected body`. The restarter's body is never
+  or `The restart service answered an unexpected body` (any other 200 body: not JSON,
+  not the shape, over 64 KiB, or one the parser refuses, such as an integer too long to
+  read or nesting past the interpreter's depth bound). The restarter's body is never
   echoed in those cases; it goes to the log. \
   Enforced in: `services/config/app/docker_ctl.py` (`restart_services`, `_validated`, `IN_PROGRESS_ERROR`, `UNEXPECTED_BODY_ERROR`, `RESTART_TIMEOUT_SECONDS`) \
-  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_answer_is_passed_through_when_it_has_exactly_the_shape`, `test_a_409_is_the_in_progress_entry`, `test_another_status_is_named_and_the_body_never_echoed`, `test_any_other_200_body_is_the_unexpected_body_entry`, `test_a_refused_connection_is_cannot_reach_with_the_class_only`, `test_an_unresolvable_restarter_is_cannot_reach`, `test_a_silent_restarter_times_out`, `test_apply_passes_the_409_on_as_an_error_entry`)
+  Pinned by: `services/config/tests/test_docker_ctl.py` (`test_the_answer_is_passed_through_when_it_has_exactly_the_shape`, `test_a_409_is_the_in_progress_entry`, `test_another_status_is_named_and_the_body_never_echoed`, `test_any_other_200_body_is_the_unexpected_body_entry`, `test_the_deep_bodies_are_past_the_parser_bound_here`, `test_a_body_refused_for_its_shape_is_the_unexpected_body_entry`, `test_the_largest_body_that_fits_is_still_passed_through`, `test_apply_answers_and_records_a_shape_refused_body_as_the_unexpected_body_entry`, `test_a_refused_connection_is_cannot_reach_with_the_class_only`, `test_an_unresolvable_restarter_is_cannot_reach`, `test_a_silent_restarter_times_out`, `test_apply_passes_the_409_on_as_an_error_entry`)
 - **OPS-CONFIG-25.** The restarter's HTTP surface is `POST /restart` and `GET /health`
   (`{"status": "ok", "service": "restarter"}`, with no Docker call). `POST /restart`
   ignores its query string, body, and headers. Any other path is 404 `Not found` and
