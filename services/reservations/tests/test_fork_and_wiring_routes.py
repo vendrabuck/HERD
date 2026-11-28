@@ -488,6 +488,29 @@ async def test_an_upstream_transport_error_is_503_failed_to_contact(network, met
     assert network.calls.call_count == 1
 
 
+NOT_JSON_4XX_DETAIL = {"cabling": "Cabling request failed", "execution": "Execution request failed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409, 499])
+@pytest.mark.parametrize("body", UNPARSEABLE.values(), ids=UNPARSEABLE.keys())
+@EVERY_UPSTREAM_ROUTE
+async def test_an_upstream_4xx_that_is_not_json_answers_fixed_wording(
+    network, method, route, body, status
+):
+    """RES-FORK-10 and RES-FORK-18: a 4xx whose body does not parse keeps its status and
+    answers the service's fixed wording, never the body's text."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    service = _upstream_of(method, route)[0]
+    network.route().mock(return_value=bad_answer(status, body))
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == status
+    assert resp.json() == {"detail": NOT_JSON_4XX_DETAIL[service]}
+    assert_nothing_leaked(resp.text)
+    assert network.calls.call_count == 1
+
+
 @pytest.mark.asyncio
 @EVERY_UPSTREAM_ROUTE
 async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(
@@ -642,9 +665,9 @@ async def test_a_save_answer_of_the_declared_shape_stages_its_version(network):
 async def test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_parse(
     network, method, route, body, status
 ):
-    """RES-FORK-10 for a body nested past the recursion limit, a 500 before #1577: a
-    4xx keeps its status and relays its text, as any other 4xx body that does not
-    parse does; a 5xx is 503 `Cabling service is unavailable`."""
+    """RES-FORK-10 for a body nested past the recursion limit: a 4xx keeps its status
+    and answers `Cabling request failed`, as any other 4xx body that does not parse
+    does; a 5xx is 503 `Cabling service is unavailable`."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     network.route().mock(return_value=bad_answer(status, body))
     async with _client_as(OWNER_ID, "user") as ac:
@@ -654,4 +677,4 @@ async def test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_
         assert resp.json() == {"detail": "Cabling service is unavailable"}
     else:
         assert resp.status_code == 409
-        assert resp.json() == {"detail": body.decode()}
+        assert resp.json() == {"detail": "Cabling request failed"}
