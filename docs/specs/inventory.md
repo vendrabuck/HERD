@@ -1332,7 +1332,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
 - **INV-BULK-27.** An import's file work and an export's rendering run off the event
   loop, so the service answers other requests between their steps; a single C call within that work still holds the loop for its own length: each
   whole-file JSON decode and the lone surrogate scan's serialization of the parsed
-  document (on one core, about 60 ms and about 50 ms for a 10 MiB file). The decode, the CSV or
+  document (from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well). The decode, the CSV or
   JSON parse, the lone surrogate scan, and the decode of each row's JSON text cell
   (`field_data` for a device, `sections` for a template) run on a worker thread before
   the import's first query; an export renders its records into one body the same way.
