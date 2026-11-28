@@ -822,11 +822,12 @@ ones, and can mark one or all read and delete one.
   another user's row answers as if absent. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`list_notifications`, `mark_read`, `delete_notification`); `services/notifications/app/services/notification_service.py` (`list_for_user`, `mark_read`, `delete_one`) \
   Pinned by: `services/notifications/tests/test_router.py` (`test_list_unauthenticated`, `test_list_returns_only_caller_notifications`, `test_mark_read_foreign_notification_returns_404`, `test_delete_foreign_returns_404`, `test_caller_id_rejects_non_uuid_subject`)
-- **INTEG-INAPP-3.** The list is newest first and pages with `limit` (1 to 200, default
-  50) and `offset` (at least 0), not the `skip` other services use. By decision; see
-  the CHANGELOG entry for issue #597. \
+- **INTEG-INAPP-3.** The list is newest first (notifications created at the same instant
+  by id ascending, so pages never overlap or skip, issue #1589) and pages with `limit`
+  (1 to 200, default 50) and `offset` (at least 0), not the `skip` other services use.
+  The `offset` name is by decision; see the CHANGELOG entry for issue #597. \
   Enforced in: `services/notifications/app/routers/notifications.py` (`list_notifications`); `services/notifications/app/services/notification_service.py` (`list_for_user`) \
-  Pinned by: `services/notifications/tests/test_router.py` (`test_list_handler_returns_items`)
+  Pinned by: `services/notifications/tests/test_router.py` (`test_list_handler_returns_items`, `test_list_breaks_created_at_ties_by_id`)
 - **INTEG-INAPP-4.** `unread_only` narrows `items` only: `total` is always every
   notification the caller has, and `unread` the caller's unread count. By decision; see
   the docstring of `list_for_user`. \

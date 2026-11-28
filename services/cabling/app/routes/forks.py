@@ -201,8 +201,8 @@ async def list_active_forks_internal(
     the best-effort archive, or any pre-phase-3 fork that predates the teardown
     wiring) is a zombie that false-contends for port claims. This is the read side;
     reservations decides which of these to freeze. ARCHIVED forks are never listed,
-    so an already-frozen fork drops out naturally. Ordered by created_at for stable
-    pagination.
+    so an already-frozen fork drops out naturally. Ordered by created_at, then id
+    (issue #1589), a total order, so offset pages are disjoint.
     """
     _check_internal_token(x_internal_token)
 
