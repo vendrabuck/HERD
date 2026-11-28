@@ -54,12 +54,21 @@ from app.services.nats_consumer import TransientUpstreamError
 from app.services.route_service import all_route_assignments_for_reservation
 from app.services.wiring_retry_service import (
     WiringReservationFrozen,
+    WiringReservationNotFrozen,
     is_retryable_failure,
     make_session_ctx_factory,
     reattempt_reservation,
+    redrive_pinned_releases,
 )
 
 logger = logging.getLogger(__name__)
+
+# The admin re-drive of pinned release rows (issue #1199) answers this on a
+# reservation whose wiring is not frozen (not ended, or unknown to execution).
+REDRIVE_NOT_ENDED_DETAIL = (
+    "Reservation wiring is not frozen; pinned release rows are re-driven only after "
+    "the reservation has ended"
+)
 
 # Pinned: the by-id run reads answer an unknown run and a run on a device the
 # caller may not see with this same detail.
@@ -871,3 +880,54 @@ async def internal_wiring_retry(
         )
     except TransientUpstreamError as exc:
         raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {exc}")
+
+
+@router.post(
+    "/reservations/{reservation_id}/wiring/redrive-pinned-releases",
+    response_model=WiringRetryResponse,
+)
+async def redrive_pinned_release_rows(
+    reservation_id: uuid.UUID,
+    payload: dict = Depends(require_admin),
+):
+    """Re-drive, once, the pinned release rows of an ended reservation. Admin only.
+
+    Issue #1199 (owner decision, option 2). A disconnect, VLAN leave, or route removal
+    that failed because the switch's driver package was broken or its template was
+    missing carries a pinned reason, which no retry channel drives, and once the
+    reservation has ended a fork re-save is not available either. After the package
+    or template is fixed, an admin calls this to drive exactly those rows in their
+    release direction (`redrive_pinned_releases`); nothing else is driven. Each row is
+    claimed before its driver call, so two concurrent calls never drive one row twice:
+    the second reports it `in_progress`. A row that is released is not driven again.
+
+    Answers 200 with the per-row outcomes (the manual retry's shape, an empty list when
+    no row qualifies), 409 when the reservation's wiring is not frozen, and 503 when an
+    inventory read fails while the rows are applied. Gated by `require_admin`, the
+    gate of execution's other admin-only retry (`POST /runs/{id}/retry`): 401 without
+    a valid token, 403 for a user who is not an admin or superadmin. Runs against
+    fresh sessions, like the internal retry route.
+    """
+    get_db_session = make_session_ctx_factory()
+    try:
+        result = await redrive_pinned_releases(reservation_id, get_db_session)
+    except WiringReservationNotFrozen:
+        raise HTTPException(status_code=409, detail=REDRIVE_NOT_ENDED_DETAIL)
+    except TransientUpstreamError as exc:
+        raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {exc}")
+    outcomes: dict[str, int] = {}
+    for row in result["results"]:
+        outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
+    logger.info(
+        "Pinned release re-drive for reservation %s by %s: %s",
+        reservation_id,
+        payload.get("sub"),
+        outcomes,
+        extra={
+            "action": "wiring_pinned_release_redrive",
+            "reservation_id": str(reservation_id),
+            "actor_id": str(payload.get("sub")),
+            "rows": len(result["results"]),
+        },
+    )
+    return result

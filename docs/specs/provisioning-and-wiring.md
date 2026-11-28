@@ -26,13 +26,15 @@ fork in cabling does, `topology.md`), does not change reservation status
 
 ## 2. Actors and permissions
 
-Execution's wiring routes are internal only; the user-facing gate is reservations'
-owner-or-admin check (RES-FORK-4) and the endpoint matrix is in [ROLES.md](../ROLES.md).
+Execution's wiring status and retry routes are internal; their user-facing gate is
+reservations' owner-or-admin check (RES-FORK-4). The one wiring route execution serves to
+users is the admin re-drive of pinned release rows (WIRE-RETRY-21 to WIRE-RETRY-24),
+gated by execution itself. The endpoint matrix is in [ROLES.md](../ROLES.md).
 
 | Actor | May | May not |
 |---|---|---|
 | User | Read the wiring status of their own reservation and retry its failed rows, through reservations' proxy | Call execution's internal routes; retry a reservation that is still `PENDING` or `PENDING_PROVISION` (refused by reservations) |
-| Admin | The same for any reservation, through the proxy | Call execution's internal routes |
+| Admin | The same for any reservation, through the proxy; re-drive an ended reservation's pinned release rows (`POST /reservations/{id}/wiring/redrive-pinned-releases`, WIRE-RETRY-21) | Call execution's internal routes |
 | Superadmin | Same as admin | Same as admin |
 | Another service (internal token) | Reservations: read the layered wiring status and trigger a manual retry (section 7) | Anything else in this area; there is no internal write route besides retry |
 | The NATS consumer (no user) | Apply `reservation.wiring_changed`, tear down on terminal events; every driver run it makes is attributed to the nil UUID (WIRE-DRIVER-5) | Act on an event reservations does not corroborate (WIRE-GATE-2) |
@@ -641,10 +643,14 @@ the same lock (WIRE-VLAN-8, WIRE-VLAN-11).
 
 ## 5. API surface
 
-None. Execution serves no user-facing wiring route. Users read wiring status and retry
-failed rows through reservations' `GET /{id}/wiring-status` and `POST /{id}/wiring/retry`
-(`reservations.md`, RES-FORK-4 and RES-FORK-18), which forward to the internal routes in
-section 7. Execution's run-listing routes (`GET /runs`) belong to
+| Method | Path | Auth | Answers | Rules |
+|---|---|---|---|---|
+| POST | `/reservations/{reservation_id}/wiring/redrive-pinned-releases` | admin or superadmin JWT (`require_admin`) | 200 `{reservation_id, results: [...]}`, each result carrying `outcome`; 401, 403, 409, 503 | WIRE-RETRY-21 to WIRE-RETRY-24 |
+
+That admin re-drive (issue #1199) is execution's only user-facing wiring route. Users
+read wiring status and retry failed rows through reservations' `GET /{id}/wiring-status`
+and `POST /{id}/wiring/retry` (`reservations.md`, RES-FORK-4 and RES-FORK-18), which
+forward to the internal routes in section 7. Execution's run-listing routes (`GET /runs`) belong to
 `operations-and-observability.md`.
 
 ## 6. Events
@@ -1643,7 +1649,8 @@ interface in section 8.15.
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_retry_frozen_reservation_processes_releases_reports_builds_frozen`); `services/execution/tests/test_wiring_retry_l2.py` (`test_frozen_processes_release_reports_build_frozen`); `services/execution/tests/test_wiring_retry_l3.py` (`test_frozen_processes_release_reports_build_frozen`)
 - **WIRE-RETRY-4.** A row whose `last_error` starts with `WIRING_UNRESOLVABLE_REASON` or
   `WIRING_NOT_SIMPLE_CHAIN_REASON` is reported `not_retryable` with no driver call; a row
-  with no error is retryable. \
+  with no error is retryable. Some pinned release rows of an ended reservation are driven
+  by the admin re-drive instead (WIRE-RETRY-21). \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`is_retryable_failure`, `reattempt_reservation`) \
   Pinned by: `services/execution/tests/test_wiring_retry_service.py` (`test_is_retryable_classifies_driver_failures_retryable`, `test_is_retryable_classifies_pinned_reasons_not_retryable`, `test_retry_non_retryable_pinned_reason_makes_no_driver_call`); `services/execution/tests/test_wiring_retry_l2.py` (`test_retry_non_retryable_pinned_reason_makes_no_driver_call`)
 - **WIRE-RETRY-5.** Each retryable row is retried in its own direction through the same
@@ -1799,6 +1806,61 @@ interface in section 8.15.
   count is above zero, and at DEBUG otherwise. \
   Enforced in: `services/execution/app/services/wiring_retry_service.py` (`run_wiring_retry_tick`); `services/execution/app/services/wiring_due.py` (`count_tick_excluded`) \
   Pinned by: `services/execution/tests/test_wiring_due.py` (`test_count_tick_excluded_counts_failed_under_cap_rows_by_reason`, `test_tick_excluded_stats_sum_the_three_ledgers`, `test_tick_excluded_stats_leave_out_rows_at_and_above_the_cap`, `test_tick_log_level_follows_each_excluded_count`, `test_a_failed_exclusion_count_does_not_fail_the_tick`, `test_tick_log_stays_at_info_while_only_excluded_rows_exist`); `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py` (`test_count_tick_excluded_counts_the_case_product`)
+
+- **WIRE-RETRY-21.** The admin re-drive (`redrive_pinned_releases`, issue #1199) drives,
+  once per call, exactly the rows of one reservation that are FAILED, intended
+  `RELEASED`, and pinned by a switch-level failure recorded while the switch itself was
+  read: a reason that starts with `WIRING_PACKAGE_UNLOADABLE_PREFIX` (a broken driver
+  package, WIRE-DRIVER-7), or one equal to `wiring_template_missing_reason` for the
+  row's own layer and switch. On L2 the row must also name an allocation that exists
+  and is not the nil placeholder (a number to remove). Every other row is neither driven
+  nor reported: build rows, release rows with a retryable reason (the tick's work), and
+  the other pinned reasons, a switch that was not found (since #1203 only an inventory
+  404 records it), an unresolvable hop, a hop set that is not a simple chain, and an L2
+  row with no allocation. The tick and the manual retry are unchanged: they still leave
+  these rows out (WIRE-RETRY-4, WIRE-RETRY-14), so a pinned load failure, which counts
+  no attempt, cannot starve the tick's batches (#1190); a row the re-drive leaves FAILED
+  waits for the next call. \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`redrive_pinned_releases`, `is_redrivable_pinned_release`); `services/execution/app/services/nats_consumer.py` (`WIRING_PACKAGE_UNLOADABLE_PREFIX`, `wiring_template_missing_reason`) \
+  Pinned by: `services/execution/tests/test_wiring_pinned_release_redrive.py` (`test_a_broken_package_at_teardown_pins_every_release_row_and_no_channel_drives_it`, `test_once_the_package_is_fixed_the_redrive_removes_every_layers_release`, `test_a_missing_template_at_teardown_is_redriven_once_the_template_is_back`, `test_a_release_row_whose_switch_was_not_found_is_never_driven`, `test_build_rows_retryable_releases_and_unresolvable_hops_are_left_alone`, `test_an_l2_release_with_no_vlan_number_is_left_alone`, `test_the_redrive_predicate_over_every_reason_direction_status_and_layer`, `test_every_permanent_load_failure_reason_is_redrivable_and_no_transient_one_is`)
+- **WIRE-RETRY-22.** The re-drive runs only on a reservation whose wiring is frozen (its
+  terminal event was handled, WIRE-FREEZE-1, which is forward-only); otherwise it raises
+  `WiringReservationNotFrozen` before any read of a switch, and the route answers 409.
+  No wiring state row reads as not frozen. On a live reservation the recovery for a
+  pinned row is a fork re-save. \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`redrive_pinned_releases`, `WiringReservationNotFrozen`); `services/execution/app/routers/executions.py` (`redrive_pinned_release_rows`, `REDRIVE_NOT_ENDED_DETAIL`) \
+  Pinned by: `services/execution/tests/test_wiring_pinned_release_redrive.py` (`test_a_reservation_whose_wiring_is_not_frozen_is_refused`, `test_the_route_answers_409_on_a_live_reservation`)
+- **WIRE-RETRY-23.** The re-drive goes through the retry channels' own machinery
+  (`_reattempt_rows`, `_reattempt_l2_rows`, `_reattempt_l3_rows` with a fresh
+  `WiringRowClaims`): a row already claimed when the call starts is reported
+  `in_progress` with no switch read and no driver call (`claimable_row_ids`); every
+  other row is claimed in the release direction immediately before its own driver call
+  (WIRE-CLAIM-1, WIRE-CLAIM-4), so of two concurrent calls only one drives a row and the
+  other reports it `in_progress`, also when it read the row as free before the other's
+  claim (refused inside the apply: on L1 and L2 first by the supersession check's
+  `write_guard`, and by the claim's compare-and-swap on every layer); every failure
+  write is a row-identity compare-and-swap under the claim (WIRE-CLAIM-8 to
+  WIRE-CLAIM-10); an L1 or L2 release another reservation reclaimed is settled
+  `superseded` with no driver call (WIRE-LEDGER-16); the switch, template, and driver
+  are read fresh, so a switch deleted since is recorded with the not-found pin and a
+  package still broken records its pin again (attempts unchanged), each with no driver
+  call; and on L2 the frozen reservation's allocation check runs after the apply
+  (WIRE-RETRY-10). A success flips the row `RELEASED`, so a second call finds nothing to
+  do. The outcomes are `released`, `superseded`, `still_failed`, and `in_progress`, in
+  the manual retry's result shape. \
+  Enforced in: `services/execution/app/services/wiring_retry_service.py` (`redrive_pinned_releases`, `_reattempt_rows`, `_reattempt_l2_rows`, `_reattempt_l3_rows`); `services/execution/app/services/wiring_claim.py` (`WiringRowClaims`, `claimable_row_ids`, `write_guard`) \
+  Pinned by: `services/execution/tests/test_wiring_pinned_release_redrive.py` (`test_a_package_still_broken_records_the_pin_again_and_drives_nothing`, `test_a_switch_deleted_since_the_pin_is_recorded_not_found_with_no_driver_call`, `test_a_second_call_after_success_finds_nothing_to_do`, `test_a_second_call_inside_the_first_ones_drive_reports_in_progress`); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py` (`test_two_concurrent_pinned_release_redrives_drive_the_row_once`, `test_a_redrive_that_read_the_row_before_the_others_claim_loses_in_the_database`)
+- **WIRE-RETRY-24.** `POST /reservations/{reservation_id}/wiring/redrive-pinned-releases`
+  is gated by `require_admin`, the gate of execution's admin run retry: 401 without a
+  valid token, 403 `Admin or superadmin role required` for a user, with nothing read or
+  driven. It answers 200 with the outcomes (an empty list when no row qualifies), 409
+  (WIRE-RETRY-22), and 503 `Upstream service unavailable: <reason>` when an inventory
+  read fails during the apply, and logs one line with the action
+  `wiring_pinned_release_redrive`, the reservation, the caller's id, and the count of
+  each outcome. Its driver runs are attributed to the nil UUID like every wiring run
+  (WIRE-DRIVER-5). \
+  Enforced in: `services/execution/app/routers/executions.py` (`redrive_pinned_release_rows`) \
+  Pinned by: `services/execution/tests/test_wiring_pinned_release_redrive.py` (`test_the_route_drives_the_rows_for_an_admin_and_relays_the_outcomes`, `test_the_route_refuses_anyone_but_an_admin`, `test_the_route_answers_503_when_an_inventory_read_fails`)
 
 **Out of scope.** Reservations' status gate on the proxy (`reservations.md`,
 RES-FORK-18).
@@ -1978,17 +2040,20 @@ RES-FORK-4, RES-FORK-18, RES-FORK-19).
 
 ## 9. Errors
 
-Only the two internal routes return HTTP errors. The consumer returns nothing to a
+Only the two internal routes and the admin re-drive return HTTP errors. The consumer returns nothing to a
 caller: its outcomes are ack, nack with a delay, or dead-letter (section 8.1). FastAPI
 validation errors (422) carry `detail` as a list.
 
 | Status | Error key or detail | When | Rule |
 |---|---|---|---|
+| 401 | `Not authenticated` or `Could not validate credentials` | no valid bearer token on the admin re-drive | WIRE-RETRY-24 |
 | 403 | `Invalid internal token` | missing or wrong `X-Internal-Token` on either internal route | WIRE-STATUS-5 |
+| 403 | `Admin or superadmin role required` | the admin re-drive called by a user | WIRE-RETRY-24 |
 | 409 | `Reservation wiring is frozen; retry is not allowed` | manual retry on a frozen reservation with no release-direction FAILED row | WIRE-RETRY-2 |
+| 409 | `Reservation wiring is not frozen; pinned release rows are re-driven only after the reservation has ended` | the admin re-drive on a reservation whose wiring is not frozen | WIRE-RETRY-22 |
 | 422 | validation list | `reservation_id` is not a UUID | WIRE-STATUS-1 |
 | 500 | `Internal API token not configured` | `INTERNAL_API_TOKEN` empty in execution | WIRE-STATUS-6 |
-| 503 | `Upstream service unavailable: <reason>` | an inventory or cabling call failed while a manual retry applied rows | WIRE-RETRY-12 |
+| 503 | `Upstream service unavailable: <reason>` | an inventory or cabling call failed while a manual retry or the admin re-drive applied rows | WIRE-RETRY-12, WIRE-RETRY-24 |
 
 Reservations relays these to the user as described in RES-FORK-18.
 
@@ -2042,8 +2107,8 @@ attempts; the claim budget (WIRE-CLAIM-3).
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/execution/tests/` (in-memory SQLite): `test_nats_consumer*.py`, `test_l1_assignment_service.py`, `test_l2_membership_service.py`, `test_route_service.py`, `test_vlan_service*.py`, `test_wiring_retry*.py`, `test_wiring_claim.py`, `test_frozen_wiring_settles.py`; `services/common/tests/test_jetstream.py`; `tests/unit/test_consumer_heartbeat_wiring.py`; `frontend/src/test/components/ReservationWiringTab.test.tsx`, `frontend/src/test/api/reservationWiring.test.tsx` | Driver calls are recorded fakes; `FOR UPDATE SKIP LOCKED` and row locks are no-ops on SQLite |
-| Functional (through the service API) | `services/execution/tests/test_router_wiring_endpoints.py` (httpx against the app); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py`, `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py`, `services/execution/tests/test_vlan_release_cas_live_pg.py`, `services/execution/tests/test_vlan_join_release_race_live_pg.py`, and `services/execution/tests/test_reservation_wide_allocation_check_live_pg.py` against a real Postgres | The live suites run in the `make master` and `make everything` gates |
-| Integration (running stack) | `tests/integration/test_wiring_changed_reconcile.py`, `test_l1_provisioning.py`, `test_l2_reconcile.py`, `test_vlan_assignment.py`, `test_l3_reconcile.py`, `test_l3_route_provisioning.py`, `test_l3_intent_execution.py`, `test_l2_l3_result_gating.py`, `test_ledger_teardown.py`, `test_failed_teardown.py`, `test_event_verification_gate.py`, `test_dlq_and_idempotency.py`, `test_device_set_patch_wiring.py`, `test_nats_consumer_configs_live.py` | Drive the checked-in mock drivers; the NOS lab tiers (`tests/nos_lab/`) drive real FRR and SR Linux and are covered in `device-configuration.md` |
+| Functional (through the service API) | `services/execution/tests/test_router_wiring_endpoints.py` and `services/execution/tests/test_wiring_pinned_release_redrive.py` (httpx against the app); `services/execution/tests/test_wiring_retry_claim_race_live_pg.py`, `services/execution/tests/test_wiring_retry_due_predicate_live_pg.py`, `services/execution/tests/test_vlan_release_cas_live_pg.py`, `services/execution/tests/test_vlan_join_release_race_live_pg.py`, and `services/execution/tests/test_reservation_wide_allocation_check_live_pg.py` against a real Postgres | The live suites run in the `make master` and `make everything` gates |
+| Integration (running stack) | `tests/integration/test_wiring_changed_reconcile.py`, `test_l1_provisioning.py`, `test_l2_reconcile.py`, `test_vlan_assignment.py`, `test_l3_reconcile.py`, `test_l3_route_provisioning.py`, `test_l3_intent_execution.py`, `test_l2_l3_result_gating.py`, `test_ledger_teardown.py`, `test_failed_teardown.py`, `test_event_verification_gate.py`, `test_dlq_and_idempotency.py`, `test_device_set_patch_wiring.py`, `test_nats_consumer_configs_live.py`, `test_wiring_pinned_release_redrive.py` (the admin re-drive's gate and 409 only) | Drive the checked-in mock drivers; the NOS lab tiers (`tests/nos_lab/`) drive real FRR and SR Linux and are covered in `device-configuration.md` |
 | Stress and load | None | No load test drives fork saves, wiring retries, or teardown; `tests/load/locustfile.py` covers reservations and topology validation only |
 | Browser end-to-end | `tests/e2e/test_reservation_wiring.py`, `test_wiring_failed_row_playwright.py`, `test_wiring_layered_playwright.py`, `test_l3_routing_playwright.py` | Run nightly and in the gates, not per pull request |
 
@@ -2061,6 +2126,10 @@ holding foreign allocation and membership rows, and WIRE-VLAN-4's reservation-wi
 check (issue #1497), whose live-Postgres suite
 `test_reservation_wide_allocation_check_live_pg.py` was run on a throwaway Postgres 16
 against an empty execution schema and then against one seeded with foreign rows.
+The admin re-drive (WIRE-RETRY-23, issue #1199) has two live-Postgres tests in the claim
+suite, run with the whole suite on a throwaway Postgres 16 against an empty execution
+schema and then against one seeded with foreign rows (a frozen reservation's pinned
+release rows at all three layers among them), which they left unchanged.
 The in-line retry's attempt count (WIRE-DRIVER-2) is asserted through the real sandbox
 since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
 
@@ -2068,12 +2137,6 @@ since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
 
 ### Open defects
 
-- #1199 (WIRE-RETRY-4, WIRE-RETRY-14): a release-direction row recorded FAILED with a
-  pinned reason while its switch still exists (the switch's template missing, or a
-  broken driver package at teardown) can never be driven once its reservation has ended:
-  the retry tick leaves it out, a manual retry reports it `not_retryable`, and a fork
-  re-save needs an ACTIVE reservation. The connection it describes may still be live on
-  the hardware.
 - Not yet filed, what #1413 leaves of a join that lost to the release of its allocation
   after its `add_to_vlan` landed (WIRE-VLAN-4). The port's membership in the released
   number is undone in the same pass, or a row keeps naming that number until a
@@ -2094,7 +2157,9 @@ since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
     non-retryable reason (a deleted switch, a broken driver package) records that
     reason in place of the landed add's (WIRE-LEDGER-16): the row still names the
     number, but the tick no longer selects it and the own-number rules no longer apply
-    to it; on an ended reservation it is then the #1199 case above. Such a row no
+    to it; on an ended reservation only the admin re-drive drives it (WIRE-RETRY-21,
+    #1199), and only when that reason is a broken package (a deleted switch is never
+    re-driven). Such a row no
     longer counts as owing a removal either: the apply drives joins on the port again
     (`membership_owes_undo` is false), the FAILED flip of a later join and the frozen
     park can move it off its number (the plain failed leave case below), after which
@@ -2246,8 +2311,9 @@ since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
     WIRE-VLAN-4): a build row left FAILED intended `ACTIVE` on a frozen reservation (a
     held build whose holder failed, a pinned-reason build, or one written after the
     teardown's read), whose add may have landed on that number, and a release row with
-    a pinned reason (#1199). The number stays allocated rather than handed out while
-    the port may still be in it.
+    a pinned reason until the admin re-drive removes it (WIRE-RETRY-21, #1199; never for
+    a deleted switch). The number stays allocated rather than handed out while the port
+    may still be in it.
 
   Its test is coarse: on a live reservation any FAILED intended-`ACTIVE` membership,
   including one at the attempts cap or with a pinned reason, and any row that owes the
@@ -2272,9 +2338,14 @@ since #1495 (`test_wiring_driver_install_once.py`); its backoff delays are not.
   failed rows are the retry channels' work. Recorded in ADR 0007 (Decision 6).
 - A pinned-reason row (unresolvable hop, not a simple chain) is never retried and never
   settled by the stale-intent pass (WIRE-RETRY-4, WIRE-STALE-1); recovery is a fork
-  re-save, which needs an ACTIVE reservation (an ended reservation's release rows are the
-  open defect above, issue #1199). Recorded in ADR 0007 (Decision 5) and the comment on
-  `NON_RETRYABLE_REASON_PREFIXES`.
+  re-save, which needs an ACTIVE reservation. On an ended reservation an admin can
+  re-drive a release row pinned by a broken package or a missing template once that is
+  fixed (WIRE-RETRY-21, issue #1199, owner decision 2026-11-25: a manual action, never
+  the tick); every other pinned row, a deleted switch's in particular, has no recovery
+  in HERD, and the device is checked by hand (TROUBLESHOOTING.md). A pinned build row the
+  teardown leaves FAILED intended `ACTIVE` (WIRE-TEARDOWN-6 (a)) is not re-driven either:
+  the re-drive only removes. Recorded in ADR 0007 (Decision 5), the comment on
+  `NON_RETRYABLE_REASON_PREFIXES`, and the docstring of `redrive_pinned_releases`.
 - What is left of a frozen reservation's unsettled wiring after #1501 (WIRE-LEDGER-17,
   WIRE-TEARDOWN-6), each recorded in issue #1501:
   - A key-based build failure whose statement's snapshot predates the freeze and that

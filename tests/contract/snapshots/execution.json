@@ -41,6 +41,10 @@
       "/internal/validate-package"
     ],
     [
+      "POST",
+      "/reservations/{reservation_id}/wiring/redrive-pinned-releases"
+    ],
+    [
       "GET",
       "/runs"
     ],

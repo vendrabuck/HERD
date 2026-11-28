@@ -240,6 +240,51 @@ class WiringReservationFrozen(RuntimeError):
     """
 
 
+class WiringReservationNotFrozen(RuntimeError):
+    """Raised when the admin re-drive of pinned release rows (issue #1199) targets a
+    reservation whose wiring is not frozen: one that has not ended, or that execution
+    has no wiring state for. The re-drive is for an ended reservation only; on a live
+    one a fork re-save is the recovery (ADR 0007 Decision 5). The route maps this to
+    409."""
+
+
+def is_redrivable_pinned_release(row, layer: str) -> bool:
+    """True for a row the admin re-drive may drive (issue #1199): FAILED, intended
+    RELEASED, and pinned by a switch-level failure recorded while the switch itself was
+    read, so the switch was there and the connection, membership, or route set the row
+    describes may still be on it.
+
+    Exactly two reasons qualify, matched against the texts the applies write:
+
+      - a broken driver package: the reason starts with
+        `nats_consumer.WIRING_PACKAGE_UNLOADABLE_PREFIX` (`_wiring_load_failure`'s
+        permanent branch, issue #1002);
+      - a missing template for the row's OWN switch: the reason equals
+        `nats_consumer.wiring_template_missing_reason(layer, <the row's switch>)`.
+
+    Every other pinned reason stays excluded: a switch that was not found (since issue
+    #1203 only an inventory 404 records that; a row written before it may carry it from
+    a refused read, which the text cannot tell apart, and stays excluded too), a hop
+    that does not resolve or a hop set that is not a simple chain (L1 rows keyed on raw
+    hop endpoints, not on a switch's port pair, so a disconnect would drive a guessed
+    pairing), and an L2 row with no VLAN allocation for its fabric. A
+    build row (intended ACTIVE) is never re-driven, pinned or not: the re-drive only
+    removes. `layer` is "l1", "l2", or "l3"; the L3 switch is the row's `device_id`.
+    """
+    from app.services.nats_consumer import (
+        WIRING_PACKAGE_UNLOADABLE_PREFIX,
+        wiring_template_missing_reason,
+    )
+
+    if row.status != "FAILED" or row.intended != "RELEASED":
+        return False
+    reason = row.last_error or ""
+    if reason.startswith(WIRING_PACKAGE_UNLOADABLE_PREFIX):
+        return True
+    switch_id = row.device_id if layer == "l3" else row.switch_device_id
+    return reason == wiring_template_missing_reason(layer, switch_id)
+
+
 def is_retryable_failure(last_error: str | None) -> bool:
     """True when a FAILED row's reason is a transient/driver failure worth reattempting.
 
@@ -1328,6 +1373,100 @@ async def reattempt_reservation(reservation_id: uuid.UUID | str, get_db_session)
     results.extend(await _reattempt_rows(retryable, get_db_session, claims))
     results.extend(await _reattempt_l2_rows(retryable_l2, get_db_session, claims))
     results.extend(await _reattempt_l3_rows(retryable_l3, get_db_session, claims))
+    return {"reservation_id": res_str, "results": results}
+
+
+async def redrive_pinned_releases(reservation_id: uuid.UUID | str, get_db_session) -> dict:
+    """Admin re-drive: drive once, now, the pinned release rows of an ended reservation.
+
+    Issue #1199, owner decision (2026-11-25): option 2, a manual-only operator action.
+    A release row (a disconnect, a VLAN leave, a route removal) that failed with a
+    pinned reason while its switch still existed (a broken driver package or a missing
+    template, `is_redrivable_pinned_release`) is driven by no other channel once its
+    reservation has ended: the tick's selects leave pinned reasons out (WIRE-RETRY-14),
+    the manual retry reports them `not_retryable` (WIRE-RETRY-4), and a fork re-save
+    needs an ACTIVE reservation. This drives exactly those rows, once per call, in their
+    own (release) direction, and changes nothing about the tick: the rows stay out of
+    its selects, so a package that is still broken costs nothing until an admin asks
+    again (making them tick-retryable would bring back the #1190 starvation, since a
+    pinned load failure counts no attempt).
+
+    Refuses with WiringReservationNotFrozen (409 at the route) unless the reservation's
+    wiring is frozen, that is, its terminal event was handled; freezing is forward-only
+    (WIRE-FREEZE-1), so a reservation read frozen here stays frozen. On a live
+    reservation the recovery is a fork re-save.
+
+    The rows go through the retry channels' own machinery, so everything that guards a
+    manual retry guards this too: each row is claimed immediately before its own driver
+    call by `WiringRowClaims.claim` (status FAILED, unclaimed, and the direction
+    admitted, here RELEASED), so of two concurrent calls only one drives a row and the
+    other reports it `in_progress`; a row already claimed when the call starts is
+    reported `in_progress` up front (`claimable_row_ids`); every failure write is a
+    row-identity compare-and-swap under the claim (WIRE-CLAIM-8 to WIRE-CLAIM-10); an
+    L1 or L2 release another reservation's ACTIVE row superseded is settled with no
+    driver call (WIRE-LEDGER-16); the switch, its template, and its driver are read
+    fresh, so a switch deleted since is recorded `switch ... not found` with no driver
+    call, and a package still broken records its pinned reason again (attempts
+    unchanged); and on L2 the frozen reservation's allocation check runs after the
+    apply (WIRE-RETRY-10). A success flips the row RELEASED, so a second call finds
+    nothing to do: the call is idempotent.
+
+    Not driven: build rows, release rows with a retryable reason (the tick's work), and
+    every other pinned reason (`is_redrivable_pinned_release`). An L2 row whose
+    allocation is the nil placeholder or no longer exists has no VLAN number a
+    `remove_from_vlan` could name, so it is left out too. None of these appear in the
+    results, which list only the rows this call drove or found held.
+
+    Returns {"reservation_id", "results": [outcome, ...]} in the manual retry's shape;
+    the outcomes are `released`, `superseded`, `still_failed`, and `in_progress`.
+    A TransientUpstreamError during the apply propagates (the route answers 503).
+    """
+    from app.models.vlan_assignment import VlanAssignment
+
+    res_str = str(reservation_id)
+    nil = uuid.UUID(int=0)
+    async with get_db_session() as db:
+        state = await get_wiring_state(db, reservation_id)
+        if state is None or not state.frozen:
+            raise WiringReservationNotFrozen(res_str)
+        failed = await failed_assignments_for_reservation(db, reservation_id)
+        failed_l2 = await failed_memberships_for_reservation(db, reservation_id)
+        failed_l3 = await failed_route_assignments_for_reservation(db, reservation_id)
+        l2_candidates = [r for r in failed_l2 if is_redrivable_pinned_release(r, "l2")]
+        va_ids = {r.vlan_assignment_id for r in l2_candidates if r.vlan_assignment_id != nil}
+        known_va_ids = (
+            set(
+                (await db.execute(select(VlanAssignment.id).where(VlanAssignment.id.in_(va_ids))))
+                .scalars()
+                .all()
+            )
+            if va_ids
+            else set()
+        )
+
+    rows_l1 = [r for r in failed if is_redrivable_pinned_release(r, "l1")]
+    rows_l2 = [r for r in l2_candidates if r.vlan_assignment_id in known_va_ids]
+    rows_l3 = [r for r in failed_l3 if is_redrivable_pinned_release(r, "l3")]
+
+    results: list[dict] = []
+    claims = WiringRowClaims()
+    async with get_db_session() as db:
+        free_l1 = await claimable_row_ids(db, L1ConnectionAssignment, [r.id for r in rows_l1])
+        free_l2 = await claimable_row_ids(db, L2PortAssignment, [r.id for r in rows_l2])
+        free_l3 = await claimable_row_ids(db, RouteAssignment, [r.id for r in rows_l3])
+    results.extend(_outcome(r, "in_progress") for r in rows_l1 if r.id not in free_l1)
+    results.extend(_l2_outcome(r, "in_progress") for r in rows_l2 if r.id not in free_l2)
+    results.extend(_l3_outcome(r, "in_progress") for r in rows_l3 if r.id not in free_l3)
+
+    results.extend(
+        await _reattempt_rows([r for r in rows_l1 if r.id in free_l1], get_db_session, claims)
+    )
+    results.extend(
+        await _reattempt_l2_rows([r for r in rows_l2 if r.id in free_l2], get_db_session, claims)
+    )
+    results.extend(
+        await _reattempt_l3_rows([r for r in rows_l3 if r.id in free_l3], get_db_session, claims)
+    )
     return {"reservation_id": res_str, "results": results}
 
 

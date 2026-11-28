@@ -598,7 +598,16 @@ reservation in the batch is still driven. A known limit by decision, WIRE-RETRY-
   the tick leaves them out, a manual retry reports them `not_retryable`, and a fork re-save
   needs an `ACTIVE` reservation. A row that was going to RELEASE (`intended` is `RELEASED`)
   may mean the hardware was left connected: the disconnect never ran, and no retry channel
-  will run it later (an open defect, issue #1199). Re-publishing the reservation's terminal
+  will run it later. For a release row whose reason is a broken driver package
+  (`recorded hop unresolvable: driver load failed: ...`) or a missing template of the
+  row's own switch, an admin can drive it once the package or template is fixed:
+  `POST /api/execution/reservations/{id}/wiring/redrive-pinned-releases` with an admin
+  token (issue #1199). It answers 409 while the reservation's wiring is not frozen, drives
+  only those rows, each in its release direction, and lists each one's outcome
+  (`released`, `superseded`, `still_failed` when the package is still broken or the
+  switch is now gone, or `in_progress` when another call is driving it); calling it again
+  is safe. Every other pinned row, a switch that was not found in particular, is left
+  for the hand check below. Re-publishing the reservation's terminal
   event does not recover these rows either: the teardown pass reads `ACTIVE` rows and
   `FAILED` rows intended `ACTIVE` (on L1 and L2 only those with a retryable reason, since
   issue #1501), never a `FAILED` row intended `RELEASED` (`_teardown_from_ledgers`). Read the row with

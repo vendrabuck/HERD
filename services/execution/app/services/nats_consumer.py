@@ -163,6 +163,27 @@ WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 # selects with no second list to edit.
 NON_RETRYABLE_REASON_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
 
+# The two pinned reasons a switch-level failure records on a row while the switch itself
+# was read (issue #1199): its driver package is broken (`_wiring_load_failure`, issue
+# #1002), or its template is missing (`wiring_template_missing_reason`). Neither says the
+# switch or the hop is gone, so a release row pinned by one of them may still describe a
+# connection on the device; the admin re-drive
+# (`wiring_retry_service.redrive_pinned_releases`) drives exactly those rows.
+WIRING_PACKAGE_UNLOADABLE_PREFIX = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: "
+
+# The switch label each layer's reasons use: "switch" (L1), "L2 switch", "L3 switch".
+WIRING_SWITCH_LABELS = {"l1": "switch", "l2": "L2 switch", "l3": "L3 switch"}
+
+
+def wiring_template_missing_reason(layer: str, switch_id) -> str:
+    """The pinned reason a row records when its switch was read but the switch's
+    template was not found (inventory answered 404), for `layer` "l1", "l2", or "l3".
+    The one builder of that text, so the re-drive's match (issue #1199) cannot drift
+    from what the applies write."""
+    return (
+        f"{WIRING_UNRESOLVABLE_REASON}: template for {WIRING_SWITCH_LABELS[layer]} "
+        f"{switch_id} not found"
+    )
 
 
 def _wiring_load_failure(exc: BaseException, switch_id: str) -> tuple[str, int]:
@@ -2390,7 +2411,7 @@ async def _apply_wiring_pairs(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: switch {switch_id} not found"
         elif template_data is None:
-            load_error = f"{WIRING_UNRESOLVABLE_REASON}: template for switch {switch_id} not found"
+            load_error = wiring_template_missing_reason("l1", switch_id)
 
         context: dict = {}
         password_keys: set = set()
@@ -2835,11 +2856,7 @@ async def _run_vlan_definition_op(
     if switch_data is None:
         return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
     if template_data is None:
-        return (
-            False,
-            0,
-            f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found",
-        )
+        return False, 0, wiring_template_missing_reason("l2", switch_id)
 
     driver_id = uuid.UUID(switch_data["driver_id"])
     driver_sha256 = switch_data.get("driver_sha256", "unknown")
@@ -3617,9 +3634,7 @@ async def _apply_l2_memberships(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
         elif template_data is None:
-            load_error = (
-                f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found"
-            )
+            load_error = wiring_template_missing_reason("l2", switch_id)
 
         context: dict = {}
         password_keys: set = set()
@@ -4895,9 +4910,7 @@ async def _apply_l3_adjacency(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: L3 switch {switch_id} not found"
         elif template_data is None:
-            load_error = (
-                f"{WIRING_UNRESOLVABLE_REASON}: template for L3 switch {switch_id} not found"
-            )
+            load_error = wiring_template_missing_reason("l3", switch_id)
 
         context: dict = {}
         password_keys: set = set()
