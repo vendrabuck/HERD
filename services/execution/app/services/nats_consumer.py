@@ -3186,7 +3186,7 @@ async def _release_orphaned_allocations(
 
     `reservation_wide` is passed only by _release_reservation_orphaned_allocations
     (issue #1497, ADR 0018 D11): the guarded release then also requires that
-    vlan_service.held_by_a_pending_join is false for the allocation, and an allocation
+    vlan_service.held_by_a_failed_membership is false for the allocation, and an allocation
     that fails that guard in the UPDATE is a lost race like any other.
 
     Runs AFTER the whole membership pass (removes and adds both applied), so a port moved
@@ -3396,22 +3396,33 @@ async def _release_reservation_orphaned_allocations(
     when it reaches its last statement. A pass that raises after removing a membership
     on one switch (a switch or template read for the next switch failing) leaves that
     membership's allocation ACTIVE with no member, and the redelivered pass no longer
-    sees the removed membership, so no later pass would touch the allocation. So every
-    full L2 reconcile (_reconcile_l2_memberships, its no-delta early return included)
-    and the terminal teardown (_teardown_from_ledgers) end with this check, in addition
-    to the per-pass one, over every ACTIVE allocation of the reservation.
+    sees the removed membership, so no later pass would touch the allocation. So this
+    check runs, in addition to the per-pass one, over every ACTIVE allocation of the
+    reservation: at the end of every full L2 reconcile (_reconcile_l2_memberships; in
+    its no-delta early return before the scope refresh and the define step), at the
+    end of the terminal teardown's L2 step (_teardown_from_ledgers, also when it finds
+    no L2 row), and, on a frozen reservation, after each retry pass's apply of the
+    reservation's L2 rows (wiring_retry_service._reattempt_l2_rows, also when that
+    apply raised TransientUpstreamError), since no reconcile or teardown follows a
+    retry of an ended reservation.
 
     An allocation is released when no ACTIVE membership references it and
-    vlan_service.held_by_a_pending_join is false: on a reservation that is not frozen,
-    the reservation has no FAILED intended-ACTIVE membership at all; on a frozen one,
-    none of its FAILED intended-ACTIVE memberships holds a live drive claim (a retry
-    pass that claimed it before the freeze may still land its join, the case the
-    teardown leaves alone, WIRE-TEARDOWN-6). The candidates are one read
+    vlan_service.held_by_a_failed_membership is false: no FAILED membership of the
+    reservation names it; on a reservation that is not frozen, the reservation has no
+    FAILED intended-ACTIVE membership at all; and none of its FAILED intended-ACTIVE
+    memberships holds a live drive claim (a retry pass that claimed it before the
+    freeze may still land its join, the case the teardown leaves alone,
+    WIRE-TEARDOWN-6). The candidates are one read
     (vlan_service.reservation_orphaned_allocations); the release is the
-    compare-and-swap of WIRE-VLAN-4 through _release_orphaned_allocations, which
-    re-checks both conditions in its guarded UPDATE and drives delete_vlan for the
-    winner. A read that fails raises before anything is released (fail closed), and
-    the caller's message is retried.
+    compare-and-swap of WIRE-VLAN-4 through _release_orphaned_allocations and
+    release_allocation_if_orphaned, which takes the allocation's row lock before its
+    guarded UPDATE, as every release does (issue #1413), re-checks both conditions in
+    that UPDATE, and drives delete_vlan for the winner. A join of the reservation with
+    no FAILED row (a first join in flight) is not seen; it loses at the join's guard
+    (record_l2_membership_active). A read that fails raises before anything is
+    released (fail closed): the reconcile's or teardown's message is redelivered, and
+    on a retry pass the exception propagates to the channel (the tick logs its L2 batch
+    as failed).
     """
     from app.services.vlan_service import reservation_orphaned_allocations
 
@@ -4072,6 +4083,11 @@ async def _reconcile_l2_memberships(
     remove_keys = set(current.keys()) - intended
 
     if not add_keys and not remove_keys and not stale_rows:
+        # The reservation-wide check (issue #1497): an allocation an earlier, raised
+        # pass left with no member is released here too, delta or not. It runs BEFORE
+        # the scope refresh and the define step below, which read only ACTIVE
+        # allocations, so a memberless allocation it releases is not defined first.
+        await _release_reservation_orphaned_allocations(reservation_id, ctx, get_db_session)
         # No membership delta, but the DEFINITION scope may still have changed (issue
         # #442): a re-wire can reroute through a new trunk-transit switch while every
         # terminal membership stays put. Refresh the stored scope on the reservation's
@@ -4083,9 +4099,6 @@ async def _reconcile_l2_memberships(
         )
         if alloc_ids:
             await _define_pending_for_allocations(set(alloc_ids), ctx, get_db_session)
-        # The reservation-wide check (issue #1497): an allocation an earlier, raised
-        # pass left with no member is released here too, delta or not.
-        await _release_reservation_orphaned_allocations(reservation_id, ctx, get_db_session)
         return
 
     # One memoized fabric resolver for the whole pass (issue #1003): each switch's

@@ -617,6 +617,18 @@ async def _reattempt_l2_rows(
     no-allocation reason or driven this tick; the other reservations are applied. With
     `upstream_skips` None (the manual channel) the error propagates (503).
 
+    The reservation-wide allocation check (issue #1497, WIRE-VLAN-4,
+    nats_consumer._release_reservation_orphaned_allocations) runs after each
+    reservation's apply when that reservation is frozen, whether the apply returned or
+    raised TransientUpstreamError, before that error is recorded as the reservation's
+    skip (tick) or raised (manual channel). A frozen reservation gets no later
+    reconcile or teardown, so an allocation an apply left with no member when it raised
+    between two switches would otherwise stay ACTIVE for good. On a reservation that is
+    not frozen it does not run here: the next full reconcile, or the terminal teardown,
+    runs it. Any other exception from the apply ends the pass before the check. A
+    TransientUpstreamError from the frozen read or the check is handled like the
+    apply's (the apply's, when both raised, is the one recorded or raised).
+
     The superseded rows' allocation release runs last, after the read-back and the
     skip accounting. Since issue #1209 the release catches a failed delete_vlan switch
     or template read per allocation itself (action `vlan_delete_upstream_failed`), so
@@ -636,6 +648,7 @@ async def _reattempt_l2_rows(
         _fetch_fork_intended_wires,
         _FetchContext,
         _release_orphaned_allocations,
+        _release_reservation_orphaned_allocations,
         _resolve_add_allocations,
     )
 
@@ -850,6 +863,7 @@ async def _reattempt_l2_rows(
             by_res.setdefault(res_str, {"removes": [], "adds": []})["adds"].append(entry)
 
         for res_str, sets in by_res.items():
+            apply_error: TransientUpstreamError | None = None
             try:
                 await _apply_l2_memberships(
                     res_str,
@@ -861,10 +875,24 @@ async def _reattempt_l2_rows(
                     claims=claims,
                 )
             except TransientUpstreamError as exc:
+                apply_error = exc
+            # Issue #1497: on a frozen reservation no reconcile or teardown follows this
+            # pass, so the reservation-wide allocation check runs here, also after an
+            # apply that raised between two switches (a removal on one, then a failed
+            # read for the next), whose per-pass check never ran. The freeze is never
+            # undone (WIRE-FREEZE-1), so a reservation read frozen here stays frozen.
+            try:
+                async with get_db_session() as db:
+                    state = await get_wiring_state(db, res_str)
+                if state is not None and state.frozen:
+                    await _release_reservation_orphaned_allocations(res_str, ctx, get_db_session)
+            except TransientUpstreamError as exc:
+                apply_error = apply_error or exc
+            if apply_error is not None:
                 if upstream_skips is None:
-                    raise
+                    raise apply_error
                 # Issue #1204: this reservation only; the next one is still applied.
-                upstream_failed[res_str] = type(exc).__name__
+                upstream_failed[res_str] = type(apply_error).__name__
 
         # The read-back and the per-reservation skips are settled BEFORE the superseded
         # rows' allocation cleanup below, so nothing that cleanup does can discard them

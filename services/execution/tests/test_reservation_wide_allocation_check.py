@@ -5,27 +5,35 @@ last statement. A pass that raises between two switches (a switch or template re
 the second one failing after the first switch's membership was removed) never gets
 there, and the redelivered pass no longer sees the removed membership, so before #1497
 its allocation stayed ACTIVE with no member for good. Every full L2 reconcile (its
-no-delta early return included) and the terminal teardown now end with
+no-delta early return included, where the check runs before the define step), the
+terminal teardown, and, on a frozen reservation, each retry pass's apply now end with
 `_release_reservation_orphaned_allocations`, which looks at every ACTIVE allocation of
 the reservation.
 
-The release condition, per allocation of reservation R:
-  - no ACTIVE membership references it, and
-  - R is frozen, or R has no FAILED intended-ACTIVE membership at all; and, on a frozen
-    R, no FAILED intended-ACTIVE membership of R holds a live drive claim (a retry pass
+The release condition, per allocation A of reservation R
+(`vlan_service.held_by_a_failed_membership` false):
+  - no ACTIVE membership references A;
+  - no FAILED membership of R, of either direction, names A (a build's add may have
+    landed on its number; a release's removal from it is pending);
+  - R is frozen, or R has no FAILED intended-ACTIVE membership at all;
+  - no FAILED intended-ACTIVE membership of R holds a live drive claim (a retry pass
     that claimed it before the freeze may still land its join; the teardown leaves
     such a row alone, WIRE-TEARDOWN-6).
 
 What this file pins:
   - the issue's two-switch raise-then-redeliver interleaving, for the reconcile and
-    for the teardown (both fail without the check);
+    for the teardown (both fail without the check), and for a retry pass on a frozen
+    reservation, through the tick and the manual channel (review finding 2);
   - the condition matrix {reconcile with delta, reconcile no-delta, teardown} x
-    {frozen, not} x {FAILED join with a real allocation, with the nil allocation,
-    none} x {ACTIVE member, none}, with another reservation's rows seeded (frozen,
-    with a FAILED join, an orphaned ACTIVE allocation) and asserted untouched;
+    {frozen, not} x {FAILED join on A, on the nil allocation, on another allocation of
+    R; FAILED removal from A; none} x {ACTIVE member, none}, with another reservation's
+    rows seeded (frozen, with a FAILED join, an orphaned ACTIVE allocation) and
+    asserted untouched;
   - the guard inside the release's own UPDATE (a failed join committed after the
-    candidate read keeps the allocation), the held-claim exception on a frozen
-    reservation, and fail-closed reads;
+    candidate read keeps the allocation), the held-claim hold on a frozen reservation
+    and what a held build's ending releases afterwards (review finding 3), the
+    no-delta order (review finding 5), that a retry pass on a live reservation does not
+    run the check, and fail-closed reads;
   - the functional path: `process_reservation_message` with a real wiring_changed
     payload and the real inventory fetch helpers behind an httpx MockTransport, first
     delivery NAKed by a 503, redelivery leaving no memberless ACTIVE allocation.
@@ -354,13 +362,16 @@ async def _snapshot(reservation) -> tuple:
 
 
 async def _seed_foreign() -> tuple:
-    """Another reservation, frozen, with a FAILED intended-ACTIVE join, an orphaned
-    ACTIVE allocation (no member), and an ACTIVE allocation with a member. If the check
-    read the freeze or the failed joins of the wrong reservation, or looked beyond
-    RES's own allocations, one of the matrix cells or this snapshot would change."""
+    """Another reservation, frozen, with a FAILED intended-ACTIVE join, the orphaned
+    ACTIVE allocation that join names (no member), an ACTIVE allocation with a member,
+    and an orphaned ACTIVE allocation nothing holds (one the check would release for
+    OTHER). If the check read the freeze or the failed rows of the wrong reservation, or
+    looked beyond RES's own allocations, one of the matrix cells or this snapshot would
+    change."""
     other_switch = str(uuid.uuid4())
     orphan = await _add_allocation(OTHER, OTHER_VLAN, uuid.uuid4(), [other_switch])
     held = await _add_allocation(OTHER, OTHER_VLAN + 1, uuid.uuid4(), [other_switch])
+    await _add_allocation(OTHER, OTHER_VLAN + 2, uuid.uuid4(), [other_switch])
     await _add_membership(OTHER, held, other_switch, "0/0/1")
     await _add_membership(OTHER, orphan, other_switch, "0/0/2", status="FAILED")
     await _freeze(OTHER)
@@ -468,20 +479,24 @@ PATHS = ("reconcile_delta", "reconcile_no_delta", "teardown")
 
 
 @pytest.mark.parametrize("member", [True, False], ids=["member", "no_member"])
-@pytest.mark.parametrize("failed", ["real", "nil", "absent"])
+@pytest.mark.parametrize("failed", ["real", "nil", "other_real", "release_row", "absent"])
 @pytest.mark.parametrize("frozen", [True, False], ids=["frozen", "not_frozen"])
 @pytest.mark.parametrize("path", PATHS)
 async def test_the_check_releases_exactly_when_the_condition_holds(
     path, frozen, failed, member, caplog
 ):
     """At each site, allocation A of R (ACTIVE, defined on S1, VLAN SEEDED_VLAN) is
-    released by the check iff no ACTIVE membership references it and (R is frozen or
-    R has no FAILED intended-ACTIVE membership). The FAILED join, A's member, and the
-    freeze are written just before the check runs (module docstring). Another
-    reservation's rows never change, and the per-pass check of the site's own work
-    still runs (the delta's new allocation keeps its member; the teardown's removed
-    allocation is released). The candidate read already applies the condition, so no
-    release loses a race here (no `vlan_release_lost_race` line)."""
+    released by the check iff no ACTIVE membership references it and
+    held_by_a_failed_membership is false: no FAILED row of R names A (`real`, a FAILED
+    join on A; `release_row`, a FAILED removal from A), and either R is frozen or R has
+    no FAILED intended-ACTIVE membership (`nil`, a FAILED join on the nil allocation;
+    `other_real`, one on another allocation of R, which holds A only while R is not
+    frozen). The FAILED row, A's member, and the freeze are written just before the
+    check runs (module docstring). Another reservation's rows never change, and the
+    per-pass check of the site's own work still runs (the delta's new allocation keeps
+    its member; the teardown's removed allocation is released). The candidate read
+    already applies the condition, so no release loses a race here (no
+    `vlan_release_lost_race` line)."""
     import logging
 
     other = await _seed_foreign()
@@ -501,10 +516,16 @@ async def test_the_check_releases_exactly_when_the_condition_holds(
         seen.append(reservation_id)
         if member:
             await _add_membership(RES, target, S1, "0/0/1")
-        if failed != "absent":
+        if failed in ("real", "nil"):
             await _add_membership(
                 RES, target if failed == "real" else NIL, S1, "0/0/7", status="FAILED"
             )
+        elif failed == "other_real":
+            other_alloc = await _add_allocation(RES, SEEDED_VLAN + 5, uuid.uuid4(), [S1])
+            await _add_membership(RES, other_alloc, S1, "0/0/6")
+            await _add_membership(RES, other_alloc, S1, "0/0/7", status="FAILED")
+        elif failed == "release_row":
+            await _add_membership(RES, target, S1, "0/0/7", status="FAILED", intended="RELEASED")
         if frozen:
             await _freeze()
         await real(reservation_id, ctx, get_db_session)
@@ -522,13 +543,15 @@ async def test_the_check_releases_exactly_when_the_condition_holds(
             await _wiring_changed(up, 1)
 
     assert seen == [RES_ID], "the site runs the reservation-wide check once"
-    expect_released = not member and (frozen or failed == "absent")
+    expect_released = not member and (
+        failed == "absent" or (frozen and failed in ("nil", "other_real"))
+    )
     rows = await _allocations()
     assert rows[target].status == ("RELEASED" if expect_released else "ACTIVE")
     assert ((None, SEEDED_VLAN) in up.actions("delete_vlan")) is expect_released
     assert rows[target].defined_switch_ids == ([] if expect_released else [S1])
     if path == "reconcile_delta":
-        (new_id,) = set(rows) - {target}
+        (new_id,) = {a for a in rows if a != target and rows[a].vlan_id != SEEDED_VLAN + 5}
         assert rows[new_id].status == "ACTIVE", "the delta's own join keeps its allocation"
     if path == "teardown":
         assert rows[worked].status == "RELEASED", "the per-pass check still runs"
@@ -664,14 +687,29 @@ async def test_a_live_claim_on_a_reservation_that_is_not_frozen_keeps_its_alloca
     assert (await _allocations())[alloc].status == "ACTIVE"
 
 
-async def test_a_failed_release_row_does_not_hold_the_allocation():
-    """Only a FAILED intended-ACTIVE row is a pending join; a FAILED intended-RELEASED
-    row (a removal to retry) holds nothing, as in the per-pass check."""
-    alloc = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
-    await _add_membership(RES, alloc, S1, "0/0/7", status="FAILED", intended="RELEASED")
-    async with TestSessionLocal() as s:
-        from app.services.vlan_service import reservation_orphaned_allocations
+@pytest.mark.parametrize("frozen", [True, False], ids=["frozen", "not_frozen"])
+async def test_a_failed_release_row_holds_its_own_allocation_and_no_other(frozen):
+    """A FAILED intended-RELEASED row (a removal to retry) is not a pending join, so it
+    holds no other allocation of R; its own allocation is kept until its removal
+    succeeds (clause 3 of held_by_a_failed_membership), frozen or not."""
+    from app.services.vlan_service import reservation_orphaned_allocations
 
+    named = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
+    other = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2])
+    await _add_membership(RES, named, S1, "0/0/7", status="FAILED", intended="RELEASED")
+    if frozen:
+        await _freeze()
+    async with TestSessionLocal() as s:
+        assert await reservation_orphaned_allocations(s, RES) == [other]
+
+
+async def test_a_released_row_naming_the_allocation_holds_nothing():
+    """Only a FAILED row holds its allocation; a RELEASED row (history) does not."""
+    from app.services.vlan_service import reservation_orphaned_allocations
+
+    alloc = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1])
+    await _add_membership(RES, alloc, S1, "0/0/7", status="RELEASED", intended="RELEASED")
+    async with TestSessionLocal() as s:
         assert await reservation_orphaned_allocations(s, RES) == [alloc]
 
 
@@ -756,6 +794,192 @@ async def test_a_failed_join_in_the_same_pass_keeps_the_leaked_allocation_until_
     up._execute = real_execute
     await _wiring_changed(up, 3)
     assert (await _allocations())[leaked].status == "RELEASED"
+    assert await _memberless_active() == set()
+
+
+# --- the no-delta order (review finding 5) ---
+
+
+async def test_the_no_delta_check_runs_before_the_define_step():
+    """A no-delta reconcile with a memberless allocation A of R that has a switch in
+    scope not yet defined: the check runs first, so A is released with no create_vlan
+    and no delete_vlan. Run after the define step, A would be defined on S1 and its
+    definition deleted again in the same pass."""
+    live = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_1, [S1], defined=[S1])
+    await _add_membership(RES, live, S1, "0/0/1")
+    leaked = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [], defined=[])
+    up = _Upstreams(wires=[WIRE_S1])
+    await _wiring_changed(up, 1)
+    rows = await _allocations()
+    assert (rows[leaked].status, rows[leaked].defined_switch_ids) == ("RELEASED", [])
+    assert rows[live].status == "ACTIVE"
+    assert up.actions("create_vlan") == []
+    assert up.actions("delete_vlan") == []
+
+
+# --- the retry channels on a frozen reservation (review findings 2 and 3) ---
+
+
+async def _tick(up: _Upstreams) -> dict:
+    from app.services.wiring_retry_service import run_wiring_retry_tick
+
+    with ExitStack() as stack:
+        up.enter(stack)
+        return await run_wiring_retry_tick(_db_session_factory())
+
+
+async def _manual(up: _Upstreams) -> dict:
+    from app.services.wiring_retry_service import reattempt_reservation
+
+    with ExitStack() as stack:
+        up.enter(stack)
+        return await reattempt_reservation(RES, _db_session_factory())
+
+
+async def _two_pending_removals() -> dict[str, uuid.UUID]:
+    """Frozen R with one pending removal per switch, each on its own allocation (A1 on
+    S1, A2 on S2, each defined on its switch): what a teardown whose removals failed
+    leaves for the retry channels."""
+    out = {}
+    for switch, fabric, vlan, port in (
+        (S1, FABRIC_1, SEEDED_VLAN, "0/0/1"),
+        (S2, FABRIC_2, SEEDED_VLAN + 1, "0/0/2"),
+    ):
+        out[switch] = await _add_allocation(RES, vlan, fabric, [switch], defined=[switch])
+        await _add_membership(RES, out[switch], switch, port, status="FAILED", intended="RELEASED")
+    await _freeze()
+    return out
+
+
+@pytest.mark.parametrize("channel", ["tick", "manual"])
+async def test_a_retry_pass_that_raised_between_switches_on_a_frozen_reservation_leaks_nothing(
+    channel,
+):
+    """Review finding 2, the retry path issue #1497 names. On a frozen reservation a
+    retry pass removes the port on the first switch, then the template read for the
+    second switch raises: the per-pass check never runs and no reconcile or teardown
+    follows. The reservation-wide check after the apply releases the first allocation
+    (its VLAN deleted); the second stays ACTIVE while its pending removal names it, and
+    the next pass removes the port and releases it. The tick records the reservation's
+    rows as skipped; the manual channel raises the error after the check."""
+    other = await _seed_foreign()
+    alloc = await _two_pending_removals()
+    up = _Upstreams()
+    up.fail_template_read = 2
+    if channel == "tick":
+        stats = await _tick(up)
+        assert stats["skipped_upstream"] == 1
+    else:
+        with pytest.raises(TransientUpstreamError):
+            await _manual(up)
+    assert len(up.actions("remove_from_vlan")) == 1
+    rows = await _allocations()
+    first = [s for s in (S1, S2) if rows[alloc[s]].status == "RELEASED"]
+    assert len(first) == 1, "the allocation whose port was removed is released"
+    (gone,) = first
+    kept = S2 if gone == S1 else S1
+    assert (None, rows[alloc[gone]].vlan_id) in up.actions("delete_vlan")
+    assert rows[alloc[kept]].status == "ACTIVE", "held while its pending removal names it"
+
+    up.fail_template_read = None
+    up.calls.clear()
+    if channel == "tick":
+        await _tick(up)
+    else:
+        await _manual(up)
+    rows = await _allocations()
+    assert {r.status for r in rows.values()} == {"RELEASED"}
+    assert await _memberless_active() == set()
+    assert await _snapshot(OTHER) == other
+
+
+async def test_a_retry_pass_on_a_live_reservation_does_not_run_the_check():
+    """On a reservation that is not frozen the retry channels run only the per-pass
+    check: a memberless allocation no removal of the pass touched waits for the next
+    full reconcile or the teardown."""
+    leaked = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1], defined=[S1])
+    removed = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2], defined=[S2])
+    await _add_membership(RES, removed, S2, "0/0/2", status="FAILED", intended="RELEASED")
+    up = _Upstreams()
+    await _tick(up)
+    rows = await _allocations()
+    assert rows[removed].status == "RELEASED", "the per-pass check of the removal"
+    assert rows[leaked].status == "ACTIVE"
+
+
+async def _held_build(claims) -> uuid.UUID:
+    """A FAILED intended-ACTIVE join H of R on (S1, 0/0/1), on allocation Ah (defined on
+    S1), claimed by `claims` (a retry pass) before R freezes."""
+    from app.services.wiring_claim import ROW_DRIVER_ACTIONS, claim_budget
+
+    ah = await _add_allocation(RES, SEEDED_VLAN, FABRIC_1, [S1], defined=[S1])
+    row_id = await _add_membership(RES, ah, S1, "0/0/1", status="FAILED")
+    async with TestSessionLocal() as s:
+        assert await claims.claim(
+            s,
+            L2PortAssignment,
+            row_id,
+            intended="ACTIVE",
+            budget=claim_budget(ROW_DRIVER_ACTIONS + 1),
+        )
+    return row_id
+
+
+@pytest.mark.parametrize("ending", ["join_fails", "join_lands"])
+async def test_a_held_build_ending_after_the_teardown_releases_the_other_allocations(ending):
+    """Review finding 3. A retry pass holds a live claim on build row H when R ends:
+    the teardown leaves H alone and keeps every memberless allocation of R (O here).
+    The holder's own pass then ends on the frozen reservation and runs the check: O is
+    released. H's allocation Ah is kept while H names it: a failed join stays FAILED
+    intended ACTIVE (its add may have landed, and no pass drives it on a frozen
+    reservation), and a landed join is parked for removal, after which the next pass
+    removes the port and releases Ah."""
+    from app.services.wiring_claim import WiringRowClaims
+    from app.services.wiring_retry_service import _reattempt_l2_rows
+
+    claims = WiringRowClaims()
+    row_id = await _held_build(claims)
+    leaked = await _add_allocation(RES, SEEDED_VLAN + 1, FABRIC_2, [S2], defined=[S2])
+    await _freeze()
+    up = _Upstreams(wires=[WIRE_S1])
+    await _teardown(up)
+    rows = await _allocations()
+    assert {r.status for r in rows.values()} == {"ACTIVE"}, "kept under the live claim"
+    assert up.calls == []
+
+    if ending == "join_fails":
+        real_execute = up._execute
+
+        def _add_fails(driver_path, action, context, **kwargs):
+            if action == "add_to_vlan":
+                return {"success": False, "output": None, "error": "boom", "duration_ms": 1}
+            return real_execute(driver_path, action, context, **kwargs)
+
+        up._execute = _add_fails
+    async with TestSessionLocal() as s:
+        h_row = (
+            await s.execute(select(L2PortAssignment).where(L2PortAssignment.id == row_id))
+        ).scalar_one()
+    with ExitStack() as stack:
+        up.enter(stack)
+        await _reattempt_l2_rows([h_row], _db_session_factory(), claims, set())
+
+    rows = await _allocations()
+    assert rows[leaked].status == "RELEASED"
+    assert (None, SEEDED_VLAN + 1) in up.actions("delete_vlan")
+    (ah,) = {a for a in rows if a != leaked}
+    assert rows[ah].status == "ACTIVE"
+    async with TestSessionLocal() as s:
+        h = (
+            await s.execute(select(L2PortAssignment).where(L2PortAssignment.id == row_id))
+        ).scalar_one()
+    if ending == "join_fails":
+        assert (h.status, h.intended, h.vlan_assignment_id) == ("FAILED", "ACTIVE", ah)
+        return
+    assert (h.status, h.intended, h.vlan_assignment_id) == ("FAILED", "RELEASED", ah)
+    up._execute = _Upstreams._execute.__get__(up)
+    await _tick(up)
+    assert (await _allocations())[ah].status == "RELEASED"
     assert await _memberless_active() == set()
 
 
