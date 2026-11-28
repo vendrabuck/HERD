@@ -30,6 +30,10 @@ services hold at most 11 x 15 = 165 connections, under the compose Postgres
 SQLite URLs (the services' unit tests) get only `pool_pre_ping`: SQLAlchemy
 picks a pool for them that takes no size arguments (an in-memory database
 uses StaticPool, which refuses `pool_size` and `max_overflow`).
+
+Statement parameters: every engine is built with `hide_parameters=True`, so the
+text of a database error (and so any log line or traceback that prints it) names
+the statement but not its bound parameters.
 """
 
 from collections.abc import AsyncGenerator
@@ -56,7 +60,11 @@ def engine_options(
     pool_pre_ping: bool = DEFAULT_POOL_PRE_PING,
 ) -> dict[str, object]:
     """The keyword arguments make_database passes to create_async_engine."""
-    options: dict[str, object] = {"echo": False, "pool_pre_ping": pool_pre_ping}
+    options: dict[str, object] = {
+        "echo": False,
+        "pool_pre_ping": pool_pre_ping,
+        "hide_parameters": True,
+    }
     if make_url(database_url).get_backend_name() != "sqlite":
         options["pool_size"] = pool_size
         options["max_overflow"] = max_overflow

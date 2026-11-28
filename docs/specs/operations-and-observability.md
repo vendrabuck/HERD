@@ -384,6 +384,12 @@ name looks like a credential.
   decision; issues #872 and #905. \
   Enforced in: `services/execution/app/services/execution_service.py` (`run_driver_action`) \
   Pinned by: `services/execution/tests/test_execution_service_edges.py` (`test_run_driver_action_start_log_omits_method_kwargs_values`, `test_run_driver_action_start_log_emits_context_keys_not_values`)
+- **OPS-LOG-11.** A database error's text names the statement but not its bound
+  parameters: every service's engine is built by `herd_common.database.make_database`,
+  whose options set `hide_parameters=True`, so a log line or traceback that prints the
+  error carries no statement parameters. \
+  Enforced in: `services/common/herd_common/database.py` (`engine_options`, `make_database`) \
+  Pinned by: `services/common/tests/test_database.py` (`test_engine_options_per_dialect`, `test_a_database_error_names_the_statement_but_not_its_parameters`, `test_without_the_shared_options_the_same_error_carries_its_parameters`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_postgres_error_from_the_shared_engine_names_no_bound_parameter`)
 
 **Out of scope.** Log shipping, retention, and metrics. What ai-orchestrator keeps out of
 its own log lines (`ai-features.md`).

@@ -5,6 +5,8 @@ URL, and a Base usable for create_all. Each call must return its own Base class
 (fresh DeclarativeBase subclass), since every service owns its own metadata.
 """
 
+import logging
+
 import pytest
 from herd_common.database import (
     DEFAULT_MAX_OVERFLOW,
@@ -14,6 +16,7 @@ from herd_common.database import (
     make_database,
 )
 from sqlalchemy import Column, Integer, String, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -110,6 +113,7 @@ def test_engine_options_per_dialect():
     assert engine_options(PG_URL, pool_size=2, max_overflow=7, pool_pre_ping=True) == {
         "echo": False,
         "pool_pre_ping": True,
+        "hide_parameters": True,
         "pool_size": 2,
         "max_overflow": 7,
     }
@@ -117,6 +121,7 @@ def test_engine_options_per_dialect():
         assert engine_options(url, pool_size=2, max_overflow=7, pool_pre_ping=True) == {
             "echo": False,
             "pool_pre_ping": True,
+            "hide_parameters": True,
         }
 
 
@@ -133,3 +138,42 @@ async def test_sqlite_engine_with_pre_ping_still_runs_queries():
     async with session_local() as session:
         assert (await session.execute(text("select 1"))).scalar_one() == 1
     await engine.dispose()
+
+
+_MARKER = "bound-value-7f3a"
+
+
+async def _refused_insert(engine: AsyncEngine) -> DBAPIError:
+    """The error of an INSERT that binds _MARKER and that the database refuses (a
+    second row with the same unique value)."""
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE marked (v VARCHAR UNIQUE)"))
+        await conn.execute(text("INSERT INTO marked (v) VALUES (:v)"), {"v": _MARKER})
+    with pytest.raises(DBAPIError) as caught:
+        async with engine.begin() as conn:
+            await conn.execute(text("INSERT INTO marked (v) VALUES (:v)"), {"v": _MARKER})
+    return caught.value
+
+
+async def test_a_database_error_names_the_statement_but_not_its_parameters(caplog):
+    engine, _, _, _ = make_database("sqlite+aiosqlite:///:memory:")
+    try:
+        error = await _refused_insert(engine)
+    finally:
+        await engine.dispose()
+    assert "INSERT INTO marked" in str(error)
+    assert _MARKER not in str(error)
+    logging.getLogger("herd.test").exception("write failed", exc_info=error)
+    assert "write failed" in caplog.text
+    assert _MARKER not in caplog.text
+
+
+async def test_without_the_shared_options_the_same_error_carries_its_parameters():
+    """The control: SQLAlchemy's default puts the bound value in the error's text,
+    which is what the shared options turn off."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        error = await _refused_insert(engine)
+    finally:
+        await engine.dispose()
+    assert _MARKER in str(error)

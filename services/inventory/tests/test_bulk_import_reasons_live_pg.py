@@ -68,6 +68,7 @@ from app.schemas.column_bounds import INT32_MAX, NON_FINITE_NUMBER_MESSAGE, NUL_
 from app.services import bulk_service, hypervisor_service
 from herd_common.pg_live_suite import pg_live_target
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _PG = pg_live_target()
@@ -1037,3 +1038,30 @@ async def test_a_dynamic_instance_whose_generated_name_is_taken_tries_the_next(
     assert (first.status_code, second.status_code) == (201, 201)
     prefix = f"pg-live-dyn-{tag}-{str(reservation_id)[:8]}"
     assert (first.json()["name"], second.json()["name"]) == (f"{prefix}-1", f"{prefix}-2")
+
+
+# The shared engine options on a real Postgres ---------------------------------------
+
+
+async def test_a_postgres_error_from_the_shared_engine_names_no_bound_parameter(tag, caplog):
+    """herd_common.database builds every service's engine with hide_parameters, so a
+    refused statement's text, and a log line that prints it, names the statement and
+    not its bound values. The statement fails for a reason of its own (a division by
+    zero), so nothing but the parameter list could carry the bound value."""
+    from herd_common.database import make_database
+
+    engine, _, _, _ = make_database(PG_DSN)
+    marker = f"pg-live-bound-{tag}"
+    try:
+        async with engine.connect() as conn:
+            with pytest.raises(DBAPIError) as caught:
+                await conn.execute(
+                    text("SELECT 1 / 0 WHERE CAST(:v AS text) IS NOT NULL"), {"v": marker}
+                )
+    finally:
+        await engine.dispose()
+    assert "SELECT 1 / 0" in str(caught.value)
+    assert marker not in str(caught.value)
+    logging.getLogger("herd.test").exception("read failed", exc_info=caught.value)
+    assert "read failed" in caplog.text
+    assert marker not in caplog.text
