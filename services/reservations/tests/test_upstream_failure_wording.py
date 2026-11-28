@@ -501,6 +501,26 @@ async def test_a_fork_route_without_an_internal_token_answers_fixed_wording(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("GET", "/{rid}/wiring-status"), ("POST", "/{rid}/wiring/retry")],
+    ids=["wiring_status", "wiring_retry"],
+)
+async def test_a_wiring_route_without_an_internal_token_answers_fixed_wording(
+    monkeypatch, method, path
+):
+    """The execution twin of the fork route's check: no call leaves the service."""
+    monkeypatch.setattr(settings, "internal_api_token", "")
+    rid = await _insert(ReservationStatus.ACTIVE, topology_id=TOPOLOGY)
+    with respx.mock(assert_all_called=False) as router:
+        async with _client() as ac:
+            resp = await ac.request(method, path.format(rid=rid))
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "internal_api_token not configured; cannot reach execution"}
+    assert router.calls.call_count == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["create", "patch"])
 async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(network, caplog, route):
     """A RuntimeError a library raises (here from the transport of cabling's validate,
