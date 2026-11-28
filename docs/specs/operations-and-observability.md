@@ -2483,7 +2483,7 @@ None at present. (#1577 is resolved by OPS-REPORT-11, OPS-REPORT-12, and OPS-REP
   that growth. Recorded in issue #1466.
 - A bulk import's file work runs off the event loop (INV-BULK-27, TOPO-BULK-23), except
   each single C call within it (the whole-file JSON decode and the surrogate scan's
-  serialization, about 60 ms and 50 ms for a 10 MiB file on one core), but its row
+  serialization, from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well), but its row
   loop does not. Each row's schema checks and writes on inventory, and each topology's
   canvas rewrite and validation on cabling, run on the event loop between that row's
   queries, so a single row as large as the file holds the loop for that row's work, as

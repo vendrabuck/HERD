@@ -2381,28 +2381,31 @@ def _connections_checked_out(pooled_engine):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/devices/export", "/templates/export"])
-async def test_an_export_holds_no_connection_while_it_renders(client, monkeypatch, path):
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+async def test_an_export_holds_no_connection_while_it_renders(client, monkeypatch, path, fmt):
     """While the render is held on its thread, the request has given its pooled
-    connection back, and the body is still the one the render gives. Mutation-checked:
-    removing the `await db.close()` from `_export_response` fails this."""
+    connection back, and the body is still the one the render gives, in both formats.
+    Mutation-checked: removing the `await db.close()` from `_export_response`, or
+    moving it into the JSON branch alone, fails this."""
     from app.routers import bulk as bulk_router
 
     template = await _create_template(client, name="Firewall")
     await _create_device(client, template["id"])
-    expected = await client.get(path, params={"format": "json"})
+    expected = await client.get(path, params={"format": fmt})
     assert expected.status_code == 200
     entered = threading.Event()
     release = threading.Event()
-    real = bulk_router.records_to_json
+    renderer = f"records_to_{fmt}"
+    real = getattr(bulk_router, renderer)
 
     def held(*args):
         entered.set()
         assert release.wait(_OFF_LOOP_WAIT), "the render was never released"
         return real(*args)
 
-    monkeypatch.setattr(bulk_router, "records_to_json", held)
+    monkeypatch.setattr(bulk_router, renderer, held)
     with _connections_checked_out(engine) as count:
-        exporting = asyncio.create_task(client.get(path, params={"format": "json"}))
+        exporting = asyncio.create_task(client.get(path, params={"format": fmt}))
         try:
             assert await _signalled(entered), "the render never started"
             held_out = count["out"]

@@ -35,7 +35,10 @@ call: Python-level work (the CSV reader's rows, each JSON cell, rendering a CSV)
 lets other requests run between its steps, but a single C call holds the loop for
 its whole length. So each whole-file JSON decode (one ``json.loads``) and the lone
 surrogate scan (one ``json.dumps`` of the parsed document) still stall the loop for
-as long as they take: on one core, about 60 ms and about 50 ms for a 10 MiB file.
+as long as they take: on one core, from about 20 ms to about 130 ms and from about
+35 ms to about 75 ms for a 10 MiB file, more the smaller and more numerous its items.
+On Python 3.13 and later ``json.dumps`` with ``indent`` is one C call as well, so a JSON
+export's render is then one such call.
 
 The limiters are built on first use and are process-wide: each service runs one uvicorn
 process with one event loop. Database work stays on the event loop in the request's
