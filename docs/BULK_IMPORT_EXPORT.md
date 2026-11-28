@@ -41,6 +41,17 @@ cabling service. There is no cross-schema bulk path.
 Import endpoints accept a single multipart file field named `file`. `format`
 defaults to `json`. `dry_run` defaults to `false`.
 
+The file may be at most 10 MiB (`IMPORT_UPLOAD_BYTES`, issue #1417). A larger
+file answers 413 with one item, `{"type": "body_too_large", "loc": ["body"],
+"msg": "Request body is larger than <limit> bytes"}`, and nothing is parsed or
+written; the import dialog shows its message. `<limit>` is 10485760 when the file
+itself is over the bound, or the route's whole-request limit (the
+`MAX_REQUEST_BODY_BYTES` setting plus 10 MiB) when the request is larger than
+that, however it is sent, chunked or not. Split a larger export into several
+files. The file's decode and parse, and an export's rendering, run off the
+service's event loop, so other requests keep being answered while a large file
+is read.
+
 The device export leaves out dynamic-instance devices, the devices that
 execution creates for a booking's dynamic request (they carry a `request_id`).
 Such a device lives only as long as the reservation that created it, and its

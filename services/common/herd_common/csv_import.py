@@ -12,10 +12,16 @@ client can upload:
 - The csv module's field limit (process-wide, 131,072 characters by default) is
   raised for the read to the length of the text, so no field of the file can pass
   it: a cell is never longer than the text it sits in. The previous limit is put
-  back before the function returns or raises. The read runs without an ``await``,
-  so no other coroutine on the event loop runs while the raised limit is in place;
-  a reader on another thread could see it, and the services that call this read
-  no other CSV.
+  back before the function returns or raises. The importers call this on worker
+  threads (``herd_common.bulk_work``, issue #1417), so two imports can read at
+  once; the raise, the read, and the restore run under ``_FIELD_LIMIT_LOCK``, so
+  one read never puts back a limit under another read still in progress (which
+  made an honest long cell a 422 and could leave the limit raised for good), and
+  the limit is at its previous value whenever no read is running. Reads wait for
+  each other, never for the event loop: call this from a worker thread, never on
+  the loop, where waiting for the lock would hold every request. A CSV reader on
+  another thread that does not take the lock could see the raised limit; the
+  services that call this read no other CSV.
 - Anything the csv module still refuses (``csv.Error``) answers 422 with a fixed
   detail naming the physical line the reader had reached, never the module's own
   text and never a cell.
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import io
+import threading
 
 from fastapi import HTTPException
 
@@ -32,6 +39,9 @@ from fastapi import HTTPException
 # physical lines the reader had read when it stopped, the header being line 1; it is
 # a count, never text from the file.
 CSV_UNREADABLE_DETAIL = "Invalid CSV: line {line} could not be read; fix it and retry"
+
+# Held for the raise of the field limit, the read, and the restore (issue #1417).
+_FIELD_LIMIT_LOCK = threading.Lock()
 
 
 def _field_limit_for(text: str) -> int:
@@ -48,18 +58,19 @@ def read_csv_rows(text: str) -> list[dict]:
     sit under the key ``None``). Raises ``HTTPException(422)`` with
     ``CSV_UNREADABLE_DETAIL`` when the csv module refuses the text.
     """
-    previous = csv.field_size_limit(_field_limit_for(text))
-    reader = csv.DictReader(io.StringIO(text, newline=""))
-    try:
-        return list(reader)
-    except csv.Error:
-        # `reader.line_num` is updated only after a row is returned; the inner
-        # reader's count includes the line it was reading when it refused.
-        raise HTTPException(
-            status_code=422, detail=CSV_UNREADABLE_DETAIL.format(line=reader.reader.line_num)
-        ) from None
-    finally:
-        csv.field_size_limit(previous)
+    with _FIELD_LIMIT_LOCK:
+        previous = csv.field_size_limit(_field_limit_for(text))
+        reader = csv.DictReader(io.StringIO(text, newline=""))
+        try:
+            return list(reader)
+        except csv.Error:
+            # `reader.line_num` is updated only after a row is returned; the inner
+            # reader's count includes the line it was reading when it refused.
+            raise HTTPException(
+                status_code=422, detail=CSV_UNREADABLE_DETAIL.format(line=reader.reader.line_num)
+            ) from None
+        finally:
+            csv.field_size_limit(previous)
 
 
 __all__ = ["CSV_UNREADABLE_DETAIL", "read_csv_rows"]

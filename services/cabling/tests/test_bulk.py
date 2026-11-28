@@ -15,15 +15,19 @@ Authorization header, which a real non-admin request always would; the mock
 stands in for that header's absence.
 """
 
+import asyncio
+import concurrent.futures
 import csv
 import functools
 import io
 import json
 import sys
+import threading
 import uuid
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload
@@ -1960,3 +1964,239 @@ async def test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing(
     }
     assert await _topology_names(user_client) == []
     assert await _count_versions() == 0
+
+
+# The parse and the rendering run off the event loop (issue #1417) --------------------
+#
+# The import's decode, parse, surrogate scan, shape check, and device-name collection
+# (`_read_import`), and the export's records and body (`render_export`), run on a bulk
+# worker thread (`herd_common.bulk_work.run_bulk_work`). Each overlap is staged with
+# events, never a sleep: the parse blocks on a `threading.Event` the test sets, and the
+# test waits for its signal off the loop.
+
+_OFF_LOOP_WAIT = 10.0
+
+
+async def _signalled(event: threading.Event) -> bool:
+    return await asyncio.to_thread(event.wait, _OFF_LOOP_WAIT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fmt", "parser", "body"),
+    [
+        ("json", "parse_json_topologies", b"[]"),
+        ("csv", "parse_csv_topologies", (_CSV_HEADER + "\n").encode()),
+    ],
+)
+async def test_another_request_is_served_while_an_import_parse_is_held(
+    user_client, monkeypatch, fmt, parser, body
+):
+    """The parse runs on a thread that is not the loop's, and while it is held the
+    service answers another request. Mutation-checked: calling `_read_import` directly
+    in `import_topologies` (on the loop) fails this."""
+    from app.services import bulk_service
+
+    loop_thread = threading.get_ident()
+    entered = threading.Event()
+    release = threading.Event()
+    parse_threads: list[int] = []
+    real_parse = getattr(bulk_service, parser)
+
+    def held_parse(raw):
+        parse_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the parse was never released"
+        return real_parse(raw)
+
+    monkeypatch.setattr(bulk_service, parser, held_parse)
+    importing = asyncio.create_task(
+        user_client.post(
+            "/topologies/import",
+            params={"format": fmt},
+            files={"file": (f"t.{fmt}", io.BytesIO(body), "text/plain")},
+        )
+    )
+    try:
+        assert await _signalled(entered), "the parse never started"
+        health = await user_client.get("/health")
+        assert health.status_code == 200
+        assert not importing.done()
+    finally:
+        release.set()
+    resp = await importing
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total"] == 0
+    assert parse_threads and parse_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_the_device_names_are_collected_with_the_parse(user_client):
+    """The names `_read_import` collects off the loop are the ones the resolver is
+    asked for, and a record rejected for its shape adds none."""
+    items = [
+        {"name": "lab", "canvas": _canvas_with_names()},
+        {"name": "bad", "canvas": {"nodes": "not-a-list"}},
+    ]
+    with _resolver({}) as resolve:
+        resp = await _import_json(user_client, items, dry_run="true")
+    assert resp.status_code == 200, resp.text
+    resolve.assert_awaited_once_with(["switch-a", "switch-b"])
+    assert [(r["identity"], r["action"]) for r in resp.json()["rows"]] == [
+        ("lab", "reject"),
+        ("bad", "reject"),
+    ]
+
+
+class _RefusingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A default executor that fails any work handed to it."""
+
+    def submit(self, *args, **kwargs):
+        raise AssertionError("work was handed to the default executor")
+
+
+@pytest.mark.asyncio
+async def test_the_import_never_takes_the_default_executor(user_client):
+    """The default executor is the one `loop.getaddrinfo` resolves names on (issue
+    #1416)."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_RefusingExecutor())
+    try:
+        resp = await _import_json(user_client, [{"name": "lab"}])
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+    assert resp.status_code == 200, resp.text
+    assert [(r["identity"], r["action"]) for r in resp.json()["rows"]] == [("lab", "create")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "json"])
+async def test_an_export_is_rendered_off_the_loop(admin_client, monkeypatch, fmt):
+    """The body is the one the renderer gives, built on a thread that is not the
+    loop's. Mutation-checked: calling `render_export` directly in the route fails
+    this."""
+    from app.routes import bulk as bulk_router
+
+    await _seed_topology("lab", ADMIN_ID, _canvas_with_ids())
+    expected = await admin_client.get("/topologies/export", params={"format": fmt})
+    assert expected.status_code == 200
+    loop_thread = threading.get_ident()
+    render_threads: list[int] = []
+    real = bulk_router.render_export
+
+    def recording(*args):
+        render_threads.append(threading.get_ident())
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, "render_export", recording)
+    resp = await admin_client.get("/topologies/export", params={"format": fmt})
+    assert resp.status_code == 200
+    assert resp.content == expected.content
+    assert resp.headers["content-type"] == expected.headers["content-type"]
+    assert resp.headers["content-disposition"] == expected.headers["content-disposition"]
+    assert render_threads and render_threads[0] != loop_thread
+    assert "lab" in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "json"])
+async def test_an_export_holds_no_connection_while_it_renders(admin_client, monkeypatch, fmt):
+    """While the render is held on its thread, the request has given its pooled
+    connection back, the topologies it renders are still readable (closed, not
+    expired), and the body is the one the render gives. Mutation-checked: removing
+    the `await db.close()` from `export_topologies` fails this."""
+    from app.routes import bulk as bulk_router
+    from sqlalchemy import event
+
+    await _seed_topology("lab", ADMIN_ID, _canvas_with_ids())
+    expected = await admin_client.get("/topologies/export", params={"format": fmt})
+    assert expected.status_code == 200
+    entered = threading.Event()
+    release = threading.Event()
+    real = bulk_router.render_export
+    count = {"out": 0, "seen": 0}
+
+    def checkout(*_args):
+        count["out"] += 1
+        count["seen"] += 1
+
+    def checkin(*_args):
+        count["out"] -= 1
+
+    def held(*args):
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the render was never released"
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, "render_export", held)
+    pool = test_engine.sync_engine.pool
+    event.listen(pool, "checkout", checkout)
+    event.listen(pool, "checkin", checkin)
+    try:
+        exporting = asyncio.create_task(
+            admin_client.get("/topologies/export", params={"format": fmt})
+        )
+        try:
+            assert await _signalled(entered), "the render never started"
+            held_out = count["out"]
+        finally:
+            release.set()
+        resp = await exporting
+    finally:
+        event.remove(pool, "checkout", checkout)
+        event.remove(pool, "checkin", checkin)
+    assert count["seen"] > 0
+    assert held_out == 0
+    assert resp.status_code == 200
+    assert resp.content == expected.content
+    assert "lab" in resp.text
+
+
+# However the upload is sent, the file bound holds (issue #1417) ------------------------
+
+
+def _multipart(file_bytes: bytes) -> tuple[bytes, dict[str, str]]:
+    """The multipart body httpx builds for one file, and its content type."""
+    request = httpx.Request(
+        "POST", "http://test/", files={"file": ("t.json", file_bytes, "application/json")}
+    )
+    return request.read(), {"content-type": request.headers["content-type"]}
+
+
+async def _chunks(body: bytes, size: int = 4096):
+    for start in range(0, len(body), size):
+        yield body[start : start + size]
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound(
+    user_client, monkeypatch
+):
+    """Sent chunked, with no Content-Length, a file at the bound is read and one a
+    byte over it is the 413 naming the bound."""
+    from app.routes import bulk as bulk_router
+
+    file_bytes = b"[" + b" " * 9000 + b"]"
+    body, headers = _multipart(file_bytes)
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(file_bytes))
+    at = await user_client.post(
+        "/topologies/import", params={"format": "json"}, content=_chunks(body), headers=headers
+    )
+    assert at.status_code == 200, at.text
+    assert at.json()["total"] == 0
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(file_bytes) - 1)
+    over = await user_client.post(
+        "/topologies/import", params={"format": "json"}, content=_chunks(body), headers=headers
+    )
+    assert over.status_code == 413, over.text
+    assert over.json() == {
+        "detail": [
+            {
+                "type": "body_too_large",
+                "loc": ["body"],
+                "msg": f"Request body is larger than {len(file_bytes) - 1} bytes",
+            }
+        ]
+    }

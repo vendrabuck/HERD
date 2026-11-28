@@ -5,12 +5,18 @@ handling (one bad row does not abort the batch), cross-instance reference
 resolution by template name / driver name, and RBAC (admin-only).
 """
 
+import asyncio
+import concurrent.futures
+import contextlib
 import csv
 import functools
 import io
 import json
 import sys
+import threading
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from app.database import Base, get_db
 from app.dependencies.auth import get_current_user_payload
@@ -23,6 +29,7 @@ from app.services.bulk_service import (
 )
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -2116,3 +2123,373 @@ async def test_a_csv_the_module_refuses_is_a_fixed_422_and_writes_nothing(
         "detail": f"Invalid CSV: line {line} could not be read; fix it and retry"
     }
     assert await _bulk_state(client) == before
+
+
+# The parse and the rendering run off the event loop (issue #1417) --------------------
+#
+# An import's decode, parse, surrogate scan, and JSON-cell decode, and an export's
+# rendering, run on a bulk worker thread (`herd_common.bulk_work.run_bulk_work`), so a
+# 10 MiB file no longer holds every other inventory request for the length of its
+# parse. Each overlap is staged with events, never a sleep: the parse blocks on a
+# `threading.Event` the test sets, and the test waits for its signal off the loop.
+
+_OFF_LOOP_WAIT = 10.0
+
+
+async def _signalled(event: threading.Event) -> bool:
+    return await asyncio.to_thread(event.wait, _OFF_LOOP_WAIT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+async def test_another_request_is_served_while_an_import_parse_is_held(client, monkeypatch, path):
+    """The parse runs on a thread that is not the loop's, and while it is held the
+    service answers another request. Mutation-checked: reading the file on the loop
+    (calling `_read_device_import` or `_read_template_import` directly in place of
+    `run_bulk_work`) fails this."""
+    from app.services import bulk_service
+
+    loop_thread = threading.get_ident()
+    entered = threading.Event()
+    release = threading.Event()
+    parse_threads: list[int] = []
+    real_parse = bulk_service.parse_import
+
+    def held_parse(*args):
+        parse_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the parse was never released"
+        return real_parse(*args)
+
+    monkeypatch.setattr(bulk_service, "parse_import", held_parse)
+    importing = asyncio.create_task(
+        client.post(
+            path,
+            params={"format": "json"},
+            files={"file": ("f.json", io.BytesIO(b"[]"), "application/json")},
+        )
+    )
+    try:
+        assert await _signalled(entered), "the parse never started"
+        health = await client.get("/health")
+        assert health.status_code == 200
+        assert not importing.done()
+    finally:
+        release.set()
+    resp = await importing
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total"] == 0
+    assert parse_threads and parse_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_a_csv_json_cell_is_decoded_off_the_loop(client, monkeypatch):
+    """A cell as large as the file is parsed with the file, not in the row loop.
+    Mutation-checked: dropping the `_decode_json_cells` call from
+    `_read_device_import` fails this (the cell is decoded on the loop)."""
+    from app.services import bulk_service
+
+    await _create_template(client, name="Firewall")
+    loop_thread = threading.get_ident()
+    loads_threads: list[int] = []
+    real_json = bulk_service.json
+
+    def recording_loads(text, *args, **kwargs):
+        loads_threads.append(threading.get_ident())
+        return real_json.loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(
+        bulk_service,
+        "json",
+        SimpleNamespace(
+            loads=recording_loads, dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError
+        ),
+    )
+    text = (
+        'name,template_name,topology_type,field_data\nd1,Firewall,PHYSICAL,"{""model"": ""x""}"\n'
+    )
+    resp = await _import_csv(client, "/devices/import", text)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", "d1")]
+    assert (await _device_by_name(client, "d1"))["field_data"] == {"model": "x"}
+    assert len(loads_threads) == 1
+    assert loads_threads[0] != loop_thread
+
+
+def _decoder_message(text: str) -> str:
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as exc:
+        return str(exc)
+    raise AssertionError("the text decoded")
+
+
+@pytest.mark.asyncio
+async def test_a_cell_decoded_with_the_file_keeps_the_outcome_the_row_loop_gave(client):
+    """Each row is judged in the order it always was: a row rejected before its cell
+    is read keeps that reason, and a cell that does not decode rejects only its own
+    row with the decoder's message. Mutation-checked: letting `_decode_json_cells`
+    raise (no `except`) fails this (the whole import fails at the first bad cell)."""
+    await _create_template(client, name="Firewall")
+    text = (
+        "name,template_name,topology_type,field_data\n"
+        "d1,Missing,PHYSICAL,{not json\n"
+        ",Firewall,PHYSICAL,{not json\n"
+        "d3,Firewall,PHYSICAL,{not json\n"
+        'd4,Firewall,PHYSICAL,"{""model"": ""x""}"\n'
+    )
+    resp = await _import_csv(client, "/devices/import", text)
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", "d1", "template not found by name: 'Missing'"),
+        ("reject", None, "missing required field: name"),
+        ("reject", "d3", _decoder_message("{not json")),
+        ("create", "d4", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_template_sections_cell_is_decoded_with_the_file(client, monkeypatch):
+    """The template importer decodes its `sections` cells the same way, off the loop:
+    a good cell creates, a bad one rejects only its row with the decoder's message.
+    Mutation-checked: decoding `field_data` in `_read_template_import` in place of
+    `sections` fails this (the cells are decoded on the loop)."""
+    from app.services import bulk_service
+
+    await _create_template(client, name="Firewall")
+    driver_name = (await client.get("/drivers")).json()["items"][0]["name"]
+    sections = json.dumps(TEMPLATE_PAYLOAD["sections"]).replace('"', '""')
+    text = (
+        "name,driver_name,vendor,model,sections\n"
+        f'T1,{driver_name},V,M,"{sections}"\n'
+        f"T2,{driver_name},V,M,[nope\n"
+    )
+    loop_thread = threading.get_ident()
+    loads_threads: list[int] = []
+    real_json = bulk_service.json
+
+    def recording_loads(text, *args, **kwargs):
+        loads_threads.append(threading.get_ident())
+        return real_json.loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(
+        bulk_service,
+        "json",
+        SimpleNamespace(
+            loads=recording_loads, dumps=real_json.dumps, JSONDecodeError=real_json.JSONDecodeError
+        ),
+    )
+    resp = await _import_csv(client, "/templates/import", text)
+    monkeypatch.setattr(bulk_service, "json", real_json)
+    assert len(loads_threads) == 2
+    assert loop_thread not in loads_threads
+    assert resp.status_code == 200, resp.text
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("create", "T1", None),
+        ("reject", "T2", _decoder_message("[nope")),
+    ]
+    templates = (await client.get("/templates")).json()["items"]
+    t1 = next(t for t in templates if t["name"] == "T1")
+    assert [f["key"] for f in t1["sections"][0]["fields"]] == ["model", "rack"]
+
+
+class _RefusingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A default executor that fails any work handed to it."""
+
+    def submit(self, *args, **kwargs):
+        raise AssertionError("work was handed to the default executor")
+
+
+@pytest.mark.asyncio
+async def test_the_import_never_takes_the_default_executor(client):
+    """The default executor is the one `loop.getaddrinfo` resolves names on (issue
+    #1416). Mutation-checked: `asyncio.to_thread` in `run_bulk_work` fails this."""
+    await _create_template(client, name="Firewall")
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_RefusingExecutor())
+    try:
+        report = await _import(
+            client,
+            json.dumps(
+                [
+                    {
+                        "name": "d1",
+                        "template_name": "Firewall",
+                        "topology_type": "PHYSICAL",
+                        "field_data": {"model": "x"},
+                    }
+                ]
+            ).encode(),
+            "json",
+        )
+    finally:
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+    assert [(r["action"], r["identity"]) for r in report["rows"]] == [("create", "d1")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fmt", ["csv", "json"])
+@pytest.mark.parametrize("path", ["/devices/export", "/templates/export"])
+async def test_an_export_is_rendered_off_the_loop(client, monkeypatch, path, fmt):
+    """The body is the one the renderer gives, built on a thread that is not the
+    loop's. Mutation-checked: calling `records_to_json` and `records_to_csv` directly
+    in `_export_response` fails this."""
+    from app.routers import bulk as bulk_router
+
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"])
+    expected = await client.get(path, params={"format": fmt})
+    assert expected.status_code == 200
+    loop_thread = threading.get_ident()
+    render_threads: list[int] = []
+    name = "records_to_json" if fmt == "json" else "records_to_csv"
+    real = getattr(bulk_router, name)
+
+    def recording(*args):
+        render_threads.append(threading.get_ident())
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, name, recording)
+    resp = await client.get(path, params={"format": fmt})
+    assert resp.status_code == 200
+    assert resp.content == expected.content
+    assert resp.headers["content-disposition"] == expected.headers["content-disposition"]
+    assert render_threads and render_threads[0] != loop_thread
+
+
+@contextlib.contextmanager
+def _connections_checked_out(pooled_engine):
+    """A live count of the engine's pooled connections checked out and not back."""
+    count = {"out": 0, "seen": 0}
+
+    def checkout(*_args):
+        count["out"] += 1
+        count["seen"] += 1
+
+    def checkin(*_args):
+        count["out"] -= 1
+
+    pool = pooled_engine.sync_engine.pool
+    event.listen(pool, "checkout", checkout)
+    event.listen(pool, "checkin", checkin)
+    try:
+        yield count
+    finally:
+        event.remove(pool, "checkout", checkout)
+        event.remove(pool, "checkin", checkin)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/export", "/templates/export"])
+@pytest.mark.parametrize("fmt", ["json", "csv"])
+async def test_an_export_holds_no_connection_while_it_renders(client, monkeypatch, path, fmt):
+    """While the render is held on its thread, the request has given its pooled
+    connection back, and the body is still the one the render gives, in both formats.
+    Mutation-checked: removing the `await db.close()` from `_export_response`, or
+    moving it into the JSON branch alone, fails this."""
+    from app.routers import bulk as bulk_router
+
+    template = await _create_template(client, name="Firewall")
+    await _create_device(client, template["id"])
+    expected = await client.get(path, params={"format": fmt})
+    assert expected.status_code == 200
+    entered = threading.Event()
+    release = threading.Event()
+    renderer = f"records_to_{fmt}"
+    real = getattr(bulk_router, renderer)
+
+    def held(*args):
+        entered.set()
+        assert release.wait(_OFF_LOOP_WAIT), "the render was never released"
+        return real(*args)
+
+    monkeypatch.setattr(bulk_router, renderer, held)
+    with _connections_checked_out(engine) as count:
+        exporting = asyncio.create_task(client.get(path, params={"format": fmt}))
+        try:
+            assert await _signalled(entered), "the render never started"
+            held_out = count["out"]
+        finally:
+            release.set()
+        resp = await exporting
+    assert count["seen"] > 0  # the export did take a connection, and gave it back
+    assert held_out == 0
+    assert resp.status_code == 200
+    assert resp.content == expected.content
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_csv_import_reads_with_long_cells_both_read():
+    """Two device imports' file reads, run as the importer runs them, at once: each
+    reads a cell past the csv module's default field limit, so each raises the
+    process-wide limit for its read; both read their rows and the limit is back at
+    its default after. The overlap of the reads themselves is staged in
+    `services/common/tests/test_csv_import.py`; this suite's in-memory database is
+    one shared connection, so two whole imports cannot run their rows at once here."""
+    from app.services import bulk_service
+    from herd_common.bulk_work import run_bulk_work
+
+    racks = {"a1": "a" * (_DEFAULT_FIELD_LIMIT + 1), "b1": "b" * (_DEFAULT_FIELD_LIMIT + 1)}
+
+    def raw(name: str) -> bytes:
+        cell = json.dumps({"model": "EX3300", "rack": racks[name]}).replace('"', '""')
+        text = f'name,template_name,topology_type,field_data\n{name},Firewall,PHYSICAL,"{cell}"\n'
+        return text.encode()
+
+    results = await asyncio.gather(
+        *(run_bulk_work(bulk_service._read_device_import, raw(n), "csv") for n in racks)
+    )
+    for rows, name in zip(results, racks, strict=True):
+        assert [row["name"] for row in rows] == [name]
+        cell = rows[0]["field_data"]
+        assert bulk_service._coerce_json_cell(cell, {}) == {"model": "EX3300", "rack": racks[name]}
+    assert csv.field_size_limit() == _DEFAULT_FIELD_LIMIT
+
+
+# However the upload is sent, the file bound holds (issue #1417) ------------------------
+
+
+def _multipart(file_bytes: bytes) -> tuple[bytes, dict[str, str]]:
+    """The multipart body httpx builds for one file, and its content type."""
+    request = httpx.Request(
+        "POST", "http://test/", files={"file": ("f.json", file_bytes, "application/json")}
+    )
+    return request.read(), {"content-type": request.headers["content-type"]}
+
+
+async def _chunks(body: bytes, size: int = 4096):
+    for start in range(0, len(body), size):
+        yield body[start : start + size]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/devices/import", "/templates/import"])
+async def test_a_streamed_upload_with_no_length_is_held_to_the_exact_file_bound(
+    client, monkeypatch, path
+):
+    """Sent chunked, with no Content-Length, a file at the bound is read and one a
+    byte over it is the 413 naming the bound."""
+    from app.routers import bulk as bulk_router
+
+    file_bytes = b"[" + b" " * 9000 + b"]"
+    body, headers = _multipart(file_bytes)
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(file_bytes))
+    at = await client.post(path, params={"format": "json"}, content=_chunks(body), headers=headers)
+    assert at.status_code == 200, at.text
+    assert at.json()["total"] == 0
+
+    monkeypatch.setattr(bulk_router, "IMPORT_UPLOAD_BYTES", len(file_bytes) - 1)
+    over = await client.post(
+        path, params={"format": "json"}, content=_chunks(body), headers=headers
+    )
+    assert over.status_code == 413, over.text
+    assert over.json() == {
+        "detail": [
+            {
+                "type": "body_too_large",
+                "loc": ["body"],
+                "msg": f"Request body is larger than {len(file_bytes) - 1} bytes",
+            }
+        ]
+    }

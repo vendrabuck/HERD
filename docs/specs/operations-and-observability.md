@@ -2481,10 +2481,28 @@ None at present. (#1577 is resolved by OPS-REPORT-11, OPS-REPORT-12, and OPS-REP
   form) can still be refused by the service it is forwarded to, which answers 413 and
   the sender relays a 4xx (OPS-VALID-12); the envelope covers what the senders add, not
   that growth. Recorded in issue #1466.
-- A bulk import file of up to 10 MiB is still decoded and parsed on the event loop,
-  the loop every reservation and topology read depends on; `_read_capped` bounds what
-  is copied out of the spool, not that parse (INV-BULK-23, TOPO-BULK-20). Step 2 of
-  issue #1417, moving the parse off the event loop, is not done.
+- A bulk import's file work runs off the event loop (INV-BULK-27, TOPO-BULK-23), except
+  each single C call within it (the whole-file JSON decode and the surrogate scan's
+  serialization, from about 20 ms to about 130 ms and from about 35 ms to about 75 ms for a 10 MiB file on one core, more the smaller and more numerous its items; on Python 3.13 and later a JSON export's render is one such call as well), but its row
+  loop does not. Each row's schema checks and writes on inventory, and each topology's
+  canvas rewrite and validation on cabling, run on the event loop between that row's
+  queries, so a single row as large as the file holds the loop for that row's work, as
+  an interactive save of that size does. Rows rejected before any query (an unknown
+  template or a missing name on inventory; a missing name or unresolved device names on
+  cabling) run with no await between them, and so does building and serializing the
+  report, so a file of many such rows holds the loop for all of them. The longest stall
+  measured on one core, the same before and after issue #1417: about 1.1 s on
+  inventory; on cabling about 1.7 s for rows with no name imported by a non-admin,
+  about 0.8 s for rows with unresolved device names, and about 0.59 s for one canvas as
+  large as the file. Recorded in INV-BULK-27 and TOPO-BULK-23.
+- A multipart upload that the body limit refuses part way through its read (sent
+  chunked, or declaring less than it sends) leaves the temporary file Starlette spooled
+  it to open until the object is freed, not when the 413 is sent: Starlette's parser
+  closes its files only when the parse fails with its own error. The file holds at
+  most the route's limit. Recorded in the tests named
+  `test_an_import_body_over_its_limit_is_413_however_it_is_sent` in
+  `services/inventory/tests/test_request_body_limit.py` and
+  `services/cabling/tests/test_request_body_limit.py`.
 
 ### Rules with no test
 
