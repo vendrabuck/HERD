@@ -322,7 +322,9 @@ async def list_apply_jobs(
             await db.execute(
                 select(DeviceConfigApplyJob)
                 .where(DeviceConfigApplyJob.device_id == device_id)
-                .order_by(DeviceConfigApplyJob.scheduled_for.desc())
+                # Latest first, then id ascending (issue #1589): two jobs may be
+                # scheduled for the same instant.
+                .order_by(DeviceConfigApplyJob.scheduled_for.desc(), DeviceConfigApplyJob.id)
                 .offset(skip)
                 .limit(limit)
             )

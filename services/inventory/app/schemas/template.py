@@ -1,3 +1,4 @@
+import math
 import re
 import uuid
 from datetime import datetime
@@ -5,7 +6,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator, model_validator
 
-from app.schemas.device import _validate_poll_interval
+from app.schemas.column_bounds import NON_FINITE_NUMBER_MESSAGE, ColumnText, column_string
+from app.schemas.device import PollInterval, _validate_poll_interval
+
+# The device_templates columns' widths (String(255), app/models/template.py).
+TEMPLATE_STRING_MAX_LENGTH = 255
+TemplateString = column_string(TEMPLATE_STRING_MAX_LENGTH)
 
 
 class FieldDefinition(BaseModel):
@@ -15,6 +21,14 @@ class FieldDefinition(BaseModel):
     required: bool = False
     default: str | float | bool | None = None
     options: list[str] | None = None
+
+    @field_validator("default")
+    @classmethod
+    def refuse_non_finite_default(cls, v: str | float | bool | None) -> str | float | bool | None:
+        # Sections are stored in a `json` column, which refuses NaN and Infinity.
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError(NON_FINITE_NUMBER_MESSAGE)
+        return v
 
     @field_validator("key")
     @classmethod
@@ -79,18 +93,18 @@ class SectionDefinition(BaseModel):
 
 
 class TemplateCreate(BaseModel):
-    name: str
+    name: TemplateString
     template_type: Literal["device", "port", "dynamic"] = "device"
     driver_id: uuid.UUID | None = None
     hypervisor_id: uuid.UUID | None = None
     exclusive: bool = True
-    icon: str | None = None
-    description: str | None = None
-    vendor: str | None = None
-    model: str | None = None
-    part_number: str | None = None
+    icon: ColumnText | None = None
+    description: ColumnText | None = None
+    vendor: TemplateString | None = None
+    model: TemplateString | None = None
+    part_number: TemplateString | None = None
     sections: list[SectionDefinition]
-    poll_interval_seconds: int | None = None
+    poll_interval_seconds: PollInterval | None = None
 
     @field_validator("vendor", "model")
     @classmethod
@@ -144,17 +158,17 @@ class TemplateCreate(BaseModel):
 
 
 class TemplateUpdate(BaseModel):
-    name: str | None = None
+    name: TemplateString | None = None
     driver_id: uuid.UUID | None = None
     hypervisor_id: uuid.UUID | None = None
     exclusive: bool | None = None
-    icon: str | None = None
-    description: str | None = None
-    vendor: str | None = None
-    model: str | None = None
-    part_number: str | None = None
+    icon: ColumnText | None = None
+    description: ColumnText | None = None
+    vendor: TemplateString | None = None
+    model: TemplateString | None = None
+    part_number: TemplateString | None = None
     sections: list[SectionDefinition] | None = None
-    poll_interval_seconds: int | None = None
+    poll_interval_seconds: PollInterval | None = None
 
     @field_validator("vendor", "model")
     @classmethod

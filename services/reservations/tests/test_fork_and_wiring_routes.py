@@ -62,7 +62,7 @@ from sqlalchemy import select
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
 from tests._route_table import otherwise_valid_request, path_segments, routes_where
-from tests._upstream_bodies import NOT_AN_OBJECT, UNPARSEABLE, assert_nothing_leaked
+from tests._upstream_bodies import MARKER, NOT_AN_OBJECT, UNPARSEABLE, assert_nothing_leaked
 from tests._upstream_bodies import answer as bad_answer
 
 OWNER_ID = str(uuid.uuid4())
@@ -474,15 +474,66 @@ async def test_an_upstream_transport_error_is_503_failed_to_contact(network, met
     connect failure, a timeout, a protocol error): what RES-FORK-10 calls a transport
     failure and RES-FORK-18 an absence. An httpx error outside TransportError (`DecodingError`,
     `TooManyRedirects`) is not tried: no rule says what it becomes, so an `except`
-    narrowed to TransportError passes here."""
+    narrowed to TransportError passes here. The error's own text (here a marker and an
+    address with userinfo) never reaches the answer: the detail names the class only."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     service = _upstream_of(method, route)[0]
-    network.route().mock(side_effect=error)
+    network.route().mock(side_effect=error(f"{MARKER} http://svc-user:svc-pw@upstream"))
     async with _client_as(OWNER_ID, "user") as ac:
         resp = await ac.request(method, **_request_for(route, target.id))
     assert resp.status_code == 503
-    assert resp.json()["detail"].startswith(f"Failed to contact {service} service: ")
+    assert resp.json() == {"detail": f"Failed to contact {service} service: {error.__name__}"}
+    assert MARKER not in resp.text
+    assert "svc-pw" not in resp.text
     assert network.calls.call_count == 1
+
+
+NOT_JSON_4XX_DETAIL = {"cabling": "Cabling request failed", "execution": "Execution request failed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409, 499])
+@pytest.mark.parametrize("body", UNPARSEABLE.values(), ids=UNPARSEABLE.keys())
+@EVERY_UPSTREAM_ROUTE
+async def test_an_upstream_4xx_that_is_not_json_answers_fixed_wording(
+    network, method, route, body, status
+):
+    """RES-FORK-10 and RES-FORK-18: a 4xx whose body does not parse keeps its status and
+    answers the service's fixed wording, never the body's text."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    service = _upstream_of(method, route)[0]
+    network.route().mock(return_value=bad_answer(status, body))
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == status
+    assert resp.json() == {"detail": NOT_JSON_4XX_DETAIL[service]}
+    assert_nothing_leaked(resp.text)
+    assert network.calls.call_count == 1
+
+
+@pytest.mark.asyncio
+@EVERY_UPSTREAM_ROUTE
+async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(
+    network, caplog, method, route
+):
+    """RES-UPSTREAM-2: a RuntimeError that is not HERD's typed upstream error (here one
+    the transport raises under call_service, which neither helper wraps) answers the
+    fixed `A service this request depends on is unavailable`, never its own text, and
+    is logged by class name."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(side_effect=RuntimeError(f"{MARKER} http://svc-user:svc-pw@upstream"))
+    caplog.set_level("DEBUG")
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "A service this request depends on is unavailable"}
+    assert network.calls.call_count == 1
+    (record,) = [
+        r for r in caplog.records if r.__dict__.get("action") == "unexpected_runtime_error"
+    ]
+    assert record.error_class == "RuntimeError"
+    assert_nothing_leaked(resp.text, caplog.text)
+    assert "svc-pw" not in resp.text + caplog.text
 
 
 # --- Issue #1577: an upstream body the relay cannot read -----------------------------
@@ -614,9 +665,9 @@ async def test_a_save_answer_of_the_declared_shape_stages_its_version(network):
 async def test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_parse(
     network, method, route, body, status
 ):
-    """RES-FORK-10 for a body nested past the recursion limit, a 500 before #1577: a
-    4xx keeps its status and relays its text, as any other 4xx body that does not
-    parse does; a 5xx is 503 `Cabling service is unavailable`."""
+    """RES-FORK-10 for a body nested past the recursion limit: a 4xx keeps its status
+    and answers `Cabling request failed`, as any other 4xx body that does not parse
+    does; a 5xx is 503 `Cabling service is unavailable`."""
     target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
     network.route().mock(return_value=bad_answer(status, body))
     async with _client_as(OWNER_ID, "user") as ac:
@@ -626,4 +677,4 @@ async def test_a_deep_cabling_error_body_is_relayed_like_any_body_that_does_not_
         assert resp.json() == {"detail": "Cabling service is unavailable"}
     else:
         assert resp.status_code == 409
-        assert resp.json() == {"detail": body.decode()}
+        assert resp.json() == {"detail": "Cabling request failed"}

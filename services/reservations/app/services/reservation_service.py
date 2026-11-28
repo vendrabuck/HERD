@@ -12,6 +12,7 @@ Key rules enforced here:
 import asyncio
 import logging
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -51,6 +52,13 @@ from app.schemas.reservation import (
 from app.services.purpose_service import (
     stamp_purpose_classify_requested,
     validate_purpose_category,
+)
+from app.services.upstream_failure import (
+    UpstreamUnavailable,
+    answered,
+    failure_label,
+    traceback_for,
+    unreachable,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,16 +103,20 @@ INVENTORY_ANSWER_UNUSABLE = "Inventory service returned an answer that could not
 # Issue #1577: the fixed 503 detail for a cabling validate answer that cannot be used.
 CABLING_VALIDATION_ANSWER_UNUSABLE = "Cabling validation returned an answer that could not be read"
 
+# The fixed 503 detail for a create whose inventory flip exhausted its attempts
+# (RES-CREATE-15); the failed devices and the cause go to the log, not the answer.
+INVENTORY_RESERVE_FAILED = "Failed to reserve devices in inventory after retries"
+
 _TOPOLOGY_TYPE_VALUES = frozenset(t.value for t in TopologyType)
 
 
-class UpstreamAnswerUnusable(RuntimeError):
+class UpstreamAnswerUnusable(UpstreamUnavailable):
     """A 2xx from inventory or cabling whose body cannot be used (issue #1577).
 
-    A RuntimeError, so the create and PATCH routes answer it as 503 with its
-    message, which is always one of the fixed constants above, never body or
-    decoder text. The wrappers that turn other exceptions into
-    `Failed to contact inventory service: ...` re-raise this type unchanged.
+    A RuntimeError (through `UpstreamUnavailable`), so the create and PATCH routes
+    answer it as 503 with its message, which is always one of the fixed constants
+    above, never body or decoder text. The wrappers that turn other exceptions into
+    `Failed to contact inventory service: <label>` re-raise this type unchanged.
     """
 
 
@@ -326,7 +338,7 @@ async def _fetch_hypervisor_internal(hypervisor_id: str) -> dict | None:
     whose hypervisor cannot be checked must not go through.
     """
     if not settings.internal_api_token:
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+        raise UpstreamUnavailable(HYPERVISOR_CHECK_UNAVAILABLE)
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -335,11 +347,11 @@ async def _fetch_hypervisor_internal(hypervisor_id: str) -> dict | None:
                 timeout=10.0,
             )
     except httpx.HTTPError as exc:
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from exc
+        raise UpstreamUnavailable(HYPERVISOR_CHECK_UNAVAILABLE) from exc
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE)
+        raise UpstreamUnavailable(HYPERVISOR_CHECK_UNAVAILABLE)
     try:
         body = read_json_body(resp, expect=dict)
         name = body.get("name")
@@ -347,7 +359,7 @@ async def _fetch_hypervisor_internal(hypervisor_id: str) -> dict | None:
             raise UpstreamBodyUnusable(WRONG_FIELD)
     except UpstreamBodyUnusable as exc:
         _log_unusable_answer("inventory_hypervisor_unusable", exc)
-        raise RuntimeError(HYPERVISOR_CHECK_UNAVAILABLE) from None
+        raise UpstreamUnavailable(HYPERVISOR_CHECK_UNAVAILABLE) from None
     return body
 
 
@@ -373,7 +385,7 @@ async def _validate_dynamic_requests(dynamic_requests, token: str) -> None:
     except (ValueError, UpstreamAnswerUnusable):
         raise
     except Exception as exc:
-        raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
+        raise unreachable("inventory", exc) from exc
 
     non_dynamic = [str(t["id"]) for t in templates if t.get("template_type") != "dynamic"]
     if non_dynamic:
@@ -464,14 +476,14 @@ async def _validate_topology_connectivity(
                 timeout=_VALIDATE_TOPOLOGY_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
+            raise unreachable("cabling", exc) from exc
 
     if resp.status_code == 404:
         # Topology was deleted between selection and submit; let downstream
         # checks decide. Treat as no validation rather than a hard failure.
         return
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cabling validation returned {resp.status_code}: {resp.text}")
+        raise answered("Cabling validation", resp.status_code)
 
     try:
         body = read_json_body(resp, expect=dict)
@@ -597,16 +609,28 @@ class ForkMembershipRefused(Exception):
     exhaustion, never permanently disabling fork creation for the rest of the
     process's lifetime the way treating it as definitive would.
     ``device_ids`` is populated only for the membership shape (empty for a
-    port-claim conflict or a 422, which carry their own detail shapes instead);
-    ``detail`` carries whatever structured detail body cabling actually
-    returned, for a caller that wants the full shape regardless of which of the
-    two it was.
+    port-claim conflict or a 422, which carry their own detail shapes instead),
+    and holds only the entries that are UUID strings; ``detail`` carries whatever
+    structured detail body cabling actually returned, for a caller that wants the
+    full shape regardless of which of the two it was. The message is fixed text and
+    the status code, never the detail: neither the message nor a log line holds
+    text cabling sent.
     """
 
-    def __init__(self, device_ids: list[str], detail: dict | str | None = None):
-        super().__init__(f"fork create refused: {detail if detail is not None else device_ids}")
+    def __init__(
+        self,
+        device_ids: list[str],
+        detail: dict | str | None = None,
+        *,
+        status_code: int | None = None,
+    ):
+        super().__init__(
+            "Cabling refused the fork create"
+            + (f" with {status_code}" if status_code is not None else "")
+        )
         self.device_ids = device_ids
         self.detail = detail
+        self.status_code = status_code
 
 
 # Per-process, in-memory set of reservations whose fork create was definitively
@@ -725,10 +749,11 @@ async def _create_reservation_fork(
             detail = {}
         device_ids: list[str] = []
         if isinstance(detail, dict) and detail.get("error") == "fork_device_not_member":
-            device_ids = detail.get("device_ids") or []
-        raise ForkMembershipRefused(device_ids, detail)
+            named = detail.get("device_ids")
+            device_ids = [d for d in named if _is_uuid_text(d)] if isinstance(named, list) else []
+        raise ForkMembershipRefused(device_ids, detail, status_code=resp.status_code)
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+        raise answered("Cabling fork-create", resp.status_code)
     # Issue #1577: a 2xx whose body is not an object with an integer
     # version_number raises UpstreamBodyUnusable, which is not retryable here.
     body = read_json_body(resp, expect=dict)
@@ -836,23 +861,24 @@ async def _create_reservation_fork_best_effort(
         )
         return False
     except ForkMembershipRefused as exc:
+        # The status and the UUID device ids only, never cabling's detail.
         logger.warning(
-            "Fork creation refused for reservation %s (cabling 409, definitive, "
-            "not retried): device_ids=%s detail=%s",
+            "Fork creation refused for reservation %s (cabling %s, definitive, "
+            "not retried): device_ids=%s",
             reservation_id,
+            exc.status_code,
             exc.device_ids,
-            exc.detail,
             extra={
                 "action": "reservation_fork_membership_refused",
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
                 "device_ids": exc.device_ids,
-                "detail": exc.detail,
+                "status_code": exc.status_code,
             },
         )
         _fork_membership_refused.add(reservation_id)
         return True
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork creation failed for reservation %s; leaving fork_id null",
             reservation_id,
@@ -861,7 +887,7 @@ async def _create_reservation_fork_best_effort(
                 "reservation_id": str(reservation_id),
                 "topology_id": str(topology_id),
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
         return False
 
@@ -964,7 +990,7 @@ async def _prune_removed_devices_from_fork(
         )
         return _PRUNE_OUTCOME_CONVERGED
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cabling fork prune returned {resp.status_code}: {resp.text}")
+        raise answered("Cabling fork prune", resp.status_code)
     # Issue #1577: a 2xx whose body is not the declared shape raises
     # UpstreamBodyUnusable; the marker is kept and the wrapper logs it.
     data = read_json_body(resp, expect=dict)
@@ -1244,7 +1270,7 @@ async def _prune_removed_devices_from_fork_best_effort(
             reservation_id=str(reservation_id),
         )
         return
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork prune failed for reservation %s; removed-device wiring not yet released, "
             "the pending-prune marker keeps the sweep retrying it",
@@ -1254,12 +1280,17 @@ async def _prune_removed_devices_from_fork_best_effort(
                 "reservation_id": str(reservation_id),
                 "removed_device_ids": [str(d) for d in removed_device_ids],
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
         return
     if outcome == _PRUNE_OUTCOME_NO_FORK and await _fork_may_still_appear(reservation_id):
         return
     await _clear_pending_fork_prune(reservation_id, removed_device_ids)
+
+
+# The fixed 503 details of a fork or wiring call made without an internal token.
+_CABLING_FORKS_NO_TOKEN = "internal_api_token not configured; cannot reach cabling forks"
+_EXECUTION_NO_TOKEN = "internal_api_token not configured; cannot reach execution"
 
 
 async def _cabling_fork_call(
@@ -1294,6 +1325,8 @@ async def _cabling_fork_call(
     devices outside that user's visibility. Every other caller leaves it unset and
     gets the unredacted service view.
     """
+    if not settings.internal_api_token:
+        raise UpstreamUnavailable(_CABLING_FORKS_NO_TOKEN)
     try:
         return await call_service(
             settings.cabling_service_url,
@@ -1303,14 +1336,12 @@ async def _cabling_fork_call(
             timeout=timeout,
             auth=InternalTokenAuth(
                 token=settings.internal_api_token,
-                missing_token_message=(
-                    "internal_api_token not configured; cannot reach cabling forks"
-                ),
+                missing_token_message=_CABLING_FORKS_NO_TOKEN,
                 on_behalf_of=on_behalf_of,
             ),
         )
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"Failed to contact cabling service: {exc}") from exc
+        raise unreachable("cabling", exc) from exc
 
 
 async def _execution_wiring_call(
@@ -1328,6 +1359,8 @@ async def _execution_wiring_call(
     convention), and returns execution's own Response so a 4xx/409 (frozen refusal) or
     a structured 200 relays to the user verbatim.
     """
+    if not settings.internal_api_token:
+        raise UpstreamUnavailable(_EXECUTION_NO_TOKEN)
     try:
         return await call_service(
             settings.execution_service_url,
@@ -1337,11 +1370,11 @@ async def _execution_wiring_call(
             timeout=30.0,
             auth=InternalTokenAuth(
                 token=settings.internal_api_token,
-                missing_token_message=("internal_api_token not configured; cannot reach execution"),
+                missing_token_message=_EXECUTION_NO_TOKEN,
             ),
         )
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"Failed to contact execution service: {exc}") from exc
+        raise unreachable("execution", exc) from exc
 
 
 async def _lazy_create_reservation_fork(
@@ -1376,7 +1409,7 @@ async def _lazy_create_reservation_fork(
         },
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cabling fork-create returned {resp.status_code}: {resp.text}")
+        raise answered("Cabling fork-create", resp.status_code)
 
 
 async def _archive_reservation_fork(reservation_id: uuid.UUID) -> None:
@@ -1389,7 +1422,7 @@ async def _archive_reservation_fork(reservation_id: uuid.UUID) -> None:
     """
     resp = await _cabling_fork_call("POST", f"/internal/forks/{reservation_id}/archive")
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cabling fork-archive returned {resp.status_code}: {resp.text}")
+        raise answered("Cabling fork-archive", resp.status_code)
 
 
 async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> None:
@@ -1413,7 +1446,7 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
             factor=2.0,
             max_delay=5.0,
         )
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Fork archive failed for reservation %s; as-built record not frozen",
             reservation_id,
@@ -1421,7 +1454,7 @@ async def _archive_reservation_fork_best_effort(reservation_id: uuid.UUID) -> No
                 "action": "reservation_fork_archive_failed",
                 "reservation_id": str(reservation_id),
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -1678,7 +1711,13 @@ async def _update_device_statuses(
 
     failed = [(did, exc) for did, exc in zip(device_ids, results) if isinstance(exc, BaseException)]
     for did, exc in failed:
-        logger.error("Failed to update device %s status to %s: %s", did, status, exc, exc_info=exc)
+        logger.error(
+            "Failed to update device %s status to %s (%s)",
+            did,
+            status,
+            failure_label(exc),
+            exc_info=traceback_for(exc),
+        )
 
     if failed and raise_on_failure:
         raise RuntimeError(
@@ -1906,10 +1945,11 @@ async def _release_exclusive_devices_best_effort(
             )
         elif isinstance(result, BaseException):
             logger.warning(
-                "Could not fetch device %s during %s; assuming exclusive",
+                "Could not fetch device %s during %s; assuming exclusive (%s)",
                 did,
                 context_label,
-                exc_info=result,
+                failure_label(result),
+                exc_info=traceback_for(result),
             )
             exclusive_ids.append(did)
         elif result.get("exclusive", True):
@@ -1940,7 +1980,7 @@ async def _release_exclusive_devices_best_effort(
             context_label,
             reservation_id,
             extra=extra,
-            exc_info=exc,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -1968,7 +2008,7 @@ async def _revert_flipped_devices_best_effort(
         return
     try:
         await _update_device_statuses(releasable, "AVAILABLE")
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Failed to revert RESERVED devices after a lost activation: %s",
             reservation_id,
@@ -1977,7 +2017,7 @@ async def _revert_flipped_devices_best_effort(
                 "reservation_id": str(reservation_id),
                 "device_ids": [str(d) for d in releasable],
             },
-            exc_info=True,
+            exc_info=traceback_for(exc),
         )
 
 
@@ -2018,7 +2058,7 @@ async def create_reservation(
     except (ValueError, UpstreamAnswerUnusable):
         raise
     except Exception as exc:
-        raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
+        raise unreachable("inventory", exc) from exc
 
     # 2. Derive topology_type. A dynamic-only booking has no physical devices to
     # read it from, so it is CLOUD by construction (ADR 0004 materializes dynamic
@@ -2247,7 +2287,7 @@ async def create_reservation(
             if releasable:
                 try:
                     await _update_device_statuses(releasable, "AVAILABLE")
-                except Exception:
+                except Exception as revert_exc:
                     logger.error(
                         "Failed to revert RESERVED devices after provisioning failure: %s",
                         reservation.id,
@@ -2256,7 +2296,7 @@ async def create_reservation(
                             "reservation_id": str(reservation.id),
                             "device_ids": [str(d) for d in releasable],
                         },
-                        exc_info=True,
+                        exc_info=traceback_for(revert_exc),
                     )
             logger.error(
                 "Reservation provisioning failed: %s",
@@ -2266,11 +2306,9 @@ async def create_reservation(
                     "reservation_id": str(reservation.id),
                     "user_id": str(user_id),
                 },
-                exc_info=exc,
+                exc_info=traceback_for(exc),
             )
-            raise RuntimeError(
-                f"Failed to reserve devices in inventory after retries: {exc}"
-            ) from exc
+            raise UpstreamUnavailable(INVENTORY_RESERVE_FAILED) from exc
 
         if has_dynamic:
             # Gated activation (ADR 0004): the exclusive devices are RESERVED,
@@ -2388,6 +2426,18 @@ async def _claim_provision_transition(
     )
 
 
+_PROVISION_ERROR_FORM = re.compile(r"provisioning failed: ([A-Za-z_][A-Za-z0-9_]{0,99})")
+
+
+def _provision_error_class(error: object) -> str | None:
+    """The class name in a provision-result `error` of execution's documented form,
+    `provisioning failed: <ClassName>`, else None (any other text is not logged)."""
+    if not isinstance(error, str):
+        return None
+    match = _PROVISION_ERROR_FORM.fullmatch(error)
+    return match.group(1) if match else None
+
+
 async def apply_provision_result(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -2480,14 +2530,17 @@ async def apply_provision_result(
     )
     await db.commit()
     await db.refresh(reservation)
+    # Execution's `error` is logged only as the class name its documented form
+    # carries (`provisioning failed: <ClassName>`), never as the text it sent.
+    error_class = _provision_error_class(error)
     logger.error(
-        "Reservation failed by provision result: %s: %s",
+        "Reservation failed by provision result: %s (%s)",
         reservation_id,
-        error,
+        error_class or "no class name reported",
         extra={
             "action": "reservation_provision_result_failed",
             "reservation_id": str(reservation_id),
-            "error": error,
+            "error_class": error_class,
         },
     )
     await _release_exclusive_devices_best_effort(
@@ -2837,7 +2890,7 @@ async def _hold_added_devices_after_edit(
                 "user_id": str(user_id),
                 "device_ids": [str(d) for d in device_ids],
             },
-            exc_info=exc,
+            exc_info=traceback_for(exc),
         )
     if not flipped:
         return
@@ -2969,7 +3022,7 @@ async def update_reservation(
             except (ValueError, UpstreamAnswerUnusable):
                 raise
             except Exception as exc:
-                raise RuntimeError(f"Failed to contact inventory service: {exc}") from exc
+                raise unreachable("inventory", exc) from exc
 
             # Validate topology_type uniformity over the booked set only (issue
             # #1030, decision A(a)): an instance device this reservation already

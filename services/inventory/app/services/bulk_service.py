@@ -18,6 +18,12 @@ first query (`_read_device_import`, `_read_template_import`); the row loop, its
 schema checks, and every database call stay on the event loop in the request's
 session. An export's rendering of its records into one body runs the same way.
 
+A rejected row's reason is fixed wording chosen by this module, never the text of
+an exception (`_row_failure_reason`): a schema error names each field and its
+message (`_validation_reason`), a service's refusal keeps its own fixed detail,
+and a row the database refuses is named by the refusal's class (its SQLSTATE, or
+SQLite's error code) alone.
+
 There is no cross-schema bulk path: this lives in the inventory service and only
 touches the inventory schema, matching the service-boundary rule.
 """
@@ -25,6 +31,7 @@ touches the inventory schema, matching the service-boundary rule.
 import csv
 import io
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -34,8 +41,9 @@ from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
 from herd_common.validation_errors import holds_lone_surrogate
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError, PendingRollbackError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device import Device
@@ -43,6 +51,7 @@ from app.models.driver_package import DriverPackage
 from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport, RowResult
+from app.schemas.column_bounds import ColumnText
 from app.schemas.device import DeviceCreate, DeviceUpdate
 from app.schemas.template import TemplateCreate, TemplateUpdate
 from app.services.inventory_service import create_device, update_device
@@ -122,6 +131,139 @@ JSON_CELL_UNREADABLE_REASON = "a JSON cell is nested too deeply or holds a numbe
 # an object of strings, so it never meets either.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
+
+# A reference cell (`template_name`, `driver_name`, `hypervisor_name`) that is present,
+# not null, and not a string, in a JSON import; and a poll interval cell that is not
+# a whole number. `{field}` is the column's name, never its value.
+CELL_NOT_A_STRING_REASON = "{field}: must be a string"
+POLL_NOT_A_WHOLE_NUMBER_REASON = "poll_interval_seconds: must be a whole number"
+# A JSON cell (`field_data`, `sections`) in a JSON import that is neither an object,
+# a list, nor JSON text (a number or a boolean).
+JSON_CELL_NOT_JSON_REASON = "a JSON cell must be an object, a list, or JSON text"
+
+# A row the database refuses. The reason names the refusal's class, read from the
+# SQLSTATE Postgres (asyncpg) gives, or the error code SQLite gives, never from the
+# exception's text. The create and update functions answer a duplicate name or a
+# missing reference with their own fixed details; the class 23 entries name such a
+# refusal raised outside them.
+DATABASE_REFUSED_REASON = "the database refused the row"
+# A failure of the database rather than of the row (SQLSTATE classes 08, 40, 53,
+# and 57, or a connection the driver reports lost): the same row may import on a
+# second run.
+DATABASE_UNAVAILABLE_REASON = "the database was unavailable or busy; run the import again"
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57"})
+_SQLSTATE_REASONS = {
+    "23505": "a value that must be unique is already in use",
+    "23503": "a record the row refers to does not exist",
+    "23502": "a required value is missing",
+    "23514": "a value is outside what the database allows",
+    "22001": "a value is longer than its column allows",
+    "22003": "a number is out of range for its column",
+    "22021": "a value holds a character the database cannot store, such as a NUL",
+    "22P05": "a value holds a character the database cannot store, such as a NUL",
+}
+# By SQLSTATE class, for a code the table above does not name.
+_SQLSTATE_CLASS_REASONS = {
+    "23": "a value breaks a database constraint",
+    "22": "a value does not fit the type of its column",
+}
+# SQLite's extended error codes (`sqlite3.Error.sqlite_errorname`) for the same classes.
+_SQLITE_SQLSTATES = {
+    "SQLITE_CONSTRAINT_UNIQUE": "23505",
+    "SQLITE_CONSTRAINT_PRIMARYKEY": "23505",
+    "SQLITE_CONSTRAINT_FOREIGNKEY": "23503",
+    "SQLITE_CONSTRAINT_NOTNULL": "23502",
+    "SQLITE_CONSTRAINT_CHECK": "23514",
+    "SQLITE_TOOBIG": "22001",
+}
+# Any other failure of a row: no exception text, only the fact.
+ROW_UNEXPECTED_REASON = "the row could not be imported"
+
+logger = logging.getLogger(__name__)
+
+
+class _RowReasonError(ValueError):
+    """A row failure whose text is a reason this module chose: one of the fixed
+    reasons above, or a JSON decoder's message (`_json_syntax_reason`). Never built
+    from a cell's value or from another exception's text."""
+
+
+def _json_syntax_reason(exc: json.JSONDecodeError) -> str:
+    """The decoder's message and position, built from its parts: the C decoder's
+    messages are fixed wording that names no content."""
+    return f"{exc.msg}: line {exc.lineno} column {exc.colno} (char {exc.pos})"
+
+
+def _sqlstate_of(exc: DBAPIError) -> str | None:
+    """The SQLSTATE of a refused statement: asyncpg's, or SQLite's error code mapped
+    to the same classes. None when the driver gives neither."""
+    orig = exc.orig
+    sqlstate = getattr(orig, "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return sqlstate
+    return _SQLITE_SQLSTATES.get(getattr(orig, "sqlite_errorname", None) or "")
+
+
+def _database_reason(exc: DBAPIError) -> str:
+    sqlstate = _sqlstate_of(exc)
+    logger.warning("bulk import row refused by the database: sqlstate=%s", sqlstate or "none")
+    if exc.connection_invalidated or (sqlstate or "")[:2] in _TRANSIENT_SQLSTATE_CLASSES:
+        return DATABASE_UNAVAILABLE_REASON
+    if sqlstate is None:
+        return DATABASE_REFUSED_REASON
+    detail = _SQLSTATE_REASONS.get(sqlstate) or _SQLSTATE_CLASS_REASONS.get(sqlstate[:2])
+    if detail is None:
+        return DATABASE_REFUSED_REASON
+    return f"{DATABASE_REFUSED_REASON}: {detail}"
+
+
+def _row_failure_reason(exc: Exception) -> str:
+    """The reason for a row that failed with `exc`, an exception that is neither an
+    `HTTPException` nor a pydantic `ValidationError` (each has its own branch). It
+    is chosen by the exception's class, never from its text."""
+    if isinstance(exc, _RowReasonError):
+        return str(exc)
+    if isinstance(exc, json.JSONDecodeError):
+        return _json_syntax_reason(exc)
+    if isinstance(exc, DBAPIError):
+        return _database_reason(exc)
+    if isinstance(exc, SQLAlchemyError):
+        logger.warning("bulk import row failed in the database layer: %s", type(exc).__name__)
+        if isinstance(exc, PendingRollbackError):
+            # The row loop rolls back after every failed row, so this arises only
+            # when the session's connection is gone: the row never reached the database.
+            return DATABASE_UNAVAILABLE_REASON
+        return DATABASE_REFUSED_REASON
+    logger.warning("bulk import row failed: %s", type(exc).__name__)
+    return ROW_UNEXPECTED_REASON
+
+
+def _http_reason(exc: HTTPException) -> str:
+    """A service refusal's detail: fixed wording the create and update functions
+    raise (`docs/specs/inventory.md` section 9). A detail that is not a string is
+    not echoed."""
+    if isinstance(exc.detail, str):
+        return exc.detail
+    return ROW_UNEXPECTED_REASON
+
+
+def _text_cell(raw_row: dict[str, Any], field: str) -> str:
+    """A reference cell, stripped; "" when absent, null, or empty. A JSON import's
+    value that is not a string rejects the row with the column's name."""
+    value = raw_row.get(field)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise _RowReasonError(CELL_NOT_A_STRING_REASON.format(field=field))
+    return value.strip()
+
+
+class _RowName(BaseModel):
+    """A row's name, checked before the importer looks it up by name: a name holding
+    a NUL character is a schema error naming the field, the one the create and update
+    schemas give (INV-COL-2), rather than a lookup the database refuses."""
+
+    name: ColumnText
 
 
 def _row_shape_reason(raw_row: Any) -> str | None:
@@ -311,14 +453,14 @@ def parse_import(
 
 class _DecodedCell:
     """A JSON cell already decoded on the parse thread (issue #1417): the value
-    `_coerce_json_cell` returned for it there, or the text of the exception it
-    raised. `_coerce_json_cell` hands the value back, or raises `_CellDecodeError`
-    with that text, when the row loop reaches the cell, so the row's outcome and
-    reason are the ones an on-loop decode gave. It keeps the text, never the
-    exception: an exception's traceback holds the decoding frame, which holds every
-    row, so each failed cell would keep the whole upload alive in a reference cycle
-    until the garbage collector found it. It equals neither None nor "", as the
-    non-empty text it stands for does not."""
+    `_coerce_json_cell` returned for it there, or the reason `_row_failure_reason`
+    chose for the exception it raised. `_coerce_json_cell` hands the value back, or
+    raises `_CellDecodeError` with that reason, when the row loop reaches the cell,
+    so the row's outcome and reason are the ones an on-loop decode gave. It keeps the
+    reason, never the exception: an exception's traceback holds the decoding frame,
+    which holds every row, so each failed cell would keep the whole upload alive in
+    a reference cycle until the garbage collector found it. It equals neither None
+    nor "", as the non-empty text it stands for does not."""
 
     __slots__ = ("reason", "value")
 
@@ -327,11 +469,10 @@ class _DecodedCell:
         self.reason = reason
 
 
-class _CellDecodeError(ValueError):
+class _CellDecodeError(_RowReasonError):
     """Raised where the row loop reads a cell whose decode failed on the parse
-    thread. Its text is that decode's exception text, and the row loop rejects the
-    row with it as it rejected the original (any exception that is neither an
-    `HTTPException` nor a pydantic `ValidationError` lands in the same branch)."""
+    thread. Its text is the reason chosen for that decode's exception, and the row
+    loop rejects the row with it as it would have rejected the original."""
 
 
 def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
@@ -339,9 +480,9 @@ def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
     `_DecodedCell` (issue #1417). Runs on the parse thread with the file parse, so a
     cell as large as the file is not decoded on the event loop. Any other value
     (absent, null, empty, a native object or list, a number) is left for the row
-    loop, which reads it without a parse. A failed decode keeps only its text, one
-    string object for each distinct text, so a file of identical bad cells holds one
-    reason, not one per row."""
+    loop, which reads it without a parse. A failed decode keeps only its reason
+    (`_row_failure_reason`), one string object for each distinct reason, so a file
+    of identical bad cells holds one reason, not one per row."""
     reasons: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -351,8 +492,8 @@ def _decode_json_cells(rows: list[Any], column: str, default: Any) -> None:
             continue
         try:
             row[column] = _DecodedCell(_coerce_json_cell(value, default), None)
-        except Exception as exc:  # its text is raised again where the loop reads it
-            reason = str(exc)
+        except Exception as exc:  # its reason is raised again where the loop reads it
+            reason = _row_failure_reason(exc)
             row[column] = _DecodedCell(None, reasons.setdefault(reason, reason))
 
 
@@ -361,11 +502,13 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
 
     JSON import passes through native objects; CSV import passes a string we
     json.loads. An empty cell yields the supplied default. A cell the parser
-    refuses for its depth or an over-long integer raises ValueError with the fixed
-    JSON_CELL_UNREADABLE_REASON (issue #1511); a syntax error keeps the decoder's
-    own message, which names a position, never the cell's content. A cell already
-    decoded on the parse thread (`_DecodedCell`, issue #1417) gives back that
-    decode's value, or raises `_CellDecodeError` with its exception's text.
+    refuses for its depth or an over-long integer raises `_RowReasonError` with the
+    fixed JSON_CELL_UNREADABLE_REASON (issue #1511); a syntax error keeps the
+    decoder's own message, which names a position, never the cell's content. A
+    value that is neither text, an object, nor a list raises the fixed
+    JSON_CELL_NOT_JSON_REASON. A cell already decoded on the parse thread
+    (`_DecodedCell`, issue #1417) gives back that decode's value, or raises
+    `_CellDecodeError` with its reason.
     """
     if isinstance(value, _DecodedCell):
         if value.reason is not None:
@@ -375,21 +518,30 @@ def _coerce_json_cell(value: Any, default: Any) -> Any:
         return default
     if isinstance(value, (dict, list)):
         return value
+    if not isinstance(value, str):
+        raise _RowReasonError(JSON_CELL_NOT_JSON_REASON)
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
         raise
     except (ValueError, RecursionError):
-        raise ValueError(JSON_CELL_UNREADABLE_REASON) from None
+        raise _RowReasonError(JSON_CELL_UNREADABLE_REASON) from None
     if holds_lone_surrogate(parsed):
-        raise ValueError(JSON_CELL_NOT_TEXT_REASON)
+        raise _RowReasonError(JSON_CELL_NOT_TEXT_REASON)
     return parsed
 
 
 def _coerce_int(value: Any) -> int | None:
+    """The poll interval cell as an integer: a number or integer text (a JSON
+    number with a fraction is truncated, as `int` does). Anything else rejects the
+    row with the fixed POLL_NOT_A_WHOLE_NUMBER_REASON, never `int`'s message, which
+    quotes the cell."""
     if value is None or value == "":
         return None
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise _RowReasonError(POLL_NOT_A_WHOLE_NUMBER_REASON) from None
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -474,8 +626,9 @@ async def _import_device_rows(
                     RowResult(row=index, action="reject", reason="missing required field: name")
                 )
                 continue
+            _RowName(name=name)
 
-            template_name = (raw_row.get("template_name") or "").strip()
+            template_name = _text_cell(raw_row, "template_name")
             if not template_name:
                 report.rows.append(
                     RowResult(
@@ -553,7 +706,9 @@ async def _import_device_rows(
         except HTTPException as exc:
             await db.rollback()
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
+                RowResult(
+                    row=index, action="reject", identity=name or None, reason=_http_reason(exc)
+                )
             )
         except ValidationError as exc:
             await db.rollback()
@@ -568,7 +723,12 @@ async def _import_device_rows(
         except Exception as exc:
             await db.rollback()
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=_row_failure_reason(exc),
+                )
             )
 
     return _tally(report)
@@ -633,9 +793,10 @@ async def _import_template_rows(
                     RowResult(row=index, action="reject", reason="missing required field: name")
                 )
                 continue
+            _RowName(name=name)
 
             driver_id: uuid.UUID | None = None
-            driver_name = (raw_row.get("driver_name") or "").strip()
+            driver_name = _text_cell(raw_row, "driver_name")
             if driver_name:
                 driver_id = driver_ids_by_name.get(driver_name)
                 if driver_id is None:
@@ -650,7 +811,7 @@ async def _import_template_rows(
                     continue
 
             hypervisor_id: uuid.UUID | None = None
-            hypervisor_name = (raw_row.get("hypervisor_name") or "").strip()
+            hypervisor_name = _text_cell(raw_row, "hypervisor_name")
             if hypervisor_name:
                 hypervisor_id = hypervisor_ids_by_name.get(hypervisor_name)
                 if hypervisor_id is None:
@@ -719,7 +880,9 @@ async def _import_template_rows(
         except HTTPException as exc:
             await db.rollback()
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc.detail))
+                RowResult(
+                    row=index, action="reject", identity=name or None, reason=_http_reason(exc)
+                )
             )
         except ValidationError as exc:
             await db.rollback()
@@ -734,7 +897,12 @@ async def _import_template_rows(
         except Exception as exc:
             await db.rollback()
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=_row_failure_reason(exc),
+                )
             )
 
     return _tally(report)

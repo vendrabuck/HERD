@@ -1327,9 +1327,11 @@ check one device now, through the same login, status, and logout sequence a poll
   Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_get_health_unknown_device_returns_synthetic_200`)
 - **OPS-HEALTH-3.** `GET /device-health` is admin only, pages with `skip` and `limit` (1
   to 500, default 50), filters by `last_status`, and orders by last poll time, newest
-  first, never-polled last. \
+  first, never-polled last; rows that tie (one poll instant, or never polled, which
+  every unpolled device shares) are ordered by `device_id` ascending, the table's
+  primary key, so pages never overlap or skip (issue #1589). \
   Enforced in: `services/execution/app/routers/health.py` (`list_device_health`) \
-  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_list_health_admin_only`, `test_list_health_pagination_and_filter`)
+  Pinned by: `services/execution/tests/test_health_endpoints.py` (`test_list_health_admin_only`, `test_list_health_pagination_and_filter`); `services/execution/tests/test_list_order_tiebreak.py` (`test_device_health_list_breaks_ties_by_device_id`, `test_device_health_order_by_reads_nulls_last_on_postgres`)
 - **OPS-HEALTH-4.** An unknown `last_status` filter answers 422 `Unknown last_status;
   allowed: UNKNOWN, HEALTHY, DEGRADED, UNREACHABLE` only when it matches no row. The
   detail never holds the submitted value (it read `Invalid last_status: <value>` before

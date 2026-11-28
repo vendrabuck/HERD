@@ -383,7 +383,7 @@ Auth service:
 | GET | `/tokens` | admin, superadmin | 200 | IAM-APITOK-6 |
 | DELETE | `/tokens/{id}` | admin, superadmin | 204 | IAM-APITOK-7 |
 | POST | `/tokens/exchange` | anyone, unauthenticated | 200 | IAM-APITOK-8, IAM-APITOK-9, IAM-APITOK-10 |
-| GET | `/groups` | any signed-in active account | 200 | IAM-GROUP-1 |
+| GET | `/groups` | any signed-in active account | 200 | IAM-GROUP-1, IAM-GROUP-14 |
 | POST | `/groups` | admin, superadmin | 201 | IAM-GROUP-3 |
 | GET | `/groups/{id}` | admin, superadmin | 200 | IAM-GROUP-2 |
 | PUT | `/groups/{id}` | admin, superadmin | 200 | IAM-GROUP-3, IAM-GROUP-4 |
@@ -1078,9 +1078,10 @@ demotes them back. Activation is in the State model (IAM-ACCT-1, IAM-ACCT-2).
 **Rules.**
 
 - **IAM-USER-1.** Admins and superadmins list every account, active or not, ordered by
-  creation time. \
+  creation time, oldest first; accounts created at the same instant are ordered by id
+  ascending, so `skip` and `limit` pages never overlap or skip (issue #1589). \
   Enforced in: `services/auth/app/routers/admin.py` (`list_users`); `services/auth/app/services/auth_service.py` (`get_all_users`) \
-  Pinned by: `services/auth/tests/test_auth.py` (`test_admin_can_list_users`, `test_superadmin_can_list_users`, `test_non_superadmin_gets_403`); `services/auth/tests/test_routers_direct.py` (`test_list_users_pagination`)
+  Pinned by: `services/auth/tests/test_auth.py` (`test_admin_can_list_users`, `test_superadmin_can_list_users`, `test_non_superadmin_gets_403`); `services/auth/tests/test_routers_direct.py` (`test_list_users_pagination`); `services/auth/tests/test_list_order_tiebreak.py` (`test_users_list_breaks_created_at_ties_by_id`)
 - **IAM-USER-2.** Only a superadmin effective role may change a role. \
   Enforced in: `services/auth/app/routers/admin.py` (`update_user_role`) \
   Pinned by: `services/auth/tests/test_auth.py` (`test_admin_cannot_change_role`, `test_superadmin_can_change_role`)
@@ -1136,6 +1137,11 @@ user can see (`inventory.md`) and which resources ACL grants open to them (secti
   timestamps), without members. \
   Enforced in: `services/auth/app/routers/groups.py` (`list_groups`) \
   Pinned by: `services/auth/tests/test_groups.py` (`test_list_groups`)
+- **IAM-GROUP-14.** The group list is ordered by creation time, oldest first; groups
+  created at the same instant are ordered by id ascending, so `skip` and `limit` pages
+  never overlap or skip (issue #1589). \
+  Enforced in: `services/auth/app/services/group_service.py` (`get_all_groups`) \
+  Pinned by: `services/auth/tests/test_list_order_tiebreak.py` (`test_groups_list_breaks_created_at_ties_by_id`)
 - **IAM-GROUP-2.** A group's detail with its members' usernames and emails is admin and
   superadmin only. By decision; see issue #711. \
   Enforced in: `services/auth/app/routers/groups.py` (`get_group`) \
@@ -1563,9 +1569,10 @@ in section 5 (`services/acl/app/routers/grants.py`).
   Enforced in: `services/acl/app/routers/grants.py` (`create_grant_endpoint`) \
   Pinned by: `services/acl/tests/test_grants_handlers_direct.py` (`test_create_grant_endpoint_returns_grant_with_granted_by`)
 - **IAM-ACL-6.** The list filters by any of `group_id`, `resource_type`, `resource_id`
-  and is ordered oldest first. \
+  and is ordered oldest first; grants made at the same instant are ordered by id
+  ascending, so `skip` and `limit` pages never overlap or skip (issue #1589). \
   Enforced in: `services/acl/app/services/grant_service.py` (`list_grants`) \
-  Pinned by: `services/acl/tests/test_grants.py` (`test_list_grants_filter_group_id`, `test_list_grants_filter_resource_type`, `test_list_grants_filter_resource_id`, `test_list_grants_filter_combined`); `services/acl/tests/test_grant_service_unit.py` (`test_list_grants_orders_by_granted_at_ascending`)
+  Pinned by: `services/acl/tests/test_grants.py` (`test_list_grants_filter_group_id`, `test_list_grants_filter_resource_type`, `test_list_grants_filter_resource_id`, `test_list_grants_filter_combined`); `services/acl/tests/test_grant_service_unit.py` (`test_list_grants_orders_by_granted_at_ascending`); `services/acl/tests/test_grants.py` (`test_list_grants_breaks_granted_at_ties_by_id`)
 - **IAM-ACL-7.** A check is allowed when any of the user's groups holds a grant on that
   exact type and resource with the requested permission; a `view` check also accepts
   `manage`, a `manage` check does not accept `view`. The answer lists the matching

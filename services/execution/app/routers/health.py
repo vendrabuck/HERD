@@ -93,7 +93,11 @@ async def list_device_health(
             detail=unknown_value_detail("last_status", HEALTH_STATUSES),
         )
     result = await db.execute(
-        query.order_by(DeviceHealthStatus.last_polled_at.desc().nulls_last())
+        # Newest poll first, never-polled last, then the primary key device_id
+        # ascending (issue #1589): every never-polled row ties at NULL.
+        query.order_by(
+            DeviceHealthStatus.last_polled_at.desc().nulls_last(), DeviceHealthStatus.device_id
+        )
         .offset(skip)
         .limit(limit)
     )

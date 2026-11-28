@@ -54,6 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models.reservation import Reservation, ReservationDynamicRequest, ReservationStatus
+from app.services.upstream_failure import traceback_for
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,8 @@ def _suggestion_refusal(body: object) -> str | None:
 
 def _purpose_classify_403_is_feature_off(resp) -> tuple[bool, object]:
     """Decide whether a 403 from the orchestrator means "the feature is off
-    there" (issue #706), and return the detail for logging either way.
+    there" (issue #706), and return the detail either way (the caller logs its
+    JSON type, never its text).
 
     A 403 on this route is reachable two ways: the flag-off refusal, and an
     internal-token mismatch (see docs/AI_PURPOSE_CLASSIFICATION.md and
@@ -382,13 +384,13 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
         )
         await _bump_purpose_classify_attempts(reservation_id)
         return "timeout"
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "Purpose classify reconcile: call to the orchestrator failed for %s "
             "(a transport error, not a timeout); treating this as transient for "
             "this tick, no attempt counted",
             reservation_id,
-            exc_info=True,
+            exc_info=traceback_for(exc),
             extra={
                 "action": "purpose_classify_transient",
                 "reservation_id": str(reservation_id),
@@ -427,13 +429,14 @@ async def classify_purpose_one(reservation_id: uuid.UUID) -> str:
                 },
             )
             return "feature_off"
+        # The detail's JSON type only, never its text (it is the orchestrator's).
         logger.warning(
             "Purpose classify reconcile: orchestrator returned 403 for %s that is "
-            "NOT the feature-off marker (detail=%r); this looks like an "
+            "NOT the feature-off marker (a detail of type %s); this looks like an "
             "internal-token mismatch, not the flag being off; ending this tick, "
             "no attempt counted",
             reservation_id,
-            detail,
+            type(detail).__name__,
             extra={
                 "action": "purpose_classify_forbidden",
                 "reservation_id": str(reservation_id),

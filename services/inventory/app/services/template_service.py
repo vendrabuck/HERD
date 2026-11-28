@@ -128,7 +128,9 @@ async def list_templates(
     and only the dynamic templates whose hypervisor is in the set, in SQL, so
     `total` counts what the caller may see.
     """
-    query = select(DeviceTemplate).order_by(DeviceTemplate.created_at.desc())
+    # Newest first, then id ascending (issue #1589): rows written in one transaction
+    # share created_at, and offset pages over a tie need the id to be disjoint.
+    query = select(DeviceTemplate).order_by(DeviceTemplate.created_at.desc(), DeviceTemplate.id)
     if template_type:
         query = query.where(DeviceTemplate.template_type == template_type)
     if visible_dynamic_hypervisor_ids is not None:

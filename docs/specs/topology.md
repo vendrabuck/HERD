@@ -282,9 +282,11 @@ run on.
   Enforced in: `services/cabling/app/routes/connections.py` (`list_connections_endpoint`) \
   Pinned by: `services/cabling/tests/test_connections.py` (`test_non_admin_list_connections_inventory_unreachable_503`); `services/cabling/tests/test_visibility_oracle.py` (`test_list_connections_non_admin_fails_closed_when_visibility_unavailable`)
 - **TOPO-CONN-8.** `device_id` filters to connections naming the device on either side;
-  the list is ordered newest first. \
+  the list is ordered newest first, and connections created at the same instant (every
+  row of one bulk create shares its transaction's `created_at`) are ordered by id
+  ascending, so `skip` and `limit` pages never overlap or skip (issue #1589). \
   Enforced in: `services/cabling/app/services/connection_service.py` (`list_connections`) \
-  Pinned by: `services/cabling/tests/test_connections.py` (`test_filter_connections_by_device_id`, `test_list_connections_pagination`)
+  Pinned by: `services/cabling/tests/test_connections.py` (`test_filter_connections_by_device_id`, `test_list_connections_pagination`); `services/cabling/tests/test_list_order_tiebreak.py` (`test_connections_list_breaks_created_at_ties_by_id`, `test_connections_device_filter_breaks_created_at_ties_by_id`); `services/cabling/tests/test_connection_list_order_live_pg.py` (`test_one_transaction_really_ties_created_at`, `test_page_walk_over_the_tie_returns_every_cable_once_in_id_order`); `tests/integration/test_connection_list_paging.py` (`test_bulk_created_cables_page_through_once_each_in_id_order`)
 - **TOPO-CONN-9.** `GET /connections/{id}` follows the list's visibility rule
   (TOPO-CONN-7): an admin reads any row; a non-admin reads the full row when at least one
   end is visible, and a row with no visible end answers the same 404 `Connection not
@@ -1079,11 +1081,12 @@ RES-FORK-17). Fork status, versions, and the restore marker are section 4.
   version number. \
   Enforced in: `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`, `ForkPruneResult`) \
   Pinned by: `services/cabling/tests/test_fork_prune.py` (`test_prune_is_idempotent_on_replay`); `services/cabling/tests/test_route_handlers_direct.py` (`test_prune_fork_devices_no_release_no_draft_change_is_a_pure_replay`)
-- **TOPO-LISTF-1.** The active fork listing holds only `ACTIVE` forks, oldest first, with
-  each fork's latest version number (0 when none), `limit` 1 to 1000 (default 200), and
-  the total. \
+- **TOPO-LISTF-1.** The active fork listing holds only `ACTIVE` forks, oldest first
+  (forks created at the same instant by fork id ascending, issue #1589), with each
+  fork's latest version number (0 when none), `limit` 1 to 1000 (default 200), and the
+  total. \
   Enforced in: `services/cabling/app/routes/forks.py` (`list_active_forks_internal`) \
-  Pinned by: `services/cabling/tests/test_forks.py` (`test_list_active_forks_excludes_archived`, `test_list_active_forks_pagination`, `test_list_active_forks_reports_latest_fork_version`, `test_list_active_forks_empty`)
+  Pinned by: `services/cabling/tests/test_forks.py` (`test_list_active_forks_excludes_archived`, `test_list_active_forks_pagination`, `test_list_active_forks_reports_latest_fork_version`, `test_list_active_forks_empty`); `services/cabling/tests/test_list_order_tiebreak.py` (`test_active_fork_listing_breaks_created_at_ties_by_id`)
 - **TOPO-BYDEV-1.** The by-device lookup answers the reservation ids, distinct and
   sorted, of every non-archived fork with a wire naming the device at either end and any
   layer, transit hops included; an unknown device answers empty, not 404. \
@@ -1114,10 +1117,11 @@ editor's Save as Template; the seven `/templates` routes in section 5.
 
 **Rules.**
 
-- **TOPO-TMPL-1.** Any signed-in user lists templates (most recently updated first) and
-  reads one with its stripped canvas; an unknown id is 404 `Template not found`. \
+- **TOPO-TMPL-1.** Any signed-in user lists templates (most recently updated first, ties
+  by id ascending, issue #1589) and reads one with its stripped canvas; an unknown id is
+  404 `Template not found`. \
   Enforced in: `services/cabling/app/routes/templates.py` (`list_templates`, `get_template`) \
-  Pinned by: `services/cabling/tests/test_templates.py` (`test_list_templates_paginated`, `test_get_template_not_found`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_create_and_list_and_get`)
+  Pinned by: `services/cabling/tests/test_templates.py` (`test_list_templates_paginated`, `test_get_template_not_found`); `services/cabling/tests/test_route_handlers_direct.py` (`test_template_create_and_list_and_get`); `services/cabling/tests/test_list_order_tiebreak.py` (`test_templates_list_breaks_updated_at_ties_by_id`)
 - **TOPO-TMPL-2.** Any signed-in user creates a template, owned by the caller, with an
   optional stripped canvas; template names are unique across all users and a duplicate
   is 409 `Template name '<name>' already exists`. \
@@ -2055,8 +2059,8 @@ autosave after 2000 ms.
 | Level | Where | Notes |
 |---|---|---|
 | Unit | `services/cabling/tests/` (in-memory SQLite, direct handler calls in `test_route_handlers_direct.py`); `services/common/tests/test_l3_validation.py`; `frontend/src/test/lib/`, `frontend/src/test/components/`, `frontend/src/test/stores/topologyStore.test.ts`, `frontend/src/test/hooks/` | Advisory locks and `FOR UPDATE` are no-ops on SQLite, so concurrency is proven only by the live-Postgres suites |
-| Functional (through the service API) | `services/cabling/tests/test_topologies.py`, `test_connections.py`, `test_connections_bulk.py`, `test_pathfind.py`, `test_bulk.py`, `test_forks.py`, `test_fork_versions.py`, `test_fork_l3_routes.py`, `test_topology_list_controls.py`, `test_visibility_oracle.py`, `test_canvas_shape_routes.py`, `test_failure_wording.py` (httpx against the app); the live-Postgres suites `test_fork_restore_save_race_live_pg.py`, `test_fork_port_claim_race_live_pg.py`, `test_l3_route_key_width_live_pg.py`, `test_topology_list_order_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
-| Integration (running stack) | `tests/integration/test_pathfinding.py`, `test_cabling_group_boundary.py`, `test_connection_device_existence.py`, `test_bulk_import_export.py`, `test_topology_validate_gate.py`, `test_topology_delete_guard.py`, `test_topology_list_controls.py`, `test_reservation_fork_flow.py`, `test_fork_save_port_resolution.py`, `test_live_edit_topology.py`, `test_l3_intent_validate_and_fork.py`, `test_template_identity.py`, `test_device_group_visibility.py` | Advisory job on pull requests; nightly |
+| Functional (through the service API) | `services/cabling/tests/test_topologies.py`, `test_connections.py`, `test_connections_bulk.py`, `test_pathfind.py`, `test_bulk.py`, `test_forks.py`, `test_fork_versions.py`, `test_fork_l3_routes.py`, `test_topology_list_controls.py`, `test_list_order_tiebreak.py`, `test_visibility_oracle.py`, `test_canvas_shape_routes.py`, `test_failure_wording.py` (httpx against the app); the live-Postgres suites `test_fork_restore_save_race_live_pg.py`, `test_fork_port_claim_race_live_pg.py`, `test_l3_route_key_width_live_pg.py`, `test_topology_list_order_live_pg.py` | The live suites run in the `make master` and `make everything` gates |
+| Integration (running stack) | `tests/integration/test_pathfinding.py`, `test_cabling_group_boundary.py`, `test_connection_device_existence.py`, `test_connection_list_paging.py`, `test_bulk_import_export.py`, `test_topology_validate_gate.py`, `test_topology_delete_guard.py`, `test_topology_list_controls.py`, `test_reservation_fork_flow.py`, `test_fork_save_port_resolution.py`, `test_live_edit_topology.py`, `test_l3_intent_validate_and_fork.py`, `test_template_identity.py`, `test_device_group_visibility.py` | Advisory job on pull requests; nightly |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser` topology list with search and sort, `BulkExporter` export, `RoutedTopologyValidator` create, PUT, validate, delete, `BulkConnectionAdmin` bulk create and delete) | No load test covers pathfind batch, fork save, import, or the delete guard |
 | Browser end-to-end | `tests/e2e/test_topology_editor.py`, `test_topologies_list_playwright.py`, `test_topology_clone.py`, `test_topology_delete_in_use_playwright.py`, `test_topology_validator.py`, `test_wiring_dialog_playwright.py`, `test_network_elements_playwright.py`, `test_l3_routing_playwright.py`, `test_fork_live_edit.py`, `test_live_edit_reservation_topology.py`, `test_topology_templates_ui.py`, `test_bulk_import_export.py`, `test_connections_playwright.py`, `test_connections_bulk_playwright.py` | Nightly and in the `make master` and `make everything` gates, not per pull request |
 

@@ -463,6 +463,68 @@ async def test_device_import_item_that_is_not_an_object_is_a_rejected_row(admin_
 
 
 @pytest.mark.asyncio
+async def test_template_import_rows_past_a_column_bound_name_the_field(admin_client):
+    """INV-BULK-28 and INV-COL-1 to INV-COL-3 through the gateway, on the stack's own
+    Postgres: each row past a column's bound is rejected with the schema item naming
+    the field, and the response carries no value of the row. A dry run, so nothing
+    needs cleaning up."""
+    tag = uuid.uuid4().hex[:8]
+    value = f"int-bulk-value-{uuid.uuid4().hex}"
+    sections = [
+        {
+            "name": "G",
+            "fields": [{"key": "pw", "label": "pw", "type": "password", "default": value}],
+        }
+    ]
+    inf_sections = [
+        {
+            "name": "G",
+            "fields": [{"key": "n", "label": "n", "type": "number", "default": float("inf")}],
+        }
+    ]
+    base = {"template_type": "port", "vendor": "V", "model": "M", "sections": sections}
+    long_name = "L" * 256 + tag
+    items = [
+        {**base, "name": long_name, "description": value},
+        {**base, "name": f"int-bulk-nul-{tag}", "description": f"{value}\u0000"},
+        {**base, "name": f"int-bulk-poll-{tag}", "poll_interval_seconds": 2**31},
+        {**base, "name": f"int-bulk-inf-{tag}", "sections": inf_sections, "description": value},
+        {**base, "name": f"int-bulk-word-{tag}", "poll_interval_seconds": value},
+        {**base, "name": f"int-bulk-good-{tag}"},
+    ]
+    resp = await admin_client.post(
+        "/inventory/templates/import",
+        params={"format": "json", "dry_run": "true"},
+        files={"file": ("t.json", io.BytesIO(json.dumps(items).encode()), "application/json")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["identity"], r["action"], r["reason"]) for r in resp.json()["rows"]] == [
+        (long_name, "reject", "name: String should have at most 255 characters"),
+        (
+            f"int-bulk-nul-{tag}",
+            "reject",
+            "description: Value error, must not contain a NUL character",
+        ),
+        (
+            f"int-bulk-poll-{tag}",
+            "reject",
+            "poll_interval_seconds: Input should be less than or equal to 2147483647",
+        ),
+        (
+            f"int-bulk-inf-{tag}",
+            "reject",
+            "sections.0.fields.0.default: Value error,"
+            " must not hold a number that is not finite (NaN or Infinity)",
+        ),
+        (f"int-bulk-word-{tag}", "reject", "poll_interval_seconds: must be a whole number"),
+        (f"int-bulk-good-{tag}", "create", None),
+    ]
+    assert value not in resp.text
+    assert "INSERT" not in resp.text
+    assert "[parameters" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_topology_import_of_a_cr_only_csv_imports_for_a_non_admin(user_client):
     """Issue #1574: a CSV with classic Mac line endings (bare carriage returns)
     answered 500 through the gateway. Every line is now read as a row."""

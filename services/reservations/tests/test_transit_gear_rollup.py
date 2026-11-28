@@ -21,8 +21,13 @@ import pytest
 import respx
 from app.config import settings
 from app.models.reservation import Base, Reservation, ReservationStatus
-from app.services.reporting_service import TransitGearUnavailable, build_utilization_report
+from app.services.reporting_service import (
+    TRANSIT_GEAR_CALL_FAILED,
+    TransitGearUnavailable,
+    build_utilization_report,
+)
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
+from app.services.upstream_failure import unreachable
 from herd_common.enums import TopologyType
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -360,7 +365,16 @@ async def test_chunking_splits_into_500_and_1(db_session):
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_raises_transit_gear_unavailable(db_session):
+@pytest.mark.parametrize(
+    "error",
+    [
+        unreachable("cabling", httpx.ConnectError("refused")),
+        RuntimeError("transit-call-marker-81c3 http://svc-user:svc-pw@cabling"),
+    ],
+    ids=["worded", "unworded"],
+)
+async def test_transport_failure_raises_transit_gear_unavailable(db_session, error):
+    """Either RuntimeError becomes the fixed message, never the error's own text."""
     device_a = uuid.uuid4()
     r = _reservation(
         USER_A, "alice", [str(device_a)], NOW - timedelta(hours=2), NOW, purpose_category="other"
@@ -372,13 +386,14 @@ async def test_transport_failure_raises_transit_gear_unavailable(db_session):
         _real_transit_lookup(),
         patch(
             "app.services.reporting_service._cabling_fork_devices_batch",
-            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+            new=AsyncMock(side_effect=error),
         ),
     ):
-        with pytest.raises(TransitGearUnavailable):
+        with pytest.raises(TransitGearUnavailable) as raised:
             await build_utilization_report(
                 db_session, NOW - timedelta(days=1), NOW, [ReservationStatus.COMPLETED]
             )
+    assert str(raised.value) == TRANSIT_GEAR_CALL_FAILED
 
 
 @pytest.mark.asyncio

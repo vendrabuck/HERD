@@ -1,10 +1,11 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from app.models.device import DeviceStatus, TopologyType
+from app.schemas.column_bounds import INT32_MAX, JsonObject, column_string
 
 # Minimum opt-in poll cadence. The execution scheduler only claims due rows
 # once per tick (HEALTH_POLL_SCHEDULER_TICK_SECONDS, default 30 seconds), so
@@ -16,6 +17,11 @@ MIN_POLL_INTERVAL_SECONDS = 30
 
 # Matches the devices.name column width (String(255), app/models/device.py).
 DEVICE_NAME_MAX_LENGTH = 255
+DeviceName = column_string(DEVICE_NAME_MAX_LENGTH, min_length=1)
+
+# A poll interval is written to an `Integer` column (devices and device_templates),
+# so it is at most the column's largest value (INV-POLL-5).
+PollInterval = Annotated[int, Field(le=INT32_MAX)]
 
 
 def _validate_poll_interval(v: int | None) -> int | None:
@@ -27,12 +33,12 @@ def _validate_poll_interval(v: int | None) -> int | None:
 
 
 class DeviceCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
+    name: DeviceName
     template_id: uuid.UUID
     topology_type: TopologyType
     status: DeviceStatus = DeviceStatus.AVAILABLE
-    field_data: dict[str, Any] = {}
-    poll_interval_seconds: int | None = None
+    field_data: JsonObject = {}
+    poll_interval_seconds: PollInterval | None = None
 
     @field_validator("poll_interval_seconds")
     @classmethod
@@ -50,17 +56,17 @@ class InternalDeviceCreate(BaseModel):
     # always-create behavior.
     template_id: uuid.UUID
     reservation_id: uuid.UUID
-    name: str | None = Field(default=None, min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
-    field_data: dict[str, Any] = {}
+    name: DeviceName | None = None
+    field_data: JsonObject = {}
     request_id: uuid.UUID | None = None
 
 
 class DeviceUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=DEVICE_NAME_MAX_LENGTH)
+    name: DeviceName | None = None
     topology_type: TopologyType | None = None
     status: DeviceStatus | None = None
-    field_data: dict[str, Any] | None = None
-    poll_interval_seconds: int | None = None
+    field_data: JsonObject | None = None
+    poll_interval_seconds: PollInterval | None = None
 
     @field_validator("name", "topology_type", "status", "field_data", mode="before")
     @classmethod
