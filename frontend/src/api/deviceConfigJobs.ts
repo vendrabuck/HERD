@@ -58,6 +58,14 @@ async function cancelJob(jobId: string): Promise<void> {
   await apiClient.delete(`/inventory/apply-jobs/${jobId}`);
 }
 
+/**
+ * Jobs the scheduled-applies panel reads on each 10-second poll: one page, the
+ * latest scheduled first (the route orders by `scheduled_for DESC, id`). The
+ * panel never walks every page on a poll; when more exist it says so through
+ * `PageCapNotice`.
+ */
+export const APPLY_JOBS_PAGE_SIZE = 50;
+
 export function useApplyJobs(deviceId: string | undefined, skip = 0, limit = 50) {
   return useQuery({
     queryKey: ["devices", deviceId, "apply-jobs", skip, limit],

@@ -10,8 +10,9 @@ The names come from an import file, which may hold up to the import route's own
 bound (OPS-VALID-10), so they are sent in batches whose JSON body stays under
 `RESOLVE_BATCH_BYTES`, half the smallest request body limit a service accepts
 (issue #1466): no import can make inventory refuse a batch for its size. A name
-longer than a device name may be (`DEVICE_NAME_MAX_LENGTH`) cannot name a device, so it
-is not sent and stays unresolved.
+longer than a device name may be (`DEVICE_NAME_MAX_LENGTH`), or one holding a NUL
+character (which no database column takes, so no device name holds one), cannot name a
+device, so it is not sent and stays unresolved.
 """
 
 import json
@@ -39,7 +40,9 @@ def _encoded_length(name: str) -> int:
 def name_batches(names: list[str]) -> list[list[str]]:
     """The unique names that could name a device, sorted, in batches whose encoded
     body is at most `RESOLVE_BATCH_BYTES`."""
-    unique = sorted({n for n in names if n and len(n) <= DEVICE_NAME_MAX_LENGTH})
+    unique = sorted(
+        {n for n in names if n and len(n) <= DEVICE_NAME_MAX_LENGTH and "\x00" not in n}
+    )
     batches: list[list[str]] = []
     current: list[str] = []
     size = _ENVELOPE_BYTES

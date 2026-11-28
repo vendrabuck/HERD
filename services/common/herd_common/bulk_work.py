@@ -41,8 +41,10 @@ On Python 3.13 and later ``json.dumps`` with ``indent`` is one C call as well, s
 export's render is then one such call.
 
 The limiters are built on first use and are process-wide: each service runs one uvicorn
-process with one event loop. Database work stays on the event loop in the request's
-own session; never pass a session or a lazy-loading ORM object to ``run_bulk_work``.
+process with one event loop. ``run_limited_work`` is the same runner under a caller's own
+limiters, for work that must not wait behind bulk work. Database work stays on the event
+loop in the request's own session; never pass a session or a lazy-loading ORM object to
+``run_bulk_work``.
 """
 
 from __future__ import annotations
@@ -85,13 +87,29 @@ def _worker_limiter() -> anyio.CapacityLimiter:
 
 async def run_bulk_work(func: Callable[..., _T], *args: object) -> _T:
     """``func(*args)`` on a bulk worker thread; see the module docstring."""
-    slots = bulk_work_limiter()
+    return await run_limited_work(bulk_work_limiter(), _worker_limiter(), func, *args)
+
+
+async def run_limited_work(
+    slots: anyio.CapacityLimiter,
+    workers: anyio.CapacityLimiter,
+    func: Callable[..., _T],
+    *args: object,
+) -> _T:
+    """``func(*args)`` on an anyio worker thread under a caller's own limiters, with
+    every promise the module docstring makes for ``run_bulk_work``'s: a slot of
+    ``slots`` is taken before the thread starts and given back only when the thread
+    ends, so a cancelled caller sees its cancellation at once and the bound holds;
+    a caller cancelled while it waits for a slot takes none and its work never
+    runs; the thread takes a token of ``workers``, never anyio's shared default
+    limiter, and ``workers`` must hold as many tokens as ``slots`` so a caller
+    holding a slot never waits for one. ``run_bulk_work`` is this with the bulk
+    limiters; a check that must never wait behind an import or an export passes
+    limiters of its own (cabling's stored canvas check does)."""
     borrower = object()
     await slots.acquire_on_behalf_of(borrower)
     try:
-        work = asyncio.ensure_future(
-            anyio.to_thread.run_sync(func, *args, limiter=_worker_limiter())
-        )
+        work = asyncio.ensure_future(anyio.to_thread.run_sync(func, *args, limiter=workers))
     except BaseException:
         slots.release_on_behalf_of(borrower)
         raise
@@ -122,4 +140,4 @@ async def run_bulk_work(func: Callable[..., _T], *args: object) -> _T:
     return await outcome
 
 
-__all__ = ["BULK_WORK_THREADS", "bulk_work_limiter", "run_bulk_work"]
+__all__ = ["BULK_WORK_THREADS", "bulk_work_limiter", "run_bulk_work", "run_limited_work"]

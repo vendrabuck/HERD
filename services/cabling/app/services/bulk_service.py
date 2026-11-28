@@ -53,6 +53,7 @@ import copy
 import csv
 import io
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -66,12 +67,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.topology import Topology, TopologyVersion
+from app.schemas._types import NAME_MAX_LENGTH
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
+from app.services.canvas_shape import canvas_problem, stored_canvas_readable
 from app.services.device_resolver import resolve_device_names
 from app.services.reservation_guard import find_blocking_reservations
 from app.services.version_service import commit_with_new_version
 from app.services.visible_devices import resolve_caller_visibility
+
+logger = logging.getLogger(__name__)
 
 # A JSON import file holding a lone surrogate (an escape such as \ud800 with no pair):
 # a value no response, database write, or later read can encode.
@@ -93,57 +98,54 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
 )
 
 # A JSON import item the importer cannot read (issue #1573): an item that is not an
-# object, a `name` that is not a string, or a canvas whose parts the device-name pass
-# reads are the wrong type (TOPO-BULK-21 lists which of these answered 500 before and
-# which were read as absent). Such an item is a rejected row with a fixed reason,
-# `<field>: <message>` naming the path and never a value, and the other rows are
-# judged on their own. A CSV import builds every record itself, so it never meets one.
+# object, a `name` that is not a string, or a canvas that does not have the shape
+# every canvas reader assumes (`canvas_shape.canvas_problem`; TOPO-BULK-21 lists which
+# of these answered 500 before and which were read as absent). Such an item is a
+# rejected row with a fixed reason, `<field>: <message>` naming the path and never a
+# value, and the other rows are judged on their own. A CSV import builds every record
+# itself, so it never meets one.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
+# A topology name the topology routes would refuse (`NAME_MAX_LENGTH`, and no NUL
+# character, which no database column takes), judged on the name as it is stored,
+# its surrounding whitespace stripped. A CSV record's name is judged the same way.
+NAME_TOO_LONG_REASON = f"name: must be at most {NAME_MAX_LENGTH} characters"
+NAME_HOLDS_NUL_REASON = "name: must not hold a NUL character"
+
+# A row whose handling raised something other than an HTTPException: the reason and
+# the log carry the exception's class name.
+ROW_FAILED_REASON_PREFIX = "row could not be imported: "
+
+# The resolve-by-name call to inventory failed (TOPO-BULK-9): a fixed answer, and the
+# log carries the exception's class name.
+IMPORT_RESOLVE_UNAVAILABLE_DETAIL = (
+    "Could not resolve device names; the import was not processed. Retry the request."
+)
 
 
 def _record_shape_reason(rec: Any) -> str | None:
     """The fixed reject reason for a record the importer cannot read, else None.
 
-    Checked before anything reads the record. The item must be an object; its `name`
-    a string; its `canvas` an object; `canvas.nodes` a list; each node an object, with
-    an object `data`, an object `data.device`, and a string `data.device.name`. A
-    null or absent `name`, `canvas`, `canvas.nodes`, `data`, `data.device`, or device
-    `name` passes; a null item or node does not. Nothing else in the canvas is read
-    outside the row's own error handling, so nothing else is checked here.
+    Checked before anything reads the record. The item must be an object and its
+    `name` a string of at most `NAME_MAX_LENGTH` characters once stripped, holding no
+    NUL character; its `canvas` must have the shape `canvas_shape.canvas_problem`
+    checks, the one every canvas write is held to, reported as
+    `canvas.<path>: <message>`. A null or absent `name` or `canvas` passes; a null
+    item does not.
     """
     if not isinstance(rec, dict):
         return ROW_NOT_AN_OBJECT_REASON
     name = rec.get("name")
     if name is not None and not isinstance(name, str):
         return NAME_NOT_A_STRING_REASON
-    canvas = rec.get("canvas")
-    if canvas is None:
-        return None
-    if not isinstance(canvas, dict):
-        return "canvas: must be an object"
-    nodes = canvas.get("nodes")
-    if nodes is None:
-        return None
-    if not isinstance(nodes, list):
-        return "canvas.nodes: must be a list"
-    for index, node in enumerate(nodes):
-        path = f"canvas.nodes.{index}"
-        if not isinstance(node, dict):
-            return f"{path}: must be an object"
-        data = node.get("data")
-        if data is None:
-            continue
-        if not isinstance(data, dict):
-            return f"{path}.data: must be an object"
-        device = data.get("device")
-        if device is None:
-            continue
-        if not isinstance(device, dict):
-            return f"{path}.data.device: must be an object"
-        device_name = device.get("name")
-        if device_name is not None and not isinstance(device_name, str):
-            return f"{path}.data.device.name: must be a string"
+    if name is not None:
+        if "\x00" in name:
+            return NAME_HOLDS_NUL_REASON
+        if len(name.strip()) > NAME_MAX_LENGTH:
+            return NAME_TOO_LONG_REASON
+    problem = canvas_problem(rec.get("canvas"))
+    if problem is not None:
+        return problem.text("canvas")
     return None
 
 
@@ -227,6 +229,16 @@ def canvas_ids_to_names(canvas: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _readable_topologies(topologies: list[Topology]) -> tuple[list[Topology], int]:
+    """The topologies whose stored canvas has the shape every reader assumes, and
+    how many were left out (TOPO-BULK-24). Each one left out is logged once (its id
+    and the problem, never its canvas)."""
+    kept = [
+        t for t in topologies if stored_canvas_readable(t.canvas_data, kind="topology", row_id=t.id)
+    ]
+    return kept, len(topologies) - len(kept)
+
+
 def topology_to_record(topology: Topology) -> dict[str, Any]:
     # Belt and braces (defense in depth): the stored canvas_data was already
     # reduced to the allowlist when it was written, but export is the one
@@ -303,13 +315,16 @@ def records_to_csv(topologies: list[Topology]) -> str:
     return out.getvalue()
 
 
-def render_export(topologies: list[Topology], fmt: str) -> str:
-    """The export body for ``fmt`` ("csv" or "json"). Run on a bulk worker thread
-    (issue #1417): it reads only each topology's ``name`` and ``canvas_data``, column
-    values the route's query already loaded, so it issues no query."""
+def render_export(topologies: list[Topology], fmt: str) -> tuple[str, int]:
+    """The export body for ``fmt`` ("csv" or "json"), and how many topologies it
+    left out because their stored canvas does not have the shape
+    (``_readable_topologies``). Run on a bulk worker thread (issue #1417): it reads
+    only each topology's ``id``, ``name``, and ``canvas_data``, column values the
+    route's query already loaded, so it issues no query."""
+    kept, skipped = _readable_topologies(topologies)
     if fmt == "csv":
-        return records_to_csv(topologies)
-    return records_to_json([topology_to_record(t) for t in topologies])
+        return records_to_csv(kept), skipped
+    return records_to_json([topology_to_record(t) for t in kept]), skipped
 
 
 # Import parsing -------------------------------------------------------------
@@ -465,22 +480,24 @@ def rewrite_canvas_names_to_ids(
 # Import ----------------------------------------------------------------------
 
 
-def _read_import(raw: bytes, fmt: str) -> tuple[list[Any], set[str]]:
+def _read_import(raw: bytes, fmt: str) -> tuple[list[Any], list[str | None], set[str]]:
     """The import's CPU work, run on a bulk worker thread (issue #1417): the file
-    parsed into records, and every device name the records carry. A record the row
-    loop will reject for its shape (issue #1573) adds no name: this pass reads every
-    record before any row runs."""
+    parsed into records, each record's shape reason (`_record_shape_reason`, None
+    for a record that has the shape), and every device name the records carry. The
+    row loop rejects a record by the reason computed here and judges its shape
+    nowhere else; a record with a reason adds no name."""
     if fmt == "json":
         records = parse_json_topologies(raw)
     elif fmt == "csv":
         records = parse_csv_topologies(raw)
     else:
         raise HTTPException(status_code=422, detail="format must be 'csv' or 'json'")
+    reasons = [_record_shape_reason(rec) for rec in records]
     all_names: set[str] = set()
-    for rec in records:
-        if _record_shape_reason(rec) is None:
+    for rec, reason in zip(records, reasons, strict=True):
+        if reason is None:
             all_names |= _collect_device_names(rec.get("canvas"))
-    return records, all_names
+    return records, reasons, all_names
 
 
 async def import_topologies(
@@ -493,7 +510,7 @@ async def import_topologies(
     actor_role: str = "user",
     authorization: str | None = None,
 ) -> BulkImportReport:
-    records, all_names = await run_bulk_work(_read_import, raw, fmt)
+    records, reasons, all_names = await run_bulk_work(_read_import, raw, fmt)
 
     # Issue #908: resolve the caller's device visibility ONCE per request,
     # before any name is resolved or any row is judged, mirroring the #763
@@ -518,12 +535,20 @@ async def import_topologies(
     try:
         name_to_id = await resolve_device_names(sorted(all_names)) if all_names else {}
     except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail=f"could not resolve device names via inventory: {exc}"
-        ) from exc
+        logger.warning("import_device_name_resolve_failed error=%s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail=IMPORT_RESOLVE_UNAVAILABLE_DETAIL) from None
+    # A resolved id is the one value name resolution writes into a canvas
+    # (`data.device.id`), and the shape check requires a string there: an answer
+    # holding anything else is refused as one that could not be used (a null one
+    # leaves its name unresolved, as an absent one does).
+    if not all(
+        device_id is None or isinstance(device_id, str) for device_id in name_to_id.values()
+    ):
+        logger.warning("import_device_name_resolve_unusable reason=device_id_not_a_string")
+        raise HTTPException(status_code=503, detail=IMPORT_RESOLVE_UNAVAILABLE_DETAIL)
 
     is_admin = actor_role in ("admin", "superadmin")
-    rows_args = (records, name_to_id, visible_ids, actor_id, actor_name, is_admin)
+    rows_args = (records, reasons, name_to_id, visible_ids, actor_id, actor_name, is_admin)
     if dry_run:
         # Issue #1064: the dry run is a rehearsal of the commit, not a
         # separate code path, so its report equals the committing report row
@@ -539,6 +564,7 @@ async def import_topologies(
 async def _import_topology_rows(
     db: AsyncSession,
     records: list[dict[str, Any]],
+    reasons: list[str | None],
     name_to_id: dict[str, str],
     visible_ids: set[uuid.UUID] | None,
     actor_id: uuid.UUID,
@@ -546,15 +572,15 @@ async def _import_topology_rows(
     is_admin: bool,
 ) -> BulkImportReport:
     """Run every topology row through the real create and update path on `db`
-    (the request session, or a rehearsal session for a dry run)."""
+    (the request session, or a rehearsal session for a dry run). `reasons` holds
+    each record's shape reason, computed with the parse (`_read_import`)."""
     # Local import of the validator to avoid a circular import at module load
     # (routes/topologies imports nothing from here, but keep the dependency one-way).
     from app.services.topology_validation import run_full_topology_validation
 
     report = _empty_report(False)
 
-    for index, rec in enumerate(records):
-        shape_reason = _record_shape_reason(rec)
+    for index, (rec, shape_reason) in enumerate(zip(records, reasons, strict=True)):
         if shape_reason is not None:
             name = rec.get("name") if isinstance(rec, dict) else None
             report.rows.append(
@@ -759,8 +785,14 @@ async def _import_topology_rows(
             )
         except Exception as exc:
             await db.rollback()
+            logger.warning("import_row_failed row=%s error=%s", index, type(exc).__name__)
             report.rows.append(
-                RowResult(row=index, action="reject", identity=name or None, reason=str(exc))
+                RowResult(
+                    row=index,
+                    action="reject",
+                    identity=name or None,
+                    reason=ROW_FAILED_REASON_PREFIX + type(exc).__name__,
+                )
             )
 
     return _tally(report)

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `CFG` (used in rule identifiers, for example `CFG-VER-1`) |
-| Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
+| Last full review | 2026-10-08 |
 | Owning services | inventory (`services/inventory/`: config versions, apply jobs, the apply scheduler, the config-schema proxy); execution (`services/execution/`: driver actions, execution runs and their command transcripts, driver loading and the driver cache, the driver sandbox, the package validator); `services/common/herd_common/` (`device_config.py`, the manage-or-owner checks in `acl.py`); the device page's configuration section in `frontend/` |
 | Other services involved | acl (explicit `manage` grants), reservations (active-reservation ownership, reservation status, the restore guard's by-device lookup), ai-orchestrator (calls `POST /execute` and `POST /internal/validate-package`; its assistant tools write versions and schedule dry runs), cabling and execution's wiring consumer (read the latest config version of a Layer 3 switch) |
 | Design records | [ADR 0002](../design/0002-driver-published-config-schemas.md), [ADR 0005](../design/0005-ai-recipe-authoring.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md) |
@@ -1150,11 +1150,17 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
 
 **Rules.**
 
-- **CFG-UI-1.** The configuration section shows the version count, a table of versions
-  with author and time, an empty state, and an error line when the list fails; its
-  buttons are shown to every viewer, and the server decides who may use them. \
-  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
-  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`)
+- **CFG-UI-1.** The configuration section shows the version count and a table of every
+  version with author and time, read across all pages of the list (500 a page, newest
+  first, issue #1590), each version once even when one is saved between two page reads;
+  `No config versions yet.` and the count need a successful answer,
+  and a failed read of any page shows the shared load error (`Could not load config
+  versions.` with Retry) and no rows, never the empty text; a failed refresh while the
+  table shows keeps the rows and the count and shows `Could not refresh config versions.`
+  with the reason and Retry above the table, with no alert; its buttons are shown to
+  every viewer, and the server decides who may use them. \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`, `VersionRow`); `frontend/src/api/deviceConfig.ts` (`useAllDeviceConfigVersions`); `frontend/src/api/paging.ts` (`uniqueById`); `frontend/src/components/ui/LoadError.tsx` (`LoadErrorNotice`); `frontend/src/pages/DevicePage.tsx` (`DeviceConfigSection`) \
+  Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`shows the empty state when the device has no config versions`, `renders an error message when the versions request fails`, `renders a populated version table with author and singular count`, `lists every version past one page, walking the pages in order (issue #1590)`, `a version saved between two page reads is listed once, not twice`, `a failed second page shows the load error, never the first page alone (issue #1590)`, `a created version refreshes the whole list through the real create hook`, `a failed refresh keeps the rows under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a failed list read shows no count and no empty text`)
 - **CFG-UI-2.** New version parses the text as JSON in the browser, an empty box being
   `{}`; a parse error is shown in the dialog and nothing is sent, and a server refusal
   shows the server's `detail`. \
@@ -1177,18 +1183,32 @@ opened from the reservation assistant; clients `frontend/src/api/deviceConfig.ts
   as given and a validation list as that text, never as an object. \
   Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`DeviceConfigSection`); `frontend/src/lib/errors.ts` (`configApplyErrorText`, `configRestoreErrorText`, `formatRestoreBlocked`) \
   Pinned by: `frontend/src/test/components/DeviceConfigSection.test.tsx` (`applies now and shows the run id on success`, `shows the stored error for a failed apply answer`, `shows the driver gate's sentence when Apply now is refused with 409`, `shows the server's sentence when Apply now is refused with 403`, `schedules at the chosen time and sends it as ISO`, `shows the driver gate's sentence, not an object, when a schedule is refused`, `lists the blocking reservations when a restore is refused with 409`, `shows the guard's sentence when a restore fails closed with 503`, `shows a create refusal's string detail and a validation list as text (#1314)`); `frontend/src/test/lib/errors.test.ts` (`shows at most three ids, then the count of the rest`, `falls back for any other shape, never returning an object`); `tests/e2e/test_device_config_apply_playwright.py` (`test_apply_now_answers_the_failed_run_and_records_it_on_the_version`, `test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`)
-- **CFG-UI-5.** The scheduled-applies panel is hidden when the device has no jobs,
-  refreshes every 10 seconds, shows each job's status and error, and offers Cancel only
-  on a `pending` job; a refused cancel shows the server's string `detail`, else
-  `Cancel failed`. \
-  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`) \
-  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
+- **CFG-UI-5.** The scheduled-applies panel reads one page of 50 jobs, the latest
+  scheduled first, and refreshes it every 10 seconds, one request per poll and never a
+  walk of every page; when the server's `total` is larger it says `Showing <rows> of
+  <total> scheduled applies, latest scheduled first.` under the table, and a `pending`
+  job past that page cannot be cancelled from the panel. The panel is hidden only when
+  the list answered empty. A failed read before any list arrived shows the heading and
+  the shared load error (`Could not load scheduled applies.` with the reason and Retry)
+  in place of the table; a failed poll keeps the rows that already arrived (or, over a
+  list that was empty, shows the heading) under `Could not refresh scheduled applies.`
+  with the reason and Retry, with no alert, until a poll answers. Each job shows its
+  status and error, with Cancel only on a `pending` job; a refused cancel shows the
+  server's string `detail`, else `Cancel failed` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/ApplyJobsPanel.tsx` (`ApplyJobsPanel`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJobs`, `APPLY_JOBS_PAGE_SIZE`); `frontend/src/components/ui/PageCapNotice.tsx` (`PageCapNotice`); `frontend/src/components/ui/LoadError.tsx` (`LoadError`, `LoadErrorNotice`) \
+  Pinned by: `frontend/src/test/components/ApplyJobsPanel.test.tsx` (`renders nothing when the device has no scheduled applies`, `shows each job's status, error, author, and run, with Cancel only on pending`, `cancels a pending job through the API and confirms with a toast`, `shows the server's sentence when a cancel loses the race (409)`, `never toasts an object detail; a non-string refusal falls back`, `refreshes the job list every 10 seconds`, `a %s failure shows the load error under the heading, and Retry loads the rows`, `a failed poll keeps the rows under a refresh notice, and the next good poll clears it`, `no jobs, then a failed poll, shows the heading and the refresh notice; a good empty poll hides the panel`, `50 jobs of 73 show the cap line, one page per poll and no page walk`, `%s shows no cap line`, `names the page, the total, and the order`, `renders nothing for %s`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`); `tests/e2e/test_device_config_apply_playwright.py` (`test_schedule_from_the_dialog_queues_a_job_the_scheduler_fires`, `test_cancel_a_pending_scheduled_apply_from_the_panel`)
 - **CFG-UI-6.** The dry-run review polls the job every 2 seconds until it is `success`,
   `failed`, `skipped`, or `cancelled`, then shows the run's transcript with simulated
   rows marked; Confirm is enabled only on `success`, Cancel dry-run only before it, and a
   refused confirm shows the server's `detail`. \
   Enforced in: `frontend/src/components/reservations/AIApplyConfirmModal.tsx` (`AIApplyConfirmModal`); `frontend/src/api/deviceConfigJobs.ts` (`useApplyJob`, `TERMINAL_STATUSES`) \
   Pinned by: `frontend/src/test/components/AIApplyConfirmModal.test.tsx` (`renders the plan text`, `shows the transcript with simulated badges once the dry-run succeeds`, `disables Confirm until the dry-run succeeds`, `Confirm POSTs to the confirm endpoint and closes`, `Cancel button cancels the dry-run job and closes`, `Confirm endpoint 409 (failed dry-run) surfaces detail as toast`); `tests/e2e/test_device_config_apply_playwright.py` (`test_dry_run_review_shows_the_transcript_and_confirm_queues_the_real_apply`)
+- **CFG-UI-7.** A failed read behind View (`Could not load this config version.`) or
+  Compare (`Could not load the config diff.`), or an answer that is not a JSON object,
+  shows the shared load error with Retry as the dialog's body, never an empty dialog;
+  while a Retry's read is on its way the button reads `Retrying...` (issue #1590). \
+  Enforced in: `frontend/src/components/device-config/DeviceConfigSection.tsx` (`ViewVersionModal`, `DiffModal`) \
+  Pinned by: `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `Retry after a failure loads the rows and clears the alert`, `a 200 JSON list shows the load error, never an empty dialog`, `the Retry button reads Retrying... until the read answers`)
 
 **Out of scope.** When the assistant opens the review (`ai-features.md`); the rest of
 the device page (`inventory.md`).
@@ -1389,13 +1409,17 @@ the child entry point `services/execution/app/services/_runner.py`;
 - **CFG-SBX-8.** A package's `requirements.txt` is installed into `_deps` (60 seconds,
   no resource limits, errors only logged) only when `ALLOW_DRIVER_PIP_INSTALL` is true
   and `_deps` does not exist yet, by `python -I -B -m pip install -r <requirements.txt>
-  --target <_deps> -q`, so pip, too, imports nothing from the package directory or the
-  current directory (issue #1180). The install child is started and ended as the driver
+  --target <_deps> -q` with `PATH` as its whole environment, so pip, too, imports
+  nothing from the package directory or the current directory (issue #1180) and sees
+  none of the device context. The install child is started and ended as the driver
   child is (CFG-SBX-5): in a session of its own, its process group killed before it is
   reaped however it ends, its timeout reached when it has not exited or its output is
-  still open (issue #1407). \
-  Enforced in: `services/execution/app/services/driver_sandbox.py` (`execute_driver_method`, `_run_child`) \
-  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_requirements_txt_skipped_when_pip_install_disabled`, `test_requirements_txt_installed_when_pip_install_enabled`, `test_execute_with_existing_deps_dir`, `test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes`, `test_run_child_timeout_kills_the_group_and_raises`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_pip_install_exception_swallowed`)
+  still open (issue #1407). An install that raises, times out, or exits non-zero is
+  logged and the driver child still runs. Each sandbox call installs before its child
+  unless its caller passes `install_dependencies=False`; the wiring path does that on
+  every attempt and installs once per action itself (WIRE-DRIVER-8, issue #1495). \
+  Enforced in: `services/execution/app/services/driver_sandbox.py` (`prepare_driver_dependencies`, `execute_driver_method`, `_run_child`) \
+  Pinned by: `services/execution/tests/test_driver_sandbox.py` (`test_requirements_txt_skipped_when_pip_install_disabled`, `test_requirements_txt_installed_when_pip_install_enabled`, `test_prepare_driver_dependencies_answers_every_case`, `test_install_dependencies_false_never_runs_pip`, `test_the_default_still_installs_before_each_call`, `test_execute_with_existing_deps_dir`, `test_run_child_bytes_mode_returns_when_a_helper_holds_the_pipes`, `test_run_child_timeout_kills_the_group_and_raises`); `services/execution/tests/test_driver_sandbox_edges.py` (`test_pip_install_exception_swallowed`)
 - **CFG-SBX-9.** The child runs as execution's own user with no namespace, filesystem,
   or network separation; driver packages are trusted code. By decision; see
   [DRIVERS.md](../DRIVERS.md), "Execution sandbox". \

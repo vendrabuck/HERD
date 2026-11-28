@@ -14,11 +14,12 @@ function renderWithProviders(node: ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const utils = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>{node}</MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...utils, client };
 }
 
 const DEVICE_A = {
@@ -130,6 +131,53 @@ describe("ReservationInventoryTab", () => {
     expect(link).toHaveAttribute("href", `/inventory/${DEVICE_B.id}`);
     // The unconnected port (eth1/2) renders without a link.
     expect(screen.getByText("eth1/2")).toBeInTheDocument();
+  });
+
+  it("a device with no ports shows No ports even when its connections read fails", async () => {
+    server.use(
+      http.get("/api/inventory/devices/:id/ports", () => HttpResponse.json([])),
+      http.get("/api/cabling/connections", () =>
+        HttpResponse.json({ detail: "cabling is restarting" }, { status: 503 }),
+      ),
+    );
+    renderWithProviders(<ReservationInventoryTab deviceIds={[DEVICE_A.id]} />);
+    fireEvent.click(await screen.findByText("fw-edge-1"));
+    expect(await screen.findByText("No ports")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a failed connections refresh keeps the peers under a refresh notice, with no alert", async () => {
+    server.use(
+      http.get("/api/inventory/devices/:id/ports", () =>
+        HttpResponse.json([{ id: "p1", name: "eth1/1", device_id: DEVICE_A.id }]),
+      ),
+      http.get("/api/cabling/connections", () =>
+        HttpResponse.json({
+          items: [
+            { id: "c1", device_a_id: DEVICE_A.id, port_a: "eth1/1", device_b_id: DEVICE_B.id, port_b: "eth5/5" },
+          ],
+          total: 1,
+          skip: 0,
+          limit: 500,
+        }),
+      ),
+    );
+    const { client } = renderWithProviders(<ReservationInventoryTab deviceIds={[DEVICE_A.id]} />);
+    fireEvent.click(await screen.findByText("fw-edge-1"));
+    expect(await screen.findByRole("link", { name: "sw-core-1, eth5/5" })).toBeInTheDocument();
+
+    server.use(
+      http.get("/api/cabling/connections", () =>
+        HttpResponse.json({ detail: "cabling is restarting" }, { status: 503 }),
+      ),
+    );
+    await client.invalidateQueries({ queryKey: ["connections"] });
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Could not refresh this device's connections. cabling is restarting",
+    );
+    expect(screen.getByRole("link", { name: "sw-core-1, eth5/5" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   describe("keyboard disclosure (issue #1405)", () => {

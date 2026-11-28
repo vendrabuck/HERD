@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `RES` (used in rule identifiers, for example `RES-CREATE-1`) |
-| Verified at | commit `fd589e50` (`v0.6.0-68-gfd589e50`), 2026-10-05 |
+| Last full review | 2026-10-05 |
 | Owning services | reservations (`services/reservations/`) |
 | Other services involved | inventory (device and template data, device status), cabling (topology validation, the per-reservation fork), execution (consumes events, posts the provision result, owns wiring status), ai-orchestrator (purpose classification), auth (JWT only), notifications and integration (consume events) |
 | Design records | [ADR 0001](../design/0001-editable-reservation-topologies.md), [ADR 0004](../design/0004-dynamic-resources.md), [ADR 0006](../design/0006-fork-reconcile-and-as-built.md), [ADR 0007](../design/0007-connection-driven-reconcile.md), [ADR 0009](../design/0009-l2-l3-connection-driven-reconcile.md), [ADR 0013](../design/0013-lab-purpose-classification.md) |
@@ -714,7 +714,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   or year 9999) is 422, a validation list whose message is `end_time must fall between
   0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
   500. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationUpdate`, `end_time_as_utc_instant`, `to_utc_instant`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationUpdate`, `end_time_as_utc_instant`); `services/common/herd_common/timeutil.py` (`to_utc_instant`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_schema_converts_every_form_to_its_utc_instant`, `test_a_naive_end_time_is_utc_not_the_host_zone`, `test_an_end_time_with_no_utc_equivalent_is_a_validation_error`, `test_an_end_time_at_the_edge_of_the_utc_range_is_accepted`, `test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`, `test_route_answers_the_same_for_one_instant_in_every_form`, `test_route_answers_422_for_an_end_time_with_no_utc_equivalent`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
 - **RES-PATCH-4.** Extending the end time (a new end whose instant, RES-PATCH-3, is later
   than the stored end) conflict-checks the added span `[old end, new end)` for the booked
@@ -812,6 +812,20 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   8601) only when the end's instant changed. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_reservation_service_unit.py` (`test_update_reservation_metadata_only_omits_end_time`, `test_update_reservation_changed_end_time_is_flagged_and_carried`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
+- **RES-PATCH-14.** The Edit devices dialog's Add list asks for one page of 50 candidates
+  for its search text and hides the devices already selected; when the server's `total`
+  is larger than the page it returned, the dialog says `Matching devices not listed: <total minus page
+  rows>. Type more of the name to narrow the list.` under the
+  list, counted against the page the server returned, so the number stays true however
+  many of the page's rows are hidden as already selected. While the read for new search
+  text is on its way the list keeps the previous rows and hides that line, whose count
+  belongs to the previous text. A failed read shows the shared load error (`Could not
+  load available devices.` with Retry) in place of the list, never `No available devices
+  found`, which needs a successful empty answer; a failed refresh while the list shows
+  rows keeps them and shows `Could not refresh available devices.` with the reason and
+  Retry above the list, with no alert (issue #1590). \
+  Enforced in: `frontend/src/components/reservations/EditDevicesModal.tsx` (`EditDevicesModal`, `EDIT_DEVICES_PAGE_SIZE`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`) \
+  Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `counts past the page the server returned, not the rows left after hiding selected ones`, `while a new search is on its way, the previous rows stay and the notice is hidden`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `a failed refresh keeps the rows under a refresh notice, with no alert`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
 
 **Out of scope.** The fork prune itself and the wiring release are cabling's and
 execution's (`provisioning-and-wiring.md`).
@@ -863,7 +877,7 @@ section 5).
   equivalent (an offset near year 1 or year 9999) is 422 `<parameter> must fall between
   0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
   500 (issue #1523). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`); `services/reservations/app/schemas/reservation.py` (`to_utc_instant`) \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`); `services/common/herd_common/timeutil.py` (`to_utc_instant`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`, `test_window_bound_with_no_utc_equivalent_is_422`, `test_window_bound_at_the_edge_of_the_utc_range_is_accepted`)
 - **RES-LIST-9.** `total` is the filtered total. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
@@ -892,6 +906,7 @@ calendar of everyone's reservations in a window, limited for non-admins to reser
 whose devices they can all see.
 
 **Surfaces.** User interface `frontend/src/components/reservations/ReservationDetailModal.tsx`
+(its Inventory tab is `frontend/src/components/reservations/ReservationInventoryTab.tsx`)
 and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
 `GET /calendar`.
 
@@ -904,6 +919,20 @@ and `frontend/src/pages/ReservationCalendarPage.tsx`; routes `GET /{id}` and
   ([ROLES.md](../ROLES.md): owner only for every role). \
   Enforced in: `services/reservations/app/routers/reservations.py` (`get_reservation_by_id`) \
   Pinned by: `services/reservations/tests/test_owner_scoped_access.py` (`test_non_owner_admin_get_by_id_is_404`)
+- **RES-VIEW-3.** The detail modal's Inventory tab lists the booked devices; expanding
+  one shows its ports and, for each port, the device and port it is cabled to, read from
+  every connection of the device across all pages. A failed ports read shows the shared
+  load error (`Could not load this device's ports.` with Retry) in place of the port
+  table, never `No ports`, which needs a successful empty answer; a device whose ports
+  read answered empty shows `No ports` whatever its connections read did. For a device
+  with ports, a failed connections read shows `Could not load this device's
+  connections.` with Retry in place of the table, never a column of `-` that reads as
+  unconnected, and until both reads have answered the panel shows `Loading ports...`. A
+  failed connections refresh while the table shows keeps the peers and shows `Could not
+  refresh this device's connections.` with the reason and Retry above the table, with no
+  alert (issue #1590). \
+  Enforced in: `frontend/src/components/reservations/ReservationInventoryTab.tsx` (`DevicePortsDetail`); `frontend/src/api/connections.ts` (`useDeviceConnections`) \
+  Pinned by: `frontend/src/test/components/ReservationInventoryTab.test.tsx` (`expanding a row loads its ports and shows the no-ports state`, `expanding a row renders ports and links connected peers`, `a device with no ports shows No ports even when its connections read fails`, `a failed connections refresh keeps the peers under a refresh notice, with no alert`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`, `shows the port as unconnected only after the connections read answered`, `while the connections read is on its way, no port reads as unconnected`)
 - **RES-CAL-1.** The calendar returns every user's reservations overlapping
   `[range_start, range_end)`. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_calendar_reservations`) \

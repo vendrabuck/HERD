@@ -21,7 +21,8 @@ published OpenAPI contract from what it is today.
 import uuid
 from typing import Annotated
 
-from pydantic import PlainSerializer
+from pydantic import AfterValidator, PlainSerializer
+from pydantic_core import PydanticCustomError
 
 UUIDStr = Annotated[uuid.UUID, PlainSerializer(str, return_type=str)]
 
@@ -44,3 +45,22 @@ UUIDStrList = Annotated[
     list[uuid.UUID],
     PlainSerializer(_serialize_uuid_list, return_type=list[str]),
 ]
+
+
+# The most characters a topology's or a template's name may hold; the import holds
+# a topology name to it too (TOPO-BULK-10).
+NAME_MAX_LENGTH = 100
+
+NUL_TEXT_TYPE = "text_holds_nul"
+NUL_TEXT_MESSAGE = "Value holds a NUL character, which no database column takes"
+
+
+def _refuse_nul(value: str) -> str:
+    if "\x00" in value:
+        raise PydanticCustomError(NUL_TEXT_TYPE, NUL_TEXT_MESSAGE)
+    return value
+
+
+# A request string that is written to a text column (a name, a description): one
+# holding a NUL character is refused with one 422 item of type `text_holds_nul`.
+ColumnText = Annotated[str, AfterValidator(_refuse_nul)]

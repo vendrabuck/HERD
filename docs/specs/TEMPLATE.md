@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `XXX` (used in rule identifiers, for example `XXX-TOPIC-1`) |
-| Verified at | commit `0000000` (`vX.Y.Z-N-g0000000`), YYYY-MM-DD |
+| Last full review | YYYY-MM-DD |
 | Owning services | the services that hold this area's data and rules |
 | Other services involved | the services this area calls or is called by |
 | Design records | the ADRs under `docs/design/` that explain why |

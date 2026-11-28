@@ -19,10 +19,16 @@ import concurrent.futures
 import gc
 import threading
 
+import anyio
 import pytest
 from fastapi import HTTPException
 from herd_common import bulk_work
-from herd_common.bulk_work import BULK_WORK_THREADS, bulk_work_limiter, run_bulk_work
+from herd_common.bulk_work import (
+    BULK_WORK_THREADS,
+    bulk_work_limiter,
+    run_bulk_work,
+    run_limited_work,
+)
 
 _WAIT = 10.0
 
@@ -227,3 +233,30 @@ async def test_the_limiter_is_one_per_process(monkeypatch):
     first = bulk_work_limiter()
     assert bulk_work_limiter() is first
     assert first.total_tokens == BULK_WORK_THREADS
+
+
+@pytest.mark.usefixtures("fresh_limiter")
+async def test_limited_work_takes_the_callers_limiters_never_the_bulk_ones(monkeypatch):
+    """The runner a check of its own uses: its slot comes from the caller's
+    limiter, its thread token from the caller's worker limiter, and no bulk slot is
+    taken. Mutation-checked: handing anyio `_worker_limiter()` fails this."""
+    slots = anyio.CapacityLimiter(1)
+    workers = anyio.CapacityLimiter(1)
+    handed: list[object] = []
+    real_run_sync = bulk_work.anyio.to_thread.run_sync
+
+    async def recording(func, *args, limiter=None, **kwargs):
+        handed.append(limiter)
+        return await real_run_sync(func, *args, limiter=limiter, **kwargs)
+
+    monkeypatch.setattr(bulk_work.anyio.to_thread, "run_sync", recording)
+    seen: list[tuple[int, int]] = []
+
+    def work(value):
+        seen.append((slots.borrowed_tokens, bulk_work_limiter().borrowed_tokens))
+        return value * 2
+
+    assert await run_limited_work(slots, workers, work, 21) == 42
+    assert handed == [workers]
+    assert seen == [(1, 0)]
+    assert slots.borrowed_tokens == 0

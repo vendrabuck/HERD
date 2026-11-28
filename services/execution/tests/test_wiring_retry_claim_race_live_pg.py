@@ -2060,3 +2060,112 @@ async def test_a_freeze_committed_after_the_writers_read_is_seen_by_its_write(
     finally:
         await _cleanup(session_factory, reservation_id)
         await _cleanup(session_factory, foreign)
+
+
+# Issue #1199: the admin re-drive of pinned release rows on an ended reservation goes
+# through the same per-row claim, so two concurrent calls drive one row once.
+
+_PACKAGE_PIN = "recorded hop unresolvable: driver load failed: DriverPackageError"
+_REDRIVE_ACTION = {"l1": "disconnect_ports", "l2": "remove_from_vlan", "l3": "remove_route"}
+
+
+async def _seed_pinned_release(session_factory, reservation_id, layer):
+    """One FAILED intended-RELEASED row pinned by a broken package, on a frozen
+    reservation (the wiring state row is this reservation's own, deleted by _cleanup)."""
+    model, row_id = await _seed_failed_row(session_factory, reservation_id, layer)
+    async with session_factory() as db:
+        row = (await db.execute(select(model).where(model.id == row_id))).scalar_one()
+        row.last_error = _PACKAGE_PIN
+        db.add(ReservationWiringState(reservation_id=reservation_id, frozen=True))
+        await db.commit()
+    return model, row_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_two_concurrent_pinned_release_redrives_drive_the_row_once(session_factory, layer):
+    """Issue #1199 on Postgres: the second call runs strictly inside the first one's
+    drive of the row, over its own sessions; the row reaches the driver exactly once,
+    the first call reports it released and the second in_progress, and the release
+    cleared the claim."""
+    from app.services.wiring_retry_service import redrive_pinned_releases
+
+    reservation_id = uuid.uuid4()
+    model, row_id = await _seed_pinned_release(session_factory, reservation_id, layer)
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
+    for p in patches:
+        p.start()
+    try:
+        first, second = await _loser_inside_holders_drive(
+            redrive_pinned_releases(reservation_id, _session_ctx(session_factory)),
+            lambda: redrive_pinned_releases(reservation_id, _session_ctx(session_factory)),
+            state,
+            entered,
+            release,
+        )
+        claimed_until, _error, _attempts = await _stored(session_factory, model, row_id)
+        async with session_factory() as db:
+            final = (await db.execute(select(model.status).where(model.id == row_id))).scalar_one()
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert _row_calls(calls) == [_REDRIVE_ACTION[layer]], (
+        f"the row must reach the driver exactly once across both calls, got {_row_calls(calls)}"
+    )
+    assert [(r["id"], r["outcome"]) for r in first["results"]] == [(str(row_id), "released")]
+    assert [(r["id"], r["outcome"]) for r in second["results"]] == [(str(row_id), "in_progress")]
+    assert final == "RELEASED"
+    assert claimed_until is None, "the release cleared the claim"
+    assert await _foreign_ledger_snapshot(session_factory, reservation_id) == foreign_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ["l1", "l2", "l3"])
+async def test_a_redrive_that_read_the_row_before_the_others_claim_loses_in_the_database(
+    session_factory, layer
+):
+    """The window the up-front check cannot close: the second call read the row as free
+    (its `claimable_row_ids` answers as it would have just before the first call's
+    claim), and only then runs while the first call is driving. The database refuses it
+    inside the apply: on L3 at the claim's compare-and-swap; on L1 first at the
+    supersession check's `write_guard`, which requires the row unclaimed, with the
+    claim's compare-and-swap behind it. It drives nothing and reports in_progress."""
+    from app.services import wiring_retry_service
+    from app.services.wiring_retry_service import redrive_pinned_releases
+
+    reservation_id = uuid.uuid4()
+    _model, row_id = await _seed_pinned_release(session_factory, reservation_id, layer)
+    execute_fn, calls, entered, release, state = _gated_driver_stub()
+    foreign_before = await _foreign_ledger_snapshot(session_factory, reservation_id)
+    patches = _patches(execute_fn, reservation_id)
+    for p in patches:
+        p.start()
+
+    async def _stale_free(db, model, row_ids, now=None):
+        return set(row_ids)
+
+    async def _second_call():
+        with patch.object(wiring_retry_service, "claimable_row_ids", _stale_free):
+            return await redrive_pinned_releases(reservation_id, _session_ctx(session_factory))
+
+    try:
+        first, second = await _loser_inside_holders_drive(
+            redrive_pinned_releases(reservation_id, _session_ctx(session_factory)),
+            _second_call,
+            state,
+            entered,
+            release,
+        )
+    finally:
+        for p in patches:
+            p.stop()
+        await _cleanup(session_factory, reservation_id)
+
+    assert _row_calls(calls) == [_REDRIVE_ACTION[layer]]
+    assert [(r["id"], r["outcome"]) for r in first["results"]] == [(str(row_id), "released")]
+    assert [(r["id"], r["outcome"]) for r in second["results"]] == [(str(row_id), "in_progress")]
+    assert await _foreign_ledger_snapshot(session_factory, reservation_id) == foreign_before

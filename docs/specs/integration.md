@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `INTEG` (used in rule identifiers, for example `INTEG-HOOK-1`) |
-| Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
+| Last full review | 2026-10-08 |
 | Owning services | integration (`services/integration/`: the `/api/v1` facade, webhook subscriptions, the webhook delivery consumer); notifications (`services/notifications/`: the notification consumer, in-app notifications, the preferences proxy, the outbound channels); the bell and the Settings page in `frontend/` |
 | Other services involved | reservations (every facade call, the lifecycle events, the active-holder lookup), execution (the device health events), auth (the admin list and user contact lookups, API token exchange), user-profile (stored notification preferences), NATS JetStream, external webhook receivers, an SMTP server, a chat incoming webhook |
 | Design records | none; the facade and webhooks shipped under issue #33, the health webhooks under issue #831, the notification channels under issue #40 (see `FEATURES.md`) |
@@ -735,7 +735,7 @@ matters, is cancelled, completes, fails, or is about to end.
   reads `unknown end`; a non-empty string that does not parse, or whose instant falls
   outside the years 1 to 9999 in UTC, is written unchanged. None of these raises, so the message is still delivered and
   acked. \
-  Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`) \
+  Enforced in: `services/notifications/app/services/event_router.py` (`_format_end_time`); `services/common/herd_common/timeutil.py` (`to_utc_instant`) \
   Pinned by: `services/notifications/tests/test_event_router.py` (`test_format_end_time_renders_the_utc_instant`, `test_format_end_time_ignores_the_host_zone`, `test_format_end_time_returns_an_unusable_string_unchanged`, `test_format_end_time_missing_or_non_string_is_unknown_end`, `test_every_end_time_message_states_the_utc_instant`, `test_unusable_end_time_still_notifies`); `services/notifications/tests/test_functional_dispatch_path.py` (`test_stored_end_time_text_is_the_utc_instant_and_bad_values_ack`)
 
 **Out of scope.** When reservations stages each event (`reservations.md`, section 6).

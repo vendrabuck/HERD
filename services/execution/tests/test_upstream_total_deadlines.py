@@ -502,10 +502,7 @@ async def test_wiring_retry_with_a_stalled_switch_read_answers_503():
 
     assert resp.status_code == 503
     detail = resp.json()["detail"]
-    assert (
-        detail
-        == f"Upstream service unavailable: fetch device {SWITCH_ID}: transport error: TimeoutError"
-    )
+    assert detail == "Upstream service unavailable"
     async with TestSessionLocal() as s:
         (row,) = (await s.execute(select(L1ConnectionAssignment))).scalars().all()
     assert (row.status, row.attempts, row.last_error) == (

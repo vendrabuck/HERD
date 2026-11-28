@@ -25,8 +25,14 @@ vi.mock("@/api/connections", () => ({
   BULK_CONNECTION_LIMIT: 200,
   useDeviceConnections: (...args: unknown[]) => mockUseDeviceConnections(...args),
 }));
+// The pickers query through useDeviceSearch (issue #1590); the mock keeps its
+// two-character threshold and hands back the same stubbed device page.
 vi.mock("@/api/inventory", () => ({
   usePaginatedDevices: (...args: unknown[]) => mockUsePaginatedDevices(...args),
+  useDeviceSearch: (term: string) => {
+    const active = term.trim().length >= 2;
+    return { active, query: mockUsePaginatedDevices(active ? { search: term.trim() } : undefined) };
+  },
 }));
 
 import { MultiConnectDialog } from "@/components/admin/connections/MultiConnectDialog";

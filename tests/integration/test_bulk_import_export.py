@@ -400,6 +400,53 @@ async def test_topology_import_item_that_is_not_an_object_is_a_rejected_row_for_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("canvas_json", "message"),
+    [
+        ('{"nodes": [1], "edges": []}', "canvas_data.nodes.0: must be an object"),
+        (
+            '{"nodes": [{"id": "n1", "data": {"k": ' + "[" * 200 + "]" * 200 + "}}]}",
+            "canvas_data.nodes.0: is nested deeper than 64 levels",
+        ),
+    ],
+    ids=["node_not_an_object", "deep"],
+)
+async def test_a_canvas_without_the_shape_is_a_422_and_the_topology_exports_as_stored(
+    user_client, canvas_json, message
+):
+    """TOPO-SHAPE-5 and TOPO-BULK-24 through the gateway, as a non-admin: the canvas
+    PUT is refused with the one `canvas_shape` item and stores nothing, and the
+    export, which walks every topology, answers 200 with this one in it, as stored."""
+    name = f"int-canvas-shape-{uuid.uuid4().hex[:8]}"
+    failure: BaseException | None = None
+    try:
+        created = await user_client.post("/cabling/topologies", json={"name": name})
+        assert created.status_code == 201, created.text
+        topology_id = created.json()["id"]
+        resp = await user_client.put(
+            f"/cabling/topologies/{topology_id}",
+            content='{"canvas_data": ' + canvas_json + "}",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422, resp.text
+        assert resp.json() == {
+            "detail": [{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": message}]
+        }
+        got = await user_client.get(f"/cabling/topologies/{topology_id}")
+        assert got.status_code == 200, got.text
+        assert got.json()["canvas_data"] is None
+        export = await user_client.get("/cabling/topologies/export", params={"format": "json"})
+        assert export.status_code == 200, export.text
+        assert name in [item["name"] for item in export.json()["items"]]
+        assert export.headers["x-export-skipped"].isdigit()
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        await _delete_topologies_named(user_client, name, failure)
+
+
+@pytest.mark.asyncio
 async def test_device_import_item_that_is_not_an_object_is_a_rejected_row(admin_client):
     """Issue #1573 on inventory: a dry run, so nothing needs cleaning up."""
     resp = await admin_client.post(

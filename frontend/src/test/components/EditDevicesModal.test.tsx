@@ -115,7 +115,7 @@ function renderModal(
       />
     </ProvidersWrapper>,
   );
-  return { ...utils, onClose, onUpdated };
+  return { ...utils, onClose, onUpdated, client };
 }
 
 function ProvidersWrapper({ client, children }: { client: QueryClient; children: ReactNode }) {
@@ -154,6 +154,128 @@ describe("EditDevicesModal", () => {
     await waitFor(() =>
       expect(screen.getByText("No available devices found")).toBeInTheDocument(),
     );
+  });
+
+  describe("more candidates than one page (issue #1590)", () => {
+    // The server holds 120 candidates for the search; the modal asks for one
+    // page of 50 and says the rest exist, and how to reach them.
+    const MANY = Array.from({ length: 50 }, (_, i) => makeDevice(`m-${i}`, `lab-node-${i}`, "tpl"));
+
+    function cappedHandler(total: number, asked: URLSearchParams[]) {
+      return http.get("/api/inventory/devices", ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        if (params.get("limit") === "500") {
+          return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+        }
+        asked.push(params);
+        return HttpResponse.json({ items: MANY, total, skip: 0, limit: 50 });
+      });
+    }
+
+    it("lists the page and says how many more match, asking for one page of 50", async () => {
+      const asked: URLSearchParams[] = [];
+      server.use(cappedHandler(120, asked));
+      renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+      expect(
+        screen.getByText(
+          "Matching devices not listed: 70. Type more of the name to narrow the list.",
+        ),
+      ).toBeInTheDocument();
+      expect(asked.length).toBeGreaterThan(0);
+      for (const params of asked) {
+        expect(params.get("skip")).toBe("0");
+        expect(params.get("limit")).toBe("50");
+      }
+    });
+
+    it("counts past the page the server returned, not the rows left after hiding selected ones", async () => {
+      // Three of the page's 50 are already selected, so the Add list draws 47;
+      // the notice still counts the 70 the server holds past its page of 50.
+      const selected = ["m-0", "m-1", "m-2"];
+      server.use(cappedHandler(120, []));
+      renderModal({ reservation: { ...RESERVATION, device_ids: selected } });
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(47);
+      expect(
+        screen.getByText(
+          "Matching devices not listed: 70. Type more of the name to narrow the list.",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it("a failed refresh keeps the rows under a refresh notice, with no alert", async () => {
+      server.use(cappedHandler(50, []));
+      const { client } = renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          if (new URL(request.url).searchParams.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          return HttpResponse.json({ detail: "inventory is restarting" }, { status: 503 });
+        }),
+      );
+      await client.invalidateQueries({ queryKey: ["devices"] });
+
+      // The dialog's other status region is the selection count.
+      const notice = await screen.findByText(/^Could not refresh available devices\./);
+      expect(notice.closest('[role="status"]')).toHaveTextContent(
+        "Could not refresh available devices. inventory is restarting",
+      );
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
+
+    it("while a new search is on its way, the previous rows stay and the notice is hidden", async () => {
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          if (params.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          // The unfiltered list answers 50 of 120; a search never answers.
+          if (params.get("search")) return new Promise<never>(() => {});
+          return HttpResponse.json({ items: MANY, total: 120, skip: 0, limit: 50 });
+        }),
+      );
+      renderModal();
+      expect(await screen.findByText(/^Matching devices not listed: 70\./)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByRole("textbox", { name: "Search available devices" }), {
+        target: { value: "lab-node-4" },
+      });
+      await waitFor(() =>
+        expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument(),
+      );
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+    });
+
+    it("says nothing more when the page holds every match", async () => {
+      server.use(cappedHandler(50, []));
+      renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+      expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument();
+    });
+
+    it("a failed read shows the load error and no notice", async () => {
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          if (new URL(request.url).searchParams.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          return HttpResponse.json({ detail: "inventory is restarting" }, { status: 500 });
+        }),
+      );
+      renderModal();
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Could not load available devices. inventory is restarting",
+      );
+      expect(screen.queryByText("No available devices found")).not.toBeInTheDocument();
+      expect(screen.queryByText(/Matching devices not listed:/)).not.toBeInTheDocument();
+    });
   });
 
   it("disables Save until the selection changes", async () => {

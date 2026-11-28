@@ -24,6 +24,18 @@ _READ_CHUNK_BYTES = 32768
 # The name of the thread that waits for a sandbox child's exit (`_watch_exit`).
 _WATCHER_THREAD_NAME = "herd-sandbox-exit-watch"
 
+# The `pip install` child's own timeout, in seconds. The wiring claim budget counts it
+# once per driver action while ALLOW_DRIVER_PIP_INSTALL is on (issue #1495,
+# wiring_claim.claim_budget), so a change here moves that budget with it.
+DRIVER_PIP_INSTALL_TIMEOUT_SECONDS = 60
+
+# What `prepare_driver_dependencies` did (issue #1495). Plain strings, for the log
+# and for a caller that wants to know; no caller branches on them today.
+DEPS_NOT_NEEDED = "not_needed"
+DEPS_INSTALL_DISABLED = "disabled"
+DEPS_INSTALLED = "installed"
+DEPS_INSTALL_FAILED = "failed"
+
 
 def _kill_group(pgid: int) -> None:
     """SIGKILL every process in the sandbox child's process group (issue #1407).
@@ -280,6 +292,77 @@ def _rlimit_pairs() -> list[tuple[str, int]]:
     ]
 
 
+def prepare_driver_dependencies(driver_path: str) -> str:
+    """Install a driver package's `requirements.txt` into its `_deps`, when that is due.
+
+    Due only when the package has a `requirements.txt` and no `_deps` directory yet.
+    Then, with ALLOW_DRIVER_PIP_INSTALL off (the default), nothing is installed and the
+    skip is logged (DEPS_INSTALL_DISABLED): drivers vendor their dependencies into
+    `_deps/`. With it on, `python -I -B -m pip install -r requirements.txt --target
+    _deps -q` runs through `_run_child` with DRIVER_PIP_INSTALL_TIMEOUT_SECONDS.
+
+    A runtime `pip install` fetches arbitrary code from the network as the service
+    uid, which is why the flag gates it. The install child does NOT apply the driver
+    rlimits: it does not run the _runner.py wrapper, so the 256MB RLIMIT_AS never bites
+    pip. It runs with `-I -B` for the same reasons the driver child does (issue #1180):
+    pip must not import a `sitecustomize.py` or a stdlib-shadowing module from the
+    package directory or the current directory, and `-B` stands in for the
+    PYTHONDONTWRITEBYTECODE that `-I` ignores. It runs through `_run_child`, like the
+    driver child, so nothing pip starts outlives it (issue #1407). Its environment is
+    PATH only: the device context the driver child gets is no business of pip's.
+
+    Never raises. An install that raises (the timeout included) or exits non-zero is
+    logged as a warning and answers DEPS_INSTALL_FAILED; the driver child then runs
+    without the missing dependencies, as it always did after a failed install. pip
+    may have written a partial `_deps` before it failed, and then no later call
+    installs again, since `_deps` exists.
+
+    Issue #1495: this used to run inside `execute_driver_method` on every sandbox
+    attempt while `_deps` was missing, so a wiring driver action (three attempts)
+    could spend three installs, up to 180 seconds, outside every timer the wiring claim
+    budget counts. The wiring path now calls this once per driver action, before the
+    first attempt (`nats_consumer._run_driver_with_retry`), and runs its attempts with
+    `install_dependencies=False`.
+    """
+    deps_dir = os.path.join(driver_path, "_deps")
+    reqs_file = os.path.join(driver_path, "requirements.txt")
+    if not os.path.exists(reqs_file) or os.path.exists(deps_dir):
+        return DEPS_NOT_NEEDED
+    if not settings.allow_driver_pip_install:
+        logger.info(
+            "Driver has a requirements.txt but allow_driver_pip_install is off; "
+            "skipping install. Vendor deps into _deps/ or enable the flag."
+        )
+        return DEPS_INSTALL_DISABLED
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
+    try:
+        result = _run_child(
+            [
+                "python",
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                reqs_file,
+                "--target",
+                deps_dir,
+                "-q",
+            ],
+            env=env,
+            timeout=DRIVER_PIP_INSTALL_TIMEOUT_SECONDS,
+            text=False,
+        )
+    except Exception as e:
+        logger.warning("Failed to install driver dependencies: %s", e)
+        return DEPS_INSTALL_FAILED
+    if result.returncode != 0:
+        logger.warning("Driver dependency install exited with status %s", result.returncode)
+        return DEPS_INSTALL_FAILED
+    return DEPS_INSTALLED
+
+
 class DryRunRefused(RuntimeError):
     """Raised when a dry-run is requested against a driver that did not opt in.
 
@@ -300,6 +383,7 @@ def execute_driver_method(
     dry_run: bool = False,
     driver_metadata: dict | None = None,
     password_keys: set[str] | None = None,
+    install_dependencies: bool = True,
 ) -> dict:
     """Execute a driver method in a sandboxed subprocess.
 
@@ -323,6 +407,10 @@ def execute_driver_method(
             template's password-typed fields). These are stripped from the child
             environment so credentials are not duplicated into /proc/<pid>/environ;
             the driver still receives them via the context temp file.
+        install_dependencies: True (the default) runs `prepare_driver_dependencies`
+            before the driver child, outside its timeout. False skips it: the
+            wiring path passes False on every attempt of an action, having
+            installed once before the first (issue #1495).
 
     Returns:
         dict with keys: success (bool), output (dict or None), error (str or None),
@@ -430,49 +518,13 @@ def execute_driver_method(
         # context key can never clobber it.
         env[_RLIMITS_ENV_KEY] = json.dumps(_rlimit_pairs())
 
-        # Install a driver's requirements.txt only when explicitly enabled. A
-        # runtime `pip install` fetches arbitrary code from the network as the
-        # service uid, so it is gated behind allow_driver_pip_install (default
-        # off). When off, drivers must vendor their deps into _deps/. The
-        # install subprocess deliberately does NOT apply the driver rlimits: it
-        # does not run the _runner.py wrapper (which reads _RLIMITS_ENV_KEY), so
-        # the 256MB RLIMIT_AS never bites pip. It runs as `python -I -B -m pip`
-        # for the same reasons the child runs with those flags (issue #1180):
-        # pip must not import a `sitecustomize.py` or a stdlib-shadowing module
-        # from the package directory or the current directory, and `-B` stands
-        # in for the PYTHONDONTWRITEBYTECODE that `-I` ignores. It runs through
-        # `_run_child`, like the driver child, so nothing pip starts outlives it
-        # (issue #1407).
-        deps_dir = os.path.join(driver_path, "_deps")
-        reqs_file = os.path.join(driver_path, "requirements.txt")
-        if os.path.exists(reqs_file) and not os.path.exists(deps_dir):
-            if settings.allow_driver_pip_install:
-                try:
-                    _run_child(
-                        [
-                            "python",
-                            "-I",
-                            "-B",
-                            "-m",
-                            "pip",
-                            "install",
-                            "-r",
-                            reqs_file,
-                            "--target",
-                            deps_dir,
-                            "-q",
-                        ],
-                        env=env,
-                        timeout=60,
-                        text=False,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to install driver dependencies: %s", e)
-            else:
-                logger.info(
-                    "Driver has a requirements.txt but allow_driver_pip_install is off; "
-                    "skipping install. Vendor deps into _deps/ or enable the flag."
-                )
+        # Install a driver's requirements.txt when that is due and enabled
+        # (prepare_driver_dependencies). A caller that runs several attempts of one
+        # action installs once itself and passes install_dependencies=False, so the
+        # install is not repeated on every attempt (issue #1495). Before the
+        # sandbox's own timer starts, so its time is not the driver's.
+        if install_dependencies:
+            prepare_driver_dependencies(driver_path)
 
         # The child finds `_deps` itself (_runner._put_package_on_path, from
         # driver_path and the same existence test), after the resource limits.

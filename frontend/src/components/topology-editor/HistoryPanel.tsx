@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 
-import { useTopologyVersions } from "@/api/topologies";
+import { useAllTopologyVersions } from "@/api/topologies";
+import { LoadErrorNotice } from "@/components/ui/LoadError";
+import { noEntries } from "@/lib/loadState";
 import type { TopologyVersion } from "@/types/topology.types";
 
 interface HistoryPanelProps {
@@ -29,13 +31,18 @@ export function HistoryPanel({
   previewVersionId,
 }: HistoryPanelProps) {
   const [selected, setSelected] = useState<string[]>([]);
-  const { data, isLoading, isError } = useTopologyVersions(topologyId, 0, 200);
+  // Every version, every page (issue #1591, owner option 1): the panel never
+  // lists only the newest page. A failed page fails the whole list. A failed
+  // refresh (a refetch on focus, after a save or a restore) keeps the rows
+  // that already arrived and says so through LoadErrorNotice instead.
+  const versionsQuery = useAllTopologyVersions(topologyId);
+  const { data: versions, isLoading, isError } = versionsQuery;
 
   const versionsById = useMemo(() => {
     const map = new Map<string, TopologyVersion>();
-    (data?.items ?? []).forEach((v) => map.set(v.id, v));
+    (versions ?? []).forEach((v) => map.set(v.id, v));
     return map;
-  }, [data]);
+  }, [versions]);
 
   const toggleSelect = (id: string) => {
     setSelected((prev) => {
@@ -80,19 +87,20 @@ export function HistoryPanel({
         </button>
       </div>
 
+      <LoadErrorNotice what="versions" query={versionsQuery} isEmpty={noEntries} className="mx-4 my-2" />
       <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
         {isLoading && (
           <p className="px-4 py-3 text-sm text-gray-500">Loading versions...</p>
         )}
-        {isError && (
+        {isError && !versions && (
           <p className="px-4 py-3 text-sm text-red-600">Failed to load versions.</p>
         )}
-        {data && data.items.length === 0 && (
+        {versions && versions.length === 0 && (
           <p className="px-4 py-3 text-sm text-gray-500">
             No versions yet. Save the topology to create the first snapshot.
           </p>
         )}
-        {data?.items.map((v) => {
+        {versions?.map((v) => {
           const isPreview = v.id === previewVersionId;
           const isSelected = selected.includes(v.id);
           return (

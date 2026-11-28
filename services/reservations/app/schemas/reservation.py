@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from herd_common.timeutil import to_utc_instant
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
@@ -9,7 +10,7 @@ from app.config import settings
 from app.models.reservation import ReservationStatus, TopologyType
 
 
-def _as_utc(dt: datetime) -> datetime:
+def _naive_as_utc(dt: datetime) -> datetime:
     """Treat a naive datetime as UTC; leave an aware one as-is.
 
     SQLite (test backend) drops tzinfo and Postgres preserves it, so request
@@ -26,20 +27,6 @@ def _as_utc(dt: datetime) -> datetime:
 UTC_RANGE_TEXT = "0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z"
 
 
-def to_utc_instant(dt: datetime) -> datetime:
-    """The instant `dt` names, as an aware UTC datetime.
-
-    The conversion the list filters, the report bounds (issue #1523), and the PATCH
-    window share. An aware value is converted; a naive one is taken as UTC, never
-    as the host's local zone (which is what astimezone would assume). Raises
-    OverflowError when the instant has no UTC equivalent; the caller turns that
-    into a 422.
-    """
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 def check_max_duration(start: datetime, end: datetime) -> None:
     """Refuse a window longer than RESERVATION_MAX_DURATION_SECONDS (0 disables the cap).
 
@@ -49,7 +36,7 @@ def check_max_duration(start: datetime, end: datetime) -> None:
     Naive datetimes are treated as UTC (SQLite drops tzinfo on read).
     """
     max_duration = settings.reservation_max_duration_seconds
-    if max_duration and (_as_utc(end) - _as_utc(start)).total_seconds() > max_duration:
+    if max_duration and (_naive_as_utc(end) - _naive_as_utc(start)).total_seconds() > max_duration:
         raise ValueError(f"reservation duration exceeds the maximum of {max_duration}s")
 
 
@@ -137,7 +124,7 @@ class ReservationCreate(BaseModel):
         against runaway or typo'd windows; 0 disables it.
         """
         now = datetime.now(timezone.utc)
-        start = _as_utc(self.start_time)
+        start = _naive_as_utc(self.start_time)
 
         grace = settings.reservation_start_grace_seconds
         if (now - start).total_seconds() > grace:

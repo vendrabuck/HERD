@@ -5,6 +5,9 @@ import { useUpdateReservation } from "@/api/reservations";
 import { usePaginatedDevices, useAllDeviceNames } from "@/api/inventory";
 import toast from "react-hot-toast";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { MoreMatchesNotice } from "@/components/ui/MoreMatchesNotice";
+import { loadState, noItems } from "@/lib/loadState";
 import type { Reservation } from "@/types/reservation.types";
 
 interface Props {
@@ -13,6 +16,9 @@ interface Props {
   onClose: () => void;
   onUpdated: () => void;
 }
+
+/** Candidates the Add Devices list asks for in one request. */
+export const EDIT_DEVICES_PAGE_SIZE = 50;
 
 export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Props) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(
@@ -27,7 +33,12 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
   // holds nothing until its window starts, so, like a new booking for a future
   // window, the server's window conflict check decides and the list is not
   // filtered by current status (issue #999).
-  const { data: availableData, isLoading } = usePaginatedDevices(
+  // One page of candidates: past it, MoreMatchesNotice says how many match and
+  // the search narrows the list (issue #1590). A failed read shows LoadError,
+  // never "No available devices found". While a new search is on its way the
+  // previous rows stay (keepPreviousData) and the notice is hidden, since its
+  // count belongs to the previous search.
+  const availableQuery = usePaginatedDevices(
     {
       topology_type: reservation.topology_type,
       status: reservation.status === "PENDING" ? undefined : "AVAILABLE",
@@ -35,9 +46,10 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
       search: search || undefined,
     },
     0,
-    50,
+    EDIT_DEVICES_PAGE_SIZE,
   );
-
+  const availableState = loadState(availableQuery, noItems);
+  const availableData = availableState === "loaded" ? availableQuery.data : undefined;
   const availableDevices = availableData?.items ?? [];
 
   // Merge available devices with currently selected ones for display
@@ -173,11 +185,26 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
             onChange={(e) => setSearch(e.target.value)}
             className="w-full border border-gray-300 rounded px-3 py-1.5 text-sm mb-2"
           />
+          <LoadErrorNotice
+            what="available devices"
+            query={availableQuery}
+            isEmpty={noItems}
+            className="mb-2"
+          />
           <div ref={addListRef} className="border border-gray-200 rounded max-h-48 overflow-y-auto">
-            {isLoading && (
+            {availableState === "loading" && (
               <p className="text-sm text-gray-400 text-center py-3">Loading...</p>
             )}
-            {!isLoading && availableDevices.length === 0 && (
+            {availableState === "error" && (
+              <LoadError
+                what="available devices"
+                error={availableQuery.error}
+                onRetry={() => void availableQuery.refetch()}
+                retrying={availableQuery.isFetching}
+                className="m-2"
+              />
+            )}
+            {availableState === "empty" && (
               <p className="text-sm text-gray-400 text-center py-3">No available devices found</p>
             )}
             {availableDevices
@@ -206,6 +233,14 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
                 </button>
               ))}
           </div>
+          {availableData && !availableQuery.isPlaceholderData && (
+            <MoreMatchesNotice
+              shown={availableData.items.length}
+              total={availableData.total}
+              noun="devices"
+              className="mt-1"
+            />
+          )}
         </div>
 
         {/* Actions */}

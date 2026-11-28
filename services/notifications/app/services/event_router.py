@@ -1,6 +1,8 @@
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
+
+from herd_common.timeutil import to_utc_instant
 
 from app.services.dispatchers.base import DispatchMessage
 from app.services.health_recipients import resolve_health_recipients
@@ -22,9 +24,7 @@ def _format_end_time(end_time: object) -> str:
         return "unknown end"
     try:
         dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return to_utc_instant(dt).strftime("%Y-%m-%d %H:%M UTC")
     except (ValueError, OverflowError):
         return end_time
 

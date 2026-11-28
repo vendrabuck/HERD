@@ -57,6 +57,7 @@ is issued with the lower role.
 | View execution runs (unscoped) | | yes | yes |
 | View execution runs for an owned reservation (runs on devices the user can see) | yes | yes | yes |
 | Execute drivers and retry failed runs | | yes | yes |
+| Re-drive an ended reservation's pinned release wiring rows | | yes | yes |
 | View device health snapshot (single device; users: devices they can see) | yes | yes | yes |
 | List device health snapshots (all devices) | | yes | yes |
 | Set `poll_interval_seconds` on a device or template | | yes | yes |
@@ -112,6 +113,7 @@ The `admin` role is granted by the superadmin. An admin has all user capabilitie
 - View execution runs (`GET /api/execution/runs`, `GET /api/execution/runs/{id}`)
 - Manually execute driver actions (`POST /api/execution/execute`)
 - Retry failed execution runs (`POST /api/execution/runs/{id}/retry`)
+- Re-drive the pinned release wiring rows of an ended reservation (`POST /api/execution/reservations/{id}/wiring/redrive-pinned-releases`, issue #1199)
 - List all registered user accounts (`GET /api/auth/users`)
 
 Backend connections represent physical cables or virtual links between devices.
@@ -1489,6 +1491,15 @@ Authorization: Bearer <admin-token>
 ```
 
 Only runs with status FAILED or TIMEOUT can be retried. A retry repeats the original run's mode: a dry run is retried as a dry run. A run that does not record whether it was a dry run (one created before that record existed) is refused with 409. A run stores its keyword arguments masked; when masking changed them, the retry reads the configuration back from the run's config version with the admin's token and refuses with 409 when the run names none or the version no longer matches (503 when inventory cannot answer).
+
+### Re-drive pinned release wiring rows
+
+```
+POST /api/execution/reservations/{reservation_id}/wiring/redrive-pinned-releases
+Authorization: Bearer <admin-token>
+```
+
+For a reservation that has ended (its wiring frozen), drives once each FAILED release row (a disconnect, a VLAN leave, or a route removal) whose reason pins a broken driver package or a missing template of the row's own switch, rows no retry channel drives (issue #1199). Answers 200 with `{reservation_id, results}`, each result carrying the row's identity and an `outcome` of `released`, `superseded`, `still_failed`, or `in_progress`, and an empty list when no row qualifies; 409 when the reservation's wiring is not frozen; 503 when an inventory read fails; 401 without a token and 403 for a user. Two calls at once never drive one row twice: the second reports it `in_progress`.
 
 ### Trigger device status check (internal)
 

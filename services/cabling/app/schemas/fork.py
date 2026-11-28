@@ -4,6 +4,7 @@ from typing import Any
 
 from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
 from app.schemas.topology import InvalidEdge
+from app.services.canvas_shape import CanvasData
 from pydantic import BaseModel, Field
 
 
@@ -155,7 +156,7 @@ class ForkDetailResponse(BaseModel):
 class ForkCanvasUpdate(BaseModel):
     """Body for PUT /internal/forks/{reservation_id}/canvas (loose draft edit)."""
 
-    canvas_data: dict[str, Any]
+    canvas_data: CanvasData
 
 
 class ForkCanvasUpdateResponse(BaseModel):
@@ -183,7 +184,7 @@ class ForkSaveRequest(BaseModel):
     device into the reservation). Reservations is the only caller.
     """
 
-    canvas_data: dict[str, Any]
+    canvas_data: CanvasData
     created_by: str | None = None
     member_device_ids: UUIDStrList
 
