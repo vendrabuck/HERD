@@ -52,9 +52,11 @@ async def fetch_device_group_ids(device_id: uuid.UUID, bearer_token: str) -> set
     except DeviceNotFoundError:
         raise
     except Exception as exc:
-        # The class name only: an httpx error's text names the service address.
+        # The detail and the log carry the class name; a failure that is not the
+        # call's own (the body's parsing here) also logs its traceback.
         logger.warning(
             "device_group_guard_unreachable",
             extra={"device_id": str(device_id), "error": type(exc).__name__},
+            exc_info=None if isinstance(exc, httpx.HTTPError) else exc,
         )
         return None

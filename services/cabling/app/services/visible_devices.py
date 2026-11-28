@@ -30,6 +30,7 @@ import httpx
 from fastapi import HTTPException
 from herd_common.auth import ADMIN_ROLES
 from herd_common.internal_client import ForwardedAuth, call_service
+from herd_common.upstream_body import WRONG_FIELD, UpstreamBodyUnusable, read_json_body
 
 from app.config import settings
 
@@ -55,8 +56,9 @@ async def fetch_visible_device_ids(caller_id: uuid.UUID, authorization: str) -> 
     route 403s a request for any user_id other than the caller's own, so
     caller_id must be the caller's own `sub`.
 
-    Raises VisibleDevicesUnavailableError on any transport error or non-2xx
-    response so the caller fails closed. Never returns None: an empty set is
+    Raises VisibleDevicesUnavailableError on any transport error, non-2xx
+    response, or body it cannot use (``read_json_body``) so the caller fails
+    closed. Never returns None: an empty set is
     a genuine "sees nothing", not "could not verify".
     """
     try:
@@ -69,7 +71,7 @@ async def fetch_visible_device_ids(caller_id: uuid.UUID, authorization: str) -> 
             auth=ForwardedAuth(authorization=authorization),
         )
     except httpx.HTTPError as exc:
-        # The class name only: an httpx error's text names the service address.
+        # The detail and the log carry the class name.
         logger.warning(
             "visible_devices_unreachable",
             extra={"caller_id": str(caller_id), "error": type(exc).__name__},
@@ -81,8 +83,23 @@ async def fetch_visible_device_ids(caller_id: uuid.UUID, authorization: str) -> 
             extra={"caller_id": str(caller_id), "status": resp.status_code},
         )
         raise VisibleDevicesUnavailableError(f"inventory returned {resp.status_code}")
-    body = resp.json()
-    return {uuid.UUID(d) for d in body.get("device_ids", [])}
+    # A body that is not an object whose `device_ids` is a list of UUID strings
+    # cannot be used, and fails closed like a failed call.
+    try:
+        body = read_json_body(resp, expect=dict)
+        device_ids = body.get("device_ids", [])
+        if not isinstance(device_ids, list) or not all(isinstance(d, str) for d in device_ids):
+            raise UpstreamBodyUnusable(WRONG_FIELD)
+        try:
+            return {uuid.UUID(d) for d in device_ids}
+        except ValueError:
+            raise UpstreamBodyUnusable(WRONG_FIELD) from None
+    except UpstreamBodyUnusable as exc:
+        logger.warning(
+            "visible_devices_bad_body",
+            extra={"caller_id": str(caller_id), "reason": exc.reason},
+        )
+        raise VisibleDevicesUnavailableError(f"inventory body unusable: {exc.reason}") from None
 
 
 async def resolve_caller_visibility(

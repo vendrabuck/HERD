@@ -539,12 +539,12 @@ anyone but that reservation's owner or an admin.
   consults it. \
   Enforced in: `services/cabling/app/routes/topologies.py` (`update_topology`) \
   Pinned by: `services/cabling/tests/test_topologies.py` (`test_update_topology_canvas_admin_bypasses_reservation_lock`, `test_update_topology_name_only_skips_reservation_lock`)
-- **TOPO-EDIT-6.** The lock fails open: a transport error or a status of 400 or above
-  from reservations means no blocking reservation, and rows naming another topology are
-  ignored. By decision (the docstring of `find_blocking_reservations`; [ROLES.md](../ROLES.md),
+- **TOPO-EDIT-6.** The lock fails open: a transport error, a status of 400 or above, or
+  a body it cannot read from reservations means no blocking reservation, and rows
+  naming another topology are ignored. By decision (the docstring of `find_blocking_reservations`; [ROLES.md](../ROLES.md),
   Delete a topology). \
   Enforced in: `services/cabling/app/services/reservation_guard.py` (`find_blocking_reservations`) \
-  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_reservation_guard_unreachable_fails_open`, `test_reservation_guard_bad_response_returns_empty`); `services/cabling/tests/test_topology_delete_guard.py` (`test_edit_lock_lookup_still_fails_open_on_the_same_answers`, `test_edit_lock_lookup_still_skips_other_topology_rows`)
+  Pinned by: `services/cabling/tests/test_route_handlers_direct.py` (`test_reservation_guard_unreachable_fails_open`, `test_reservation_guard_bad_response_returns_empty`); `services/cabling/tests/test_failure_wording.py` (`test_a_body_fault_in_either_lookup_logs_its_traceback`); `services/cabling/tests/test_topology_delete_guard.py` (`test_edit_lock_lookup_still_fails_open_on_the_same_answers`, `test_edit_lock_lookup_still_skips_other_topology_rows`)
 
 **Out of scope.** A live reservation's own wiring is edited through its fork (section
 8.12), not the parent topology; the fork pins the parent version at activation.
@@ -1995,9 +1995,18 @@ Calls into this area are in section 7. Cabling publishes no event.
 - **TOPO-CALL-1.** When one of these calls fails, the answer and every log line name the
   exception's class and fixed wording only, never its text (which can name the service
   address) or a value from the answer: the visibility, device-group, edit lock, delete
-  guard, name resolution, and routing-pass lookups, and an import row that raised. \
+  guard, name resolution, and routing-pass lookups, and an import row that raised. A
+  failure in the edit lock's or the device-group lookup's own reading of the body is
+  logged with its traceback as well; a transport failure is not. The visibility lookup,
+  the delete guard, and both routing-pass lookups read the body through
+  `herd_common.upstream_body.read_json_body`, and a body each cannot use (not JSON,
+  nested too deep, or not of the documented shape: the visibility answer an object
+  whose `device_ids` is a list of UUID strings, the device batch a list of objects each
+  with a UUID `id`, the config an object or null whose `config` is an object or null
+  and whose `id` is a UUID or absent) fails closed as a failed call does, with the
+  fixed reason. \
   Enforced in: `services/cabling/app/services/visible_devices.py` (`fetch_visible_device_ids`); `services/cabling/app/services/device_group_guard.py` (`fetch_device_group_ids`); `services/cabling/app/services/connection_service.py` (`_resolve_group_cache_for_batch`); `services/cabling/app/services/reservation_guard.py` (`find_blocking_reservations`, `find_blocking_reservations_strict`); `services/cabling/app/services/bulk_service.py` (`import_topologies`, `_import_topology_rows`); `services/cabling/app/services/l3_validation.py` (`L3InventoryContext`) \
-  Pinned by: `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`, `test_an_unexpected_row_failure_is_reported_by_class_only`, `test_the_visibility_lookup_logs_and_raises_the_class_only`, `test_the_edit_lock_lookup_logs_the_class_only`, `test_the_delete_guard_logs_the_class_only`, `test_the_delete_guard_logs_an_unreadable_body_by_class_only`, `test_the_device_group_lookup_logs_the_class_only`, `test_the_bulk_device_group_lookup_logs_the_class_only`, `test_the_routing_pass_failure_carries_the_class_only`)
+  Pinned by: `services/cabling/tests/test_failure_wording.py` (`test_the_import_503_names_nothing_of_the_failure`, `test_an_unexpected_row_failure_is_reported_by_class_only`, `test_the_visibility_lookup_logs_and_raises_the_class_only`, `test_the_edit_lock_lookup_logs_the_class_only`, `test_the_delete_guard_logs_the_class_only`, `test_the_delete_guard_logs_an_unreadable_body_by_class_only`, `test_the_device_group_lookup_logs_the_class_only`, `test_the_bulk_device_group_lookup_logs_the_class_only`, `test_the_routing_pass_failure_carries_the_class_only`, `test_a_body_fault_in_either_lookup_logs_its_traceback`, `test_the_delete_guard_answers_a_body_nested_too_deep_with_its_503`, `test_a_visibility_body_that_cannot_be_used_fails_closed`, `test_a_visibility_body_of_uuid_strings_is_read`, `test_a_routing_pass_body_that_cannot_be_used_fails_closed`, `test_a_routing_pass_body_of_the_documented_shape_is_read`)
 
 ## 11. Configuration
 

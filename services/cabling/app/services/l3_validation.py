@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 from fastapi import HTTPException
@@ -50,6 +51,7 @@ from herd_common.l3_validation import (
     usable_virtual_routers,
     validate_one_route,
 )
+from herd_common.upstream_body import WRONG_FIELD, UpstreamBodyUnusable, read_json_body
 
 from app.config import settings
 from app.schemas.topology import InvalidRoute
@@ -145,10 +147,24 @@ class L3InventoryContext:
             ) from exc
         if resp.status_code >= 400:
             raise L3ConfigUnavailable(f"inventory device batch fetch returned {resp.status_code}")
+        # A body that is not a list of objects each with a UUID `id` cannot be
+        # used, and fails closed like a failed call.
+        try:
+            parsed: list[tuple[uuid.UUID, Any]] = []
+            for item in read_json_body(resp, expect=list):
+                if not isinstance(item, dict) or "id" not in item:
+                    raise UpstreamBodyUnusable(WRONG_FIELD)
+                try:
+                    parsed.append((uuid.UUID(str(item["id"])), item.get("connection_type")))
+                except ValueError:
+                    raise UpstreamBodyUnusable(WRONG_FIELD) from None
+        except UpstreamBodyUnusable as exc:
+            raise L3ConfigUnavailable(
+                f"inventory device batch fetch answered an unusable body: {exc.reason}"
+            ) from None
         found: set[uuid.UUID] = set()
-        for item in resp.json():
-            device_id = uuid.UUID(str(item["id"]))
-            self._device_types[device_id] = item.get("connection_type")
+        for device_id, connection_type in parsed:
+            self._device_types[device_id] = connection_type
             found.add(device_id)
         return found
 
@@ -194,9 +210,23 @@ class L3InventoryContext:
             return None, None
         if resp.status_code >= 400:
             raise L3ConfigUnavailable(f"inventory config fetch returned {resp.status_code}")
-        body = resp.json() or {}
-        version_id = uuid.UUID(str(body["id"])) if body.get("id") else None
-        return body.get("config"), version_id
+        # A body that is not an object (or null) whose `config` is an object (or
+        # null) and whose `id` is a UUID (or absent) cannot be used, and fails
+        # closed like a failed call.
+        try:
+            body = read_json_body(resp, expect=(dict, type(None))) or {}
+            config = body.get("config")
+            if config is not None and not isinstance(config, dict):
+                raise UpstreamBodyUnusable(WRONG_FIELD)
+            try:
+                version_id = uuid.UUID(str(body["id"])) if body.get("id") else None
+            except ValueError:
+                raise UpstreamBodyUnusable(WRONG_FIELD) from None
+        except UpstreamBodyUnusable as exc:
+            raise L3ConfigUnavailable(
+                f"inventory config fetch answered an unusable body: {exc.reason}"
+            ) from None
+        return config, version_id
 
     def config(self, device_id: uuid.UUID) -> dict | None:
         return self._configs.get(device_id)

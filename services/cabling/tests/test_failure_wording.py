@@ -247,3 +247,159 @@ async def test_the_routing_pass_failure_carries_the_class_only(which):
                 await ctx.load_configs([uuid.uuid4()])
     assert str(exc.value).endswith(": ConnectError")
     assert "inventory-marker-7c1d" not in str(exc.value)
+
+
+# A body that cannot be used ------------------------------------------------------------
+
+
+def _answering_client(response: httpx.Response) -> MagicMock:
+    """A patch for `httpx.AsyncClient` whose get and post answer `response`."""
+    inner = MagicMock()
+    inner.get = AsyncMock(return_value=response)
+    inner.post = AsyncMock(return_value=response)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=inner)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm)
+
+
+def _answer(content: str) -> httpx.Response:
+    return httpx.Response(200, content=content.encode(), request=httpx.Request("GET", ADDRESS))
+
+
+@pytest.mark.asyncio
+async def test_a_body_fault_in_either_lookup_logs_its_traceback(caplog):
+    """A failure that is not the call's own, here an item without an `id`, is logged
+    with its class and its traceback; a transport failure has no traceback."""
+    from app.services import device_group_guard, reservation_guard
+
+    caplog.set_level(logging.INFO)
+    with patch.object(
+        device_group_guard.httpx, "AsyncClient", _answering_client(_answer('[{"x": 1}]'))
+    ):
+        assert await device_group_guard.fetch_device_group_ids(uuid.uuid4(), "t") is None
+    with patch.object(reservation_guard.httpx, "AsyncClient", _answering_client(_answer("[1]"))):
+        assert await reservation_guard.find_blocking_reservations(uuid.uuid4()) == []
+    records = [
+        r
+        for r in caplog.records
+        if r.getMessage() in ("device_group_guard_unreachable", "reservation_guard_unreachable")
+    ]
+    assert [(r.getMessage(), r.error) for r in records] == [
+        ("device_group_guard_unreachable", "KeyError"),
+        ("reservation_guard_unreachable", "AttributeError"),
+    ]
+    assert all(r.exc_info is not None and r.exc_info[1] is not None for r in records)
+
+
+@pytest.mark.asyncio
+async def test_the_delete_guard_answers_a_body_nested_too_deep_with_its_503(caplog):
+    from app.services import reservation_guard
+    from fastapi import HTTPException
+
+    deep = _answer("[" * 100_000 + "]" * 100_000)
+    with patch.object(reservation_guard.httpx, "AsyncClient", _answering_client(deep)):
+        with pytest.raises(HTTPException) as exc:
+            await reservation_guard.find_blocking_reservations_strict(uuid.uuid4())
+    assert exc.value.status_code == 503
+    assert "unparseable by-topology body" in caplog.text
+    assert "UpstreamBodyUnusable" in caplog.text
+
+
+_UNUSABLE_VISIBILITY = {
+    "not_json": "<html>",
+    "a_list": "[]",
+    "ids_not_a_list": '{"device_ids": "x"}',
+    "an_id_not_a_string": '{"device_ids": [5]}',
+    "an_id_not_a_uuid": '{"device_ids": ["not-a-uuid"]}',
+    "too_deep": "[" * 100_000 + "]" * 100_000,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body", list(_UNUSABLE_VISIBILITY.values()), ids=list(_UNUSABLE_VISIBILITY)
+)
+async def test_a_visibility_body_that_cannot_be_used_fails_closed(body, caplog):
+    from app.services import visible_devices
+
+    with patch.object(visible_devices, "call_service", AsyncMock(return_value=_answer(body))):
+        with pytest.raises(visible_devices.VisibleDevicesUnavailableError) as exc:
+            await visible_devices.fetch_visible_device_ids(uuid.uuid4(), "Bearer t")
+    assert str(exc.value).startswith("inventory body unusable: ")
+    assert exc.value.__cause__ is None and exc.value.__suppress_context__
+    assert [r.getMessage() for r in caplog.records if r.name == "app.services.visible_devices"] == [
+        "visible_devices_bad_body"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_visibility_body_of_uuid_strings_is_read():
+    from app.services import visible_devices
+
+    device_id = uuid.uuid4()
+    body = json.dumps({"device_ids": [str(device_id)]})
+    with patch.object(visible_devices, "call_service", AsyncMock(return_value=_answer(body))):
+        assert await visible_devices.fetch_visible_device_ids(uuid.uuid4(), "Bearer t") == {
+            device_id
+        }
+
+
+_UNUSABLE_DEVICE_BATCH = {
+    "not_json": "<html>",
+    "an_object": "{}",
+    "an_item_not_an_object": "[1]",
+    "an_item_without_an_id": '[{"connection_type": "x"}]',
+    "an_id_not_a_uuid": '[{"id": "not-a-uuid"}]',
+    "too_deep": "[" * 100_000 + "]" * 100_000,
+}
+_UNUSABLE_CONFIG = {
+    "not_json": "<html>",
+    "a_list": "[1]",
+    "a_config_not_an_object": '{"config": "x"}',
+    "an_id_not_a_uuid": '{"id": "not-a-uuid", "config": {}}',
+    "too_deep": "[" * 100_000 + "]" * 100_000,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("which", "body"),
+    [("device_types", b) for b in _UNUSABLE_DEVICE_BATCH.values()]
+    + [("config", b) for b in _UNUSABLE_CONFIG.values()],
+    ids=[f"device_types-{k}" for k in _UNUSABLE_DEVICE_BATCH]
+    + [f"config-{k}" for k in _UNUSABLE_CONFIG],
+)
+async def test_a_routing_pass_body_that_cannot_be_used_fails_closed(which, body):
+    from app.services import l3_validation
+
+    ctx = l3_validation.L3InventoryContext()
+    with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer(body))):
+        with pytest.raises(l3_validation.L3ConfigUnavailable) as exc:
+            if which == "device_types":
+                await ctx.load_device_types([uuid.uuid4()])
+            else:
+                await ctx.load_configs([uuid.uuid4()])
+    assert "answered an unusable body: " in str(exc.value)
+    assert exc.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_a_routing_pass_body_of_the_documented_shape_is_read():
+    from app.services import l3_validation
+
+    device_id, version_id = uuid.uuid4(), uuid.uuid4()
+    ctx = l3_validation.L3InventoryContext()
+    batch = json.dumps([{"id": str(device_id), "connection_type": "Layer 3 Switch"}])
+    with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer(batch))):
+        await ctx.load_device_types([device_id])
+    assert ctx.connection_type(device_id) == "Layer 3 Switch"
+    config = json.dumps({"id": str(version_id), "config": {"interfaces": {}}})
+    with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer(config))):
+        await ctx.load_configs([device_id])
+    assert ctx.config(device_id) == {"interfaces": {}}
+    assert ctx.config_version_id(device_id) == version_id
+    other = uuid.uuid4()
+    with patch.object(l3_validation, "call_service", AsyncMock(return_value=_answer("null"))):
+        await ctx.load_configs([other])
+    assert (ctx.config(other), ctx.config_version_id(other)) == (None, None)
