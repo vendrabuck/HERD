@@ -102,8 +102,9 @@ LONE_SURROGATE = "holds a lone surrogate escape, which is not valid text"
 # one more for every ``TEXT_CHARS_PER_VALUE`` characters it holds. Beyond that, each
 # node or edge costs a fixed number of lookups of its named parts. Measured on one
 # core, a canvas at this budget is judged in about 1 ms to about 10 ms, more the more
-# nodes and edges it holds (10,000 edges of one key each took the longest); an editor
-# canvas of 100 devices and 200 links costs about 5,400.
+# nodes and edges it holds (10,000 edges each holding only an id of 15 characters
+# that are not ASCII took the longest, about 7 ms); an editor canvas of 100 devices and
+# 200 links costs about 5,400 to 7,300, by its shape.
 INLINE_CHECK_VALUES = 20_000
 # Searching 16 characters for a lone surrogate takes about as long as judging one
 # small value; a string of fewer costs only its place in its container.

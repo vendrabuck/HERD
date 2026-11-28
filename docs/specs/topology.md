@@ -1926,9 +1926,12 @@ sections 8.4 to 8.14.
   runs on and keeps its slot until its thread ends. That wait is bounded: only these
   checks take the slots; a request reaches its check after the query that loaded the
   canvas, so each one waiting holds one of the process's pooled connections, and at
-  most `DB_POOL_SIZE` + `DB_MAX_OVERFLOW` (15 by default) checks wait or run at once;
-  and each check is one walk of one canvas, which on one core took about 1 s at most
-  for a 10 MiB canvas (the most an import file holds) of the costliest shape measured. \
+  most `DB_POOL_SIZE` + `DB_MAX_OVERFLOW` (15 by default) requests wait for or run a
+  check at once, beside at most `STORED_CHECK_THREADS` checks still running for
+  requests already cancelled; and each check is one walk of one canvas, which on one
+  core took about 1.5 s at most for a 10 MiB canvas (the most an import file holds) of
+  the costliest shape measured, garbage collection included. An editor canvas of more
+  than about 250 devices with two links each is judged on a worker thread. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `TEXT_CHARS_PER_VALUE`, `STORED_CHECK_THREADS`, `stored_check_limiter`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/common/herd_common/bulk_work.py` (`run_limited_work`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
   Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`, `test_a_wide_top_level_is_judged_on_a_worker_thread`, `test_a_long_string_is_charged_by_its_length`, `test_at_most_two_checks_run_at_once_on_their_own_slots`, `test_a_check_never_waits_behind_bulk_work`, `test_a_check_cancelled_while_it_waits_takes_no_slot_and_runs_nothing`, `test_a_cancelled_check_keeps_its_slot_until_its_thread_ends`, `test_a_check_raising_on_its_thread_gives_its_slot_back`); `services/common/tests/test_bulk_work.py` (`test_limited_work_takes_the_callers_limiters_never_the_bulk_ones`)
 - **TOPO-SHAPE-7.** Each stored canvas found without the shape is logged once per
@@ -1947,12 +1950,12 @@ sections 8.4 to 8.14.
   stored draft is still without the shape and the fork holds at least one connection
   or L3 route row, answers 409 `The stored draft cannot be read and this fork holds
   wiring; restore a saved version, or rebuild the canvas, before saving a canvas with
-  no nodes` and writes nothing; a canvas with nodes saves as any other. When the read
-  answers the latest saved canvas in the draft's place, the editor showed the real
-  drawing, so a canvas with no nodes saves as over any draft, a save releasing the
-  wiring as any deliberate empty save does. By decision,
+  no nodes` and writes nothing; a canvas with nodes saves as any other. By decision,
   as TOPO-SHAPE-6: an editor never opens a drawing it could not load as an empty one
-  whose save would release the reservation's cables. The fork version read and the
+  whose save would release the reservation's cables. When the read answers the latest
+  saved canvas in the draft's place, the editor showed the real drawing, so a canvas
+  with no nodes saves as it would over any draft, a save releasing the wiring as any
+  deliberate empty save does. The fork version read and the
   version restore answer the 409 of TOPO-SHAPE-6 for a version without the shape; fork
   create answers it for a parent canvas without the shape, judged as written (an edge
   id over 255 characters included, TOPO-SHAPE-1), and writes nothing; and a prune reads a saved canvas without
@@ -2043,9 +2046,9 @@ Calls into this area are in section 7. Cabling publishes no event.
 
 - **TOPO-CALL-1.** When one of these calls fails, the answer and every log line carry
   the exception's class name and fixed wording only, and no value from the answer: the visibility, device-group, edit lock, delete
-  guard, name resolution, and routing-pass lookups, and an import row that raised. A
-  failure in the edit lock's or the device-group lookup's own reading of the body is
-  logged with its traceback as well; a transport failure is not. The visibility lookup,
+  guard, name resolution, and routing-pass lookups, and an import row that raised. The
+  edit lock and the device-group lookup add a traceback for any fault that is not a
+  transport error (`httpx.HTTPError`), such as one in their own reading of the body. The visibility lookup,
   the delete guard, and both routing-pass lookups read the body through
   `herd_common.upstream_body.read_json_body`, and a body each cannot use (not JSON,
   nested too deep, or not of the documented shape: the visibility answer an object
