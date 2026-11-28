@@ -6,6 +6,7 @@ pagination ordering) without going through dependency overrides.
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from app.database import Base
@@ -127,10 +128,18 @@ async def test_list_grants_orders_by_granted_at_ascending(db):
         permission="view",
         granted_by=None,
     )
+    # Explicit, distinct granted_at values, the LAST created the oldest (issue
+    # #1589). The three creates otherwise share SQLite's one-second
+    # CURRENT_TIMESTAMP, so the old expectation [g1, g2, g3] was a tie that
+    # insertion order happened to break, and the id tiebreak reorders it.
+    base = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    for grant, hours in ((g1, 2), (g2, 1), (g3, 0)):
+        grant.granted_at = base + timedelta(hours=hours)
+    await db.commit()
     items, total = await list_grants(db, skip=0, limit=50)
     assert total == 3
     ids_in_order = [item.id for item in items]
-    assert ids_in_order == [g1.id, g2.id, g3.id]
+    assert ids_in_order == [g3.id, g2.id, g1.id]
 
 
 @pytest.mark.asyncio

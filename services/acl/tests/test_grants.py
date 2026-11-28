@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1039,3 +1040,45 @@ async def test_check_topology_manage(mock_fetch, user_client):
     )
     assert resp.status_code == 200
     assert resp.json()["allowed"] is True
+
+
+# Issue #1589: the list sorts by granted_at ascending, and grants made in one
+# transaction share it, so the id (ascending) is the last key. The tied block is
+# inserted in an order that is neither ascending nor descending by id, so a list
+# without the id key fails the exact-order assertion whichever way SQLite scans.
+_TIE = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _tie_id(n: int) -> uuid.UUID:
+    return uuid.UUID(int=(0x1589 << 64) | n)
+
+
+_TIE_ROWS = [(100, _TIE - timedelta(hours=1))]
+_TIE_ROWS += [(n, _TIE) for n in (4, 1, 7, 3, 6, 2, 5)]
+_TIE_ROWS += [(50, _TIE + timedelta(hours=1))]
+_TIE_EXPECTED = [str(_tie_id(n)) for n in (100, 1, 2, 3, 4, 5, 6, 7, 50)]
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 500])
+async def test_list_grants_breaks_granted_at_ties_by_id(admin_client, limit):
+    async with TestSessionLocal() as session:
+        for n, granted in _TIE_ROWS:
+            session.add(
+                ResourceGrant(
+                    id=_tie_id(n),
+                    group_id=_group_id_1,
+                    resource_type="device",
+                    resource_id=uuid.UUID(int=n),
+                    permission="view",
+                    granted_at=granted,
+                )
+            )
+            await session.flush()
+        await session.commit()
+    seen: list[str] = []
+    for skip in range(0, len(_TIE_EXPECTED), limit):
+        resp = await admin_client.get("/grants", params={"skip": skip, "limit": limit})
+        assert resp.status_code == 200
+        assert resp.json()["total"] == len(_TIE_EXPECTED)
+        seen += [g["id"] for g in resp.json()["items"]]
+    assert seen == _TIE_EXPECTED
