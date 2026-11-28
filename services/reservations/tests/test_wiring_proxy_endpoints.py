@@ -18,6 +18,7 @@ from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import WIRING_RETRY_NOT_PROVISIONED, bearer_scheme
+from app.services.upstream_failure import unreachable
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
@@ -144,11 +145,12 @@ async def test_status_execution_unreachable_maps_to_503():
     rid = await _insert_reservation()
     with patch(
         "app.routers.reservations._execution_wiring_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact execution service")),
+        new=AsyncMock(side_effect=unreachable("execution", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.get(f"/{rid}/wiring-status")
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact execution service: ConnectError"}
 
 
 # --- POST /{id}/wiring/retry ------------------------------------------------
@@ -252,8 +254,9 @@ async def test_retry_execution_unreachable_maps_to_503():
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
     with patch(
         "app.routers.reservations._execution_wiring_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact execution service")),
+        new=AsyncMock(side_effect=unreachable("execution", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.post(f"/{rid}/wiring/retry")
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact execution service: ConnectError"}

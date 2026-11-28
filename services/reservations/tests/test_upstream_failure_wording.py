@@ -501,21 +501,38 @@ async def test_a_fork_route_without_an_internal_token_answers_fixed_wording(monk
 
 
 @pytest.mark.asyncio
-async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(network, caplog):
-    """A RuntimeError a library raises (here from the transport itself) is not relayed:
-    the route answers SERVICE_UNAVAILABLE and logs the class name (RES-UPSTREAM-2)."""
-    rid = await _insert(ReservationStatus.ACTIVE, topology_id=TOPOLOGY)
-    network.get(f"{CAB}/internal/forks/{rid}").mock(side_effect=RuntimeError(EXC_TEXT))
+@pytest.mark.parametrize("route", ["create", "patch"])
+async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(network, caplog, route):
+    """A RuntimeError a library raises (here from the transport of cabling's validate,
+    which create and PATCH do not wrap) is not relayed: the route answers
+    SERVICE_UNAVAILABLE and logs the class name (RES-UPSTREAM-2). The fork and wiring
+    routes have the same test in test_fork_and_wiring_routes.py."""
+    added = {**_device(), "id": str(uuid.uuid4()), "name": "sw-2"}
+    network.post(f"{INV}/devices/batch").mock(
+        return_value=httpx.Response(200, json={"items": [_device(), added]})
+    )
+    network.post(f"{CAB}/topologies/{TOPOLOGY}/validate/internal").mock(
+        side_effect=RuntimeError(EXC_TEXT)
+    )
     caplog.set_level(logging.DEBUG)
     async with _client() as ac:
-        resp = await ac.get(f"/{rid}/fork")
+        if route == "create":
+            resp = await ac.post("/", json=_booking(topology_id=str(TOPOLOGY)))
+        else:
+            rid = await _insert(
+                ReservationStatus.PENDING,
+                topology_id=TOPOLOGY,
+                start=NOW + timedelta(days=1),
+                end=NOW + timedelta(days=1, hours=2),
+            )
+            resp = await ac.patch(f"/{rid}", json={"device_ids": [str(DEVICE), added["id"]]})
     assert resp.status_code == 503
     assert resp.json() == {"detail": SERVICE_UNAVAILABLE}
     (record,) = [
         r for r in caplog.records if r.__dict__.get("action") == "unexpected_runtime_error"
     ]
     assert record.error_class == "RuntimeError"
-    _assert_absent(caplog, resp.text)
+    _assert_absent(caplog, resp.text, await _stored_text())
 
 
 # --- the background fork calls -----------------------------------------------------------

@@ -488,6 +488,31 @@ async def test_an_upstream_transport_error_is_503_failed_to_contact(network, met
     assert network.calls.call_count == 1
 
 
+@pytest.mark.asyncio
+@EVERY_UPSTREAM_ROUTE
+async def test_a_runtime_error_no_rule_words_answers_the_fixed_detail(
+    network, caplog, method, route
+):
+    """RES-UPSTREAM-2: a RuntimeError that is not HERD's typed upstream error (here one
+    the transport raises under call_service, which neither helper wraps) answers the
+    fixed `A service this request depends on is unavailable`, never its own text, and
+    is logged by class name."""
+    target = await _insert_reservation(owner=OWNER_ID, status=ReservationStatus.ACTIVE)
+    network.route().mock(side_effect=RuntimeError(f"{MARKER} http://svc-user:svc-pw@upstream"))
+    caplog.set_level("DEBUG")
+    async with _client_as(OWNER_ID, "user") as ac:
+        resp = await ac.request(method, **_request_for(route, target.id))
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "A service this request depends on is unavailable"}
+    assert network.calls.call_count == 1
+    (record,) = [
+        r for r in caplog.records if r.__dict__.get("action") == "unexpected_runtime_error"
+    ]
+    assert record.error_class == "RuntimeError"
+    assert_nothing_leaked(resp.text, caplog.text)
+    assert "svc-pw" not in resp.text + caplog.text
+
+
 # --- Issue #1577: an upstream body the relay cannot read -----------------------------
 
 # The 2xx a relay cannot parse answers 503 with fixed wording: the RES-FORK-10 answer

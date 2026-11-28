@@ -23,6 +23,7 @@ from app.config import settings
 from app.models.reservation import Base, Reservation, ReservationStatus
 from app.services.reporting_service import TransitGearUnavailable, build_utilization_report
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
+from app.services.upstream_failure import unreachable
 from herd_common.enums import TopologyType
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -372,7 +373,7 @@ async def test_transport_failure_raises_transit_gear_unavailable(db_session):
         _real_transit_lookup(),
         patch(
             "app.services.reporting_service._cabling_fork_devices_batch",
-            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+            new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
         ),
     ):
         with pytest.raises(TransitGearUnavailable):

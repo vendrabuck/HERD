@@ -18,6 +18,7 @@ from app.dependencies.auth import get_current_user_payload
 from app.main import app
 from app.models.reservation import Reservation, ReservationStatus, TopologyType
 from app.routers.reservations import FORK_RESTORE_REQUIRES_ACTIVE, bearer_scheme
+from app.services.upstream_failure import unreachable
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
@@ -152,11 +153,12 @@ async def test_get_fork_version_cabling_unreachable_503():
     rid = await _insert_reservation()
     with patch(
         "app.routers.reservations._cabling_fork_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.get(f"/{rid}/fork/versions/{uuid.uuid4()}")
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 # --- POST /{id}/fork/versions/{version_id}/restore ------------------------------------
@@ -275,11 +277,12 @@ async def test_restore_cabling_unreachable_503():
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
     with patch(
         "app.routers.reservations._cabling_fork_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.post(f"/{rid}/fork/versions/{uuid.uuid4()}/restore")
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 @pytest.mark.asyncio

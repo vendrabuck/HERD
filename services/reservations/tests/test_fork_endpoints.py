@@ -25,6 +25,7 @@ from app.routers.reservations import (
     bearer_scheme,
 )
 from app.services import reservation_service
+from app.services.upstream_failure import unreachable
 from httpx import ASGITransport, AsyncClient
 
 from tests._harness import TestSessionLocal, override_bearer, override_get_db
@@ -279,11 +280,12 @@ async def test_get_fork_cabling_unreachable_maps_to_503():
     rid = await _insert_reservation()
     with patch(
         "app.routers.reservations._cabling_fork_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.get(f"/{rid}/fork")
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 @pytest.mark.asyncio
@@ -367,11 +369,12 @@ async def test_put_canvas_cabling_unreachable_503():
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
     with patch(
         "app.routers.reservations._cabling_fork_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.put(f"/{rid}/fork/canvas", json={"canvas_data": {}})
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 # --- POST /{id}/fork/save ------------------------------------------------------------
@@ -482,11 +485,12 @@ async def test_save_cabling_unreachable_503():
     rid = await _insert_reservation(status=ReservationStatus.ACTIVE)
     with patch(
         "app.routers.reservations._cabling_fork_call",
-        new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service")),
+        new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
     ):
         async with _client_as(OWNER_ID) as ac:
             resp = await ac.post(f"/{rid}/fork/save", json={"canvas_data": {}})
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 @pytest.mark.asyncio

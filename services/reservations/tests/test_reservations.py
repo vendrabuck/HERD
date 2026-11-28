@@ -17,6 +17,7 @@ from app.routers.reservations import bearer_scheme
 from app.schemas.reservation import ProvisionResultRequest
 from app.services.reporting_service import _fetch_transit_devices as _real_fetch_transit_devices
 from app.services.reservation_service import TopologyDeviceNotMember, TopologyRoutingIntentInvalid
+from app.services.upstream_failure import unreachable
 from fastapi import FastAPI
 from fastapi.routing import RouteContext
 from fastapi.security import HTTPAuthorizationCredentials
@@ -2181,7 +2182,7 @@ async def test_create_reservation_cabling_unreachable_is_503(client):
         ),
         patch(
             "app.services.reservation_service._validate_topology_connectivity",
-            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+            new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
         ),
         patch(
             "app.services.reservation_service._update_device_statuses",
@@ -2190,6 +2191,7 @@ async def test_create_reservation_cabling_unreachable_is_503(client):
     ):
         resp = await client.post("/", json=body)
     assert resp.status_code == 503
+    assert resp.json() == {"detail": "Failed to contact cabling service: ConnectError"}
 
 
 @pytest.mark.asyncio
@@ -3687,7 +3689,7 @@ async def test_utilization_report_cabling_unreachable_is_503(admin_client):
         ),
         patch(
             "app.services.reporting_service._cabling_fork_devices_batch",
-            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+            new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
         ),
     ):
         resp = await admin_client.get(
@@ -3746,7 +3748,7 @@ async def test_utilization_report_csv_cabling_unreachable_is_503(admin_client):
         ),
         patch(
             "app.services.reporting_service._cabling_fork_devices_batch",
-            new=AsyncMock(side_effect=RuntimeError("Failed to contact cabling service: boom")),
+            new=AsyncMock(side_effect=unreachable("cabling", httpx.ConnectError("refused"))),
         ),
     ):
         resp = await admin_client.get(
