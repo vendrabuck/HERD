@@ -30,7 +30,9 @@ async def create_group(
 async def get_all_groups(
     db: AsyncSession, skip: int = 0, limit: int = 50
 ) -> tuple[list[UserGroup], int]:
-    stmt = select(UserGroup).order_by(UserGroup.created_at)
+    # id tiebreak (issue #1589): equal created_at values otherwise leave the order of
+    # the tied rows undefined, so offset pages could repeat or drop one.
+    stmt = select(UserGroup).order_by(UserGroup.created_at, UserGroup.id)
     return await paginate(db, stmt, skip=skip, limit=limit)
 
 

@@ -1,6 +1,7 @@
 import base64
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -9,6 +10,7 @@ import pytest
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
+from app.models.notification import Notification
 from app.routers.notifications import (
     _caller_id,
     delete_notification,
@@ -729,3 +731,59 @@ async def test_put_preferences_relays_a_user_profile_413_as_413(user_client):
         )
     assert resp.status_code == 413
     assert resp.json() == {"detail": PREFERENCES_TOO_LARGE_DETAIL}
+
+
+# Issue #1589: the list is newest first, and notifications written in one
+# transaction share created_at, so the id (ascending) is the last sort key. The
+# tied block is inserted in an order that is neither ascending nor descending by
+# id, so neither a forward nor a backward scan of SQLite's (user_id, created_at)
+# index yields the order under test without the id key.
+_TIE = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+_TIE_INSERT_ORDER = [4, 1, 7, 3, 6, 2, 5]
+
+
+def _tie_id(n: int) -> uuid.UUID:
+    return uuid.UUID(int=(0x1589 << 64) | n)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 200])
+async def test_list_breaks_created_at_ties_by_id(user_client, limit):
+    rows = [(100, _TIE + timedelta(hours=1))]
+    rows += [(n, _TIE) for n in _TIE_INSERT_ORDER]
+    rows += [(50, _TIE - timedelta(hours=1))]
+    async with TestSessionLocal() as session:
+        for n, created in rows:
+            session.add(
+                Notification(
+                    id=_tie_id(n),
+                    user_id=_user_id,
+                    event_type="reservation.created",
+                    title="t",
+                    body="b",
+                    data={},
+                    created_at=created,
+                )
+            )
+            await session.flush()
+        # Another user's notifications on the same instant never reach the page.
+        for n in _TIE_INSERT_ORDER:
+            session.add(
+                Notification(
+                    id=_tie_id(1000 + n),
+                    user_id=_other_user_id,
+                    event_type="reservation.created",
+                    title="t",
+                    body="b",
+                    data={},
+                    created_at=_TIE,
+                )
+            )
+        await session.commit()
+    expected = [str(_tie_id(n)) for n in (100, 1, 2, 3, 4, 5, 6, 7, 50)]
+    seen: list[str] = []
+    for offset in range(0, len(expected), limit):
+        resp = await user_client.get("/notifications", params={"offset": offset, "limit": limit})
+        assert resp.status_code == 200
+        assert resp.json()["total"] == len(expected)
+        seen += [item["id"] for item in resp.json()["items"]]
+    assert seen == expected

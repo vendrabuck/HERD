@@ -28,10 +28,9 @@ export class ListPagingLimitError extends Error {
  *
  * The result is the whole row set, each row once, only when the server's
  * order is a stable total order and no row is inserted or deleted during the
- * walk. Offset pages over an order with ties (several routes sort on
- * `created_at` alone), or over a list that changes mid-walk, can repeat a row
- * or skip one at a page boundary; this helper neither detects nor removes
- * that.
+ * walk. Every route this helper walks has a total order since #1589, so only a
+ * list that changes during the walk can still repeat a row or skip one at a
+ * page boundary; this helper neither detects nor removes that.
  *
  * The walk ends on a short page (fewer rows than asked for, an empty page
  * included) or when `skip` reaches the reported `total`. Pages are fetched
