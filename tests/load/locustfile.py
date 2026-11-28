@@ -247,6 +247,20 @@ class ReservationUser(HerdUser):
         )
 
 
+# The driver packages the default seed uploads through the API (seedtools/cli.py),
+# so each one's archive is stored. A package another suite left listed may have
+# no archive (its download answers 500), so the download task picks only these.
+SEEDED_DRIVER_NAMES = frozenset(
+    {
+        "Network OS Management",
+        "Endpoint Management",
+        "L1 Switch Driver",
+        "L2 Switch Driver",
+        "Cisco 6509 L2 Driver",
+    }
+)
+
+
 class InventoryBrowser(HerdUser):
     """Simulates users browsing inventory."""
 
@@ -260,9 +274,11 @@ class InventoryBrowser(HerdUser):
         if resp.status_code == 200:
             self._device_ids = [d["id"] for d in resp.json()["items"]]
         self._driver_ids = []
-        resp = self._auth_get("/api/inventory/drivers")
+        resp = self._auth_get("/api/inventory/drivers", params={"limit": 500})
         if resp.status_code == 200:
-            self._driver_ids = [d["id"] for d in resp.json()["items"]]
+            self._driver_ids = [
+                d["id"] for d in resp.json()["items"] if d["name"] in SEEDED_DRIVER_NAMES
+            ]
 
     @task(5)
     def list_devices(self):
@@ -282,7 +298,9 @@ class InventoryBrowser(HerdUser):
     def download_driver(self):
         # Any signed-in user may download a package (INV-DRV-17). Concurrent
         # downloads share inventory's four storage threads (INV-DRV-22), so the
-        # device reads above show whether they stay flat while downloads run.
+        # device reads above show whether they stay flat while downloads run. Only
+        # the seed's own packages are picked (SEEDED_DRIVER_NAMES), so a 500 here
+        # is a real storage failure.
         if self._driver_ids:
             self._auth_get(
                 f"/api/inventory/drivers/{random.choice(self._driver_ids)}/download",

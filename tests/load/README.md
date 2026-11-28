@@ -44,7 +44,7 @@ locust -f locustfile.py \
 | Class | Weight | Description |
 |-------|--------|-------------|
 | ReservationUser | 3 | Create, list, calendar query, release reservations |
-| InventoryBrowser | 5 | List devices, get device detail, list templates, download a driver package |
+| InventoryBrowser | 5 | List devices, get device detail, list templates, download one of the driver packages the default seed uploads (`SEEDED_DRIVER_NAMES`) |
 | ACLChecker | 2 | Single and batch permission checks |
 | LoginLimitProbe | exactly 1 user | After 15 s, floods wrong-password logins from this host until auth's per-source attempt limit answers 429; any answer but 401 or 429 fails the run |
 | OversizedBodySender | exactly 1 user | Never signs in; sends bodies one byte over `MAX_REQUEST_BODY_BYTES` to one route of every service, with a Content-Length or chunked; any answer but the 413 `body_too_large` fails the run |
