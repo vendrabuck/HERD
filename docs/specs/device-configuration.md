@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `CFG` (used in rule identifiers, for example `CFG-VER-1`) |
-| Verified at | commit `cd3eaeed` (`v0.6.0-215-gcd3eaeed`), 2026-10-08 |
+| Last full review | 2026-10-08 |
 | Owning services | inventory (`services/inventory/`: config versions, apply jobs, the apply scheduler, the config-schema proxy); execution (`services/execution/`: driver actions, execution runs and their command transcripts, driver loading and the driver cache, the driver sandbox, the package validator); `services/common/herd_common/` (`device_config.py`, the manage-or-owner checks in `acl.py`); the device page's configuration section in `frontend/` |
 | Other services involved | acl (explicit `manage` grants), reservations (active-reservation ownership, reservation status, the restore guard's by-device lookup), ai-orchestrator (calls `POST /execute` and `POST /internal/validate-package`; its assistant tools write versions and schedule dry runs), cabling and execution's wiring consumer (read the latest config version of a Layer 3 switch) |
 | Design records | [ADR 0002](../design/0002-driver-published-config-schemas.md), [ADR 0005](../design/0005-ai-recipe-authoring.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md) |
