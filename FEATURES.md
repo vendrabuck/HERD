@@ -1,6 +1,7 @@
 # HERD Features
 
-This document tracks what HERD currently supports and what is on the roadmap.
+This document tracks what HERD currently supports; what is planned is in
+[PLANNED_FEATURES.md](PLANNED_FEATURES.md).
 For the big-picture story of why HERD exists, see [README.md](README.md). For
 architectural detail, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For the
 exact rules each feature follows, with the code that enforces each rule and the test
@@ -10,8 +11,6 @@ one per area; all ten areas are written.
 **Status legend:**
 
 - **Shipped**: implemented and on the main branch.
-- **Partial**: a working subset is shipped; further iterations are planned.
-- **Planned**: not yet started.
 
 ---
 
@@ -29,8 +28,9 @@ one per area; all ten areas are written.
   reconcile of membership (with pre-provisioning of new users), and an opt-in
   deactivation/reactivation sweep for users removed or disabled upstream,
   guarded by a circuit breaker (ADR 0011, `docs/design/0011-ldap-group-sync.md`,
-  issue #38). Managed from the admin UI (`/admin/ldap-sync`): mapping CRUD, a
-  sync-now button, and run history.
+  issue #38, all six phases delivered). Managed from the admin UI
+  (`/admin/ldap-sync`): mapping CRUD, a sync-now button, and run history; the
+  interval loop prunes run history past `LDAP_SYNC_RUNS_RETENTION_DAYS` (default 90).
 - **Three-role RBAC** (Shipped): user, admin, superadmin. See
   [docs/ROLES.md](docs/ROLES.md).
 - **User profile** (Shipped): every account has a display name, plus an optional
@@ -64,7 +64,13 @@ one per area; all ten areas are written.
 - **Device and port templates** (Shipped): user-defined templates with typed custom
   fields (string, number, boolean, dropdown, password) and per-field defaults.
 - **Driver packages** (Shipped): standalone driver entities classified by connection
-  type (Management, Layer 1/2/3 Switch). Stored on local filesystem by default;
+  type (Management, Layer 1/2/3 Switch). All four contracts are live: the execution
+  service loads a user-authored Python package and invokes it at reservation
+  lifecycle events (see the Layer 3 section of [docs/DRIVERS.md](docs/DRIVERS.md)).
+  A package declares capabilities in `driver_metadata.json` (for example
+  `supports_dry_run` and `supports_vrf`) and either vendors its dependencies in
+  `_deps/` or ships a `requirements.txt`, which is installed only when the operator
+  sets `ALLOW_DRIVER_PIP_INSTALL=true`. Stored on local filesystem by default;
   MinIO/S3-compatible storage supported when configured.
 - **Inventory page filters** (Shipped, issue #842): Status, Template (labelled with
   vendor and model), and Topology filters beside the name search, each with an All
@@ -164,7 +170,9 @@ one per area; all ten areas are written.
   drew from); multiple attachments to one element bundle into one edge on the
   canvas with a count badge, the same rendering the wiring dialog already uses.
   Two device ports attached to the same element validate as reachable by
-  definition, with no BFS against the element itself. Unlike a dynamic
+  definition, with no BFS against the element itself; an element-to-element edge
+  and an element edge with no device port are refused as invalid edges
+  (`element_to_element`, `element_edge_no_port`). Unlike a dynamic
   placeholder, an element node and its attachment edges are saved with the
   topology and ride into reservation forks and version snapshots for free
   (canvas-native, topology-local storage; no new database table). No
@@ -195,7 +203,9 @@ one per area; all ten areas are written.
   first, so a hidden device reports the same reason an unknown one does. Execution drives
   the intent-derived route set in precedence over the config-version fallback (see the
   Reservations section below), passing a route's `virtual_router` only to a driver whose
-  package declares `supports_vrf`. See
+  package declares `supports_vrf`; a switch whose driver does not declare it is
+  refused with `l3_vrf_unsupported` and no driver call. Pathfinding refuses a
+  non-admin caller's hidden endpoint and redacts a hidden transit hop. See
   [docs/TOPOLOGY_EDITOR.md](docs/TOPOLOGY_EDITOR.md#layer-3-routing-intent-adr-0014-issue-34).
 
 ## Reservations
@@ -277,7 +287,11 @@ one per area; all ten areas are written.
   alongside a `transit_reservations`/transit-hours pair, with a fail-closed
   `include_transit` toggle to fall back to reserved-devices-only; see
   [docs/design/0013-lab-purpose-classification.md](docs/design/0013-lab-purpose-classification.md)
-  (issue #646).
+  (issue #646). The suggestions read the signals HERD already holds: the free-text
+  purpose, device names and templates, wiring shape, config-apply job names and counts,
+  fork version count, and duration, plus the reservation assistant's transcripts unless
+  `AI_PURPOSE_INCLUDE_TRANSCRIPTS` is false. The category rides every `reservation.*`
+  lifecycle event and the `/api/v1` facade.
 
 ## Dynamic resources
 
@@ -419,8 +433,19 @@ one per area; all ten areas are written.
   scheduler tick claims and how many polls run concurrently, and each device
   carries a persisted poll tier (idle or in-use) flipped by the reservation
   lifecycle events the service already consumes, with optional per-tier
-  interval overrides. A poller-only run mode lets the background polling work
-  scale as its own replica fleet, separate from the API replicas.
+  interval overrides. A poller-only run mode (`EXECUTION_POLLER_ONLY=true`) lets the
+  background polling work scale as its own replica fleet, separate from the API
+  replicas. A concurrency setting above the asyncio thread-pool cap logs a startup
+  warning.
+- **Driver-published configuration schemas** (Shipped, issue #23): a driver may declare
+  an optional `config_schema()` classmethod returning a JSON Schema. The execution
+  service extracts it in the sandbox without instantiating the driver, caches it with
+  the driver (valid for one SHA-256), and validates a `configure` call against it first,
+  falling back to the central registry only when the driver publishes none or an
+  unusable one. Inventory serves it at `GET /api/inventory/drivers/{id}/config-schema`,
+  and the reservation assistant's `get_device_config_schema` tool reads it too. The
+  checked-in `drivers/frr_mgmt` driver is the worked example: it accepts raw
+  `{commands, command}` vtysh lines that the registry's vocabulary does not describe.
 
 ## Operations and observability
 
@@ -451,7 +476,9 @@ one per area; all ten areas are written.
 - **Durable event delivery** (Shipped): reservation lifecycle and device-health
   events are staged in a per-service transactional outbox in the same database
   transaction as the state change, then drained to NATS by a background relay that
-  retries across a messaging outage and prunes old rows, so an outage delays delivery
+  retries across a messaging outage and prunes old rows (it claims each row with
+  `FOR UPDATE SKIP LOCKED`, so several relay replicas never publish one row twice),
+  so an outage delays delivery
   instead of silently dropping a provisioning or notification event. Consumers dedupe
   on a stable per-event id, so a relay republish is recognized as a duplicate rather
   than reprocessed. (Issue #21.) The underlying JetStream store itself is durable
@@ -499,29 +526,11 @@ one per area; all ten areas are written.
   [docs/EXTERNAL_API.md](docs/EXTERNAL_API.md) and
   [docs/api/v1-openapi.json](docs/api/v1-openapi.json). (Issue #33.)
 
-## Multi-tenancy
+## Roadmap
 
-- **Team workspaces** (Planned): organizational isolation where teams have their own
-  device pools, topologies, and reservations. Builds on resource-level ACL to
-  provide workspace-level boundaries. Cross-workspace resource sharing is a
-  later consideration, deliberately out of the first slice (issue #35).
-
-## Future considerations
-
-Longer-term ideas under exploration; not yet committed to a near-term slot.
-
-- **Federated lab support**: connect multiple HERD instances across geographically
-  distributed labs into a unified view.
-- **Hardware-in-the-loop simulation**: integrate virtual or simulated devices
-  alongside physical hardware in the same topology.
-- **Mobile-friendly interface**: list and table pages degrade gracefully on
-  narrow viewports (tables scroll horizontally rather than reflowing), and the
-  hover-based navigation is not touch-friendly; dedicated mobile views for
-  on-the-go reservation management are a future consideration (issue #44).
-- **Audit logging service**: comprehensive, tamper-evident audit trail of user
-  actions and system events for compliance and troubleshooting.
-- **Plugin and extension system**: allow third-party or internal extensions for
-  custom device drivers, validators, or workflow automations.
+Work that has not shipped (multi-tenancy, audit logging, federated labs, mobile views,
+and the rest) is listed only in [PLANNED_FEATURES.md](PLANNED_FEATURES.md), as Now, Next,
+and Later. A capability moves from there to this file when it ships.
 
 ---
 
