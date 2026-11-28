@@ -1,27 +1,158 @@
 """Driver package object storage: MinIO when MINIO_ENDPOINT is set, else a local directory.
 
-Every function here is synchronous and blocking (a MinIO network round trip, or a
-local file read, write, or unlink of up to DRIVER_MAX_SIZE_BYTES). ``driver_service``
-is the only caller of ``upload_object``, ``download_object`` and ``delete_object``,
-and runs each through ``asyncio.to_thread``, never on the event loop (issue #1327).
-``init_storage`` is called once, from the lifespan in ``app/main.py``, before the
-app serves a request. Because reads and writes of one key can now overlap, a local
-write replaces the file atomically (``_write_local_atomically``).
+Every storage function here is synchronous and blocking (a MinIO network round trip,
+or a local file read, write, or unlink of up to DRIVER_MAX_SIZE_BYTES).
+``driver_service`` is the only caller of ``upload_object``, ``download_object`` and
+``delete_object``, and runs each through ``run_on_storage_thread``, never on the event
+loop (issue #1327) and never on asyncio's default executor (issue #1416).
+``init_storage`` is called once, from the lifespan in ``app/main.py``, before the app
+serves a request, and ``shutdown_storage_executor`` once, from the same lifespan, when
+it stops. Because reads and writes of one key can overlap, a local write
+replaces the file atomically (``_write_local_atomically``).
+
+The storage threads (issue #1416). ``run_on_storage_thread`` runs a call on this
+module's own pool of ``DRIVER_STORAGE_THREADS`` (4) threads. asyncio's default
+executor is the one ``loop.getaddrinfo`` resolves names on, so new database and NATS
+connections wait for a free thread there; with storage calls on their own pool, a
+stalled object store can hold at most those four threads, and name resolution, the
+event loop, and every other worker thread stay free. A fifth call waits in the pool's
+queue for a thread, with no bound on the wait; a call cancelled while it waits never
+runs, and one cancelled while it runs keeps its thread until it ends, so the bound
+holds whatever is cancelled. At most four package archives are read or written at once.
+
+The MinIO client's HTTP pool (``_minio_http_client``) replaces the library's defaults
+(a 5-minute connect and read timeout and 5 retries). A connect gives up after
+``MINIO_CONNECT_TIMEOUT_SECONDS`` (15), and the request is sent under the same
+timeout: urllib3 hands a request body (one part, at most 5 MiB) to one ``sendall``,
+so over plain HTTP (``MINIO_USE_SSL=false``, the compose default) the whole body must
+be sent within 15 s, about 341 KiB/s for a 5 MiB part, however steadily the store
+takes it; over TLS the timeout applies to each send. A wait for the next bytes of an
+answer gives up after ``MINIO_READ_TIMEOUT_SECONDS`` (30). A GET, HEAD, PUT, or
+DELETE that fails that way, or is answered 500, 502, 503, or 504, is tried again at
+most ``MINIO_RETRIES`` (2) times, with backoffs of 0 s and then 0.4 s between the
+attempts and never a wait the store names in a Retry-After header; urllib3 tries a
+POST again only when its connection fails.
+
+Those bound one request. A storage call is one request, except an upload over 5 MiB
+(minio's MIN_PART_SIZE), which minio sends as a multipart upload: a POST to start it,
+its 5 MiB parts as PUTs in parallel on minio's own threads, a POST to complete it,
+and, after any failure once it has started, a DELETE to abort it. Against a store
+that accepts connections and never answers:
+
+- a download, a delete, or an upload of at most 5 MiB ends within three 30 s attempts
+  and the 0.4 s backoff, 90.4 s;
+- a download whose answer stops after its headers ends 30 s after its last bytes (a
+  body read is not tried again);
+- a multipart upload ends within 30 s when its start goes unanswered; within about
+  181 s when the start is answered and the parts are not (the parts' 90.4 s, then the
+  abort's 90.4 s); and about 120 s after its parts are stored when the completion goes
+  unanswered (30 s, then the abort's 90.4 s).
+
+Apart from a body send over plain HTTP, these are bounds on each wait for progress,
+not on a whole transfer: a store that keeps sending a few bytes at a time is not cut
+off by them, and the lookup of the store's host name (on the storage thread) is not
+bounded by the connect timeout.
 """
 
+import asyncio
+import contextvars
+import functools
 import io
 import logging
 import os
 import secrets
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypeVar
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# At most this many driver storage calls (and package inspections, which
+# driver_service runs on the same threads) run at once in the process.
+DRIVER_STORAGE_THREADS = 4
+
+# The MinIO client's per-request bounds (issue #1416). Named constants rather than
+# settings: the values bound a failure, they do not tune a deployment.
+MINIO_CONNECT_TIMEOUT_SECONDS = 15
+MINIO_READ_TIMEOUT_SECONDS = 30
+MINIO_RETRIES = 2
+MINIO_RETRY_BACKOFF_FACTOR = 0.2
+MINIO_RETRY_STATUSES = (500, 502, 503, 504)
+# The threads the MinIO client sends one multipart upload's parts on (its own
+# ThreadPool, in addition to the storage threads); passed to put_object explicitly.
+MINIO_PART_THREADS = 3
+# Connections the urllib3 pool keeps: every storage thread's own request plus its
+# upload's part threads, so concurrent multipart uploads never open more connections
+# at once than the pool takes back (urllib3 discards a connection returned to a full
+# pool, with a "Connection pool is full" warning). It caps idle connections only;
+# urllib3 opens a connection when a request needs one.
+MINIO_POOL_CONNECTIONS = DRIVER_STORAGE_THREADS * (MINIO_PART_THREADS + 1)
+
+_T = TypeVar("_T")
+
 _backend: str = "none"  # "minio" or "local"
 _client = None  # Minio instance when using minio backend
 _local_path: Path | None = None
+_executor: ThreadPoolExecutor | None = None
+
+
+def storage_executor() -> ThreadPoolExecutor:
+    """The process-wide pool every ``run_on_storage_thread`` call runs on, built on
+    first use. Each service runs one uvicorn process; the pool is not tied to a loop."""
+    global _executor
+    if _executor is None:
+        _executor = ThreadPoolExecutor(
+            max_workers=DRIVER_STORAGE_THREADS, thread_name_prefix="driver-storage"
+        )
+    return _executor
+
+
+def shutdown_storage_executor() -> None:
+    """Shut the storage pool down; the lifespan in ``app/main.py`` calls this at app
+    shutdown. Calls still waiting for a thread are cancelled and never run, and the
+    shutdown does not wait for a call that is running: a stalled store could hold it
+    until the MinIO bounds end it, and the interpreter's exit still joins that thread.
+    A later ``run_on_storage_thread`` builds a new pool."""
+    global _executor
+    executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+async def run_on_storage_thread(func: Callable[..., _T], *args: object) -> _T:
+    """``func(*args)`` on a storage thread; it returns what ``func`` returns, or
+    raises what it raised (an ``HTTPException`` included, unchanged). The caller's
+    context variables are copied to the thread, as ``asyncio.to_thread`` does."""
+    loop = asyncio.get_running_loop()
+    call = functools.partial(contextvars.copy_context().run, func, *args)
+    return await loop.run_in_executor(storage_executor(), call)
+
+
+def _minio_http_client():
+    """The urllib3 pool the MinIO client sends through: the library's own default
+    pool with the bounds above in place of its 5-minute timeouts and 5 retries. The
+    certificate checks are the library's defaults (``SSL_CERT_FILE`` or certifi's
+    bundle, certificates required)."""
+    import certifi
+    import urllib3
+
+    return urllib3.PoolManager(
+        timeout=urllib3.Timeout(
+            connect=MINIO_CONNECT_TIMEOUT_SECONDS, read=MINIO_READ_TIMEOUT_SECONDS
+        ),
+        maxsize=MINIO_POOL_CONNECTIONS,
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
+        retries=urllib3.Retry(
+            total=MINIO_RETRIES,
+            backoff_factor=MINIO_RETRY_BACKOFF_FACTOR,
+            status_forcelist=list(MINIO_RETRY_STATUSES),
+            respect_retry_after_header=False,
+        ),
+    )
 
 
 def _resolve_local(key: str) -> Path:
@@ -86,6 +217,7 @@ def init_storage() -> None:
             access_key=settings.minio_access_key,
             secret_key=settings.minio_secret_key,
             secure=settings.minio_use_ssl,
+            http_client=_minio_http_client(),
         )
         if not _client.bucket_exists(settings.minio_bucket):
             _client.make_bucket(settings.minio_bucket)
@@ -108,6 +240,7 @@ def upload_object(key: str, data: bytes, content_type: str = "application/octet-
             io.BytesIO(data),
             length=len(data),
             content_type=content_type,
+            num_parallel_uploads=MINIO_PART_THREADS,
         )
     elif _backend == "local":
         dest = _resolve_local(key)

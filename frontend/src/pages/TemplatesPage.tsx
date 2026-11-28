@@ -5,6 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { usePaginatedTemplates, useDeleteTemplate, useCreateTemplate } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
 import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { copyName } from "@/lib/copyName";
 import { loadState, noItems } from "@/lib/loadState";
 import { isAdminRole } from "@/lib/roles";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
@@ -66,7 +67,7 @@ export function TemplatesPage() {
       // and driver_id are null on the types they do not apply to, which the
       // backend accepts (only a non-null value is type-checked).
       await createTemplate.mutateAsync({
-        name: `Copy of ${t.name}`,
+        name: copyName(t.name),
         template_type: t.template_type as "device" | "port" | "dynamic",
         driver_id: t.driver_id,
         hypervisor_id: t.hypervisor_id,

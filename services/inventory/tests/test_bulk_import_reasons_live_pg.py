@@ -24,7 +24,13 @@ routes, with the request session on Postgres:
   `update_device`'s own detail;
 - a driver deleted, or a device name taken, by another connection between the
   import's lookup and the insert is answered by the create functions' own fixed
-  details (INV-TPL-14, INV-DEV-1), which the importer keeps.
+  details (INV-TPL-14, INV-DEV-1), which the importer keeps;
+- a generated dynamic-instance name is stored whole by the real column whatever the
+  template name's length (INV-DYN-2);
+- a device create the database refuses answers `Device with name '<name>' already
+  exists` only for a real unique violation, and `Device violates a database
+  constraint` for any other class 23 refusal, a trigger's or a real foreign key's,
+  on `POST /devices` and in an import row (INV-DEV-11).
 
 Each test carries a marker value in the rows' other cells and asserts each outcome
 and reason exactly, and that neither the response body nor any log record at INFO
@@ -61,8 +67,9 @@ from app.models.template import DeviceTemplate
 from app.schemas.column_bounds import INT32_MAX, NON_FINITE_NUMBER_MESSAGE, NUL_CHARACTER_MESSAGE
 from app.services import bulk_service, hypervisor_service
 from herd_common.pg_live_suite import pg_live_target
-from sqlalchemy import delete, select, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 _PG = pg_live_target()
 PG_DSN = _PG.dsn
@@ -762,3 +769,299 @@ async def test_a_device_name_taken_before_its_insert_gets_the_fixed_reason(
     async with session_factory() as s:
         winner = (await s.execute(select(Device).where(Device.name == raced))).scalar_one()
         assert winner.field_data == {"pw": "first"}
+
+
+# A generated device name always fits its column -----------------------------------
+
+
+@pytest.mark.parametrize("length", [244, 245, 255])
+async def test_generated_device_names_are_stored_by_the_real_column(
+    client, session_factory, lab, tag, sentinel, caplog, length
+):
+    """The internal create names a dynamic instance after its template (INV-DYN-2).
+    With a template name of 245 to 255 characters (four-byte characters here) every
+    generated name is stored whole by the real devices.name column, and two creates
+    get distinct names."""
+    caplog.set_level(logging.INFO)
+    async with session_factory() as s:
+        recipe = DriverPackage(
+            name=f"pg-live-recipe-{tag}",
+            connection_type="Hypervisor",
+            filename="r.zip",
+            storage_key=f"r-{tag}",
+            size_bytes=1,
+            sha256="0" * 64,
+            uploaded_by="pg",
+        )
+        hypervisor = Hypervisor(
+            name=f"pg-live-hv-{tag}",
+            endpoint="https://hv.example:8006",
+            hypervisor_type="proxmox",
+            secret_id=uuid.uuid4(),
+        )
+        s.add_all([recipe, hypervisor])
+        await s.flush()
+        template = DeviceTemplate(
+            name=_at(length, tag),
+            template_type="dynamic",
+            vendor="V",
+            model="M",
+            driver_id=recipe.id,
+            hypervisor_id=hypervisor.id,
+            sections=_SECTIONS,
+        )
+        s.add(template)
+        await s.commit()
+        template_id, template_name = template.id, template.name
+
+    reservation_id = uuid.uuid4()
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(reservation_id),
+        "field_data": {"pw": sentinel},
+    }
+    answers = [
+        await client.post(
+            "/devices/internal", headers={"X-Internal-Token": "test-token"}, json=body
+        )
+        for _ in range(2)
+    ]
+
+    expected = []
+    for n in (1, 2):
+        suffix = f"-{str(reservation_id)[:8]}-{n}"
+        expected.append(template_name[: 255 - len(suffix)] + suffix)
+    for resp, name in zip(answers, expected, strict=True):
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["name"] == name
+    _assert_clean(caplog.text, sentinel)
+    async with session_factory() as s:
+        rows = await s.execute(
+            select(Device.name, func.char_length(Device.name)).where(
+                Device.template_id == template_id
+            )
+        )
+        stored = dict(rows.all())
+    assert set(stored) == set(expected)
+    assert all(chars <= 255 for chars in stored.values())
+    if length == 244:
+        assert expected[0] == f"{template_name}-{str(reservation_id)[:8]}-1"
+    else:
+        assert stored[expected[0]] == 255
+
+
+# A device create's integrity refusals ------------------------------------------------
+
+_CONSTRAINT = "Device violates a database constraint"
+
+
+@pytest.mark.parametrize("code", ["23514", "23503", "23502", "23P01", "23000"])
+async def test_a_device_create_refused_for_anything_but_its_name_is_not_a_name_clash(
+    client, session_factory, lab, tag, sentinel, refusing_trigger, caplog, code
+):
+    """Every integrity error on create used to answer `Device with name ... already
+    exists`. A class 23 refusal that is not a unique violation, raised here by the
+    trigger with the row's field data in its message, detail, and hint, answers the
+    generic detail on the route and in an import row, and its log line names the
+    SQLSTATE only."""
+    caplog.set_level(logging.INFO)
+    name = f"create-{code}-{tag}"
+    payload = {
+        "name": name,
+        "template_id": str(lab["template_id"]),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+
+    item = {
+        "name": f"import-{code}-{tag}",
+        "template_name": lab["template"],
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    imported = await _import(client, "devices", [item], dry_run=False)
+    _assert_clean(imported.text, sentinel)
+    assert _outcomes(imported) == [(f"import-{code}-{tag}", "reject", _CONSTRAINT)]
+
+    _assert_clean(caplog.text, sentinel)
+    assert f"sqlstate={code}" in caplog.text
+    assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+async def test_a_device_create_whose_name_is_taken_is_a_name_clash(client, lab, sentinel):
+    """A real unique violation on create keeps the name detail."""
+    payload = {
+        "name": lab["device"],
+        "template_id": str(lab["template_id"]),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": f"Device with name '{lab['device']}' already exists"}
+
+
+async def test_a_template_deleted_before_a_device_insert_is_not_a_name_clash(
+    client, session_factory, lab, tag, sentinel, caplog, monkeypatch
+):
+    """A real foreign key violation (23503): another connection deletes the device's
+    template after create_device read it and before the insert commits."""
+    caplog.set_level(logging.INFO)
+    async with session_factory() as s:
+        doomed = DeviceTemplate(
+            name=f"pg-live-doomed-{tag}", vendor="V", model="M", sections=_SECTIONS
+        )
+        s.add(doomed)
+        await s.commit()
+        doomed_id = doomed.id
+    real_commit = AsyncSession.commit
+    raced = False
+
+    async def template_goes_first(self):
+        # The request's commit of the new device: another connection deletes the
+        # template first, after create_device has read and checked it.
+        nonlocal raced
+        pending = [obj for obj in self.new if isinstance(obj, Device)]
+        if not raced and any(obj.name == f"fk-{tag}" for obj in pending):
+            raced = True
+            async with session_factory() as other:
+                await other.execute(delete(DeviceTemplate).where(DeviceTemplate.id == doomed_id))
+                await real_commit(other)
+        return await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", template_goes_first)
+    payload = {
+        "name": f"fk-{tag}",
+        "template_id": str(doomed_id),
+        "topology_type": "PHYSICAL",
+        "field_data": {"pw": sentinel},
+    }
+    resp = await client.post("/devices", json=payload)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+    _assert_clean(caplog.text, sentinel)
+    assert raced
+    assert "sqlstate=23503" in caplog.text
+    assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+# A dynamic-instance create's integrity refusals -----------------------------------
+
+
+async def _dynamic_template(session_factory, tag: str) -> uuid.UUID:
+    async with session_factory() as s:
+        recipe = DriverPackage(
+            name=f"pg-live-recipe-{tag}",
+            connection_type="Hypervisor",
+            filename="r.zip",
+            storage_key=f"r-{tag}",
+            size_bytes=1,
+            sha256="0" * 64,
+            uploaded_by="pg",
+        )
+        hypervisor = Hypervisor(
+            name=f"pg-live-hv-{tag}",
+            endpoint="https://hv.example:8006",
+            hypervisor_type="proxmox",
+            secret_id=uuid.uuid4(),
+        )
+        s.add_all([recipe, hypervisor])
+        await s.flush()
+        template = DeviceTemplate(
+            name=f"pg-live-dyn-{tag}",
+            template_type="dynamic",
+            vendor="V",
+            model="M",
+            driver_id=recipe.id,
+            hypervisor_id=hypervisor.id,
+            sections=_SECTIONS,
+        )
+        s.add(template)
+        await s.commit()
+        return template.id
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["generated-name", "explicit-name"])
+@pytest.mark.parametrize("code", ["23514", "23503"])
+async def test_a_dynamic_instance_refused_for_anything_but_a_unique_violation_answers_at_once(
+    client, session_factory, lab, tag, sentinel, refusing_trigger, caplog, code, named
+):
+    """The internal create tries the next generated name only after a unique
+    violation (INV-DYN-10). A trigger refusing every insert of this test's rows with
+    another class 23 SQLSTATE answers the generic detail after one insert, where
+    the name loop used to run to its 10000-try cap."""
+    caplog.set_level(logging.INFO)
+    template_id = await _dynamic_template(session_factory, tag)
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    if named:
+        body["name"] = f"dyn-{code}-{tag}"
+    resp = await client.post(
+        "/devices/internal", headers={"X-Internal-Token": "test-token"}, json=body
+    )
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+    _assert_clean(caplog.text, sentinel)
+    assert caplog.text.count(f"sqlstate={code}") == 1
+    assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+async def test_a_dynamic_instance_whose_generated_name_is_taken_tries_the_next(
+    client, session_factory, lab, tag
+):
+    """A real unique violation on the generated name, with a request_id no device
+    holds, moves on to the next n."""
+    template_id = await _dynamic_template(session_factory, tag)
+    reservation_id = uuid.uuid4()
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(reservation_id),
+        "field_data": {"pw": "x"},
+    }
+    headers = {"X-Internal-Token": "test-token"}
+    first = await client.post(
+        "/devices/internal", headers=headers, json={**body, "request_id": str(uuid.uuid4())}
+    )
+    second = await client.post(
+        "/devices/internal", headers=headers, json={**body, "request_id": str(uuid.uuid4())}
+    )
+    assert (first.status_code, second.status_code) == (201, 201)
+    prefix = f"pg-live-dyn-{tag}-{str(reservation_id)[:8]}"
+    assert (first.json()["name"], second.json()["name"]) == (f"{prefix}-1", f"{prefix}-2")
+
+
+# The shared engine options on a real Postgres ---------------------------------------
+
+
+async def test_a_postgres_error_from_the_shared_engine_names_no_bound_parameter(tag, caplog):
+    """herd_common.database builds every service's engine with hide_parameters, so a
+    refused statement's text, and a log line that prints it, names the statement and
+    not its bound values. The statement fails for a reason of its own (a division by
+    zero), so nothing but the parameter list could carry the bound value."""
+    from herd_common.database import make_database
+
+    engine, _, _, _ = make_database(PG_DSN)
+    marker = f"pg-live-bound-{tag}"
+    try:
+        async with engine.connect() as conn:
+            with pytest.raises(DBAPIError) as caught:
+                await conn.execute(
+                    text("SELECT 1 / 0 WHERE CAST(:v AS text) IS NOT NULL"), {"v": marker}
+                )
+    finally:
+        await engine.dispose()
+    assert "SELECT 1 / 0" in str(caught.value)
+    assert marker not in str(caught.value)
+    logging.getLogger("herd.test").exception("read failed", exc_info=caught.value)
+    assert "read failed" in caplog.text
+    assert marker not in caplog.text

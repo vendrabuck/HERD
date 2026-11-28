@@ -907,6 +907,41 @@ describe("InventoryPage", () => {
       );
     });
 
+    it.each([
+      ["an ASCII character", "d"],
+      ["a character outside the BMP", "\u{1D11E}"],
+    ])("cuts a long device name of %s so the copy's name fits its column", async (_kind, char) => {
+      const longName = char.repeat(255);
+      let sentName: string | undefined;
+      server.use(
+        http.get("/api/inventory/devices", () =>
+          HttpResponse.json({
+            items: [makeDevice({ name: longName })],
+            total: 1,
+            skip: 0,
+            limit: 50,
+          }),
+        ),
+        http.get("/api/inventory/devices/aaaaaaaa-1111-2222-3333-444444444444/ports", () =>
+          HttpResponse.json([]),
+        ),
+        http.post("/api/inventory/devices", async ({ request }) => {
+          sentName = ((await request.json()) as { name: string }).name;
+          return HttpResponse.json(makeDevice({ id: "new-device-id", name: sentName }), {
+            status: 201,
+          });
+        }),
+      );
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText(longName)).toBeInTheDocument());
+
+      fireEvent.click(screen.getByTitle("Duplicate device"));
+
+      await waitFor(() => expect(sentName).toBeDefined());
+      expect(sentName).toBe("Copy of " + char.repeat(247));
+      expect(Array.from(sentName as string)).toHaveLength(255);
+    });
+
     it("reports a plain success message when the device has no ports", async () => {
       const toastModule = await import("react-hot-toast");
       server.use(

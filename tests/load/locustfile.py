@@ -2,7 +2,9 @@
 
 Eleven user classes, selected by default:
 - ReservationUser: creates, lists, queries calendar, releases reservations
-- InventoryBrowser: browses devices, templates, and the topologies list
+- InventoryBrowser: browses devices, templates, and the topologies list, and
+  downloads a driver package (issue #1416: downloads run on inventory's storage
+  threads beside the device reads)
 - BulkExporter: exports devices, templates, and topologies; dry-runs a device import
 - ACLChecker: batch checks permissions
 - RoutedTopologyValidator: repeatedly validates one topology carrying Layer 3
@@ -245,6 +247,20 @@ class ReservationUser(HerdUser):
         )
 
 
+# The driver packages the default seed uploads through the API (seedtools/cli.py),
+# so each one's archive is stored. A package another suite left listed may have
+# no archive (its download answers 500), so the download task picks only these.
+SEEDED_DRIVER_NAMES = frozenset(
+    {
+        "Network OS Management",
+        "Endpoint Management",
+        "L1 Switch Driver",
+        "L2 Switch Driver",
+        "Cisco 6509 L2 Driver",
+    }
+)
+
+
 class InventoryBrowser(HerdUser):
     """Simulates users browsing inventory."""
 
@@ -257,6 +273,12 @@ class InventoryBrowser(HerdUser):
         resp = self._auth_get("/api/inventory/devices")
         if resp.status_code == 200:
             self._device_ids = [d["id"] for d in resp.json()["items"]]
+        self._driver_ids = []
+        resp = self._auth_get("/api/inventory/drivers", params={"limit": 500})
+        if resp.status_code == 200:
+            self._driver_ids = [
+                d["id"] for d in resp.json()["items"] if d["name"] in SEEDED_DRIVER_NAMES
+            ]
 
     @task(5)
     def list_devices(self):
@@ -271,6 +293,19 @@ class InventoryBrowser(HerdUser):
     @task(2)
     def list_templates(self):
         self._auth_get("/api/inventory/templates")
+
+    @task(1)
+    def download_driver(self):
+        # Any signed-in user may download a package (INV-DRV-17). Concurrent
+        # downloads share inventory's four storage threads (INV-DRV-22), so the
+        # device reads above show whether they stay flat while downloads run. Only
+        # the seed's own packages are picked (SEEDED_DRIVER_NAMES), so a 500 here
+        # is a real storage failure.
+        if self._driver_ids:
+            self._auth_get(
+                f"/api/inventory/drivers/{random.choice(self._driver_ids)}/download",
+                name="/api/inventory/drivers/[id]/download",
+            )
 
     @task(2)
     def list_topologies(self):

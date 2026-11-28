@@ -510,6 +510,167 @@ async def test_create_device_duplicate_name():
         with pytest.raises(HTTPException) as exc:
             await create_device(db, data)
         assert exc.value.status_code == 409
+        assert exc.value.detail == "Device with name 'Dupe' already exists"
+
+
+class _PgOrig(Exception):
+    """A driver error as asyncpg gives it: an SQLSTATE, and text that names the
+    constraint and the row's values."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(
+            f'duplicate key value violates unique constraint "devices_name_key" '
+            f"DETAIL: Key (name)=(Dupe) already exists. sqlstate {sqlstate}"
+        )
+        self.sqlstate = sqlstate
+        self.constraint_name = "devices_name_key"
+
+
+class _SqliteOrig(Exception):
+    """A driver error as sqlite3 gives it: an extended error name, and text."""
+
+    def __init__(self, errorname: str, text: str) -> None:
+        super().__init__(text)
+        self.sqlite_errorname = errorname
+
+
+def _refusal(orig: Exception):
+    from sqlalchemy.exc import IntegrityError
+
+    return IntegrityError("INSERT INTO devices (name, field_data) VALUES (?, ?)", {}, orig)
+
+
+_NAME_TAKEN = [
+    _PgOrig("23505"),
+    _SqliteOrig("SQLITE_CONSTRAINT_UNIQUE", "UNIQUE constraint failed: devices.name"),
+]
+_OTHER_REFUSALS = [
+    _PgOrig("23503"),
+    _PgOrig("23502"),
+    _PgOrig("23514"),
+    _PgOrig("23P01"),
+    _SqliteOrig("SQLITE_CONSTRAINT_FOREIGNKEY", "FOREIGN KEY constraint failed"),
+    _SqliteOrig("SQLITE_CONSTRAINT_CHECK", "CHECK constraint failed: x"),
+    # Text that reads like a unique violation but carries no code: the class is
+    # never read from the text.
+    Exception("UNIQUE constraint failed: devices.name"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orig",
+    _NAME_TAKEN,
+    ids=lambda o: (
+        getattr(o, "sqlstate", None) or getattr(o, "sqlite_errorname", None) or "text-only"
+    ),
+)
+async def test_create_device_unique_violation_is_a_taken_name(orig):
+    from unittest.mock import patch
+
+    async with TestSessionLocal() as db:
+        template = await _create_template(db)
+        data = DeviceCreate(
+            name="Dupe",
+            template_id=template.id,
+            topology_type=TopologyType.PHYSICAL,
+            field_data={"model": "M"},
+        )
+        with patch.object(db, "commit", side_effect=_refusal(orig)):
+            with pytest.raises(HTTPException) as exc:
+                await create_device(db, data)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Device with name 'Dupe' already exists"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orig",
+    _OTHER_REFUSALS,
+    ids=lambda o: (
+        getattr(o, "sqlstate", None) or getattr(o, "sqlite_errorname", None) or "text-only"
+    ),
+)
+async def test_create_device_other_integrity_error_is_not_a_name_clash(orig, caplog):
+    """Every IntegrityError on create used to read as a taken name. Only a unique
+    violation does now; anything else is the fixed generic detail, naming no
+    constraint, statement, or value, and the log names the SQLSTATE only."""
+    from unittest.mock import patch
+
+    async with TestSessionLocal() as db:
+        template = await _create_template(db)
+        data = DeviceCreate(
+            name="Dupe",
+            template_id=template.id,
+            topology_type=TopologyType.PHYSICAL,
+            field_data={"model": "M"},
+        )
+        with patch.object(db, "commit", side_effect=_refusal(orig)):
+            with pytest.raises(HTTPException) as exc:
+                await create_device(db, data)
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Device violates a database constraint"
+    assert "Dupe" not in caplog.text
+    assert "devices_name_key" not in caplog.text
+    assert "INSERT" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orig",
+    _OTHER_REFUSALS,
+    ids=lambda o: (
+        getattr(o, "sqlstate", None) or getattr(o, "sqlite_errorname", None) or "text-only"
+    ),
+)
+async def test_update_device_other_integrity_error_is_not_a_name_clash(orig):
+    from unittest.mock import patch
+
+    async with TestSessionLocal() as db:
+        template = await _create_template(db)
+        dev = await create_device(
+            db,
+            DeviceCreate(
+                name="Dev1",
+                template_id=template.id,
+                topology_type=TopologyType.PHYSICAL,
+                field_data={"model": "M1"},
+            ),
+        )
+        with patch.object(db, "commit", side_effect=_refusal(orig)):
+            with pytest.raises(HTTPException) as exc:
+                await update_device(db, dev.id, DeviceUpdate(name="Dev2"))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Device violates a database constraint"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "orig",
+    _NAME_TAKEN,
+    ids=lambda o: (
+        getattr(o, "sqlstate", None) or getattr(o, "sqlite_errorname", None) or "text-only"
+    ),
+)
+async def test_update_device_unique_violation_is_a_taken_name(orig):
+    from unittest.mock import patch
+
+    async with TestSessionLocal() as db:
+        template = await _create_template(db)
+        dev = await create_device(
+            db,
+            DeviceCreate(
+                name="Dev1",
+                template_id=template.id,
+                topology_type=TopologyType.PHYSICAL,
+                field_data={"model": "M1"},
+            ),
+        )
+        with patch.object(db, "commit", side_effect=_refusal(orig)):
+            with pytest.raises(HTTPException) as exc:
+                await update_device(db, dev.id, DeviceUpdate(name="Dev2"))
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Device with name 'Dev2' already exists"
 
 
 # --- update_device ---

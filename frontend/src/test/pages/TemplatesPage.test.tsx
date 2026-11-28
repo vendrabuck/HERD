@@ -180,6 +180,22 @@ describe("TemplatesPage copy", () => {
     });
   });
 
+  it("cuts a long template name so the copy's name fits its 255-character column", async () => {
+    const longName = "\u{1D11E}".repeat(255);
+    mockUsePaginatedTemplates.mockReturnValue({
+      data: { items: [{ ...DYNAMIC_TEMPLATE, name: longName }], total: 1, skip: 0, limit: 50 },
+      isLoading: false,
+      isError: false,
+    });
+    renderPage();
+    fireEvent.click(screen.getAllByTitle("Duplicate template")[0]);
+
+    await waitFor(() => expect(mockCreateTemplate.mutateAsync).toHaveBeenCalledTimes(1));
+    const sent = mockCreateTemplate.mutateAsync.mock.calls[0][0].name as string;
+    expect(sent).toBe("Copy of " + "\u{1D11E}".repeat(247));
+    expect(Array.from(sent)).toHaveLength(255);
+  });
+
   it("surfaces the backend detail on a copy failure", async () => {
     mockCreateTemplate.mutateAsync.mockRejectedValueOnce({
       response: { data: { detail: "Template with name 'Copy of Ubuntu VM' already exists" } },

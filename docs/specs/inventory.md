@@ -312,9 +312,11 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   Enforced in: `services/inventory/app/services/template_service.py` (`_validate_driver_connection_type`, `create_template`) \
   Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_dynamic_template_non_hypervisor_driver_422`, `test_device_template_hypervisor_driver_422`)
 - **INV-TPL-14.** A driver or hypervisor id that does not exist answers 422
-  `Referenced hypervisor or driver does not exist`, never a name conflict. \
+  `Referenced hypervisor or driver does not exist`, never a name conflict. The
+  refusal is classified by its SQLSTATE, or SQLite's extended error code, never by
+  its text. \
   Enforced in: `services/inventory/app/services/template_service.py` (`_integrity_kind`, `_integrity_http_error`) \
-  Pinned by: `services/inventory/tests/test_template_integrity_errors.py` (`test_create_fk_violation_is_422_not_name_conflict`, `test_integrity_kind_postgres_sqlstates`)
+  Pinned by: `services/inventory/tests/test_template_integrity_errors.py` (`test_create_fk_violation_is_422_not_name_conflict`, `test_integrity_kind_postgres_sqlstates`, `test_integrity_kind_sqlite_error_codes`, `test_integrity_kind_never_reads_a_class_from_the_text`)
 - **INV-TPL-15.** `PUT /templates/{id}` changes only the fields the body names. An
   unknown id answers 404. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
@@ -350,9 +352,11 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   Pinned by: `services/inventory/tests/test_templates_internal.py` (`test_internal_template_exposes_driver_sha256_and_filename`, `test_internal_template_null_driver_fields_for_port_template`); `services/inventory/tests/test_template_default_redaction.py` (`test_admin_template_reads_return_password_defaults_in_clear`, `test_internal_template_read_returns_password_defaults_in_clear`)
 - **INV-TPL-21.** The templates page's Copy creates `Copy of <name>` carrying the
   type, driver, hypervisor, exclusive flag, icon, description, identity, poll interval,
-  and sections, and shows the server's detail when the create is refused. \
-  Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`handleCopy`) \
-  Pinned by: `frontend/src/test/pages/TemplatesPage.test.tsx` (`copies a dynamic template with template_type, driver_id, and hypervisor_id (issue #473)`, `copies a device template with its driver and identity fields`, `surfaces the backend detail on a copy failure`)
+  and sections, and shows the server's detail when the create is refused. The copy's
+  name always fits its column: a source name too long for the prefix is cut from its
+  end, by characters, to make `Copy of <name>` exactly 255 characters. \
+  Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`handleCopy`); `frontend/src/lib/copyName.ts` (`copyName`, `NAME_MAX_LENGTH`) \
+  Pinned by: `frontend/src/test/pages/TemplatesPage.test.tsx` (`copies a dynamic template with template_type, driver_id, and hypervisor_id (issue #473)`, `copies a device template with its driver and identity fields`, `surfaces the backend detail on a copy failure`, `cuts a long template name so the copy's name fits its 255-character column`); `frontend/src/test/lib/copyName.test.ts` (`a %i-character name gives a copy name within the 255-character column`, `never splits a character outside the BMP`)
 - **INV-TPL-22.** The templates page offers All, Device, Port, and Dynamic type filters,
   and shows Create Template, Copy, and Delete only to admins. \
   Enforced in: `frontend/src/pages/TemplatesPage.tsx` (`TYPE_FILTER_OPTIONS`, `TemplatesPage`) \
@@ -404,8 +408,8 @@ deleted, and can be booked.
 
 - **INV-DEV-1.** A device name is 1 to 255 characters and unique; a duplicate answers
   409 `Device with name '<name>' already exists` on create and on rename. \
-  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceCreate`, `DEVICE_NAME_MAX_LENGTH`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`) \
-  Pinned by: `services/inventory/tests/test_devices.py` (`test_create_device_duplicate_name`, `test_update_device_duplicate_name`); `services/inventory/tests/test_schema_bounds.py` (`test_device_create_name_empty_rejected`, `test_device_create_name_over_cap_rejected`)
+  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceCreate`, `DEVICE_NAME_MAX_LENGTH`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`, `_device_write_refused`) \
+  Pinned by: `services/inventory/tests/test_devices.py` (`test_create_device_duplicate_name`, `test_update_device_duplicate_name`); `services/inventory/tests/test_schema_bounds.py` (`test_device_create_name_empty_rejected`, `test_device_create_name_over_cap_rejected`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_device_create_whose_name_is_taken_is_a_name_clash`)
 - **INV-DEV-2.** `POST /devices` accepts only a template of type `device`: an unknown
   template answers 422 `Template not found`, a port or dynamic template 422. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_device`) \
@@ -445,11 +449,15 @@ deleted, and can be booked.
 - **INV-DEV-11.** An update that sends an explicit null for `name`, `topology_type`,
   `status`, or `field_data` (NOT NULL columns) answers 422 `<field> cannot be null; omit
   the field to leave it unchanged`; an omitted field is left unchanged, and a null
-  `poll_interval_seconds` still clears the override. Only a unique violation at commit
-  answers 409 `Device with name '<name>' already exists`; any other integrity error
-  answers 409 `Device violates a database constraint`. \
-  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceUpdate`); `services/inventory/app/services/inventory_service.py` (`update_device`) \
-  Pinned by: `services/inventory/tests/test_schema_bounds.py` (`test_device_update_explicit_null_on_not_null_column_rejected_by_name`, `test_device_update_explicit_null_poll_interval_still_clears_the_override`); `services/inventory/tests/test_inventory_service_unit.py` (`test_update_device_duplicate_name`, `test_update_device_non_unique_integrity_error_is_not_a_name_clash`); `services/inventory/tests/test_bulk.py` (`test_put_device_explicit_null_status_is_422_naming_the_field`)
+  `poll_interval_seconds` still clears the override. On create and on update alike,
+  only a unique violation at commit answers 409 `Device with name '<name>' already
+  exists`; any other integrity error (a template deleted after the create read it, a
+  NOT NULL, a CHECK, or one a trigger raises) answers 409 `Device violates a database
+  constraint`, naming no constraint and no statement. The refusal is classified by its
+  SQLSTATE, or SQLite's extended error code, never by its text, and the log line
+  names the SQLSTATE only. \
+  Enforced in: `services/inventory/app/schemas/device.py` (`DeviceUpdate`); `services/inventory/app/services/inventory_service.py` (`create_device`, `update_device`, `_device_write_refused`, `DEVICE_CONSTRAINT_DETAIL`); `services/inventory/app/services/db_refusal.py` (`sqlstate_of`, `UNIQUE_VIOLATION`, `SQLITE_SQLSTATES`) \
+  Pinned by: `services/inventory/tests/test_schema_bounds.py` (`test_device_update_explicit_null_on_not_null_column_rejected_by_name`, `test_device_update_explicit_null_poll_interval_still_clears_the_override`); `services/inventory/tests/test_inventory_service_unit.py` (`test_update_device_duplicate_name`, `test_update_device_non_unique_integrity_error_is_not_a_name_clash`, `test_create_device_unique_violation_is_a_taken_name`, `test_create_device_other_integrity_error_is_not_a_name_clash`, `test_update_device_unique_violation_is_a_taken_name`, `test_update_device_other_integrity_error_is_not_a_name_clash`); `services/inventory/tests/test_db_refusal.py` (`test_an_asyncpg_sqlstate_is_read_as_given`, `test_a_sqlite_error_name_maps_to_its_sqlstate`, `test_a_real_sqlite_unique_violation_reads_23505`, `test_text_alone_names_no_class`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_device_create_refused_for_anything_but_its_name_is_not_a_name_clash`, `test_a_template_deleted_before_a_device_insert_is_not_a_name_clash`); `services/inventory/tests/test_bulk.py` (`test_put_device_explicit_null_status_is_422_naming_the_field`)
 - **INV-DEV-12.** Deleting a device removes its ports and its group memberships with it. \
   Enforced in: `services/inventory/app/models/device.py` (`Device`); `services/inventory/app/models/device_group.py` (`DeviceGroupDevice`) \
   Pinned by: `services/inventory/tests/test_ports.py` (`test_delete_device_cascades_ports`); `services/inventory/tests/test_device_groups.py` (`test_delete_device_cascades_from_group`); `services/inventory/tests/test_storage_constraints.py` (`test_delete_device_cascades_device_group_device`)
@@ -630,7 +638,7 @@ size per user. Admins can also copy and bulk-delete devices.
 **Surfaces.** User interface `frontend/src/pages/InventoryPage.tsx`,
 `frontend/src/lib/inventoryFilters.ts`; route `GET /devices` (and the port and cabling
 connection reads for an expanded row). Import and export controls and Copy render for
-admins only. Copy names the new device `Copy of <name>` and sends the source's template,
+admins only. Copy names the new device `Copy of <name>` (cut to fit, INV-LIST-16) and sends the source's template,
 topology type, and `field_data`, leaving the status to the default; the Template
 filter pages through the device templates instead of stopping at the first 500
 (issue #1336).
@@ -722,9 +730,10 @@ filter pages through the device templates instead of stopping at the first 500
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`selects and deselects every row`, `deletes every selected device and reports the count on full success`, `reports a partial failure count when one delete fails`, `says remove the cables first when a bulk delete is refused as cabled (issue #940)`)
 - **INV-LIST-16.** Copy creates a new device and then copies the source's ports one at
   a time; the toast reports how many ports were copied or failed, and a failed port
-  copy does not undo the device. \
-  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`handleCopy`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`duplicates a device with its ports and reports the count`, `reports the count of ports that failed to copy without failing the whole operation`, `shows an error toast when the device create itself fails`)
+  copy does not undo the device. The copy's name always fits its column, cut as
+  INV-TPL-21 says. \
+  Enforced in: `frontend/src/pages/InventoryPage.tsx` (`handleCopy`); `frontend/src/lib/copyName.ts` (`copyName`) \
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`duplicates a device with its ports and reports the count`, `reports the count of ports that failed to copy without failing the whole operation`, `shows an error toast when the device create itself fails`, `cuts a long device name of %s so the copy's name fits its column`)
 
 **Out of scope.** The filter panel's layout component (`ListFilterPanel`) is shared by
 every list page and carries no inventory rule. Cabling connections shown in an
@@ -1020,12 +1029,60 @@ download, delete); routes under `/drivers`. The package format is in
 - **INV-DRV-19.** A driver upload, file replacement, download, or delete does its
   blocking work off the event loop (issue #1327): the upload's SHA256, the
   `driver_metadata.json` read, and every storage write, read, and delete (a MinIO round
-  trip or a local file operation) run in a worker thread through `asyncio.to_thread`,
-  so the service answers other requests, `GET /health` among them, while one is in
-  flight. A 422 refusal raised by the metadata read in the worker reaches the caller
-  unchanged, and nothing is stored. \
-  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`) \
+  trip or a local file operation) run in a worker thread, one of the storage threads of
+  INV-DRV-22, so the service answers other requests, `GET /health` among them, while
+  one is in flight. A 422 refusal raised by the metadata read in the worker reaches the
+  caller unchanged, and nothing is stored. \
+  Enforced in: `services/inventory/app/services/driver_service.py` (`_inspect_package`, `create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`); `services/inventory/app/storage.py` (`run_on_storage_thread`) \
   Pinned by: `services/inventory/tests/test_driver_storage_offload.py` (`test_driver_upload_hashes_parses_and_stores_off_the_event_loop`, `test_a_refused_oversized_metadata_upload_still_parses_off_the_event_loop`, `test_duplicate_name_cleanup_delete_runs_off_the_event_loop`, `test_file_replace_parses_stores_and_deletes_off_the_event_loop`, `test_both_download_routes_read_storage_off_the_event_loop`, `test_driver_delete_removes_the_object_off_the_event_loop`, `test_health_answers_while_a_driver_upload_is_blocked_in_storage`)
+- **INV-DRV-22.** The work of INV-DRV-19 runs on inventory's own pool of
+  `DRIVER_STORAGE_THREADS` (4) storage threads, never on asyncio's default executor,
+  where `loop.getaddrinfo` resolves the names of new database and NATS connections
+  (issue #1416). A call sees its caller's context variables. At most four such calls
+  run at once; another waits for a thread, with no bound on the wait, and one
+  cancelled while it waits never runs. A stalled
+  object store can hold those four threads, and the up to `MINIO_PART_THREADS` (3)
+  threads the MinIO client starts for each multipart upload in addition to them, and
+  so delay other driver uploads, replacements, downloads, and deletes, but not name
+  resolution, the event loop, or any other worker thread. Replacements and deletes
+  keep their pooled database connection while they wait on storage; create and
+  download hold none (a download gives its connection back before it waits for a
+  storage thread). When the app stops, the pool is shut down: a call still waiting
+  for a thread is cancelled and never runs, and the shutdown does not wait for a
+  running call. \
+  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`, `shutdown_storage_executor`, `MINIO_PART_THREADS`); `services/inventory/app/services/driver_service.py` (`create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`); `services/inventory/app/main.py` (`lifespan`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_the_callers_context_variables_reach_the_storage_call`, `test_a_call_cancelled_while_it_waits_for_a_thread_never_runs`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`, `test_a_create_waiting_on_storage_holds_no_database_connection`, `test_app_shutdown_cancels_queued_storage_calls_and_does_not_wait_for_running_ones`)
+- **INV-DRV-23.** On MinIO, a connect gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
+  (15), and a request is sent under the same timeout: over plain HTTP
+  (`MINIO_USE_SSL=false`, the default) a whole request body (one part, at most 5 MiB)
+  must be sent within it, about 341 KiB/s for a 5 MiB part however steadily the store
+  takes it, and over TLS it applies to each send. A wait for the next bytes of an
+  answer gives up after `MINIO_READ_TIMEOUT_SECONDS` (30). A GET, HEAD, PUT, or
+  DELETE that fails that way or is answered 500, 502, 503, or 504 is tried again at
+  most `MINIO_RETRIES` (2) times, 0 s and then 0.4 s apart, with no wait a Retry-After
+  header names; a POST (the start or the completion of a multipart upload) is tried
+  again only when its connection fails (issue #1416). Those are the bounds of one
+  request. A storage call is one request, except an upload over 5 MiB, which the
+  MinIO client sends as a multipart upload: a POST to start it, its parts of 5 MiB as
+  parallel PUTs, a POST to complete it, and, after a failure once it has started, a
+  DELETE to abort it. Against a store that accepts connections and never answers, a
+  download, a delete, or an upload of at most 5 MiB ends within 90.4 s (three 30 s
+  attempts and the 0.4 s backoff); a download whose answer stops after its headers
+  ends 30 s after its last bytes (a body read is not tried again); and a multipart
+  upload ends within 30 s when its start goes unanswered, within about 181 s when the
+  start is answered and its parts are not (the parts' 90.4 s, then the abort's
+  90.4 s), and about 120 s after its parts are stored when its completion goes
+  unanswered (30 s, then the abort's 90.4 s). Apart from a body send over plain HTTP,
+  the bounds are on each wait for progress, not on a whole transfer. Execution's
+  internal download client (`download_driver_package`) gives up after 30 s without
+  an answer, before inventory's retries end; inventory's call still runs to its own
+  bound on its storage thread. The pool keeps up to `MINIO_POOL_CONNECTIONS` (16)
+  connections, every storage thread's own request plus its upload's three part
+  threads, so concurrent multipart uploads never discard a connection. These are
+  named constants, not settings. The failure answers as
+  INV-DRV-20 and section 10 say. \
+  Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `upload_object`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`, `MINIO_PART_THREADS`, `MINIO_POOL_CONNECTIONS`); `services/execution/app/services/driver_loader.py` (`download_driver_package`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`, `test_each_request_of_a_storage_call_is_tried_as_its_method_allows`, `test_concurrent_multipart_uploads_never_overflow_the_connection_pool`)
 - **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
   create answers 500 and commits no row, and a storage failure on file replace answers
   500 and leaves the row naming the old archive, which is still stored and still
@@ -1417,7 +1474,7 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   NaN; a JSON number with a fraction is truncated), `poll_interval_seconds: must be a
   whole number`. A refused row is rolled back and the rows after it are judged on
   their own (INV-BULK-7). \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_sqlstate_of`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `_RowName`, `DATABASE_REFUSED_REASON`, `DATABASE_UNAVAILABLE_REASON`, `_TRANSIENT_SQLSTATE_CLASSES`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
+  Enforced in: `services/inventory/app/services/db_refusal.py` (`sqlstate_of`, `SQLITE_SQLSTATES`); `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `_RowName`, `DATABASE_REFUSED_REASON`, `DATABASE_UNAVAILABLE_REASON`, `_TRANSIENT_SQLSTATE_CLASSES`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
   Pinned by: `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_device_rows_past_a_column_bound_name_the_field`, `test_template_rows_past_a_column_bound_name_the_field`, `test_a_refusal_raised_outside_the_service_functions_gets_its_fixed_reason`, `test_a_template_whose_driver_goes_before_its_insert_gets_the_fixed_reason`, `test_a_device_name_taken_before_its_insert_gets_the_fixed_reason`); `services/inventory/tests/test_bulk_service_unit.py` (`test_a_refused_row_is_named_by_its_sqlstate`, `test_a_row_whose_connection_was_lost_is_named_unavailable`, `test_a_row_sqlite_refuses_is_named_by_its_error_code`, `test_a_row_that_fails_otherwise_keeps_no_text`, `test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason`, `test_a_json_cell_that_is_not_json_raises_the_fixed_reason`, `test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason`); `services/inventory/tests/test_bulk.py` (`test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route`, `test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason`, `test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason`, `test_an_unexpected_row_failure_is_reported_without_its_text`); `services/inventory/tests/test_column_bounds.py` (`test_the_device_importers_name_the_field_a_row_breaks`, `test_the_template_importers_name_the_field_a_row_breaks`); `tests/integration/test_bulk_import_export.py` (`test_template_import_rows_past_a_column_bound_name_the_field`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
@@ -1514,18 +1571,23 @@ instance lifecycle is `dynamic-resources.md`'s.
   Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_rejects_non_dynamic_template_422`)
 - **INV-DYN-2.** Without a name, the device is named `<template name>-<first 8
   characters of reservation_id>-<n>`, with `n` counting up from 1 past every name
-  already taken. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`, `test_internal_create_name_collision_disambiguates`)
+  already taken. A generated device name always fits its column: when the whole name
+  would pass 255 characters, the template name is cut from its end, by characters,
+  so the name is exactly 255 with the `-<reservation>-<n>` suffix whole; the name
+  depends only on the template name, the reservation, and `n`. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `generated_device_name`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_generates_name`, `test_internal_create_name_collision_disambiguates`, `test_a_generated_device_name_always_fits_its_column`, `test_internal_create_generated_names_fit_the_column_at_the_boundary_lengths`)
 - **INV-DYN-3.** `field_data` is validated against the template with unknown keys
   allowed, so instance attributes the recipe returns are kept; defaults and required
   fields still apply. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`validate_field_data`, `create_dynamic_instance_device`) \
   Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_allows_unknown_field_data`)
 - **INV-DYN-4.** A create carrying a `request_id` that already has a device answers 201
-  with that same device and creates nothing. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_unique_conflict_target`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_same_request_id_returns_same_device`, `test_internal_create_explicit_name_same_request_id_returns_existing`)
+  with that same device and creates nothing, also when a concurrent create with that
+  `request_id` commits first: after a unique violation the create looks the
+  `request_id` up and answers its device. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_insert_dynamic_device`, `_holder_of_request_id`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_same_request_id_returns_same_device`, `test_internal_create_explicit_name_same_request_id_returns_existing`, `test_internal_create_that_loses_a_request_id_race_returns_the_winner`)
 - **INV-DYN-5.** Without a `request_id` every create makes a new device; an explicit
   name that is taken answers 409 `Device with name '<name>' already exists`. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
@@ -1545,6 +1607,15 @@ instance lifecycle is `dynamic-resources.md`'s.
   `Could not generate a unique device name for prefix '<prefix>'`. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_MAX_NAME_ATTEMPTS`) \
   Pinned by: none
+- **INV-DYN-10.** A refused insert moves the generated name on to the next `n` only
+  for a unique violation that no device holding the `request_id` explains, and an
+  explicit name answers 409 `Device with name '<name>' already exists` only then. Any
+  other integrity error (a foreign key, a CHECK, or one a trigger raises) answers 409
+  `Device violates a database constraint` after that one insert, with a log line
+  naming the SQLSTATE only (INV-DEV-11). The refusal is classified by its SQLSTATE,
+  or SQLite's extended error code, never by its text. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`_insert_dynamic_device`, `_holder_of_request_id`, `_device_write_refused`); `services/inventory/app/services/db_refusal.py` (`sqlstate_of`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_a_refusal_that_is_not_a_unique_violation_answers_at_once`, `test_internal_create_name_collision_retry_with_request_id_set`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_dynamic_instance_refused_for_anything_but_a_unique_violation_answers_at_once`, `test_a_dynamic_instance_whose_generated_name_is_taken_tries_the_next`)
 
 **Out of scope.** The execution ledger, retries, and teardown order
 (`dynamic-resources.md`).
@@ -1694,7 +1765,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `{"error": "device_cabled", "connection_count", "connection_ids"}` | delete of a device a connection names | INV-DEL-4 |
 | 409 | `{"error": "port_cabled", "connection_count", "connection_ids"}` | delete or rename of a port a connection names | INV-PORT-8, INV-PORT-10 |
 | 409 | `Device with name '<name>' already exists` | duplicate device name | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
-| 409 | `Device violates a database constraint` | a non-unique integrity error on device update | INV-DEV-11 |
+| 409 | `Device violates a database constraint` | a non-unique integrity error on device create or update, or on a dynamic-instance create | INV-DEV-11, INV-DYN-10 |
 | 409 | `Could not generate a unique device name for prefix '<prefix>'` | the dynamic-instance name search ran out | INV-DYN-9 |
 | 409 | `Device is not a dynamic instance` | internal delete of a non-dynamic device | INV-DYN-7 |
 | 409 | `Template with name '<name>' already exists` or `Template violates a database constraint` | duplicate template name; another integrity error | INV-TPL-3 |
@@ -1745,7 +1816,7 @@ A rejected import row is not an HTTP error: it is a `reject` entry with a `reaso
 | inventory to cabling | cabling | `GET /internal/forks/by-device/{id}` (`X-Internal-Token`, 5 s) | delete guard: fork wiring and connections naming the device | fail closed: 503 (INV-DEL-5) |
 | inventory to cabling | cabling | `GET /connections/internal/by-port?device_id&port_name` (`X-Internal-Token`, 5 s) | port delete and rename guard: connections naming the port | fail closed: 503 (INV-PORT-8) |
 | inventory to secrets | secrets | `GET /internal/secrets/{id}/value` (`X-Internal-Token`, 10 s); only the status code is read | hypervisor secret exists | fail closed: 404 is 422, anything else 503 (INV-HYP-3, INV-HYP-4) |
-| inventory to storage | local disk or MinIO | put, get, remove object | driver archives | upload or download failure is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
+| inventory to storage | local disk or MinIO | put, get, remove object, on the storage threads (INV-DRV-22), each MinIO request bounded by INV-DRV-23 | driver archives | upload or download failure, a MinIO timeout included, is unhandled (500); a delete failure is ignored (INV-DRV-12, INV-DRV-13) |
 | inventory to execution, acl, reservations | | config schema, apply, and fire-time checks | device configuration | specified in `device-configuration.md` |
 
 The calls other services make to inventory are section 7.
@@ -1766,8 +1837,8 @@ The calls other services make to inventory are section 7.
 
 | Level | Where | Notes |
 |---|---|---|
-| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
-| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
+| Unit | `services/inventory/tests/` (`test_*_unit.py`, `test_db_refusal.py`, `test_template_schema_validators.py`, `test_schema_bounds.py`, `test_storage.py`, `test_storage_atomic_write.py`, `test_storage_constraints.py`, `test_device_delete_guard.py`); `services/common/tests/test_csv_safety.py`, `services/common/tests/test_csv_import.py`; `tests/unit/test_poll_floor_parity.py`; frontend `frontend/src/test/api/deleteDeviceErrorMessage.test.ts` | SQLite in memory; `test_storage_constraints.py` turns on SQLite foreign keys, no other inventory suite does |
+| Functional (through the service API) | `services/inventory/tests/test_devices.py`, `test_templates.py`, `test_ports.py`, `test_drivers.py`, `test_driver_metadata_bounds.py`, `test_driver_storage_offload.py`, `test_driver_storage_threads.py`, `test_driver_storage_consistency.py`, `test_hypervisors.py`, `test_device_groups.py`, `test_bulk.py`, `test_devices_internal.py`, `test_device_read_visibility_gate.py`, `test_rbac_denial.py`, and siblings; frontend page tests under `frontend/src/test/pages/` | Upstream services are patched; the delete guard is patched to pass in most suites. `test_bulk_import_reasons_live_pg.py` drives the import routes with the request session on a real Postgres, in the gates' Postgres-live phase only (INV-BULK-28) |
 | Integration (running stack) | `tests/integration/test_device_delete_guard.py`, `test_device_group_visibility.py`, `test_device_batch_fetch.py`, `test_bulk_import_export.py`, `test_driver_flow.py`, `test_dynamic_resources.py`, `test_provisioning_failed.py` | Run by the advisory CI `integration` job and the gates |
 | Stress and load | `tests/load/locustfile.py` (`InventoryBrowser`, `BulkExporter`) | Read and export load only; no write load on inventory |
 | Browser end-to-end | `tests/e2e/test_inventory_filters_playwright.py`, `test_inventory_expanded_playwright.py`, `test_inventory_saved_search_late_load_playwright.py`, `test_inventory_effects_playwright.py`, `test_templates_playwright.py`, `test_dynamic_template_authoring_playwright.py`, `test_device_groups.py`, `test_drivers.py`, `test_bulk_import_export.py`, `test_add_device_ui.py` | Nightly and the gates, not per-PR CI |

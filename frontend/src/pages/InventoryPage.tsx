@@ -15,6 +15,7 @@ import { fetchPorts, useCreatePort, usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
 import { useTemplates } from "@/api/templates";
 import { useAuthStore } from "@/stores/authStore";
+import { copyName } from "@/lib/copyName";
 import { isAdminRole } from "@/lib/roles";
 import { ROW_PRIMARY_CONTROL_CLASS, rowClick } from "@/lib/rowNavigation";
 import {
@@ -467,7 +468,7 @@ export function InventoryPage() {
   const handleCopy = async (device: Device) => {
     try {
       const newDevice = await createDevice.mutateAsync({
-        name: `Copy of ${device.name}`,
+        name: copyName(device.name),
         template_id: device.template_id,
         topology_type: device.topology_type,
         field_data: device.field_data,

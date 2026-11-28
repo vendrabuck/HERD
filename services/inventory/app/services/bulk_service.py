@@ -54,6 +54,7 @@ from app.schemas.bulk import BulkImportReport, RowResult
 from app.schemas.column_bounds import ColumnText
 from app.schemas.device import DeviceCreate, DeviceUpdate
 from app.schemas.template import TemplateCreate, TemplateUpdate
+from app.services.db_refusal import sqlstate_of
 from app.services.inventory_service import create_device, update_device
 from app.services.template_service import create_template, update_template
 
@@ -167,15 +168,6 @@ _SQLSTATE_CLASS_REASONS = {
     "23": "a value breaks a database constraint",
     "22": "a value does not fit the type of its column",
 }
-# SQLite's extended error codes (`sqlite3.Error.sqlite_errorname`) for the same classes.
-_SQLITE_SQLSTATES = {
-    "SQLITE_CONSTRAINT_UNIQUE": "23505",
-    "SQLITE_CONSTRAINT_PRIMARYKEY": "23505",
-    "SQLITE_CONSTRAINT_FOREIGNKEY": "23503",
-    "SQLITE_CONSTRAINT_NOTNULL": "23502",
-    "SQLITE_CONSTRAINT_CHECK": "23514",
-    "SQLITE_TOOBIG": "22001",
-}
 # Any other failure of a row: no exception text, only the fact.
 ROW_UNEXPECTED_REASON = "the row could not be imported"
 
@@ -194,18 +186,8 @@ def _json_syntax_reason(exc: json.JSONDecodeError) -> str:
     return f"{exc.msg}: line {exc.lineno} column {exc.colno} (char {exc.pos})"
 
 
-def _sqlstate_of(exc: DBAPIError) -> str | None:
-    """The SQLSTATE of a refused statement: asyncpg's, or SQLite's error code mapped
-    to the same classes. None when the driver gives neither."""
-    orig = exc.orig
-    sqlstate = getattr(orig, "sqlstate", None)
-    if isinstance(sqlstate, str):
-        return sqlstate
-    return _SQLITE_SQLSTATES.get(getattr(orig, "sqlite_errorname", None) or "")
-
-
 def _database_reason(exc: DBAPIError) -> str:
-    sqlstate = _sqlstate_of(exc)
+    sqlstate = sqlstate_of(exc)
     logger.warning("bulk import row refused by the database: sqlstate=%s", sqlstate or "none")
     if exc.connection_invalidated or (sqlstate or "")[:2] in _TRANSIENT_SQLSTATE_CLASSES:
         return DATABASE_UNAVAILABLE_REASON
