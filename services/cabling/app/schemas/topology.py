@@ -1,23 +1,29 @@
 from datetime import datetime
 from typing import Any
 
-from app.schemas._types import OptionalUUIDStr, UUIDStr, UUIDStrList
+from app.schemas._types import (
+    NAME_MAX_LENGTH,
+    ColumnText,
+    OptionalUUIDStr,
+    UUIDStr,
+    UUIDStrList,
+)
 from app.services.canvas_shape import CanvasData
 from pydantic import BaseModel, Field
 
 
 class TopologyCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: ColumnText = Field(min_length=1, max_length=NAME_MAX_LENGTH)
 
 
 class TopologyClone(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: ColumnText = Field(min_length=1, max_length=NAME_MAX_LENGTH)
 
 
 class TopologyUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=100)
+    name: ColumnText | None = Field(default=None, min_length=1, max_length=NAME_MAX_LENGTH)
     canvas_data: CanvasData | None = None
-    description: str | None = Field(default=None, max_length=2000)
+    description: ColumnText | None = Field(default=None, max_length=2000)
 
 
 class TopologyResponse(BaseModel):
@@ -86,7 +92,7 @@ class TopologyVersionDiff(BaseModel):
 
 
 class TopologyRestoreRequest(BaseModel):
-    description: str | None = Field(default=None, max_length=2000)
+    description: ColumnText | None = Field(default=None, max_length=2000)
     restore_name: bool = False
 
 

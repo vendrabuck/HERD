@@ -1876,10 +1876,41 @@ async def test_a_device_cell_past_the_field_limit_is_judged_not_a_500(user_clien
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dry_run", [True, False])
 async def test_a_topology_name_past_the_field_limit_is_read(user_client, dry_run):
+    """The reader reads the whole cell, and the row is then judged by its name's
+    length like any other (TOPO-BULK-10)."""
     name = "t" * (_DEFAULT_FIELD_LIMIT + 1)
-    resp = await _import_csv(user_client, f"{_CSV_HEADER}\n{name},,,,,\n", dry_run=dry_run)
+    resp = await _import_csv(
+        user_client, f"{_CSV_HEADER}\n{name},,,,,\nlab,,,,,\n", dry_run=dry_run
+    )
     assert resp.status_code == 200, resp.text
-    assert [(r["action"], r["identity"]) for r in resp.json()["rows"]] == [("create", name)]
+    assert [(r["action"], r["identity"], r["reason"]) for r in resp.json()["rows"]] == [
+        ("reject", name, "name: must be at most 100 characters"),
+        ("create", "lab", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("n" * 100, None),
+        ("  " + "n" * 100 + "  ", None),
+        ("n" * 101, "name: must be at most 100 characters"),
+        ("m" * 255, "name: must be at most 100 characters"),
+        ("o" * 256, "name: must be at most 100 characters"),
+        ("a\x00b", "name: must not hold a NUL character"),
+        ("\x00", "name: must not hold a NUL character"),
+    ],
+    ids=["100", "100_padded", "101", "255", "256", "nul", "only_nul"],
+)
+async def test_a_topology_name_is_held_to_the_topology_routes_bound(user_client, name, reason):
+    """The import's name bound is `TopologyCreate`'s: at most 100 characters once
+    stripped, and no NUL; past it the row is rejected with a reason naming the
+    field, and the other rows import."""
+    resp = await _import_json(user_client, [{"name": name}, {"name": "other"}], dry_run="true")
+    assert resp.status_code == 200, resp.text
+    rows = [(r["action"], r["reason"]) for r in resp.json()["rows"]]
+    assert rows == [("create" if reason is None else "reject", reason), ("create", None)]
 
 
 @pytest.mark.asyncio

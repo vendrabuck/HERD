@@ -973,3 +973,71 @@ async def test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases(client, 
         assert latest.version_number == 2
         assert latest.canvas_data is None
         assert (await db.execute(select(ForkConnection))).scalars().all() == []
+
+
+# Text written to a column ---------------------------------------------------------------
+
+NUL_422_ITEM = {
+    "type": "text_holds_nul",
+    "msg": "Value holds a NUL character, which no database column takes",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["a\u0000b", "\u0000", "ab\u0000"], ids=["middle", "only", "end"])
+async def test_every_name_and_description_holding_a_nul_is_a_422(client, text):
+    """Each request field cabling writes to a name or description column refuses a
+    NUL character with one 422 item naming the field, and writes nothing."""
+    topology_id = await _seed_topology("lab", USER_A, _good_canvas())
+    (version_id,) = await _version_ids(topology_id)
+    template = await client.post("/templates", json={"name": "tmpl"})
+    assert template.status_code == 201, template.text
+    template_id = template.json()["id"]
+    sends = [
+        (client.post, "/topologies", {"name": text}, ["body", "name"]),
+        (client.put, f"/topologies/{topology_id}", {"name": text}, ["body", "name"]),
+        (client.put, f"/topologies/{topology_id}", {"description": text}, ["body", "description"]),
+        (client.post, f"/topologies/{topology_id}/clone", {"name": text}, ["body", "name"]),
+        (
+            client.post,
+            f"/topologies/{topology_id}/versions/{version_id}/restore",
+            {"description": text},
+            ["body", "description"],
+        ),
+        (client.post, "/templates", {"name": text}, ["body", "name"]),
+        (client.post, "/templates", {"name": "t2", "description": text}, ["body", "description"]),
+        (client.put, f"/templates/{template_id}", {"name": text}, ["body", "name"]),
+        (
+            client.put,
+            f"/templates/{template_id}",
+            {"description": text},
+            ["body", "description"],
+        ),
+        (
+            client.post,
+            f"/templates/{template_id}/instantiate",
+            {"name": text, "role_assignments": {}},
+            ["body", "name"],
+        ),
+        (
+            client.post,
+            f"/templates/from-topology/{topology_id}",
+            {"name": text},
+            ["body", "name"],
+        ),
+        (
+            client.post,
+            f"/templates/from-topology/{topology_id}",
+            {"name": "t3", "description": text},
+            ["body", "description"],
+        ),
+    ]
+    for send, url, body, loc in sends:
+        resp = await send(url, json=body)
+        assert resp.status_code == 422, (url, resp.text)
+        assert resp.json() == {"detail": [{**NUL_422_ITEM, "loc": loc}]}, url
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(Topology.name))).scalars().all() == ["lab"]
+        templates = (await db.execute(select(TopologyTemplate.name))).scalars().all()
+    assert templates == ["tmpl"]
+    assert len(await _version_ids(topology_id)) == 1

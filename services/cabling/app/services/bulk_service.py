@@ -67,6 +67,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.topology import Topology, TopologyVersion
+from app.schemas._types import NAME_MAX_LENGTH
 from app.schemas.bulk import BulkImportReport, RowResult
 from app.services.canvas_nodes import redact_invisible_device_nodes, strip_device_nodes
 from app.services.canvas_shape import canvas_problem, stored_canvas_readable
@@ -105,6 +106,11 @@ IMPORT_JSON_UNREADABLE_DETAIL = (
 # itself, so it never meets one.
 ROW_NOT_AN_OBJECT_REASON = "row is not an object"
 NAME_NOT_A_STRING_REASON = "name: must be a string"
+# A topology name the topology routes would refuse (`NAME_MAX_LENGTH`, and no NUL
+# character, which no database column takes), judged on the name as it is stored,
+# its surrounding whitespace stripped. A CSV record's name is judged the same way.
+NAME_TOO_LONG_REASON = f"name: must be at most {NAME_MAX_LENGTH} characters"
+NAME_HOLDS_NUL_REASON = "name: must not hold a NUL character"
 
 # A row whose handling raised something other than an HTTPException: the reason and
 # the log carry the exception's class name.
@@ -121,7 +127,8 @@ def _record_shape_reason(rec: Any) -> str | None:
     """The fixed reject reason for a record the importer cannot read, else None.
 
     Checked before anything reads the record. The item must be an object and its
-    `name` a string; its `canvas` must have the shape `canvas_shape.canvas_problem`
+    `name` a string of at most `NAME_MAX_LENGTH` characters once stripped, holding no
+    NUL character; its `canvas` must have the shape `canvas_shape.canvas_problem`
     checks, the one every canvas write is held to, reported as
     `canvas.<path>: <message>`. A null or absent `name` or `canvas` passes; a null
     item does not.
@@ -131,6 +138,11 @@ def _record_shape_reason(rec: Any) -> str | None:
     name = rec.get("name")
     if name is not None and not isinstance(name, str):
         return NAME_NOT_A_STRING_REASON
+    if name is not None:
+        if "\x00" in name:
+            return NAME_HOLDS_NUL_REASON
+        if len(name.strip()) > NAME_MAX_LENGTH:
+            return NAME_TOO_LONG_REASON
     problem = canvas_problem(rec.get("canvas"))
     if problem is not None:
         return problem.text("canvas")

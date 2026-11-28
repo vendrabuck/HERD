@@ -1250,9 +1250,13 @@ inside the dialog) is INV-BULK-17 in `inventory.md`, not a rule here.
 - **TOPO-BULK-10.** A row with no name is rejected `missing required field: name`; a row
   naming devices that did not resolve is rejected `unresolved device names: <names>`. A
   device name longer than 255 characters or holding a NUL character cannot name a
-  device, so it is never sent to inventory and its row is rejected so. \
-  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`); `services/cabling/app/services/device_resolver.py` (`name_batches`) \
-  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup`)
+  device, so it is never sent to inventory and its row is rejected so. A topology name
+  is held to the topology routes' bound, judged once its surrounding whitespace is
+  stripped: one longer than `NAME_MAX_LENGTH` (100) characters is rejected `name: must
+  be at most 100 characters`, and one holding a NUL character `name: must not hold a
+  NUL character`, in a JSON or a CSV import alike. \
+  Enforced in: `services/cabling/app/services/bulk_service.py` (`import_topologies`, `rewrite_canvas_names_to_ids`, `_record_shape_reason`, `NAME_TOO_LONG_REASON`, `NAME_HOLDS_NUL_REASON`); `services/cabling/app/services/device_resolver.py` (`name_batches`) \
+  Pinned by: `services/cabling/tests/test_bulk.py` (`test_missing_name_rejected`, `test_unresolved_device_name_is_rejected`, `test_a_topology_name_is_held_to_the_topology_routes_bound`, `test_a_topology_name_past_the_field_limit_is_read`); `services/cabling/tests/test_route_handlers_direct.py` (`test_import_missing_name_and_unresolved_rejected`, `test_device_resolver_drops_a_name_no_device_can_have`, `test_import_of_a_device_name_holding_a_nul_rejects_its_row_without_a_lookup`)
 - **TOPO-BULK-11.** For a non-admin, visibility is read once per request (503 and nothing
   processed when it fails); a name resolving to a hidden device is reported exactly like
   an unknown name, and a device node carrying a raw id with no name is redacted before
@@ -1918,13 +1922,24 @@ sections 8.4 to 8.14.
   wiring; restore a saved version, or rebuild the canvas, before saving a canvas with
   no nodes` and writes nothing; a canvas with nodes saves as any other. By decision,
   as TOPO-SHAPE-6: an editor never opens a drawing it could not load as an empty one
-  whose save would release the reservation's cables. The fork version read and the version restore answer the 409
-  of TOPO-SHAPE-6 for a version without the shape; fork create answers it for a parent
+  whose save would release the reservation's cables. The fork version read and the
+  version restore answer the 409 of TOPO-SHAPE-6 for a version without the shape; fork
+  create answers it for a parent
   canvas without the shape and writes nothing; and a prune reads a saved canvas without
   the shape as none (every row touching a removed device releases, and the appended
   version's canvas is null) and leaves a draft without the shape as it is. \
   Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_answered_draft`, `_refuse_empty_canvas_over_unreadable_draft`, `EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL`, `update_fork_canvas_internal`, `save_fork_internal`, `get_fork_version_internal`, `restore_fork_version_internal`); `services/cabling/app/services/fork_service.py` (`create_fork`); `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`); `services/cabling/app/services/canvas_shape.py` (`readable_canvas_or_none`) \
   Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_over_a_bad_draft`, `test_a_fork_read_over_a_bad_draft_answers_the_latest_saved_canvas`, `test_an_empty_canvas_over_a_bad_draft_is_refused_while_the_fork_holds_wiring`, `test_an_empty_canvas_saves_when_the_draft_is_readable_or_nothing_is_wired`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
+- **TOPO-SHAPE-9.** Every request string cabling writes to a name or description column
+  refuses a NUL character, which no database column takes, with one 422 item
+  `{"type": "text_holds_nul", "loc": ["body", "<field>"], "msg": "Value holds a NUL
+  character, which no database column takes"}` and writes nothing: the `name` of a
+  topology create, PUT, and clone, of a template create, update, and from-topology, and
+  of a template instantiate, and the `description` of a topology PUT, a version restore,
+  and a template create, update, and from-topology. The topology import holds a record's
+  name to the same rules, as a rejected row (TOPO-BULK-10). \
+  Enforced in: `services/cabling/app/schemas/_types.py` (`ColumnText`, `NAME_MAX_LENGTH`, `NUL_TEXT_TYPE`, `NUL_TEXT_MESSAGE`); `services/cabling/app/schemas/topology.py` (`TopologyCreate`, `TopologyClone`, `TopologyUpdate`, `TopologyRestoreRequest`); `services/cabling/app/schemas/template.py` (`TemplateCreate`, `TemplateFromTopologyRequest`, `TemplateUpdate`, `InstantiateRequest`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_name_and_description_holding_a_nul_is_a_422`)
 
 **Out of scope.** The editor's own handling of a canvas it loads is sections 8.17 and
 8.20.
@@ -1970,6 +1985,7 @@ other error carries `detail` as a string or the object shown.
 | 422 | `Invalid CSV: line <n> could not be read; fix it and retry` | a CSV import the csv module refuses | TOPO-BULK-22 |
 | 422 | `{"error": "l3_intent_malformed", "node_id", "message"}` | fork save with malformed routing intent | TOPO-FORK-14 |
 | 422 | validation list, one item of type `canvas_shape` | a canvas body without the shape | TOPO-SHAPE-5 |
+| 422 | validation list, one item of type `text_holds_nul` | a name or description holding a NUL character | TOPO-SHAPE-9 |
 | 422 | validation list | a schema bound: name lengths, bulk item count, pair count, unknown sort or owner value, missing `member_device_ids`, missing internal token header, devices batch size | TOPO-CONN-2, TOPO-CONN-12, TOPO-PATH-7, TOPO-LIST-4, TOPO-CRUD-1, TOPO-FORK-3, TOPO-FORK-13, TOPO-DEVB-1 |
 | 500 | `internal: missing Authorization header while resolving device visibility` | a non-admin request reaching a visibility-filtered route with no header (only a test harness does this) | TOPO-VIS-1 |
 | 503 | the route's own visibility wording, for example `Could not verify device visibility; connections were not returned. Retry the request.` | a non-admin's visibility lookup failed | TOPO-CONN-7, TOPO-CONN-9, TOPO-FORK-25, TOPO-PATH-11, TOPO-VAL-11, TOPO-BULK-11 |
