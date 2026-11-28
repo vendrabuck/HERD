@@ -1408,10 +1408,12 @@ provision-result callback.
   fork and wiring routes) answers 503 with its message only when it is an
   `UpstreamUnavailable`, the type every message of RES-UPSTREAM-1 has
   (`UpstreamAnswerUnusable` is one). Any other `RuntimeError` answers `A service this
-  request depends on is unavailable` and is logged at WARNING with `action`
-  `unexpected_runtime_error` and its class name only. \
+  request depends on is unavailable` and is logged at ERROR with `action`
+  `unexpected_runtime_error`, `error_class` (its class name), and `error_location`
+  (`<file>:<line>:<function>` of the innermost frame of its traceback, or `no
+  traceback`), never its message or the traceback itself. \
   Enforced in: `services/reservations/app/services/upstream_failure.py` (`unavailable_detail`, `SERVICE_UNAVAILABLE`); `services/reservations/app/routers/reservations.py` (`create_new_reservation`, `update_reservation_by_id`, `get_reservation_fork`, `update_reservation_fork_canvas`, `save_reservation_fork`, `get_reservation_fork_version`, `restore_reservation_fork_version`, `get_reservation_wiring_status`, `retry_reservation_wiring`) \
-  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unavailable_detail_keeps_a_worded_failure_and_replaces_any_other`, `test_a_runtime_error_no_rule_words_answers_the_fixed_detail`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_a_runtime_error_no_rule_words_answers_the_fixed_detail`)
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unavailable_detail_keeps_a_worded_failure_and_replaces_any_other`, `test_an_unworded_runtime_error_is_logged_by_its_innermost_frame`, `test_a_runtime_error_no_rule_words_answers_the_fixed_detail`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_a_runtime_error_no_rule_words_answers_the_fixed_detail`)
 - **RES-UPSTREAM-3.** A log line about a failed call names the status code, the
   exception's class name (or the label of RES-UPSTREAM-1), and ids only: a failed
   inventory device status update (`Failed to update device <id> status to <status>

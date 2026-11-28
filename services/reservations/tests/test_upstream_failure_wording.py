@@ -284,6 +284,39 @@ def test_unavailable_detail_keeps_a_worded_failure_and_replaces_any_other(caplog
     assert unavailable_detail(RecursionError(EXC_TEXT)) == SERVICE_UNAVAILABLE
     (first, second) = [r for r in caplog.records if r.__dict__.get("action")]
     assert (first.error_class, second.error_class) == ("RuntimeError", "RecursionError")
+    # Neither was raised, so neither has a frame to name.
+    assert (first.error_location, second.error_location) == ("no traceback", "no traceback")
+    assert first.levelno == second.levelno == logging.ERROR
+    assert first.exc_info is None and second.exc_info is None
+    _assert_absent(caplog)
+
+
+def _raise_not_implemented():
+    raise NotImplementedError(EXC_TEXT)
+
+
+def test_an_unworded_runtime_error_is_logged_by_its_innermost_frame(caplog):
+    """A programming error answers the fixed detail and is logged at ERROR with
+    `<file>:<line>:<function>` of the frame that raised it: the frame, never the
+    message, and no traceback."""
+    caplog.set_level(logging.DEBUG)
+    try:
+        _raise_not_implemented()
+    except NotImplementedError as exc:
+        assert unavailable_detail(exc) == SERVICE_UNAVAILABLE
+    line = _raise_not_implemented.__code__.co_firstlineno + 1
+    location = f"{__file__}:{line}:_raise_not_implemented"
+    (record,) = [
+        r for r in caplog.records if r.__dict__.get("action") == "unexpected_runtime_error"
+    ]
+    assert record.levelno == logging.ERROR
+    assert record.error_class == "NotImplementedError"
+    assert record.error_location == location
+    assert record.getMessage() == (
+        f"A request failed on an unexpected NotImplementedError at {location}; "
+        "answered 503 with fixed wording"
+    )
+    assert record.exc_info is None
     _assert_absent(caplog)
 
 

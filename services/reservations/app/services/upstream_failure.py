@@ -16,13 +16,15 @@ sent or the address it was reached at.
 - `answered(call, status_code)`: `<call> returned <status_code>`.
 - `unavailable_detail(exc)`: the 503 detail a route answers for a
   `RuntimeError`: the message of an `UpstreamUnavailable`, and for any other
-  `RuntimeError` the fixed `SERVICE_UNAVAILABLE`, logged by class name.
+  `RuntimeError` the fixed `SERVICE_UNAVAILABLE`, logged at ERROR by class name
+  and the innermost frame of its traceback.
 - `traceback_for(exc)`: the `exc_info` argument of a failure line about a call
   to another service: no traceback when the error or any exception it chains is
   an `httpx.HTTPStatusError`, else the error itself.
 """
 
 import logging
+import traceback
 
 import httpx
 
@@ -87,18 +89,36 @@ def answered(call: str, status_code: int) -> UpstreamUnavailable:
     return UpstreamUnavailable(f"{call} returned {status_code}")
 
 
+def _innermost_frame(exc: BaseException) -> str:
+    """`<file>:<line>:<function>` of the frame that raised `exc`, read from its
+    traceback's frames only (never its message), or `no traceback`."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "no traceback"
+    frame = frames[-1]
+    return f"{frame.filename}:{frame.lineno}:{frame.name}"
+
+
 def unavailable_detail(exc: RuntimeError) -> str:
     """The 503 detail for a RuntimeError a route caught.
 
     An `UpstreamUnavailable` (and `UpstreamAnswerUnusable`, its subclass) carries
-    its own fixed message. Any other RuntimeError (one a library raised) answers
-    `SERVICE_UNAVAILABLE`, and its class name is logged.
+    its own fixed message. Any other RuntimeError (a library's, or a programming
+    error such as `NotImplementedError` or `RecursionError`) answers
+    `SERVICE_UNAVAILABLE` and is logged at ERROR with its class name and the
+    innermost frame of its traceback, never its message or the traceback itself.
     """
     if isinstance(exc, UpstreamUnavailable):
         return str(exc)
-    logger.warning(
-        "A request failed on an unexpected %s; answered 503 with fixed wording",
+    location = _innermost_frame(exc)
+    logger.error(
+        "A request failed on an unexpected %s at %s; answered 503 with fixed wording",
         type(exc).__name__,
-        extra={"action": "unexpected_runtime_error", "error_class": type(exc).__name__},
+        location,
+        extra={
+            "action": "unexpected_runtime_error",
+            "error_class": type(exc).__name__,
+            "error_location": location,
+        },
     )
     return SERVICE_UNAVAILABLE
