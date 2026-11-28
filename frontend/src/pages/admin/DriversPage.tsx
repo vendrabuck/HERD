@@ -13,6 +13,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import type { ConnectionType } from "@/types/driver.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 
 const CONNECTION_TYPES: ConnectionType[] = [
   "Management",
@@ -31,8 +33,10 @@ function formatBytes(bytes: number): string {
 export function DriversPage() {
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading } = usePaginatedDrivers(skip, limit);
-  const drivers = data?.items;
+  const driversQuery = usePaginatedDrivers(skip, limit);
+  const { data } = driversQuery;
+  const state = loadState(driversQuery, noItems);
+  const drivers = data?.items ?? [];
   const total = data?.total ?? 0;
   const createDriver = useCreateDriver();
   const deleteDriver = useDeleteDriver();
@@ -142,9 +146,18 @@ export function DriversPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading ? (
+          <LoadErrorNotice what="drivers" query={driversQuery} isEmpty={noItems} className="m-4" />
+          {state === "loading" ? (
             <p className="text-sm text-gray-500 px-4 py-4">Loading drivers...</p>
-          ) : !drivers || drivers.length === 0 ? (
+          ) : state === "error" ? (
+            <LoadError
+              what="drivers"
+              error={driversQuery.error}
+              onRetry={() => void driversQuery.refetch()}
+              retrying={driversQuery.isFetching}
+              className="m-4"
+            />
+          ) : state === "empty" ? (
             <p className="text-sm text-gray-500 px-4 py-4">No drivers found</p>
           ) : (
             <div className="overflow-x-auto">

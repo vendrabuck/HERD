@@ -132,7 +132,7 @@ export function MultiConnectDialog({ open, onSubmit, onSuccess, onCancel }: Mult
   const [deviceA, setDeviceA] = useState<PickedDevice | null>(null);
   const [deviceB, setDeviceB] = useState<PickedDevice | null>(null);
 
-  const { source, target, connectionsLoading } = usePortAvailability(
+  const { source, target, connectionsUnknown } = usePortAvailability(
     deviceA?.id ?? "",
     deviceB?.id ?? "",
   );
@@ -234,7 +234,7 @@ export function MultiConnectDialog({ open, onSubmit, onSuccess, onCancel }: Mult
   );
 
   const duplicateCount = useMemo(() => lines.filter((l) => l.duplicate).length, [lines]);
-  const interactionDisabled = connectionsLoading || submitting;
+  const interactionDisabled = connectionsUnknown || submitting;
 
   const registerRowRef = useCallback((side: Side, portId: string, el: HTMLDivElement | null) => {
     if (el) rowRefs.current[side].set(portId, el);
@@ -606,6 +606,7 @@ export function MultiConnectDialog({ open, onSubmit, onSuccess, onCancel }: Mult
       ports: filteredPorts[side],
       totalCount: sideData[side].ports.length,
       isLoading: sideData[side].isLoading,
+      loadError: sideData[side].loadError,
       visuals: visuals[side],
       cabledCount: sideData[side].cabled.size,
       filter: filter[side],

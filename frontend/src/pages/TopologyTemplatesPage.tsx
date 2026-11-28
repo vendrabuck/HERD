@@ -15,6 +15,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Pagination } from "@/components/ui/Pagination";
 import toast from "react-hot-toast";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { loadState, noItems } from "@/lib/loadState";
 
 export function TopologyTemplatesPage() {
   const user = useAuthStore((s) => s.user);
@@ -23,7 +25,9 @@ export function TopologyTemplatesPage() {
 
   const [skip, setSkip] = useState(0);
   const limit = 50;
-  const { data, isLoading, isError } = useTopologyTemplates(skip, limit);
+  const templatesQuery = useTopologyTemplates(skip, limit);
+  const { data } = templatesQuery;
+  const state = loadState(templatesQuery, noItems);
   const templates = data?.items ?? [];
   const total = data?.total ?? 0;
 
@@ -42,20 +46,27 @@ export function TopologyTemplatesPage() {
         </div>
 
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {isLoading && (
+          <LoadErrorNotice what="topology templates" query={templatesQuery} isEmpty={noItems} className="m-4" />
+          {state === "loading" && (
             <p role="status" className="text-sm text-gray-400 text-center py-8">
               Loading templates...
             </p>
           )}
-          {isError && (
-            <p className="text-sm text-red-500 text-center py-8">Failed to load templates</p>
+          {state === "error" && (
+            <LoadError
+              what="topology templates"
+              error={templatesQuery.error}
+              onRetry={() => void templatesQuery.refetch()}
+              retrying={templatesQuery.isFetching}
+              className="m-4"
+            />
           )}
-          {!isLoading && templates.length === 0 && (
+          {state === "empty" && (
             <p className="text-sm text-gray-400 text-center py-8">
               No templates yet. Open a topology and click "Save as Template" to create one.
             </p>
           )}
-          {templates.length > 0 && (
+          {state === "loaded" && (
             <table className="w-full">
               <thead>
                 <tr className="border-b border-gray-200 bg-gray-50">
@@ -159,8 +170,11 @@ function InstantiateTemplateDialog({
   onClose: () => void;
   onCreated: (topologyId: string) => void;
 }) {
-  const { data: template, isLoading } = useTopologyTemplate(templateId);
-  const { data: devices } = useAllDevices();
+  const templateQuery = useTopologyTemplate(templateId);
+  const { data: template } = templateQuery;
+  const templateState = loadState(templateQuery);
+  const devicesQuery = useAllDevices();
+  const { data: devices } = devicesQuery;
   const instantiate = useInstantiateTemplate();
 
   const [name, setName] = useState("");
@@ -195,7 +209,15 @@ function InstantiateTemplateDialog({
 
   return (
     <Modal open onClose={onClose} title={template ? `Instantiate "${template.name}"` : "Instantiate"}>
-      {isLoading && <p className="text-xs text-gray-400">Loading template...</p>}
+      {templateState === "loading" && <p className="text-xs text-gray-400">Loading template...</p>}
+      {templateState === "error" && (
+        <LoadError
+          what="this template"
+          error={templateQuery.error}
+          onRetry={() => void templateQuery.refetch()}
+          retrying={templateQuery.isFetching}
+        />
+      )}
       {template && (
         <form onSubmit={handleSubmit}>
           <label htmlFor="instantiate-name" className="block text-sm font-medium text-gray-700 mb-1">
@@ -212,6 +234,14 @@ function InstantiateTemplateDialog({
 
           <div className="mt-4 space-y-2">
             <p className="text-xs font-medium text-gray-700">Role to device map</p>
+            {uniqueRoles.length > 0 && loadState(devicesQuery) === "error" && (
+              <LoadError
+                what="devices"
+                error={devicesQuery.error}
+                onRetry={() => void devicesQuery.refetch()}
+                retrying={devicesQuery.isFetching}
+              />
+            )}
             {uniqueRoles.length === 0 && (
               <p className="text-xs text-gray-500">This template has no roles to assign.</p>
             )}

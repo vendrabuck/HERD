@@ -1,5 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
 import apiClient from "./client";
+import { isUnreadableAnswer } from "./answerGuard";
 
 export interface ServiceVersion {
   service: string;
@@ -66,7 +67,15 @@ export const SERVICES: ServiceDescriptor[] = [
 ];
 
 export async function fetchServiceVersion(service: ServiceDescriptor): Promise<ServiceVersion> {
-  const resp = await apiClient.get<unknown>(service.path);
+  let resp;
+  try {
+    resp = await apiClient.get<unknown>(service.path);
+  } catch (err) {
+    // The client refuses an HTML or unparsed 2xx (issue #1320); for this page
+    // that is still "answered, but not a version", not "unreachable".
+    if (isUnreadableAnswer(err)) throw new InvalidVersionResponseError(service.name);
+    throw err;
+  }
   if (!isServiceVersion(resp.data)) {
     throw new InvalidVersionResponseError(service.name);
   }

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { isAxiosError } from "axios";
 import toast from "react-hot-toast";
 import {
   useDevice,
@@ -19,6 +20,8 @@ import { DeviceInfoPanel } from "@/components/inventory/DeviceInfoPanel";
 import { deviceEditPayload, type DeviceEditFields } from "@/lib/deviceEdit";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 const STATUS_COLORS: Record<string, string> = {
   AVAILABLE: "bg-green-100 text-green-800",
@@ -35,8 +38,11 @@ const TOPOLOGY_COLORS: Record<string, string> = {
 export function DevicePage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { data: device, isLoading, isError } = useDevice(id);
-  const { data: template } = useTemplate(device?.template_id);
+  const deviceQuery = useDevice(id);
+  const { data: device } = deviceQuery;
+  const deviceState = loadState(deviceQuery, undefined, isPlainObject);
+  const templateQuery = useTemplate(device?.template_id);
+  const { data: template } = templateQuery;
   const updateDevice = useUpdateDevice();
   const deleteDevice = useDeleteDevice();
   const user = useAuthStore((s) => s.user);
@@ -117,7 +123,7 @@ export function DevicePage() {
     setEditing(false);
   };
 
-  if (isLoading) {
+  if (deviceState === "loading") {
     return (
       <div className="h-full flex items-center justify-center">
         <p className="text-sm text-gray-400">Loading device...</p>
@@ -125,7 +131,34 @@ export function DevicePage() {
     );
   }
 
-  if (isError || !device) {
+  // Issue #1320: a 404 reads "Device not found" (also when a refetch finds the
+  // device gone); any other failed load is a load error with Retry, never a
+  // page (or an editor) without its device. A failed refetch of a device
+  // already shown keeps the page, with LoadErrorNotice above it.
+  const deviceMissing =
+    isAxiosError(deviceQuery.error) && deviceQuery.error.response?.status === 404;
+  if (!deviceMissing && deviceState === "error") {
+    return (
+      <div className="h-full overflow-y-auto">
+        <div className="max-w-6xl mx-auto px-6 py-6 space-y-4">
+          <button
+            onClick={() => navigate("/inventory")}
+            className="text-sm text-blue-600 hover:text-blue-800"
+          >
+            Back to Inventory
+          </button>
+          <LoadError
+            what="this device"
+            error={deviceQuery.error}
+            onRetry={() => void deviceQuery.refetch()}
+            retrying={deviceQuery.isFetching}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (deviceMissing || !device) {
     return (
       <div className="h-full flex items-center justify-center">
         <p className="text-sm text-red-500">Device not found</p>
@@ -189,6 +222,8 @@ export function DevicePage() {
             )}
           </div>
         </div>
+
+        <LoadErrorNotice what="this device" query={deviceQuery} isValid={isPlainObject} />
 
         {cabledRefusal && (
           <div
@@ -284,6 +319,17 @@ export function DevicePage() {
                 </div>
               </div>
             </>
+          )}
+
+          {/* Without its template the device's field values cannot be shown
+              or edited, so a failed template load says so (issue #1320). */}
+          {loadState(templateQuery) === "error" && (
+            <LoadError
+              what="this device's template"
+              error={templateQuery.error}
+              onRetry={() => void templateQuery.refetch()}
+              retrying={templateQuery.isFetching}
+            />
           )}
 
           {editing ? (

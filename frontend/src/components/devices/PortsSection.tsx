@@ -9,6 +9,8 @@ import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer"
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Modal } from "@/components/ui/Modal";
 import { deletePortErrorText, errorDetail } from "@/lib/errors";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState, noEntries } from "@/lib/loadState";
 import type { Port } from "@/types/port.types";
 import type { DeviceTemplate } from "@/types/template.types";
 
@@ -18,13 +20,17 @@ interface PortsSectionProps {
 }
 
 export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
-  const { data: ports, isLoading } = usePorts(deviceId);
-  const { data: portTemplates } = useTemplates("port");
+  const portsQuery = usePorts(deviceId);
+  const { data: ports } = portsQuery;
+  const portsState = loadState(portsQuery, noEntries);
+  const portTemplatesQuery = useTemplates("port");
+  const { data: portTemplates } = portTemplatesQuery;
   const createPort = useCreatePort();
   const createPortsBulk = useCreatePortsBulk();
   const deletePort = useDeletePort();
 
-  const { data: connections } = useDeviceConnections(deviceId);
+  const connectionsQuery = useDeviceConnections(deviceId);
+  const { data: connections } = connectionsQuery;
   const { data: deviceNameMap } = useAllDeviceNames();
 
   const connectionMap = useMemo(() => {
@@ -171,11 +177,32 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
         )}
       </div>
 
-      {isLoading && (
+      {portsState === "loading" && (
         <p className="text-sm text-gray-400">Loading ports...</p>
       )}
 
-      {ports && ports.length > 0 && (
+      {portsState === "error" && (
+        <LoadError
+          what="this device's ports"
+          error={portsQuery.error}
+          onRetry={() => void portsQuery.refetch()}
+          retrying={portsQuery.isFetching}
+        />
+      )}
+
+      {/* A failed connections fetch would leave every Connected To cell
+          reading "-", as if nothing were cabled (issue #1320). */}
+      {portsState === "loaded" && loadState(connectionsQuery) === "error" && (
+        <LoadError
+          what="this device's connections"
+          error={connectionsQuery.error}
+          onRetry={() => void connectionsQuery.refetch()}
+          retrying={connectionsQuery.isFetching}
+          className="mb-2"
+        />
+      )}
+
+      {ports && portsState === "loaded" && (
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-200 bg-gray-50">
@@ -241,7 +268,7 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
         </table>
       )}
 
-      {ports && ports.length === 0 && !showForm && (
+      {portsState === "empty" && !showForm && (
         <p className="text-sm text-gray-400">No ports configured</p>
       )}
 
@@ -284,6 +311,14 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
               ))}
             </select>
           </div>
+          {loadState(portTemplatesQuery) === "error" && (
+            <LoadError
+              what="port templates"
+              error={portTemplatesQuery.error}
+              onRetry={() => void portTemplatesQuery.refetch()}
+              retrying={portTemplatesQuery.isFetching}
+            />
+          )}
           {selectedTemplate && (
             <DynamicFieldRenderer
               sections={selectedTemplate.sections}
@@ -402,6 +437,14 @@ export function PortsSection({ deviceId, isAdmin }: PortsSectionProps) {
               ))}
             </select>
           </div>
+          {loadState(portTemplatesQuery) === "error" && (
+            <LoadError
+              what="port templates"
+              error={portTemplatesQuery.error}
+              onRetry={() => void portTemplatesQuery.refetch()}
+              retrying={portTemplatesQuery.isFetching}
+            />
+          )}
           {bulkSelectedTemplate && (
             <DynamicFieldRenderer
               sections={bulkSelectedTemplate.sections}

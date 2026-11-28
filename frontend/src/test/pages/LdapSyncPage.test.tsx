@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+import { AxiosError } from "axios";
 
 // Mock HTMLDialogElement methods (jsdom has no native <dialog> support)
 beforeAll(() => {
@@ -202,17 +203,20 @@ describe("LdapSyncPage", () => {
       data: undefined,
       isLoading: false,
       isError: true,
+      error: new AxiosError("Network Error", "ERR_NETWORK"),
       refetch: mockRefetch,
     });
     render(<LdapSyncPage />);
-    expect(screen.getByText("Could not load directory sync status.")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load directory sync status. The server did not answer.",
+    );
     expect(
       screen.queryByText(/This deployment uses local authentication/),
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create mapping" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Sync now" })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading directory sync status" }));
     expect(mockRefetch).toHaveBeenCalled();
   });
 

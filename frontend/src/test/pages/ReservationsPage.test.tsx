@@ -247,11 +247,20 @@ describe("ReservationsPage", () => {
       ),
     );
     renderWithProviders(<ReservationsPage />);
-    await waitFor(() =>
-      expect(
-        screen.getByText("Failed to load reservations"),
-      ).toBeInTheDocument(),
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load reservations. boom",
     );
+    expect(screen.queryByText("No reservations yet")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and a good empty answer is the empty state.
+    server.use(
+      http.get("/api/reservations/", () =>
+        HttpResponse.json({ items: [], total: 0, skip: 0, limit: 50 }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading reservations" }));
+    expect(await screen.findByText("No reservations yet")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("releases an ACTIVE reservation without navigating to its detail modal", async () => {

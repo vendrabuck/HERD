@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
+import { LoadError } from "@/components/ui/LoadError";
 import { usePortAvailability } from "./wiring/usePortAvailability";
 import { EMPTY_ID_SET } from "./wiring/portAvailability";
 import { LayerSegmentedControl } from "./wiring/LayerSegmentedControl";
@@ -51,7 +52,7 @@ export function QuickConnectPopover({
   const [sourcePortId, setSourcePortId] = useState("");
   const [targetPortId, setTargetPortId] = useState("");
 
-  const { source, target, connectionsLoading } = usePortAvailability(sourceDeviceId, targetDeviceId);
+  const { source, target, connectionsUnknown } = usePortAvailability(sourceDeviceId, targetDeviceId);
 
   const selectedSourcePort = source.ports.find((p) => p.id === sourcePortId);
   const selectedTargetPort = target.ports.find((p) => p.id === targetPortId);
@@ -61,7 +62,7 @@ export function QuickConnectPopover({
   // Never compute selectability/portsCabled against a still-empty connections
   // list (issue #517 review item 6): while either side's cabling fetch is in
   // flight, the whole popover is inert.
-  const canConnect = sourcePortId !== "" && targetPortId !== "" && !connectionsLoading;
+  const canConnect = sourcePortId !== "" && targetPortId !== "" && !connectionsUnknown;
 
   const handleConfirm = () => {
     onConfirm({
@@ -86,7 +87,14 @@ export function QuickConnectPopover({
           <label className="block text-sm font-medium text-gray-700 mb-1">
             Source port ({sourceDeviceName})
           </label>
-          {source.isLoading ? (
+          {source.loadError ? (
+            <LoadError
+              what={source.loadError.what}
+              error={source.loadError.error}
+              onRetry={source.loadError.retry}
+              retrying={source.loadError.retrying}
+            />
+          ) : source.isLoading ? (
             <p className="text-sm text-gray-400">Loading ports...</p>
           ) : source.ports.length === 0 ? (
             <select disabled className="w-full border rounded px-3 py-2 text-sm bg-gray-50 text-gray-400">
@@ -96,7 +104,7 @@ export function QuickConnectPopover({
             <select
               value={sourcePortId}
               onChange={(e) => setSourcePortId(e.target.value)}
-              disabled={connectionsLoading}
+              disabled={connectionsUnknown}
               className="w-full border rounded px-3 py-2 text-sm font-mono disabled:bg-gray-50 disabled:text-gray-400"
             >
               <option value="">Select a port</option>
@@ -121,7 +129,14 @@ export function QuickConnectPopover({
           <label className="block text-sm font-medium text-gray-700 mb-1">
             Target port ({targetDeviceName})
           </label>
-          {target.isLoading ? (
+          {target.loadError ? (
+            <LoadError
+              what={target.loadError.what}
+              error={target.loadError.error}
+              onRetry={target.loadError.retry}
+              retrying={target.loadError.retrying}
+            />
+          ) : target.isLoading ? (
             <p className="text-sm text-gray-400">Loading ports...</p>
           ) : target.ports.length === 0 ? (
             <select disabled className="w-full border rounded px-3 py-2 text-sm bg-gray-50 text-gray-400">
@@ -131,7 +146,7 @@ export function QuickConnectPopover({
             <select
               value={targetPortId}
               onChange={(e) => setTargetPortId(e.target.value)}
-              disabled={connectionsLoading}
+              disabled={connectionsUnknown}
               className="w-full border rounded px-3 py-2 text-sm font-mono disabled:bg-gray-50 disabled:text-gray-400"
             >
               <option value="">Select a port</option>

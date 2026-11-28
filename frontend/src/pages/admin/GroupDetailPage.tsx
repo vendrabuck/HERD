@@ -8,6 +8,8 @@ import { useAllUsers } from "@/api/admin";
 import { TransferList } from "@/components/ui/TransferList";
 import type { TransferItem } from "@/components/ui/TransferList";
 import { errorDetail } from "@/lib/errors";
+import { LoadError, LoadErrorNotice } from "@/components/ui/LoadError";
+import { isPlainObject, loadState } from "@/lib/loadState";
 
 export function GroupDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -15,13 +17,18 @@ export function GroupDetailPage() {
   const user = useAuthStore((s) => s.user);
   const isNew = !id;
 
-  const { data: group, isLoading } = useGroup(id);
+  const groupQuery = useGroup(id);
+  const { data: group } = groupQuery;
+  // Issue #1320: an existing group whose fetch failed renders no form, so a
+  // save can never overwrite a group the page never loaded.
+  const groupState = isNew ? "loaded" : loadState(groupQuery, undefined, isPlainObject);
   const createGroup = useCreateGroup();
   const updateGroup = useUpdateGroup();
   const bulkAdd = useBulkAddMembers();
   const bulkRemove = useBulkRemoveMembers();
   const isAdmin = isAdminRole(user?.role);
-  const { data: allUsers } = useAllUsers(isAdmin);
+  const usersQuery = useAllUsers(isAdmin);
+  const { data: allUsers } = usersQuery;
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -57,11 +64,33 @@ export function GroupDetailPage() {
     [group?.members]
   );
 
-  if (!isNew && isLoading) {
+  if (groupState === "loading") {
     return (
       <div className="h-full overflow-y-auto">
         <div className="px-6 xl:px-12 2xl:px-16 py-8">
           <p className="text-sm text-gray-500">Loading group...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (groupState === "error") {
+    return (
+      <div className="h-full overflow-y-auto">
+        <div className="px-6 xl:px-12 2xl:px-16 py-8">
+          <button
+            onClick={() => navigate("/admin/groups")}
+            className="text-sm text-blue-600 hover:text-blue-800 mb-4 inline-block"
+          >
+            Back to User Groups
+          </button>
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">Edit User Group</h2>
+          <LoadError
+            what="this user group"
+            error={groupQuery.error}
+            onRetry={() => void groupQuery.refetch()}
+            retrying={groupQuery.isFetching}
+          />
         </div>
       </div>
     );
@@ -132,6 +161,13 @@ export function GroupDetailPage() {
           {isNew ? "Create User Group" : "Edit User Group"}
         </h2>
 
+        <LoadErrorNotice
+          what="this user group"
+          query={groupQuery}
+          isValid={isPlainObject}
+          className="mb-4"
+        />
+
         {/* Group form */}
         <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
           <div className="space-y-4">
@@ -178,6 +214,15 @@ export function GroupDetailPage() {
             <h3 className="text-sm font-semibold text-gray-900 mb-3">
               Members ({group.members.length})
             </h3>
+            {loadState(usersQuery) === "error" && (
+              <LoadError
+                what="users"
+                error={usersQuery.error}
+                onRetry={() => void usersQuery.refetch()}
+                retrying={usersQuery.isFetching}
+                className="mb-3"
+              />
+            )}
             <TransferList
               availableItems={availableItems}
               assignedItems={assignedItems}

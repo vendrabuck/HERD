@@ -60,7 +60,7 @@ export function ElementAttachDialog({
   onConfirm,
   onCancel,
 }: ElementAttachDialogProps) {
-  const { source, connectionsLoading } = usePortAvailability(deviceId, deviceId);
+  const { source, connectionsUnknown } = usePortAvailability(deviceId, deviceId);
   const [selected, setSelected] = useState<Map<string, string>>(new Map());
   const [filter, setFilter] = useState("");
 
@@ -112,19 +112,19 @@ export function ElementAttachDialog({
   // arbitrate, so mousedown toggles directly.
   const handleMouseDown = useCallback(
     (port: Port, _e: React.MouseEvent) => {
-      if (connectionsLoading) return;
+      if (connectionsUnknown) return;
       handleToggle(port);
     },
-    [connectionsLoading, handleToggle],
+    [connectionsUnknown, handleToggle],
   );
 
   const noopRegisterRowRef = useCallback(() => {}, []);
   const noopScroll = useCallback(() => {}, []);
 
   const handleConfirm = useCallback(() => {
-    if (selected.size === 0 || connectionsLoading) return;
+    if (selected.size === 0 || connectionsUnknown) return;
     onConfirm(Array.from(selected, ([portId, portName]) => ({ portId, portName })));
-  }, [selected, connectionsLoading, onConfirm]);
+  }, [selected, connectionsUnknown, onConfirm]);
 
   const Icon = ELEMENT_ICONS[elementType];
   const side: Side = "source";
@@ -153,13 +153,14 @@ export function ElementAttachDialog({
             ports={filteredPorts}
             totalCount={source.ports.length}
             isLoading={source.isLoading}
+            loadError={source.loadError}
             visuals={visuals}
             cabledCount={source.cabled.size}
             filter={filter}
             onFilterChange={setFilter}
             armedPortId={null}
             highlightFree={false}
-            interactionDisabled={connectionsLoading}
+            interactionDisabled={connectionsUnknown}
             onPortMouseDown={handleMouseDown}
             onPortActivate={handleToggle}
             registerRowRef={noopRegisterRowRef}
@@ -191,7 +192,7 @@ export function ElementAttachDialog({
             variant="primary"
             size="sm"
             onClick={handleConfirm}
-            disabled={selected.size === 0 || connectionsLoading}
+            disabled={selected.size === 0 || connectionsUnknown}
           >
             {confirmLabel}
           </Button>

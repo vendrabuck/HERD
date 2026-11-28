@@ -57,6 +57,22 @@ export function mockStandardPorts(mockUsePorts: Mock) {
   });
 }
 
+/**
+ * A query result whose fetch failed with nothing loaded (issue #1320): a 500
+ * carrying `detail`, with `refetch` the given spy. Build it ONCE per test and
+ * return the same object from every mock call, like the other stable fixtures.
+ */
+export function failedQuery(detail: string, refetch: Mock) {
+  return {
+    data: undefined,
+    isLoading: false,
+    isError: true,
+    isFetching: false,
+    error: { response: { status: 500, data: { detail } } },
+    refetch,
+  };
+}
+
 export function mockNoConnections(mockUseDeviceConnections: Mock) {
   mockUseDeviceConnections.mockReturnValue({ data: EMPTY_CONNECTIONS, isLoading: false });
 }

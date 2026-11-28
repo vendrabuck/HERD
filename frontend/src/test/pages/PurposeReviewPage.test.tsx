@@ -159,6 +159,24 @@ beforeEach(() => {
 });
 
 describe("PurposeReviewPage", () => {
+  it("a failed queue load is an error with Retry, never 'Nothing to review' (#1320)", async () => {
+    server.use(
+      http.get("/api/reservations/admin/purpose-review", () =>
+        HttpResponse.json({ detail: "queue unavailable" }, { status: 500 }),
+      ),
+    );
+    renderWithProviders(<PurposeReviewPage />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the review queue. queue unavailable",
+    );
+    expect(screen.queryByText("Nothing to review")).not.toBeInTheDocument();
+
+    mockReview();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the review queue" }));
+    expect(await screen.findByText("regression suite")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("groups items by top suggested category, shows owner names and counts", async () => {
     mockReview();
     renderWithProviders(<PurposeReviewPage />);

@@ -2,6 +2,8 @@ import { useState } from "react";
 import toast from "react-hot-toast";
 import { useCreateDevice } from "@/api/inventory";
 import { useTemplates } from "@/api/templates";
+import { LoadError } from "@/components/ui/LoadError";
+import { loadState } from "@/lib/loadState";
 import { DynamicFieldRenderer } from "@/components/devices/DynamicFieldRenderer";
 import type { TopologyType, DeviceStatus } from "@/types/device.types";
 import type { DeviceTemplate } from "@/types/template.types";
@@ -40,7 +42,8 @@ const INITIAL_FORM: FormState = {
 
 export function CreateDeviceForm() {
   const create = useCreateDevice();
-  const { data: templates } = useTemplates("device");
+  const templatesQuery = useTemplates("device");
+  const { data: templates } = templatesQuery;
   const [form, setForm] = useState<FormState>(INITIAL_FORM);
 
   const selectedTemplate: DeviceTemplate | undefined = templates?.find(
@@ -123,6 +126,15 @@ export function CreateDeviceForm() {
             </option>
           ))}
         </select>
+        {loadState(templatesQuery) === "error" && (
+          <LoadError
+            what="device templates"
+            error={templatesQuery.error}
+            onRetry={() => void templatesQuery.refetch()}
+            retrying={templatesQuery.isFetching}
+            className="mt-2"
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-4">

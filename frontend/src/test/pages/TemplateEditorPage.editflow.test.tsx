@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { AxiosError, type AxiosResponse } from "axios";
 
 // Mock react-router-dom; id is controlled per test via mockParamsId.
 const mockNavigate = vi.fn();
@@ -119,10 +120,41 @@ describe("TemplateEditorPage loading and not-found states", () => {
     expect(screen.getByText("Loading template...")).toBeInTheDocument();
   });
 
-  it("shows a not-found message when the fetch finished with no data", () => {
-    mockUseTemplate.mockReturnValue({ data: undefined, isLoading: false });
+  it("shows the not-found message when the fetch answered 404", () => {
+    const error = new AxiosError("Request failed", "ERR_BAD_REQUEST", undefined, undefined, {
+      status: 404,
+      data: { detail: "Template not found" },
+    } as AxiosResponse);
+    mockUseTemplate.mockReturnValue({ data: undefined, isLoading: false, isError: true, error });
     render(<TemplateEditorPage />);
     expect(screen.getByText("Template not found")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("shows a load error with Retry, and no editor, when the fetch failed otherwise (#1320)", () => {
+    const refetch = vi.fn();
+    const error = new AxiosError("Request failed", "ERR_BAD_RESPONSE", undefined, undefined, {
+      status: 503,
+      data: { detail: "inventory is restarting" },
+    } as AxiosResponse);
+    mockUseTemplate.mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error,
+      refetch,
+    });
+    render(<TemplateEditorPage />);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not load this template. inventory is restarting",
+    );
+    expect(screen.queryByText("Template not found")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading this template" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 });
 

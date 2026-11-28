@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
@@ -295,9 +295,9 @@ describe("ReportingPage", () => {
       ),
     );
     renderWithProviders(<ReportingPage />);
-    expect(
-      await screen.findByText("Failed to load report. Try again in a moment."),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the report. The server answered with HTTP 500.",
+    );
     expect(screen.queryByText(/status code/)).not.toBeInTheDocument();
   });
 
@@ -308,9 +308,21 @@ describe("ReportingPage", () => {
       ),
     );
     renderWithProviders(<ReportingPage />);
-    await waitFor(() =>
-      expect(screen.getByText(/Failed to load report/i)).toBeInTheDocument(),
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load the report. boom",
     );
+    // Issue #1320: a report that never loaded shows no zero totals, no empty
+    // tables, and no "No data in this window".
+    expect(screen.queryByText("No data in this window")).not.toBeInTheDocument();
+    expect(screen.queryByText("By User")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and the report renders from the answer.
+    server.use(
+      http.get("/api/reservations/reports/utilization", () => HttpResponse.json(REPORT)),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the report" }));
+    expect(await screen.findByText("By User")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("renders fleet utilization stats and per-device rates", async () => {
@@ -564,6 +576,47 @@ describe("ReportingPage", () => {
       expect(
         screen.getByText("End date must be after start date."),
       ).toBeInTheDocument(),
+    );
+  });
+});
+
+describe("ReportingPage failed refresh (issue #1320 review)", () => {
+  it("keeps the report and says the refresh failed, with Retry, instead of an error strip", async () => {
+    let failing = false;
+    server.use(
+      http.get("/api/reservations/reports/utilization", () =>
+        failing
+          ? HttpResponse.json({ detail: "reservations is restarting" }, { status: 503 })
+          : HttpResponse.json(REPORT),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReportingPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText("By User")).toBeInTheDocument();
+
+    failing = true;
+    await act(async () => {
+      await client.refetchQueries();
+    });
+    const notice = await screen.findByText(/^Could not refresh the report\./);
+    expect(notice.closest("[role=status]")).toHaveTextContent(
+      "Could not refresh the report. reservations is restarting",
+    );
+    expect(screen.getByText("By User")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    failing = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the report" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/^Could not refresh the report\./)).not.toBeInTheDocument(),
     );
   });
 });

@@ -369,6 +369,15 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   are not filtered (issue #1053; `dynamic-resources.md`, DYN-REQ-9). \
   Enforced in: `services/inventory/app/services/device_visibility.py` (`resolve_visible_dynamic_hypervisor_ids`, `dynamic_template_visible`, `dynamic_templates_exist`); `services/inventory/app/routers/templates.py` (`get_templates`, `get_template_by_id`); `services/inventory/app/services/template_service.py` (`list_templates`) \
   Pinned by: `services/inventory/tests/test_dynamic_visibility.py` (`test_dynamic_template_visible_through_its_hypervisors_device_group`, `test_hidden_dynamic_template_answers_like_an_unknown_id`, `test_admin_sees_every_dynamic_template_without_a_group_lookup`, `test_physical_template_read_needs_no_group_lookup`, `test_dynamic_template_read_fails_closed_when_auth_cannot_answer`, `test_template_list_hides_invisible_dynamic_templates_and_counts_what_it_shows`, `test_template_list_of_another_type_skips_the_group_lookup`, `test_user_with_no_groups_sees_no_dynamic_template`)
+- **INV-TPL-26.** When an existing template's read fails, the editor renders no form,
+  no Edit, and no Save: a 404 shows `Template not found`, and any other failure (no
+  answer, a 5xx) shows `Could not load this template.` with the server's reason and
+  Retry. A failed driver or hypervisor list shows `Could not load drivers.` or `Could not
+  load hypervisors.` with Retry under its picker instead of an empty picker (issue
+  #1320). When a refresh of a template already shown fails, the page stays and
+  `Could not refresh this template.` with Retry shows above it. \
+  Enforced in: `frontend/src/pages/TemplateEditorPage.tsx` (`TemplateEditorPage`) \
+  Pinned by: `frontend/src/test/pages/TemplateEditorPage.editflow.test.tsx` (`shows the not-found message when the fetch answered 404`, `shows a load error with Retry, and no editor, when the fetch failed otherwise (#1320)`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`a 404 keeps the deliberate 'Template not found'`, `Retry loads the template`, `a failed driver list shows its own load error under the driver picker`, `a failed hypervisor list shows its own load error under the hypervisor picker`, `keeps the record on screen and says the refresh failed, with Retry`)
 
 **Out of scope.** The AI identity suggestion in the editor (`ai-features.md`). What a
 dynamic template does at booking time (`dynamic-resources.md`).
@@ -452,6 +461,16 @@ deleted, and can be booked.
   touch is never sent, and a save with no change sends nothing (issue #1020). \
   Enforced in: `frontend/src/lib/deviceEdit.ts` (`deviceEditPayload`); `frontend/src/pages/DevicePage.tsx` (`DevicePage`) \
   Pinned by: `frontend/src/test/pages/DevicePage.test.tsx` (`a rename does not write back a status that changed server-side after the page loaded`, `Edit starts from the current device, not the copy taken when the page opened`, `saving with nothing changed sends no request and leaves edit mode`); `frontend/src/test/lib/deviceEdit.test.ts` (`sends only the changed name, trimmed, and never the status`)
+- **INV-DEV-16.** When the device read fails, the device page renders no details, no
+  Edit, and no sections: a 404 shows `Device not found`, and any other failure shows
+  `Could not load this device.` with the server's reason, Retry, and Back to Inventory.
+  When the device's template read fails, the page says `Could not load this device's
+  template.` with Retry where the template's fields would be (issue #1320). When a
+  refresh of a device already shown fails with anything but a 404, the page stays and
+  `Could not refresh this device.` with Retry shows above it; a 404 on refresh shows
+  `Device not found`. \
+  Enforced in: `frontend/src/pages/DevicePage.tsx` (`DevicePage`) \
+  Pinned by: `frontend/src/test/pages/DevicePage.test.tsx` (`renders an error state when the device is not found`); `frontend/src/test/pages/pageLoadFailureForms.test.tsx` (`Retry loads the device`, `a failed template load says so where the device's fields would be`, `DevicePage: a refresh Retry reads Retrying..., is aria-disabled, and keeps focus`, `a refresh that answers 404 shows Device not found, not the stale device`, `keeps the record on screen and says the refresh failed, with Retry`)
 
 **Out of scope.** Changing a device's template: the update body has no template
 field. The configuration section of the device page and the ports section's
@@ -665,9 +684,13 @@ filter pages through the device templates instead of stopping at the first 500
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`) \
   Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`keeps an expanded row open when a list change still contains it`, `drops an expanded row whose id left the list and does not resurrect it`, `still clears the bulk selection on a list change while keeping the expansion`)
 - **INV-LIST-13.** An expanded row lists the device's ports and, per port, the device
-  and port it is cabled to, matched by port name. \
+  and port it is cabled to, matched by port name. When the ports fetch or the
+  connections fetch fails, the row shows that failure (`Could not load this device's
+  ports.` or `Could not load this device's connections.`, then the server's reason) with
+  Retry in place of the list, never `No ports configured` or a column of `Not connected`
+  (issue #1320). \
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`ExpandedPortsRow`) \
-  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`resolves a connected port to the other device's name and port, linked to that device`, `shows an unconnected port as Not connected`)
+  Pinned by: `frontend/src/test/pages/InventoryPage.test.tsx` (`resolves a connected port to the other device's name and port, linked to that device`, `shows an unconnected port as Not connected`); `frontend/src/test/pages/pageLoadFailureSecondary.test.tsx` (`a failed load shows the load error where it would fill, and Retry clears it`)
 - **INV-LIST-14.** Selection checkboxes and the Actions column (Copy) are shown to admins
   only; the bulk-action bar appears once an admin selects a device. \
   Enforced in: `frontend/src/pages/InventoryPage.tsx` (`InventoryPage`, `DeviceRow`) \

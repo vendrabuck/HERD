@@ -39,6 +39,12 @@ describe("ReservationCalendarPage", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(`Could not load the calendar. ${detail}`);
     expect(screen.queryByText("No reservations in this range")).not.toBeInTheDocument();
+
+    // Issue #1320: Retry refetches, and a good empty answer is the empty state.
+    server.use(http.get("/api/reservations/calendar", () => HttpResponse.json([])));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading the calendar" }));
+    expect(await screen.findByText("No reservations in this range")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("falls back to a generic reason when the error has no detail", async () => {
@@ -49,7 +55,7 @@ describe("ReservationCalendarPage", () => {
     renderPage();
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
-      "Could not load the calendar. The reservations service did not answer.",
+      "Could not load the calendar. The server did not answer.",
     );
   });
 

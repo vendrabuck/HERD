@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { usePorts } from "@/api/ports";
 import { useDeviceConnections } from "@/api/connections";
 import { computeCabledNames } from "./portAvailability";
+import { loadState, noEntries } from "@/lib/loadState";
 import type { Port } from "@/types/port.types";
 import type { Connection } from "@/types/connection.types";
 
@@ -19,20 +20,100 @@ import type { Connection } from "@/types/connection.types";
 const NO_PORTS: Port[] = [];
 const NO_CONNECTIONS: Connection[] = [];
 
+/**
+ * A side whose ports or cabling could not be loaded (issue #1320): the column
+ * shows `LoadError` for `what` with Retry instead of its ports, so a failed
+ * ports read never reads "No ports configured" and a failed connections read
+ * never shows every port as free to cable.
+ */
+export interface PortSideLoadError {
+  what: string;
+  error: unknown;
+  retry: () => void;
+  retrying: boolean;
+}
+
 export interface PortSideData {
   ports: Port[];
   isLoading: boolean;
   // Port names with a registered physical connection (see portAvailability).
   cabled: Set<string>;
+  // Set when this side's ports or its connections failed to load (the ports
+  // failure wins when both did); null otherwise.
+  loadError: PortSideLoadError | null;
 }
 
 export interface PortAvailabilityResult {
   source: PortSideData;
   target: PortSideData;
-  // True while either side's physical-cabling fetch is in flight: availability
-  // must never be computed against a still-empty connections list (issue #517
-  // review item 6), so callers gate interaction on this.
-  connectionsLoading: boolean;
+  // True while either side's physical cabling is not known: its fetch is in
+  // flight, or it failed with nothing loaded (issue #1320). Availability must
+  // never be computed against a connections list that is empty only because
+  // it never arrived (issue #517 review item 6), so callers gate interaction
+  // on this.
+  connectionsUnknown: boolean;
+}
+
+/** The slice of a TanStack Query result this hook reads. */
+interface SideQuery<T> {
+  data: T | undefined;
+  isLoading: boolean;
+  isError: boolean;
+  isFetching: boolean;
+  error: unknown;
+  refetch: () => unknown;
+}
+
+/** True when the query failed and holds nothing (loadState's `error`). */
+function failed<T>(query: SideQuery<T[]>): boolean {
+  return loadState(query, noEntries) === "error";
+}
+
+/**
+ * The side's load error, memoized on the fields it reads so the side object
+ * (and every memo chain downstream of it) stays referentially stable while
+ * nothing about the failure changes.
+ */
+function useSideLoadError(
+  ports: SideQuery<Port[]>,
+  connections: SideQuery<Connection[]>,
+): PortSideLoadError | null {
+  const portsFailed = failed(ports);
+  const connectionsFailed = failed(connections);
+  const portsError = ports.error;
+  const portsFetching = ports.isFetching;
+  const portsRefetch = ports.refetch;
+  const connectionsError = connections.error;
+  const connectionsFetching = connections.isFetching;
+  const connectionsRefetch = connections.refetch;
+  return useMemo(() => {
+    if (portsFailed) {
+      return {
+        what: "this device's ports",
+        error: portsError,
+        retry: () => void portsRefetch(),
+        retrying: portsFetching,
+      };
+    }
+    if (connectionsFailed) {
+      return {
+        what: "this device's connections",
+        error: connectionsError,
+        retry: () => void connectionsRefetch(),
+        retrying: connectionsFetching,
+      };
+    }
+    return null;
+  }, [
+    portsFailed,
+    portsError,
+    portsFetching,
+    portsRefetch,
+    connectionsFailed,
+    connectionsError,
+    connectionsFetching,
+    connectionsRefetch,
+  ]);
 }
 
 /**
@@ -53,10 +134,14 @@ export function usePortAvailability(
   sourceDeviceId: string,
   targetDeviceId: string,
 ): PortAvailabilityResult {
-  const { data: sourcePorts, isLoading: sourceLoading } = usePorts(sourceDeviceId);
-  const { data: targetPorts, isLoading: targetLoading } = usePorts(targetDeviceId);
-  const { data: sourceConns, isLoading: sourceConnsLoading } = useDeviceConnections(sourceDeviceId);
-  const { data: targetConns, isLoading: targetConnsLoading } = useDeviceConnections(targetDeviceId);
+  const sourcePortsQuery = usePorts(sourceDeviceId);
+  const targetPortsQuery = usePorts(targetDeviceId);
+  const sourceConnsQuery = useDeviceConnections(sourceDeviceId);
+  const targetConnsQuery = useDeviceConnections(targetDeviceId);
+  const { data: sourcePorts, isLoading: sourceLoading } = sourcePortsQuery;
+  const { data: targetPorts, isLoading: targetLoading } = targetPortsQuery;
+  const { data: sourceConns, isLoading: sourceConnsLoading } = sourceConnsQuery;
+  const { data: targetConns, isLoading: targetConnsLoading } = targetConnsQuery;
 
   const sourceCabled = useMemo(
     () => computeCabledNames(sourceConns ?? NO_CONNECTIONS, sourceDeviceId),
@@ -67,18 +152,37 @@ export function usePortAvailability(
     [targetConns, targetDeviceId],
   );
 
+  const sourceLoadError = useSideLoadError(sourcePortsQuery, sourceConnsQuery);
+  const targetLoadError = useSideLoadError(targetPortsQuery, targetConnsQuery);
+
   const source: PortSideData = useMemo(
-    () => ({ ports: sourcePorts ?? NO_PORTS, isLoading: sourceLoading, cabled: sourceCabled }),
-    [sourcePorts, sourceLoading, sourceCabled],
+    () => ({
+      ports: sourcePorts ?? NO_PORTS,
+      isLoading: sourceLoading,
+      cabled: sourceCabled,
+      loadError: sourceLoadError,
+    }),
+    [sourcePorts, sourceLoading, sourceCabled, sourceLoadError],
   );
   const target: PortSideData = useMemo(
-    () => ({ ports: targetPorts ?? NO_PORTS, isLoading: targetLoading, cabled: targetCabled }),
-    [targetPorts, targetLoading, targetCabled],
+    () => ({
+      ports: targetPorts ?? NO_PORTS,
+      isLoading: targetLoading,
+      cabled: targetCabled,
+      loadError: targetLoadError,
+    }),
+    [targetPorts, targetLoading, targetCabled, targetLoadError],
   );
-  const connectionsLoading = sourceConnsLoading || targetConnsLoading;
+  // A side whose connections failed reads as unknown, never as "nothing
+  // cabled": every port would otherwise show, and act, as free to cable.
+  const connectionsUnknown =
+    sourceConnsLoading ||
+    targetConnsLoading ||
+    failed(sourceConnsQuery) ||
+    failed(targetConnsQuery);
 
   return useMemo(
-    () => ({ source, target, connectionsLoading }),
-    [source, target, connectionsLoading],
+    () => ({ source, target, connectionsUnknown }),
+    [source, target, connectionsUnknown],
   );
 }

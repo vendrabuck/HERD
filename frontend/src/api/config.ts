@@ -1,11 +1,15 @@
 import axios from "axios";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useConfigStore } from "@/stores/configStore";
+import { rejectUnreadableAnswer } from "./answerGuard";
 
 const configClient = axios.create({
   baseURL: "/api/config",
   headers: { "Content-Type": "application/json" },
 });
+
+// A 2xx the caller cannot read as JSON is an error, never data (issue #1320).
+configClient.interceptors.response.use(rejectUnreadableAnswer);
 
 configClient.interceptors.request.use((config) => {
   const token = useConfigStore.getState().configToken;
