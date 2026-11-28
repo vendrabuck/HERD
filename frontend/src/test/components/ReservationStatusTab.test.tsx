@@ -103,6 +103,10 @@ describe("ReservationStatusTab", () => {
 
     fireEvent.click(screen.getByText("Edit Schedule"));
     expect(screen.getByPlaceholderText("Purpose")).toBeInTheDocument();
+    // Both editors carry an accessible name (issue #1405); the visible
+    // captions beside them are plain spans, not labels.
+    expect(screen.getByRole("textbox", { name: "Purpose" })).toBeInTheDocument();
+    expect(screen.getByLabelText("End time")).toHaveAttribute("type", "datetime-local");
     expect(screen.getByText("Save")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Cancel"));

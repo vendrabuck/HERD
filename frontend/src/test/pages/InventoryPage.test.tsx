@@ -587,6 +587,69 @@ describe("InventoryPage", () => {
       expect(screen.getByText("2 selected")).toBeInTheDocument();
     });
 
+    it("names each row checkbox by its device and the select-all box by its scope (issue #1405)", async () => {
+      server.use(twoDevicesHandler());
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-1")).toBeInTheDocument());
+
+      expect(screen.getByRole("checkbox", { name: "Select all devices on this page" })).toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Select device dev-1" })).toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Select device dev-2" })).toBeInTheDocument();
+      // Every checkbox on the page is one of those three: none is left unnamed.
+      expect(screen.getAllByRole("checkbox")).toHaveLength(3);
+    });
+
+    it("selects from the keyboard and shows the mixed state on select-all (issue #1405)", async () => {
+      const user = userEvent.setup();
+      server.use(twoDevicesHandler());
+      const { navigations } = renderInCountingRouter(<InventoryPage />, "/inventory");
+      await waitFor(() => expect(screen.getByText("dev-1")).toBeInTheDocument());
+
+      const selectAll = screen.getByRole("checkbox", { name: "Select all devices on this page" });
+      const row1 = screen.getByRole("checkbox", { name: "Select device dev-1" });
+      const row2 = screen.getByRole("checkbox", { name: "Select device dev-2" });
+      expect(selectAll).not.toBeChecked();
+      expect(selectAll).not.toBePartiallyChecked();
+
+      // Space on a row checkbox selects that row only, and opens nothing: the
+      // row's own click handler must not navigate to the device.
+      await tabTo(user, row1);
+      await user.keyboard(" ");
+      expect(row1).toBeChecked();
+      expect(row2).not.toBeChecked();
+      expect(screen.getByText("1 selected")).toBeInTheDocument();
+      expect(selectAll).toBePartiallyChecked();
+
+      // Space on select-all completes the selection and clears the mixed state.
+      await tabTo(user, selectAll);
+      await user.keyboard(" ");
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+      expect(selectAll).toBeChecked();
+      expect(selectAll).not.toBePartiallyChecked();
+
+      // And again clears it.
+      await user.keyboard(" ");
+      expect(screen.queryByText(/selected$/)).not.toBeInTheDocument();
+      expect(selectAll).not.toBeChecked();
+      expect(selectAll).not.toBePartiallyChecked();
+      expect(row1).not.toBeChecked();
+      expect(navigations).toEqual([]);
+    });
+
+    it("exposes the ports toggle's state with aria-expanded (issue #1405)", async () => {
+      server.use(twoDevicesHandler());
+      renderWithProviders(<InventoryPage />);
+      await waitFor(() => expect(screen.getByText("dev-1")).toBeInTheDocument());
+      const row = screen.getByText("dev-1").closest("tr") as HTMLElement;
+      const toggle = within(row).getByRole("button", { name: "Expand ports" });
+      expect(toggle).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(toggle);
+      expect(within(row).getByRole("button", { name: "Collapse ports" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+    });
+
     it("clears the selection via the Clear button", async () => {
       server.use(twoDevicesHandler());
       renderWithProviders(<InventoryPage />);

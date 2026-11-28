@@ -263,6 +263,7 @@ function ChatAssistant({
           value={input}
           onChange={(e) => setInput(e.target.value.slice(0, MAX_QUESTION_LENGTH))}
           onKeyDown={onKeyDown}
+          aria-label="Question"
           placeholder="Type your question. Enter to send, Shift+Enter for a new line."
           rows={2}
           className="w-full text-sm px-2 py-1.5 border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-gray-900"
