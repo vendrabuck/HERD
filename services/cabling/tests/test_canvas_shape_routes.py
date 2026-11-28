@@ -564,13 +564,13 @@ async def test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thre
     """A topology read whose canvas holds more than `INLINE_CHECK_VALUES` values is
     judged on a bulk worker thread, good or bad, with the answer a small one gets."""
     seen: list[int] = []
-    real = canvas_shape.canvas_problem
+    real = canvas_shape.stored_shape_problem
 
     def recording(canvas):
         seen.append(threading.get_ident())
         return real(canvas)
 
-    monkeypatch.setattr(canvas_shape, "canvas_problem", recording)
+    monkeypatch.setattr(canvas_shape, "stored_shape_problem", recording)
     wide = [{} for _ in range(INLINE_CHECK_VALUES)]
     good_id = await _seed_topology("wide-good", USER_A, {"nodes": [], "edges": [*wide, {}]})
     bad_id = await _seed_topology("wide-bad", USER_A, {"nodes": [], "edges": [*wide, 1]})
@@ -937,6 +937,74 @@ async def test_a_fork_is_not_created_from_a_bad_parent(client, kind):
     assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
     async with TestSessionLocal() as db:
         assert (await db.execute(select(ReservationFork))).scalars().all() == []
+
+
+def _long_edge_id_canvas() -> dict:
+    canvas = _good_canvas()
+    canvas["edges"][0]["id"] = "e" * 300
+    return canvas
+
+
+@pytest.mark.asyncio
+async def test_a_stored_long_edge_id_is_read_and_refused_only_where_it_is_written(client):
+    """The edge id bound is the width of the fork's wiring column: a stored
+    topology or template canvas with a longer id is read, exported, and replaced as
+    any other, a body carrying it is refused, and a fork is not created from it."""
+    topology_id = await _seed_topology("long-id", USER_A, _long_edge_id_canvas())
+    template_id = await _seed_template(_long_edge_id_canvas())
+    _as(USER_A)
+    resp = await client.get(f"/topologies/{topology_id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["canvas_data"]["edges"][0]["id"] == "e" * 300
+    resp = await client.get(f"/templates/{template_id}")
+    assert resp.status_code == 200, resp.text
+    resp = await client.get("/topologies/export", params={"format": "json"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["x-export-skipped"] == "0"
+    assert [i["name"] for i in resp.json()["items"]] == ["long-id"]
+    resp = await client.put(
+        f"/topologies/{topology_id}", json={"canvas_data": _long_edge_id_canvas()}
+    )
+    assert (resp.status_code, resp.json()) == (
+        422,
+        _expected_422("canvas_data.edges.0.id: is longer than 255 characters"),
+    )
+    resp = await client.post(
+        "/internal/forks",
+        json={
+            "reservation_id": str(uuid.uuid4()),
+            "parent_topology_id": str(topology_id),
+            "member_device_ids": [DEV_A, DEV_B],
+        },
+        headers=_internal(),
+    )
+    assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
+    async with TestSessionLocal() as db:
+        assert (await db.execute(select(ReservationFork))).scalars().all() == []
+        assert (await db.execute(select(ForkConnection))).scalars().all() == []
+    # The owner repairs it with a canvas whose edge id fits.
+    resp = await client.put(f"/topologies/{topology_id}", json={"canvas_data": _good_canvas()})
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_fork_draft_with_a_long_edge_id_is_read_and_its_save_refused(client):
+    reservation_id, fork_id, _ = await _seed_fork(_long_edge_id_canvas(), _good_canvas())
+    before = await _connection_rows(fork_id)
+    assert [row[3] for row in before] == ["e1"]
+    resp = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["canvas_data"]["edges"][0]["id"] == "e" * 300
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": resp.json()["canvas_data"], "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert (resp.status_code, resp.json()) == (
+        422,
+        _expected_422("canvas_data.edges.0.id: is longer than 255 characters"),
+    )
+    assert await _connection_rows(fork_id) == before
 
 
 @pytest.mark.asyncio

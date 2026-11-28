@@ -21,10 +21,10 @@ The shape:
   ``data.element`` are objects;
 - on an edge: ``id``, ``source``, ``target``, ``data.layer``,
   ``data.source_port_name``, ``data.target_port_name``, ``data.sourcePort``, and
-  ``data.targetPort`` are strings; ``data`` is an object; and ``id``, which a fork
-  save writes into each of the edge's wiring rows (``fork_connections.edge_key``,
-  ``String(255)``), is at most ``MAX_EDGE_ID_LENGTH`` characters and holds no NUL
-  character;
+  ``data.targetPort`` are strings; ``data`` is an object; and ``id`` holds no NUL
+  character, and, on the write side only, is at most ``MAX_EDGE_ID_LENGTH``
+  characters (a fork writes it into each of the edge's wiring rows,
+  ``fork_connections.edge_key``, ``String(255)``);
 - JSON ``null`` and an absent key pass everywhere a part is named above, and a
   wrong type is refused even when it is empty, zero, or false;
 - no object or list is nested deeper than ``MAX_CANVAS_DEPTH`` levels, the canvas
@@ -45,9 +45,11 @@ Write side: the request schemas that carry a canvas take ``CanvasData``, whose
 validator answers a refused canvas with one 422 item
 ``{"type": "canvas_shape", "loc": ["body", "canvas_data"], "msg": "<path>: <message>"}``;
 the topology import judges each record's canvas with the same function (its own
-reason, ``canvas.<path>: <message>``). The body check runs where pydantic validates
-the request body, on the event loop. Read side: a stored canvas need not have the
-shape. ``require_readable_canvas`` answers 409
+reason, ``canvas.<path>: <message>``); and fork create judges the parent canvas it
+copies with it (``as_written``). The body check runs where pydantic validates the
+request body, on the event loop. Read side: a stored canvas need not have the shape,
+and is judged by ``stored_shape_problem``, the same check without the edge id's
+length bound. ``require_readable_canvas`` answers 409
 ``STORED_CANVAS_UNREADABLE_DETAIL`` for a route that needs the canvas, and
 ``readable_canvas_or_none`` gives a reader that can do without the canvas None
 instead; both judge through ``stored_canvas_problem``, which keeps a canvas that
@@ -177,16 +179,23 @@ def _node_structure(node: dict, path: tuple[str | int, ...]) -> CanvasProblem | 
     return None
 
 
+def _written_edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | None:
+    """``_edge_structure`` with the write side's bound on the edge id's length,
+    judged right after its type, so in the order of the module docstring."""
+    edge_id = edge.get("id")
+    if isinstance(edge_id, str) and len(edge_id) > MAX_EDGE_ID_LENGTH:
+        return CanvasProblem((*path, "id"), TOO_LONG_FOR_ITS_COLUMN)
+    return _edge_structure(edge, path)
+
+
 def _edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | None:
-    """The first named part of one edge with the wrong type, in the order of the
-    module docstring, else None."""
+    """The first named part of one edge with the wrong type, or an id holding a
+    NUL, in the order of the module docstring, else None."""
     get = edge.get
     edge_id = get("id")
     if edge_id is not None:
         if type(edge_id) is not str and not isinstance(edge_id, str):
             return CanvasProblem((*path, "id"), MUST_BE_A_STRING)
-        if len(edge_id) > MAX_EDGE_ID_LENGTH:
-            return CanvasProblem((*path, "id"), TOO_LONG_FOR_ITS_COLUMN)
         if "\x00" in edge_id:
             return CanvasProblem((*path, "id"), HOLDS_A_NUL)
     for key in _EDGE_ENDS:
@@ -398,8 +407,10 @@ def _judge_items(
     return None, found, left
 
 
-def _judge(canvas: Any, left: int) -> CanvasProblem | None:
-    """``canvas_problem`` within a budget of ``left`` values; ``_Unfinished`` when
+def _judge(canvas: Any, left: int, edge_structure: Any) -> CanvasProblem | None:
+    """The check, judging each edge's named parts with ``edge_structure`` (the write
+    side's ``_written_edge_structure`` or the read side's ``_edge_structure``),
+    within a budget of ``left`` values; ``_Unfinished`` when
     the canvas costs more than that. Each entry of the canvas itself costs one,
     charged before any is judged, and a top-level key or scalar string that is not
     ASCII one more for every ``TEXT_CHARS_PER_VALUE`` characters, charged before it
@@ -412,7 +423,7 @@ def _judge(canvas: Any, left: int) -> CanvasProblem | None:
     if left < 0:
         raise _Unfinished
     content: dict[str, CanvasProblem] = {}
-    for collection, structure in (("nodes", _node_structure), ("edges", _edge_structure)):
+    for collection, structure in (("nodes", _node_structure), ("edges", edge_structure)):
         items = canvas.get(collection)
         if items is None:
             continue
@@ -477,20 +488,33 @@ def canvas_problem(canvas: Any) -> CanvasProblem | None:
     parts and walks it for the depth, the numbers, and the text; a structural
     problem anywhere is answered before a content problem anywhere, so the first
     content problem of each list is kept while the pass goes on. Then the top-level
-    entries are judged in canvas order. An empty item holds nothing to judge."""
-    return _judge(canvas, sys.maxsize)
+    entries are judged in canvas order. An empty item holds nothing to judge.
+
+    The write side's check: it holds an edge id to ``MAX_EDGE_ID_LENGTH``.
+    ``stored_shape_problem`` is the same check without that bound."""
+    return _judge(canvas, sys.maxsize, _written_edge_structure)
 
 
-async def stored_canvas_problem(canvas: Any) -> CanvasProblem | None:
-    """``canvas_problem`` for a stored canvas read by a request. The check starts on
-    the event loop and stops there once the canvas has cost more than
-    ``INLINE_CHECK_VALUES`` (as the constant's comment counts); such a canvas is then
-    judged whole on a bulk worker thread (``herd_common.bulk_work.run_bulk_work``),
-    so the loop is never held for the whole check."""
+def stored_shape_problem(canvas: Any) -> CanvasProblem | None:
+    """The read side's check: ``canvas_problem`` without the bound on an edge id's
+    length, which exists for the column a fork writes the id to, so a stored
+    canvas with a longer edge id stays readable, and repairable in the editor."""
+    return _judge(canvas, sys.maxsize, _edge_structure)
+
+
+async def stored_canvas_problem(canvas: Any, *, as_written: bool = False) -> CanvasProblem | None:
+    """``stored_shape_problem`` for a stored canvas read by a request, or, with
+    ``as_written``, ``canvas_problem`` for a reader that writes the canvas's edge
+    ids to a column (fork create). The check starts on the event loop and stops
+    there once the canvas has cost more than ``INLINE_CHECK_VALUES`` (as the
+    constant's comment counts); such a canvas is then judged whole on a bulk worker
+    thread (``herd_common.bulk_work.run_bulk_work``), so the loop is never held for
+    the whole check."""
+    edge_structure = _written_edge_structure if as_written else _edge_structure
     try:
-        return _judge(canvas, INLINE_CHECK_VALUES)
+        return _judge(canvas, INLINE_CHECK_VALUES, edge_structure)
     except _Unfinished:
-        return await run_bulk_work(canvas_problem, canvas)
+        return await run_bulk_work(canvas_problem if as_written else stored_shape_problem, canvas)
 
 
 def _check_canvas_data(value: dict[str, Any]) -> dict[str, Any]:
@@ -518,19 +542,21 @@ def stored_canvas_readable(canvas: Any, *, kind: str, row_id: uuid.UUID | None) 
     calls it on its bulk worker thread). One that does not is logged at warning
     with the row's kind and id and the problem's path and message, and nothing of
     the canvas."""
-    problem = canvas_problem(canvas)
+    problem = stored_shape_problem(canvas)
     if problem is None:
         return True
     _log_unreadable(problem, kind=kind, row_id=row_id)
     return False
 
 
-async def require_readable_canvas(canvas: Any, *, kind: str, row_id: uuid.UUID | None) -> Any:
-    """``canvas`` itself when it has the shape (``stored_canvas_problem``);
-    otherwise log it as ``stored_canvas_readable`` does and answer 409
-    ``STORED_CANVAS_UNREADABLE_DETAIL``. For a route that needs the stored canvas:
-    its single read, a copy of it, a judgment of it."""
-    problem = await stored_canvas_problem(canvas)
+async def require_readable_canvas(
+    canvas: Any, *, kind: str, row_id: uuid.UUID | None, as_written: bool = False
+) -> Any:
+    """``canvas`` itself when it has the shape (``stored_canvas_problem``, with
+    ``as_written`` as given); otherwise log it as ``stored_canvas_readable`` does and
+    answer 409 ``STORED_CANVAS_UNREADABLE_DETAIL``. For a route that needs the
+    stored canvas: its single read, a copy of it, a judgment of it."""
+    problem = await stored_canvas_problem(canvas, as_written=as_written)
     if problem is not None:
         _log_unreadable(problem, kind=kind, row_id=row_id)
         raise HTTPException(status_code=409, detail=STORED_CANVAS_UNREADABLE_DETAIL)
@@ -559,5 +585,6 @@ __all__ = [
     "readable_canvas_or_none",
     "require_readable_canvas",
     "stored_canvas_problem",
+    "stored_shape_problem",
     "stored_canvas_readable",
 ]

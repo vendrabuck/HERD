@@ -1838,10 +1838,14 @@ sections 8.4 to 8.14.
   import write each as a string or null); on an edge, `id`, `source`,
   `target`, `data.layer`, `data.source_port_name`, `data.target_port_name`,
   `data.sourcePort`, and `data.targetPort` are strings and `data` is an object; an
-  edge's `id`, which a fork save writes into each of its wiring rows
-  (`fork_connections.edge_key`, 255 characters), is at most `MAX_EDGE_ID_LENGTH` (255)
-  characters (`is longer than 255 characters`) and holds no NUL character (`holds a
-  NUL character, which no database column takes`), judged right after its type. No
+  edge's `id` holds no NUL character (`holds a NUL character, which no database
+  column takes`), judged right after its type. On the write side only (a body, an
+  import record, and the parent canvas a fork create copies), an edge's `id`, which a
+  fork writes into each of its wiring rows (`fork_connections.edge_key`, 255
+  characters), is also at most `MAX_EDGE_ID_LENGTH` (255) characters (`is longer than
+  255 characters`), judged after its type and before the NUL; a stored canvas read by
+  any other route is judged without that bound (`stored_shape_problem`), so one with a
+  longer edge id is read, and replaced in the editor, as any other. No
   other canvas string is copied into a column: a wiring row's ports come from the
   physical connections, and an L3 route's fields are bounded by TOPO-L3-1. A null
   or absent part passes, a part under a null or absent parent is not judged, and a
@@ -1849,8 +1853,8 @@ sections 8.4 to 8.14.
   as it is; `data.l3` keeps its own parser (TOPO-L3-1). The first problem is named:
   nodes before edges, items in order, a node's or edge's parts in the order above, and
   only then the walk of TOPO-SHAPE-2 and TOPO-SHAPE-3. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `_judge_items`, `_node_structure`, `_edge_structure`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_an_edge_id_is_bounded_by_its_column`, `test_an_edge_id_holding_a_nul_is_refused`, `test_the_edge_id_is_judged_before_the_edge_ends`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `stored_shape_problem`, `_judge_items`, `_node_structure`, `_edge_structure`, `_written_edge_structure`); `services/cabling/app/services/fork_service.py` (`create_fork`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_an_edge_id_is_bounded_by_its_column`, `test_an_edge_id_holding_a_nul_is_refused`, `test_the_edge_id_is_judged_before_the_edge_ends`, `test_a_stored_edge_id_past_its_column_stays_readable`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
 - **TOPO-SHAPE-2.** No object or list in a canvas is nested deeper than
   `MAX_CANVAS_DEPTH`, 64 levels, the canvas itself being level 1, a node or edge level
   3. The check walks with a stack, so a canvas nested past the interpreter's recursion
@@ -1934,12 +1938,12 @@ sections 8.4 to 8.14.
   as TOPO-SHAPE-6: an editor never opens a drawing it could not load as an empty one
   whose save would release the reservation's cables. The fork version read and the
   version restore answer the 409 of TOPO-SHAPE-6 for a version without the shape; fork
-  create answers it for a parent
-  canvas without the shape and writes nothing; and a prune reads a saved canvas without
+  create answers it for a parent canvas without the shape, judged as written (an edge
+  id over 255 characters included, TOPO-SHAPE-1), and writes nothing; and a prune reads a saved canvas without
   the shape as none (every row touching a removed device releases, and the appended
   version's canvas is null) and leaves a draft without the shape as it is. \
   Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_answered_draft`, `_refuse_empty_canvas_over_unreadable_draft`, `EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL`, `update_fork_canvas_internal`, `save_fork_internal`, `get_fork_version_internal`, `restore_fork_version_internal`); `services/cabling/app/services/fork_service.py` (`create_fork`); `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`); `services/cabling/app/services/canvas_shape.py` (`readable_canvas_or_none`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_over_a_bad_draft`, `test_a_fork_read_over_a_bad_draft_answers_the_latest_saved_canvas`, `test_an_empty_canvas_over_a_bad_draft_is_refused_while_the_fork_holds_wiring`, `test_an_empty_canvas_saves_when_the_draft_is_readable_or_nothing_is_wired`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_over_a_bad_draft`, `test_a_fork_read_over_a_bad_draft_answers_the_latest_saved_canvas`, `test_an_empty_canvas_over_a_bad_draft_is_refused_while_the_fork_holds_wiring`, `test_an_empty_canvas_saves_when_the_draft_is_readable_or_nothing_is_wired`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_stored_long_edge_id_is_read_and_refused_only_where_it_is_written`, `test_a_fork_draft_with_a_long_edge_id_is_read_and_its_save_refused`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
 - **TOPO-SHAPE-9.** Every request string cabling writes to a name or description column
   refuses a NUL character, which no database column takes, with one 422 item
   `{"type": "text_holds_nul", "loc": ["body", "<field>"], "msg": "Value holds a NUL

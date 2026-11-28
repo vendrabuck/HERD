@@ -26,6 +26,8 @@ from app.services.canvas_shape import (
     readable_canvas_or_none,
     require_readable_canvas,
     stored_canvas_problem,
+    stored_canvas_readable,
+    stored_shape_problem,
 )
 from fastapi import HTTPException
 
@@ -261,6 +263,35 @@ def test_the_edge_id_is_judged_before_the_edge_ends():
     assert canvas_problem({"edges": [edge]}) == CanvasProblem(
         ("edges", 0, "id"), "is longer than 255 characters"
     )
+    assert stored_shape_problem({"edges": [edge]}) == CanvasProblem(("edges", 0, "source"), STRING)
+
+
+async def test_a_stored_edge_id_past_its_column_stays_readable():
+    """The length bound is the write side's: a stored canvas with a longer edge id
+    is read (and so repaired in the editor), while a NUL is refused on either side.
+    A reader that writes the ids to the column judges it as written."""
+    long_id = {"edges": [{"id": "e" * 256, "source": "n1", "target": "n2"}]}
+    too_long = CanvasProblem(("edges", 0, "id"), "is longer than 255 characters")
+    assert canvas_problem(long_id) == too_long
+    assert stored_shape_problem(long_id) is None
+    assert await stored_canvas_problem(long_id) is None
+    assert await stored_canvas_problem(long_id, as_written=True) == too_long
+    assert stored_canvas_readable(long_id, kind="topology", row_id=None) is True
+    assert await require_readable_canvas(long_id, kind="topology", row_id=None) is long_id
+    with pytest.raises(HTTPException) as exc:
+        await require_readable_canvas(long_id, kind="fork_parent", row_id=None, as_written=True)
+    assert (exc.value.status_code, exc.value.detail) == (409, STORED_CANVAS_UNREADABLE_DETAIL)
+    # The same on a worker thread, for a canvas past the inline budget.
+    wide = {"edges": [*long_id["edges"], *({} for _ in range(INLINE_CHECK_VALUES))]}
+    assert await stored_canvas_problem(wide) is None
+    assert await stored_canvas_problem(wide, as_written=True) == too_long
+    holds_nul = CanvasProblem(
+        ("edges", 0, "id"), "holds a NUL character, which no database column takes"
+    )
+    both = {"edges": [{"id": "\x00" + "e" * 300}]}
+    assert canvas_problem(both) == too_long
+    assert stored_shape_problem(both) == holds_nul
+    assert await stored_canvas_problem(both) == holds_nul
 
 
 # Depth ---------------------------------------------------------------------------
@@ -559,15 +590,16 @@ async def test_readable_canvas_or_none_gives_none_for_a_bad_canvas(caplog):
 
 
 def _threads_of_the_check(monkeypatch) -> list[int]:
-    """Record the thread each full ``canvas_problem`` call runs on."""
+    """Record the thread each full read-side check (``stored_shape_problem``) runs
+    on."""
     seen: list[int] = []
-    real = canvas_shape.canvas_problem
+    real = canvas_shape.stored_shape_problem
 
     def recording(canvas):
         seen.append(threading.get_ident())
         return real(canvas)
 
-    monkeypatch.setattr(canvas_shape, "canvas_problem", recording)
+    monkeypatch.setattr(canvas_shape, "stored_shape_problem", recording)
     return seen
 
 
@@ -637,7 +669,8 @@ class _Text(str):
 
 # Every place the check searches a string character by character, with what the
 # canvas costs besides that string's characters, and how many times the string is
-# searched. `TEXT_CHARS_PER_VALUE` characters cost one value each time.
+# searched (an edge id is searched for a NUL, and one that is not ASCII for a lone
+# surrogate as well). `TEXT_CHARS_PER_VALUE` characters cost one value each time.
 TEXT_POSITIONS = {
     "top_level_value": (lambda s: {"k": s}, 1, 1),
     "top_level_key": (lambda s: {s: 0}, 1, 1),
@@ -649,6 +682,8 @@ TEXT_POSITIONS = {
     "nested_key": (lambda s: {"nodes": [{"d": {s: 0}}]}, 5, 1),
     "nested_list_item": (lambda s: {"nodes": [{"d": [s]}]}, 5, 1),
     "edge_value": (lambda s: {"edges": [{"v": s}]}, 3, 1),
+    "edge_id_ascii": (lambda s: {"edges": [{"id": s.replace("\u00e9", "e")}]}, 3, 1),
+    "edge_id_not_ascii": (lambda s: {"edges": [{"id": s}]}, 3, 2),
     "subclass_top_level": (lambda s: {"k": _Text(s)}, 1, 1),
     "subclass_node_value": (lambda s: {"nodes": [{"v": _Text(s)}]}, 3, 1),
     "subclass_nested_value": (lambda s: {"nodes": [{"d": {"v": _Text(s)}}]}, 5, 1),
@@ -657,7 +692,7 @@ TEXT_POSITIONS = {
 
 @pytest.mark.parametrize("position", list(TEXT_POSITIONS))
 async def test_a_long_string_is_charged_by_its_length(monkeypatch, position):
-    """A string that is not ASCII costs one more value for every
+    """A string that is not ASCII, and an edge id, costs one more value for every
     `TEXT_CHARS_PER_VALUE` characters, wherever it sits: the longest one the budget
     holds is judged on the loop, one character more on a worker thread."""
     assert TEXT_CHARS_PER_VALUE == 16
