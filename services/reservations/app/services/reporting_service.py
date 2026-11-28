@@ -45,6 +45,10 @@ UNCLASSIFIED_PURPOSE = "unclassified"
 _TRANSIT_BATCH_CHUNK_SIZE = 500
 
 
+# The fixed message of a transit lookup whose call to cabling raised.
+TRANSIT_GEAR_CALL_FAILED = "cabling /internal/forks/devices/batch could not be called"
+
+
 class TransitGearUnavailable(RuntimeError):
     """Cabling was unreachable, returned a non-200, or returned a 200 whose body is
     not an object holding a ``devices`` object (issue #1553), fetching transit
@@ -162,7 +166,7 @@ async def _fetch_transit_devices(
         try:
             resp = await _cabling_fork_devices_batch(chunk)
         except RuntimeError as exc:
-            raise TransitGearUnavailable(str(exc)) from exc
+            raise TransitGearUnavailable(TRANSIT_GEAR_CALL_FAILED) from exc
         if resp.status_code != 200:
             raise TransitGearUnavailable(
                 f"cabling /internal/forks/devices/batch returned {resp.status_code}"
