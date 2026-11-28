@@ -714,7 +714,7 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   or year 9999) is 422, a validation list whose message is `end_time must fall between
   0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
   500. \
-  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationUpdate`, `end_time_as_utc_instant`, `to_utc_instant`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
+  Enforced in: `services/reservations/app/schemas/reservation.py` (`ReservationUpdate`, `end_time_as_utc_instant`); `services/common/herd_common/timeutil.py` (`to_utc_instant`); `services/reservations/app/services/reservation_service.py` (`update_reservation`) \
   Pinned by: `services/reservations/tests/test_coverage_gaps.py` (`test_update_reservation_end_time_not_after_start_rejected`, `test_update_reservation_end_time_in_past_rejected`); `services/reservations/tests/test_reservation_patch_end_time_utc.py` (`test_schema_converts_every_form_to_its_utc_instant`, `test_a_naive_end_time_is_utc_not_the_host_zone`, `test_an_end_time_with_no_utc_equivalent_is_a_validation_error`, `test_an_end_time_at_the_edge_of_the_utc_range_is_accepted`, `test_patch_end_time_is_judged_by_its_instant`, `test_patch_end_time_is_judged_against_now_by_its_instant`, `test_route_answers_the_same_for_one_instant_in_every_form`, `test_route_answers_422_for_an_end_time_with_no_utc_equivalent`); `services/reservations/tests/test_reservation_patch_end_time_live_pg.py` (`test_free_extension_stores_the_instant_in_every_offset_form`)
 - **RES-PATCH-4.** Extending the end time (a new end whose instant, RES-PATCH-3, is later
   than the stored end) conflict-checks the added span `[old end, new end)` for the booked
@@ -863,7 +863,7 @@ section 5).
   equivalent (an offset near year 1 or year 9999) is 422 `<parameter> must fall between
   0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999Z once converted to UTC`, never a
   500 (issue #1523). \
-  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`); `services/reservations/app/schemas/reservation.py` (`to_utc_instant`) \
+  Enforced in: `services/reservations/app/services/reservation_service.py` (`_apply_list_filters`); `services/reservations/app/routers/reservations.py` (`_as_utc`); `services/common/herd_common/timeutil.py` (`to_utc_instant`) \
   Pinned by: `services/reservations/tests/test_reservation_list_filters.py` (`test_window_bounds_are_half_open`, `test_window_bad_or_naive_timestamp_is_422`, `test_window_bound_with_offset_is_compared_by_instant`, `test_window_bound_with_no_utc_equivalent_is_422`, `test_window_bound_at_the_edge_of_the_utc_range_is_accepted`)
 - **RES-LIST-9.** `total` is the filtered total. \
   Enforced in: `services/reservations/app/services/reservation_service.py` (`list_user_reservations`, `list_all_reservations`) \
