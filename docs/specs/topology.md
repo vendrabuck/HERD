@@ -1825,7 +1825,7 @@ sections 8.4 to 8.14.
   as it is; `data.l3` keeps its own parser (TOPO-L3-1). The first problem is named:
   nodes before edges, items in order, a node's or edge's parts in the order above, and
   only then the walk of TOPO-SHAPE-2 and TOPO-SHAPE-3. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `_structure_problem`, `_NODE_FIELDS`, `_EDGE_FIELDS`) \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`canvas_problem`, `_judge_items`, `_node_structure`, `_edge_structure`) \
   Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_each_json_type_in_each_position`, `test_the_canvas_itself_must_be_an_object`, `test_an_empty_canvas_has_the_shape`, `test_a_missing_parent_leaves_its_children_unjudged`, `test_a_list_item_must_be_an_object_whatever_it_is`, `test_the_first_problem_in_canvas_order_is_named`)
 - **TOPO-SHAPE-2.** No object or list in a canvas is nested deeper than
   `MAX_CANVAS_DEPTH`, 64 levels, the canvas itself being level 1, a node or edge level
@@ -1833,14 +1833,14 @@ sections 8.4 to 8.14.
   limit is judged, not raised on. By decision (the constant's comment in
   `canvas_shape.py`): what HERD writes nests about seven levels, and 64 stays far below
   the response models' serialization limit and the recursion limit. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`MAX_CANVAS_DEPTH`, `_content_problem`) \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`MAX_CANVAS_DEPTH`, `_drain`) \
   Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_the_bound_is_what_the_docstring_says`, `test_a_node_at_the_bound_passes_and_one_past_it_is_refused`, `test_lists_count_as_levels_like_objects`, `test_another_top_level_key_is_judged_and_never_named`, `test_a_canvas_past_the_recursion_limit_is_judged_not_raised_on`)
 - **TOPO-SHAPE-3.** No number in a canvas is `NaN` or infinite (a literal such as `1e400`
   reads as infinity), and no string or key holds a lone surrogate. A problem of
   TOPO-SHAPE-2 or TOPO-SHAPE-3 is named by the node or edge that holds it
   (`nodes.<i>`, `edges.<i>`), or by the canvas for any other top-level key, whose name
   is never in the path. No message holds a key or a value from the canvas. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`_content_problem`, `canvas_problem`, `CanvasProblem`) \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`_judge_items`, `_drain`, `canvas_problem`, `CanvasProblem`) \
   Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_a_number_that_is_not_finite_is_refused`, `test_finite_numbers_of_every_kind_pass`, `test_a_lone_surrogate_is_refused`, `test_a_character_outside_the_bmp_is_not_a_lone_surrogate`, `test_no_message_holds_a_submitted_value`)
 - **TOPO-SHAPE-4.** Every canvas HERD itself writes has the shape: the editor's
   (`persistableCanvas`), the seed data's, the AI commit's, a CSV import's, and every

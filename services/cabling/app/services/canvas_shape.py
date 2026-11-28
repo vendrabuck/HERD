@@ -28,10 +28,12 @@ The shape:
 Every other key passes as it is: ``data.l3`` keeps its own parser and its own
 ``l3_malformed`` answer (``l3_intent.py``), and keys only the editor reads
 (``position``, ``type``, handles, ``selectedEdgeLayer``) are not cabling's to judge.
-The structural checks run first, nodes then edges in canvas order, and then one
-walk of each top-level entry for the depth, the numbers, and the text. The walk
-uses a stack, so a canvas nested past the interpreter's recursion limit is judged,
-not raised on.
+A structural problem anywhere is named before a content problem (the depth, the
+numbers, the text) anywhere: nodes then edges, items in order, an item's parts in
+the order above; then the content problems in canvas order of the top-level keys.
+One pass over each list judges an item's named parts and walks its content, so the
+check costs one visit of every value; the walk uses a stack, so a canvas nested past
+the interpreter's recursion limit is judged, not raised on.
 
 Write side: the request schemas that carry a canvas take ``CanvasData``, whose
 validator answers a refused canvas with one 422 item
@@ -81,34 +83,9 @@ STORED_CANVAS_UNREADABLE_DETAIL = (
     "Stored canvas cannot be read; save a new canvas to replace it, or delete it"
 )
 
-# The parts of a node and of an edge that a reader dereferences, in the order they
-# are checked, each with the type it must have when present and not null.
-_NODE_FIELDS: tuple[tuple[tuple[str, ...], type], ...] = (
-    (("id",), str),
-    (("data",), dict),
-    (("data", "device"), dict),
-    (("data", "device", "name"), str),
-    (("data", "device", "id"), str),
-    (("data", "device", "template_name"), str),
-    (("data", "device", "role"), str),
-    (("data", "label"), str),
-    (("data", "element"), dict),
-)
-_EDGE_FIELDS: tuple[tuple[tuple[str, ...], type], ...] = (
-    (("id",), str),
-    (("source",), str),
-    (("target",), str),
-    (("data",), dict),
-    (("data", "layer"), str),
-    (("data", "source_port_name"), str),
-    (("data", "target_port_name"), str),
-    (("data", "sourcePort"), str),
-    (("data", "targetPort"), str),
-)
-_TYPE_MESSAGE = {dict: MUST_BE_AN_OBJECT, list: MUST_BE_A_LIST, str: MUST_BE_A_STRING}
-
 # A surrogate code unit in a Python str is always a lone one: a pair written as two
-# JSON escapes decodes to one code point.
+# JSON escapes decodes to one code point. Only a string that is not ASCII can hold
+# one, and `str.isascii` answers in constant time, so the search runs only there.
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -129,90 +106,240 @@ class CanvasProblem:
         return ".".join([root, *(str(part) for part in self.path)]) + ": " + self.message
 
 
-def _structure_problem(
-    item: Any, path: tuple[str | int, ...], fields: tuple[tuple[tuple[str, ...], type], ...]
-) -> CanvasProblem | None:
-    """The first named part of one node or edge with the wrong type, else None."""
-    if not isinstance(item, dict):
-        return CanvasProblem(path, MUST_BE_AN_OBJECT)
-    for keys, expected in fields:
-        parent: Any = item
-        for key in keys[:-1]:
-            parent = parent.get(key) if isinstance(parent, dict) else None
-        if not isinstance(parent, dict):
-            # An absent or null parent; a parent of the wrong type was refused
-            # when its own row of the table was checked.
-            continue
-        value = parent.get(keys[-1])
-        if value is not None and not isinstance(value, expected):
-            return CanvasProblem((*path, *keys), _TYPE_MESSAGE[expected])
+def _not_text(value: str) -> bool:
+    """Whether the string ``value`` holds a lone surrogate."""
+    return not value.isascii() and _SURROGATE.search(value) is not None
+
+
+def _node_structure(node: dict, path: tuple[str | int, ...]) -> CanvasProblem | None:
+    """The first named part of one node with the wrong type, in the order of the
+    module docstring, else None."""
+    value = node.get("id")
+    if value is not None and type(value) is not str and not isinstance(value, str):
+        return CanvasProblem((*path, "id"), MUST_BE_A_STRING)
+    data = node.get("data")
+    if data is None:
+        return None
+    if type(data) is not dict and not isinstance(data, dict):
+        return CanvasProblem((*path, "data"), MUST_BE_AN_OBJECT)
+    if not data:
+        return None
+    device = data.get("device")
+    if device is not None:
+        if type(device) is not dict and not isinstance(device, dict):
+            return CanvasProblem((*path, "data", "device"), MUST_BE_AN_OBJECT)
+        if device:
+            for key in _DEVICE_TEXT:
+                value = device.get(key)
+                if value is not None and type(value) is not str and not isinstance(value, str):
+                    return CanvasProblem((*path, "data", "device", key), MUST_BE_A_STRING)
+    value = data.get("label")
+    if value is not None and type(value) is not str and not isinstance(value, str):
+        return CanvasProblem((*path, "data", "label"), MUST_BE_A_STRING)
+    value = data.get("element")
+    if value is not None and type(value) is not dict and not isinstance(value, dict):
+        return CanvasProblem((*path, "data", "element"), MUST_BE_AN_OBJECT)
     return None
 
 
-def _content_problem(value: Any, depth: int, path: tuple[str | int, ...]) -> CanvasProblem | None:
-    """Walk ``value`` (at nesting level ``depth``) for a container nested past the
-    bound, a number that is not finite, or text holding a lone surrogate. A stack,
-    never recursion; only containers are pushed."""
-    stack: list[tuple[Any, int]] = [(value, depth)]
+def _edge_structure(edge: dict, path: tuple[str | int, ...]) -> CanvasProblem | None:
+    """The first named part of one edge with the wrong type, in the order of the
+    module docstring, else None."""
+    get = edge.get
+    for key in _EDGE_TEXT:
+        value = get(key)
+        if value is not None and type(value) is not str and not isinstance(value, str):
+            return CanvasProblem((*path, key), MUST_BE_A_STRING)
+    data = get("data")
+    if data is None:
+        return None
+    if type(data) is not dict and not isinstance(data, dict):
+        return CanvasProblem((*path, "data"), MUST_BE_AN_OBJECT)
+    if not data:
+        return None
+    get = data.get
+    for key in _EDGE_DATA_TEXT:
+        value = get(key)
+        if value is not None and type(value) is not str and not isinstance(value, str):
+            return CanvasProblem((*path, "data", key), MUST_BE_A_STRING)
+    return None
+
+
+# The string parts checked on a node's `data.device`, on an edge, and on an edge's
+# `data`, each in the order of the module docstring.
+_DEVICE_TEXT = ("name", "id", "template_name", "role")
+_EDGE_TEXT = ("id", "source", "target")
+_EDGE_DATA_TEXT = ("layer", "source_port_name", "target_port_name", "sourcePort", "targetPort")
+
+
+def _drain(stack: list[tuple[Any, int]]) -> str | None:
+    """Judge every container on ``stack`` (each with its nesting level) and those
+    nested in it, the last pushed first, and answer the message of the first
+    problem, else None; the stack is left empty either way.
+
+    For each container: its keys (a lone surrogate), then its depth, then its
+    values (a lone surrogate, a number that is not finite), its child containers
+    pushed to be judged after it. An empty child container is pushed only when it
+    would sit past the bound, since one within it holds nothing to judge. A stack,
+    never recursion, so a canvas nested past the interpreter's recursion limit is
+    judged, not raised on."""
+    push = stack.append
+    pop = stack.pop
     while stack:
-        current, level = stack.pop()
-        if isinstance(current, dict):
-            children: Any = current.values()
+        current, level = pop()
+        if type(current) is dict or isinstance(current, dict):
             for key in current:
-                if isinstance(key, str) and _SURROGATE.search(key):
-                    return CanvasProblem(path, LONE_SURROGATE)
-        elif isinstance(current, list):
-            children = current
+                if (type(key) is str or isinstance(key, str)) and not key.isascii():
+                    if _SURROGATE.search(key) is not None:
+                        stack.clear()
+                        return LONE_SURROGATE
+            children: Any = current.values()
         else:
-            children = (current,)
-            level -= 1
+            children = current
         if level > MAX_CANVAS_DEPTH:
-            return CanvasProblem(path, TOO_DEEP)
+            stack.clear()
+            return TOO_DEEP
+        deeper = level + 1
+        at_bound = level >= MAX_CANVAS_DEPTH
         for child in children:
-            if isinstance(child, (dict, list)):
-                stack.append((child, level + 1))
-            elif isinstance(child, float):
+            kind = type(child)
+            if kind is str:
+                if not child.isascii() and _SURROGATE.search(child) is not None:
+                    stack.clear()
+                    return LONE_SURROGATE
+            elif kind is dict or kind is list:
+                if child or at_bound:
+                    push((child, deeper))
+            elif kind is int or kind is bool or child is None:
+                continue
+            elif kind is float:
                 if not math.isfinite(child):
-                    return CanvasProblem(path, NOT_FINITE)
-            elif isinstance(child, str):
-                if _SURROGATE.search(child):
-                    return CanvasProblem(path, LONE_SURROGATE)
+                    stack.clear()
+                    return NOT_FINITE
+            else:
+                message = _other_message(child)
+                if message is not None:
+                    stack.clear()
+                    return message
+                if isinstance(child, (dict, list)) and (child or at_bound):
+                    push((child, deeper))
     return None
+
+
+def _other_message(value: Any) -> str | None:
+    """The message for a scalar of a subclass of ``str`` or ``float`` (never built
+    from JSON, only by a Python caller), else None."""
+    if isinstance(value, str) and _not_text(value):
+        return LONE_SURROGATE
+    if isinstance(value, float) and not math.isfinite(value):
+        return NOT_FINITE
+    return None
+
+
+def _value_message(value: Any, level: int) -> str | None:
+    """The walk of ``_drain`` for any value at nesting level ``level``: a scalar
+    is judged on its own."""
+    if isinstance(value, (dict, list)):
+        return _drain([(value, level)])
+    return _other_message(value)
+
+
+def _judge_items(
+    items: list, collection: str, structure: Any
+) -> tuple[CanvasProblem | None, CanvasProblem | None]:
+    """One pass over the items of ``nodes`` or ``edges``: the first structural
+    problem (which ends the pass), and the first content problem, kept while the
+    pass goes on. Each item is level 3 (the canvas is level 1, the list level 2).
+    Its own keys and values are judged here, as ``_drain`` judges a container, and
+    only its non-empty child containers are pushed for ``_drain``, so an item with
+    no nested container costs no walk."""
+    found: CanvasProblem | None = None
+    stack: list[tuple[Any, int]] = []
+    push = stack.append
+    for index, item in enumerate(items):
+        if type(item) is not dict and not isinstance(item, dict):
+            return CanvasProblem((collection, index), MUST_BE_AN_OBJECT), None
+        if not item:
+            continue
+        problem = structure(item, (collection, index))
+        if problem is not None:
+            return problem, None
+        if found is not None:
+            continue
+        message: str | None = None
+        for key in item:
+            if (type(key) is str or isinstance(key, str)) and not key.isascii():
+                if _SURROGATE.search(key) is not None:
+                    message = LONE_SURROGATE
+                    break
+        if message is None:
+            for child in item.values():
+                kind = type(child)
+                if kind is str:
+                    if not child.isascii() and _SURROGATE.search(child) is not None:
+                        message = LONE_SURROGATE
+                        break
+                elif kind is dict or kind is list:
+                    if child:
+                        push((child, 4))
+                elif kind is int or kind is bool or child is None:
+                    continue
+                elif kind is float:
+                    if not math.isfinite(child):
+                        message = NOT_FINITE
+                        break
+                else:
+                    message = _other_message(child)
+                    if message is not None:
+                        break
+                    if isinstance(child, (dict, list)) and child:
+                        push((child, 4))
+        if message is None and stack:
+            message = _drain(stack)
+        if message is not None:
+            found = CanvasProblem((collection, index), message)
+            stack.clear()
+    return None, found
 
 
 def canvas_problem(canvas: Any) -> CanvasProblem | None:
     """The first part of ``canvas`` that does not have the shape of the module
-    docstring, or None when it has it. A null canvas (no canvas at all) has it."""
+    docstring, or None when it has it. A null canvas (no canvas at all) has it.
+
+    One pass over each list's items, nodes then edges, judges each item's named
+    parts and walks it for the depth, the numbers, and the text; a structural
+    problem anywhere is answered before a content problem anywhere, so the first
+    content problem of each list is kept while the pass goes on. Then the top-level
+    entries are judged in canvas order. An empty item holds nothing to judge."""
     if canvas is None:
         return None
     if not isinstance(canvas, dict):
         return CanvasProblem((), MUST_BE_AN_OBJECT)
-    for collection, fields in (("nodes", _NODE_FIELDS), ("edges", _EDGE_FIELDS)):
+    content: dict[str, CanvasProblem] = {}
+    for collection, structure in (("nodes", _node_structure), ("edges", _edge_structure)):
         items = canvas.get(collection)
         if items is None:
             continue
         if not isinstance(items, list):
             return CanvasProblem((collection,), MUST_BE_A_LIST)
-        for index, item in enumerate(items):
-            problem = _structure_problem(item, (collection, index), fields)
-            if problem is not None:
-                return problem
+        problem, found = _judge_items(items, collection, structure)
+        if problem is not None:
+            return problem
+        if found is not None:
+            content[collection] = found
     for key, value in canvas.items():
-        if isinstance(key, str) and _SURROGATE.search(key):
+        if isinstance(key, str) and _not_text(key):
             return CanvasProblem((), LONE_SURROGATE)
         if key in ("nodes", "edges") and isinstance(value, list):
-            # Each item is judged on its own so the path names it: the canvas is
-            # level 1, the list level 2, the item level 3.
-            for index, item in enumerate(value):
-                problem = _content_problem(item, 3, (key, index))
-                if problem is not None:
-                    return problem
+            # Each item was judged on its own above, so the path names it.
+            if key in content:
+                return content[key]
         else:
             # Any other top-level key's name is the caller's, so the path stops
             # at the canvas.
-            problem = _content_problem(value, 2, ())
-            if problem is not None:
-                return problem
+            message = _value_message(value, 2)
+            if message is not None:
+                return CanvasProblem((), message)
     return None
 
 
