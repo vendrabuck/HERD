@@ -1900,14 +1900,20 @@ sections 8.4 to 8.14.
   `canvas_shape.py`), as stored data no reader can render is answered elsewhere
   (OPS-SECRET-19 in `operations-and-observability.md`), and so the editor never opens a
   drawing it could not load as an empty one. No stored row is rewritten. Every read of
-  a stored canvas here and in TOPO-SHAPE-8 judges it through `stored_canvas_problem`: a
-  canvas of at most `INLINE_CHECK_VALUES` (20,000) values, counting each list item and
-  each container with each of its keys and values, is judged on the event loop, in at
-  most about 1 ms to about 7 ms on one core; a larger one is judged on a bulk worker
-  thread (`run_bulk_work`, TOPO-BULK-23), whose slots it shares with the import and the
-  export. \
-  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`)
+  a stored canvas here and in TOPO-SHAPE-8 judges it through `stored_canvas_problem`,
+  which starts on the event loop and charges each value before it touches it: one for
+  each entry of the canvas itself, each list item, and each container with one for
+  each of its entries, and, for each key or string it searches character by character
+  (one that is not ASCII, searched for a lone surrogate; an edge id, searched for a
+  NUL), one more for every
+  `TEXT_CHARS_PER_VALUE` (16) characters; beyond that, each node or edge costs a fixed
+  number of lookups of its named parts. A canvas that costs at most
+  `INLINE_CHECK_VALUES` (20,000) is judged there, in about 1 ms to about 10 ms on one
+  core at that budget; once the charges pass it, the check stops and the canvas is
+  judged whole on a bulk worker thread (`run_bulk_work`, TOPO-BULK-23), whose slots it
+  shares with the import and the export. \
+  Enforced in: `services/cabling/app/services/canvas_shape.py` (`require_readable_canvas`, `stored_canvas_problem`, `INLINE_CHECK_VALUES`, `TEXT_CHARS_PER_VALUE`, `STORED_CANVAS_UNREADABLE_DETAIL`); `services/cabling/app/routes/topologies.py` (`get_topology`, `update_topology`, `clone_topology`, `validate_topology`, `validate_topology_internal`); `services/cabling/app/routes/versions.py` (`get_version`, `diff_versions`, `restore_version`); `services/cabling/app/routes/templates.py` (`get_template`, `update_template`, `create_template_from_topology`, `instantiate_template`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_every_reader_of_a_bad_topology_answers_409`, `test_a_diff_or_restore_of_a_bad_version_answers_409`, `test_the_owner_repairs_a_bad_topology_with_a_put_or_deletes_it`, `test_the_topology_list_still_lists_a_bad_row`, `test_a_bad_template_answers_409_and_its_owner_can_replace_it`, `test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread`); `services/cabling/tests/test_canvas_shape.py` (`test_a_stored_canvas_within_the_budget_is_judged_on_the_loop`, `test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread`, `test_a_wide_top_level_is_judged_on_a_worker_thread`, `test_a_long_string_is_charged_by_its_length`)
 - **TOPO-SHAPE-7.** Each stored canvas found without the shape is logged once per
   read, at warning: `stored_canvas_unreadable kind=<kind> id=<row id>
   problem=canvas_data.<path>: <message>`, and nothing of the canvas. \

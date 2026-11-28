@@ -20,6 +20,7 @@ from app.services.canvas_shape import (
     INLINE_CHECK_VALUES,
     MAX_CANVAS_DEPTH,
     STORED_CANVAS_UNREADABLE_DETAIL,
+    TEXT_CHARS_PER_VALUE,
     CanvasProblem,
     canvas_problem,
     readable_canvas_or_none,
@@ -571,41 +572,99 @@ def _threads_of_the_check(monkeypatch) -> list[int]:
 
 
 async def test_a_stored_canvas_within_the_budget_is_judged_on_the_loop(monkeypatch):
-    """Each list item costs one, so `INLINE_CHECK_VALUES` empty edges are exactly
-    the budget: judged where the request runs, with no worker thread."""
+    """The canvas's own entry and each list item cost one, so one entry holding
+    `INLINE_CHECK_VALUES - 1` empty edges is exactly the budget: judged where the
+    request runs, with no worker thread."""
     seen = _threads_of_the_check(monkeypatch)
-    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
+    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)]}
     assert await stored_canvas_problem(canvas) is None
     assert seen == []
-    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)] + [1]}
+    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 2)] + [1]}
     assert await stored_canvas_problem(bad) == CanvasProblem(
-        ("edges", INLINE_CHECK_VALUES - 1), OBJECT
+        ("edges", INLINE_CHECK_VALUES - 2), OBJECT
     )
     # An item costs one more for each of its keys, and a nested container one
     # plus one for each of its values: each canvas here is exactly the budget.
-    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 1)}]}
+    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 2)}]}
     assert await stored_canvas_problem(one_wide_item) is None
-    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 3)}}]}
+    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 4)}}]}
     assert await stored_canvas_problem(nested) is None
+    wide_top_level = {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES)}
+    assert await stored_canvas_problem(wide_top_level) is None
     assert seen == []
 
 
 async def test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread(monkeypatch):
-    """One value more and the whole check runs on a bulk worker thread, with the
-    same answer the check gives anywhere."""
+    """One value more and the whole check runs on a worker thread, with the same
+    answer the check gives anywhere."""
     seen = _threads_of_the_check(monkeypatch)
     loop_thread = threading.get_ident()
-    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES + 1)]}
+    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
     assert await stored_canvas_problem(canvas) is None
     assert len(seen) == 1 and seen[0] != loop_thread
-    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)] + [{"id": 1}]}
+    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)] + [{"id": 1}]}
     assert await stored_canvas_problem(bad) == CanvasProblem(
-        ("edges", INLINE_CHECK_VALUES, "id"), STRING
+        ("edges", INLINE_CHECK_VALUES - 1, "id"), STRING
     )
     assert len(seen) == 2 and seen[1] != loop_thread
     # Each of the exact-budget canvases of the test above, one value larger.
-    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES)}]}
+    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 1)}]}
     assert await stored_canvas_problem(one_wide_item) is None
-    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 2)}}]}
+    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 3)}}]}
     assert await stored_canvas_problem(nested) is None
     assert len(seen) == 4 and loop_thread not in seen
+
+
+async def test_a_wide_top_level_is_judged_on_a_worker_thread(monkeypatch):
+    """Every entry of the canvas itself costs one, scalar or not, so a canvas of
+    many top-level keys is not judged whole on the loop; a bad value past the
+    budget is still found."""
+    seen = _threads_of_the_check(monkeypatch)
+    wide = {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES + 1)}
+    assert await stored_canvas_problem(wide) is None
+    assert len(seen) == 1
+    wide[f"k{INLINE_CHECK_VALUES + 1}"] = math.inf
+    assert await stored_canvas_problem(wide) == CanvasProblem(
+        (), "holds a number that is not finite"
+    )
+    assert len(seen) == 2 and threading.get_ident() not in seen
+
+
+class _Text(str):
+    """A ``str`` subclass, which only a Python caller builds, judged on the check's
+    slower path."""
+
+
+# Every place the check searches a string character by character, with what the
+# canvas costs besides that string's characters, and how many times the string is
+# searched. `TEXT_CHARS_PER_VALUE` characters cost one value each time.
+TEXT_POSITIONS = {
+    "top_level_value": (lambda s: {"k": s}, 1, 1),
+    "top_level_key": (lambda s: {s: 0}, 1, 1),
+    "top_level_nested_value": (lambda s: {"k": {"v": s}}, 3, 1),
+    "top_level_nested_key": (lambda s: {"k": {s: 0}}, 3, 1),
+    "node_value": (lambda s: {"nodes": [{"v": s}]}, 3, 1),
+    "node_key": (lambda s: {"nodes": [{s: 0}]}, 3, 1),
+    "node_label": (lambda s: {"nodes": [{"data": {"label": s}}]}, 5, 1),
+    "nested_key": (lambda s: {"nodes": [{"d": {s: 0}}]}, 5, 1),
+    "nested_list_item": (lambda s: {"nodes": [{"d": [s]}]}, 5, 1),
+    "edge_value": (lambda s: {"edges": [{"v": s}]}, 3, 1),
+    "subclass_top_level": (lambda s: {"k": _Text(s)}, 1, 1),
+    "subclass_node_value": (lambda s: {"nodes": [{"v": _Text(s)}]}, 3, 1),
+    "subclass_nested_value": (lambda s: {"nodes": [{"d": {"v": _Text(s)}}]}, 5, 1),
+}
+
+
+@pytest.mark.parametrize("position", list(TEXT_POSITIONS))
+async def test_a_long_string_is_charged_by_its_length(monkeypatch, position):
+    """A string that is not ASCII costs one more value for every
+    `TEXT_CHARS_PER_VALUE` characters, wherever it sits: the longest one the budget
+    holds is judged on the loop, one character more on a worker thread."""
+    assert TEXT_CHARS_PER_VALUE == 16
+    build, base, searches = TEXT_POSITIONS[position]
+    seen = _threads_of_the_check(monkeypatch)
+    fits = ((INLINE_CHECK_VALUES - base) // searches) * 16 + 15
+    assert await stored_canvas_problem(build("\u00e9" * fits)) is None
+    assert seen == []
+    assert await stored_canvas_problem(build("\u00e9" * (fits + 1))) is None
+    assert len(seen) == 1 and seen[0] != threading.get_ident()

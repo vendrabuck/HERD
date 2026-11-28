@@ -50,9 +50,10 @@ the request body, on the event loop. Read side: a stored canvas need not have th
 shape. ``require_readable_canvas`` answers 409
 ``STORED_CANVAS_UNREADABLE_DETAIL`` for a route that needs the canvas, and
 ``readable_canvas_or_none`` gives a reader that can do without the canvas None
-instead; both judge through ``stored_canvas_problem``, which keeps a canvas larger
-than ``INLINE_CHECK_VALUES`` off the event loop, and both log one warning naming the
-row's kind, its id, and the problem, never any of the canvas.
+instead; both judge through ``stored_canvas_problem``, which keeps a canvas that
+costs more than ``INLINE_CHECK_VALUES`` (as the constant's comment counts) off the
+event loop, and both log one warning naming the row's kind, its id, and the problem,
+never any of the canvas.
 """
 
 from __future__ import annotations
@@ -89,13 +90,21 @@ TOO_DEEP = f"is nested deeper than {MAX_CANVAS_DEPTH} levels"
 NOT_FINITE = "holds a number that is not finite"
 LONE_SURROGATE = "holds a lone surrogate escape, which is not valid text"
 
-# The most values (a list item, and a container with each of its keys and values,
-# as ``_judge`` counts them) a stored canvas read by a request is judged for on the
-# event loop; a canvas holding more is judged on a bulk worker thread instead
-# (``stored_canvas_problem``). Measured on one core, the check judges this many in
-# about 1 ms to about 7 ms, more the smaller and more numerous the values; an editor
-# canvas of 100 devices and 200 links holds about 4,600.
+# The most values a stored canvas read by a request is judged for on the event loop;
+# a canvas that costs more is judged on a worker thread instead
+# (``stored_canvas_problem``). ``_judge`` charges each value before it touches it:
+# each entry of the canvas itself, each list item, and each container with one for
+# each of its entries; and each key or string it searches character by character (one
+# that is not ASCII, searched for a lone surrogate; an edge id, searched for a NUL)
+# one more for every ``TEXT_CHARS_PER_VALUE`` characters it holds. Beyond that, each
+# node or edge costs a fixed number of lookups of its named parts. Measured on one
+# core, a canvas at this budget is judged in about 1 ms to about 10 ms, more the more
+# nodes and edges it holds (10,000 edges of one key each took the longest); an editor
+# canvas of 100 devices and 200 links costs about 5,400.
 INLINE_CHECK_VALUES = 20_000
+# Searching 16 characters for a lone surrogate takes about as long as judging one
+# small value; a string of fewer costs only its place in its container.
+TEXT_CHARS_PER_VALUE = 16
 
 # The answer to a request that needs a stored canvas which fails the check.
 STORED_CANVAS_UNREADABLE_DETAIL = (
@@ -226,7 +235,9 @@ def _drain(stack: list[tuple[Any, int]], left: int) -> tuple[str | None, int]:
     """Judge every container on ``stack`` (each with its nesting level) and those
     nested in it, the last pushed first: the message of the first problem, else
     None, and what is left of the budget ``left``. Each container costs one plus
-    its length; ``_Unfinished`` is raised when the budget goes below zero.
+    its length, and each key or string that is not ASCII one more for every
+    ``TEXT_CHARS_PER_VALUE`` characters, charged before it is searched;
+    ``_Unfinished`` is raised when the budget goes below zero.
 
     For each container: its keys (a lone surrogate), then its depth, then its
     values (a lone surrogate, a number that is not finite), its child containers
@@ -244,6 +255,9 @@ def _drain(stack: list[tuple[Any, int]], left: int) -> tuple[str | None, int]:
         if type(current) is dict or isinstance(current, dict):
             for key in current:
                 if (type(key) is str or isinstance(key, str)) and not key.isascii():
+                    left -= len(key) // TEXT_CHARS_PER_VALUE
+                    if left < 0:
+                        raise _Unfinished
                     if _SURROGATE.search(key) is not None:
                         return LONE_SURROGATE, left
             children: Any = current.values()
@@ -256,8 +270,12 @@ def _drain(stack: list[tuple[Any, int]], left: int) -> tuple[str | None, int]:
         for child in children:
             kind = type(child)
             if kind is str:
-                if not child.isascii() and _SURROGATE.search(child) is not None:
-                    return LONE_SURROGATE, left
+                if not child.isascii():
+                    left -= len(child) // TEXT_CHARS_PER_VALUE
+                    if left < 0:
+                        raise _Unfinished
+                    if _SURROGATE.search(child) is not None:
+                        return LONE_SURROGATE, left
             elif kind is dict or kind is list:
                 if child or at_bound:
                     push((child, deeper))
@@ -267,12 +285,24 @@ def _drain(stack: list[tuple[Any, int]], left: int) -> tuple[str | None, int]:
                 if not math.isfinite(child):
                     return NOT_FINITE, left
             else:
+                left -= _text_cost(child)
+                if left < 0:
+                    raise _Unfinished
                 message = _other_message(child)
                 if message is not None:
                     return message, left
                 if isinstance(child, (dict, list)) and (child or at_bound):
                     push((child, deeper))
     return None, left
+
+
+def _text_cost(value: Any) -> int:
+    """What searching ``value`` character by character costs beyond the value
+    itself: one for every ``TEXT_CHARS_PER_VALUE`` characters of a string that is
+    not ASCII, else nothing."""
+    if isinstance(value, str) and not value.isascii():
+        return len(value) // TEXT_CHARS_PER_VALUE
+    return 0
 
 
 def _other_message(value: Any) -> str | None:
@@ -291,13 +321,17 @@ def _judge_items(
     """One pass over the items of ``nodes`` or ``edges``: the first structural
     problem (which ends the pass), the first content problem, kept while the pass
     goes on, and what is left of the budget ``left`` (each item costs one plus its
-    length, and its walk what ``_drain`` charges). Each item is level 3 (the canvas
-    is level 1, the list level 2). Its own keys and values are judged here, as
-    ``_drain`` judges a container, and only its non-empty child containers are
-    pushed for ``_drain``, so an item with no nested container costs no walk."""
+    length; an edge's ``id``, which ``_edge_structure`` searches for a NUL, and each
+    key or string of the item that is not ASCII, one more for every
+    ``TEXT_CHARS_PER_VALUE`` characters, charged before the search; and its walk
+    what ``_drain`` charges). Each item is level 3 (the canvas is level 1, the list
+    level 2). Its own keys and values are judged here, as ``_drain`` judges a
+    container, and only its non-empty child containers are pushed for ``_drain``,
+    so an item with no nested container costs no walk."""
     found: CanvasProblem | None = None
     stack: list[tuple[Any, int]] = []
     push = stack.append
+    searched_id = collection == "edges"
     left -= len(items)
     if left < 0:
         raise _Unfinished
@@ -307,6 +341,10 @@ def _judge_items(
         if not item:
             continue
         left -= len(item)
+        if searched_id:
+            edge_id = item.get("id")
+            if isinstance(edge_id, str):
+                left -= len(edge_id) // TEXT_CHARS_PER_VALUE
         if left < 0:
             raise _Unfinished
         problem = structure(item, (collection, index))
@@ -317,6 +355,9 @@ def _judge_items(
         message: str | None = None
         for key in item:
             if (type(key) is str or isinstance(key, str)) and not key.isascii():
+                left -= len(key) // TEXT_CHARS_PER_VALUE
+                if left < 0:
+                    raise _Unfinished
                 if _SURROGATE.search(key) is not None:
                     message = LONE_SURROGATE
                     break
@@ -324,9 +365,13 @@ def _judge_items(
             for child in item.values():
                 kind = type(child)
                 if kind is str:
-                    if not child.isascii() and _SURROGATE.search(child) is not None:
-                        message = LONE_SURROGATE
-                        break
+                    if not child.isascii():
+                        left -= len(child) // TEXT_CHARS_PER_VALUE
+                        if left < 0:
+                            raise _Unfinished
+                        if _SURROGATE.search(child) is not None:
+                            message = LONE_SURROGATE
+                            break
                 elif kind is dict or kind is list:
                     if child:
                         push((child, 4))
@@ -337,6 +382,9 @@ def _judge_items(
                         message = NOT_FINITE
                         break
                 else:
+                    left -= _text_cost(child)
+                    if left < 0:
+                        raise _Unfinished
                     message = _other_message(child)
                     if message is not None:
                         break
@@ -352,11 +400,17 @@ def _judge_items(
 
 def _judge(canvas: Any, left: int) -> CanvasProblem | None:
     """``canvas_problem`` within a budget of ``left`` values; ``_Unfinished`` when
-    the canvas holds more than that."""
+    the canvas costs more than that. Each entry of the canvas itself costs one,
+    charged before any is judged, and a top-level key or scalar string that is not
+    ASCII one more for every ``TEXT_CHARS_PER_VALUE`` characters, charged before it
+    is searched."""
     if canvas is None:
         return None
     if not isinstance(canvas, dict):
         return CanvasProblem((), MUST_BE_AN_OBJECT)
+    left -= len(canvas)
+    if left < 0:
+        raise _Unfinished
     content: dict[str, CanvasProblem] = {}
     for collection, structure in (("nodes", _node_structure), ("edges", _edge_structure)):
         items = canvas.get(collection)
@@ -370,22 +424,48 @@ def _judge(canvas: Any, left: int) -> CanvasProblem | None:
         if found is not None:
             content[collection] = found
     for key, value in canvas.items():
-        if isinstance(key, str) and _not_text(key):
-            return CanvasProblem((), LONE_SURROGATE)
-        if key in ("nodes", "edges") and isinstance(value, list):
+        if type(key) is not str or not key.isascii():
+            left -= _text_cost(key)
+            if left < 0:
+                raise _Unfinished
+            if isinstance(key, str) and _not_text(key):
+                return CanvasProblem((), LONE_SURROGATE)
+        kind = type(value)
+        if (key == "nodes" or key == "edges") and kind is list:
             # Each item was judged on its own above, so the path names it.
             if key in content:
                 return content[key]
-        elif isinstance(value, (dict, list)):
+            continue
+        message: str | None = None
+        if kind is dict or kind is list:
             # Any other top-level key's name is the caller's, so the path stops
             # at the canvas.
             message, left = _drain([(value, 2)], left)
-            if message is not None:
-                return CanvasProblem((), message)
+        elif kind is str:
+            if not value.isascii():
+                left -= len(value) // TEXT_CHARS_PER_VALUE
+                if left < 0:
+                    raise _Unfinished
+                if _SURROGATE.search(value) is not None:
+                    message = LONE_SURROGATE
+        elif kind is int or kind is bool or value is None:
+            continue
+        elif kind is float:
+            if not math.isfinite(value):
+                message = NOT_FINITE
+        elif (key == "nodes" or key == "edges") and isinstance(value, list):
+            if key in content:
+                return content[key]
+            continue
+        elif isinstance(value, (dict, list)):
+            message, left = _drain([(value, 2)], left)
         else:
+            left -= _text_cost(value)
+            if left < 0:
+                raise _Unfinished
             message = _other_message(value)
-            if message is not None:
-                return CanvasProblem((), message)
+        if message is not None:
+            return CanvasProblem((), message)
     return None
 
 
@@ -402,10 +482,11 @@ def canvas_problem(canvas: Any) -> CanvasProblem | None:
 
 
 async def stored_canvas_problem(canvas: Any) -> CanvasProblem | None:
-    """``canvas_problem`` for a stored canvas read by a request. A canvas of at most
-    ``INLINE_CHECK_VALUES`` values is judged on the event loop; a larger one is
-    judged on a bulk worker thread (``herd_common.bulk_work.run_bulk_work``), so
-    the loop is never held for the whole check."""
+    """``canvas_problem`` for a stored canvas read by a request. The check starts on
+    the event loop and stops there once the canvas has cost more than
+    ``INLINE_CHECK_VALUES`` (as the constant's comment counts); such a canvas is then
+    judged whole on a bulk worker thread (``herd_common.bulk_work.run_bulk_work``),
+    so the loop is never held for the whole check."""
     try:
         return _judge(canvas, INLINE_CHECK_VALUES)
     except _Unfinished:
