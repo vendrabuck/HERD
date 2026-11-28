@@ -817,11 +817,13 @@ on removal from an `ACTIVE` row, `herd.reservations.wiring_changed` via the prun
   is larger than the page it returned, the dialog says `<total minus page rows> more
   matching devices are not listed. Type more of the name to narrow the list.` under the
   list, counted against the page the server returned, so the number stays true however
-  many of the page's rows are hidden as already selected. A failed read shows the shared load error (`Could not load available devices.`
-  with Retry) in place of the list, never `No available devices found`, which needs a
-  successful empty answer (issue #1590). \
+  many of the page's rows are hidden as already selected. A failed read shows the shared
+  load error (`Could not load available devices.` with Retry) in place of the list, never
+  `No available devices found`, which needs a successful empty answer; a failed refresh
+  while the list shows rows keeps them and shows `Could not refresh available devices.`
+  with the reason and Retry above the list, with no alert (issue #1590). \
   Enforced in: `frontend/src/components/reservations/EditDevicesModal.tsx` (`EditDevicesModal`, `EDIT_DEVICES_PAGE_SIZE`); `frontend/src/components/ui/MoreMatchesNotice.tsx` (`MoreMatchesNotice`) \
-  Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `counts past the page the server returned, not the rows left after hiding selected ones`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
+  Pinned by: `frontend/src/test/components/EditDevicesModal.test.tsx` (`lists the page and says how many more match, asking for one page of 50`, `counts past the page the server returned, not the rows left after hiding selected ones`, `says nothing more when the page holds every match`, `a failed read shows the load error and no notice`, `a failed refresh keeps the rows under a refresh notice, with no alert`, `shows an empty state when no available devices are returned`); `frontend/src/test/pages/pageLoadFailureFollowUp.test.tsx` (`a %s failure shows the load error with its reason, never the empty text`)
 
 **Out of scope.** The fork prune itself and the wiring release are cabling's and
 execution's (`provisioning-and-wiring.md`).

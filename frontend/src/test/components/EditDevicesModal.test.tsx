@@ -115,7 +115,7 @@ function renderModal(
       />
     </ProvidersWrapper>,
   );
-  return { ...utils, onClose, onUpdated };
+  return { ...utils, onClose, onUpdated, client };
 }
 
 function ProvidersWrapper({ client, children }: { client: QueryClient; children: ReactNode }) {
@@ -203,6 +203,30 @@ describe("EditDevicesModal", () => {
           "70 more matching devices are not listed. Type more of the name to narrow the list.",
         ),
       ).toBeInTheDocument();
+    });
+
+    it("a failed refresh keeps the rows under a refresh notice, with no alert", async () => {
+      server.use(cappedHandler(50, []));
+      const { client } = renderModal();
+      expect(await screen.findByText("lab-node-49")).toBeInTheDocument();
+
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          if (new URL(request.url).searchParams.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          return HttpResponse.json({ detail: "inventory is restarting" }, { status: 503 });
+        }),
+      );
+      await client.invalidateQueries({ queryKey: ["devices"] });
+
+      // The dialog's other status region is the selection count.
+      const notice = await screen.findByText(/^Could not refresh available devices\./);
+      expect(notice.closest('[role="status"]')).toHaveTextContent(
+        "Could not refresh available devices. inventory is restarting",
+      );
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
 
     it("says nothing more when the page holds every match", async () => {

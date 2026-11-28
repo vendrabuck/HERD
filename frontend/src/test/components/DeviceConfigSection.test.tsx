@@ -45,7 +45,7 @@ function renderWithProviders(ui: ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return { ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>), client };
 }
 
 describe("DeviceConfigSection", () => {
@@ -125,6 +125,28 @@ describe("DeviceConfigSection", () => {
     );
     expect(screen.queryByText("v501")).not.toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  });
+
+  it("a failed refresh keeps the rows under a refresh notice, with no alert", async () => {
+    server.use(
+      http.get(VERSIONS_URL, () =>
+        HttpResponse.json({ items: [makeVersion()], total: 1, skip: 0, limit: 500 }),
+      ),
+    );
+    const { client } = renderWithProviders(<DeviceConfigSection deviceId={DEVICE_ID} />);
+    expect(await screen.findByText("v1")).toBeInTheDocument();
+
+    server.use(
+      http.get(VERSIONS_URL, () => HttpResponse.json({ detail: "inventory is restarting" }, { status: 503 })),
+    );
+    await client.invalidateQueries({ queryKey: ["devices"] });
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Could not refresh config versions. inventory is restarting",
+    );
+    expect(screen.getByText("v1")).toBeInTheDocument();
+    expect(screen.getByText("1 version")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("renders a populated version table with author and singular count", async () => {

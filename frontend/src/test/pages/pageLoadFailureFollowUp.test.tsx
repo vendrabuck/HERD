@@ -35,7 +35,7 @@ const STAMP = "2026-01-01T00:00:00Z";
 const DEV_ID = "dev-1";
 const page = (items: unknown[]) => ({ items, total: items.length, skip: 0, limit: 50 });
 
-type Mode = "server" | "nginx" | "html" | "empty" | "loaded";
+type Mode = "server" | "nginx" | "html" | "list" | "empty" | "loaded";
 let mode: Mode = "loaded";
 
 const NGINX_503 =
@@ -52,6 +52,9 @@ function answer(emptyBody: unknown, loadedBody: unknown) {
       return HttpResponse.json({ detail: NGINX_503 }, { status: 503 });
     case "html":
       return new HttpResponse(SPA_PAGE, { status: 200, headers: { "Content-Type": "text/html" } });
+    case "list":
+      // A readable 200 of the wrong shape: a JSON list where an object belongs.
+      return HttpResponse.json([]);
     case "empty":
       return HttpResponse.json(emptyBody as never);
     default:
@@ -406,5 +409,32 @@ describe("DeviceConfigSection never shows the error and the empty text together 
     await screen.findByRole("alert");
     expect(screen.queryByText("No config versions yet.")).not.toBeInTheDocument();
     expect(screen.queryByText(/^\d+ versions?$/)).not.toBeInTheDocument();
+  });
+});
+
+describe.each(SPECS.filter((s) => s.modal))("$name, an answer that is not an object (issue #1590)", (spec) => {
+  it("a 200 JSON list shows the load error, never an empty dialog", async () => {
+    mode = "list";
+    renderSpec(spec);
+    await spec.open!();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(`Could not load ${spec.what}. The server's answer could not be read.`);
+    expect(alert.closest("dialog")!.querySelector("pre")).toBeNull();
+  });
+});
+
+describe("DeviceConfigSection View, Retry while the read is on its way (issue #1590)", () => {
+  it("the Retry button reads Retrying... until the read answers", async () => {
+    mode = "list";
+    const spec = SPECS.find((s) => s.name === "DeviceConfigSection View modal")!;
+    renderSpec(spec);
+    await spec.open!();
+    await screen.findByRole("alert");
+
+    server.use(
+      http.get(`/api/inventory/devices/${DEV_ID}/config-versions/ver-1`, () => new Promise<never>(() => {})),
+    );
+    fireEvent.click(screen.getByRole("button", { name: `Retry loading ${spec.what}` }));
+    expect(await screen.findByRole("button", { name: "Retrying..." })).toHaveAttribute("aria-disabled", "true");
   });
 });

@@ -6,7 +6,7 @@
  * narrows the list. A search too short to run sends no request.
  */
 import { http, HttpResponse } from "msw";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactElement } from "react";
@@ -113,6 +113,31 @@ describe("DeviceSearchPicker, more matches than one page (issue #1590)", () => {
     type("lab");
     expect(await screen.findByRole("button", { name: "lab-node-2" })).toBeInTheDocument();
     expect(screen.queryByText(NOTICE)).not.toBeInTheDocument();
+  });
+
+  it("a search still on its way shows nothing, never No devices match", async () => {
+    const asked: URLSearchParams[] = [];
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        asked.push(new URL(request.url).searchParams);
+        return new Promise<never>(() => {});
+      }),
+    );
+    renderPicker();
+    type("lab");
+    await waitFor(() => expect(asked.length).toBeGreaterThan(0));
+    await flushPending();
+    expect(screen.queryByText("No devices match")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("searches for the trimmed text", async () => {
+    const asked: URLSearchParams[] = [];
+    server.use(searchHandler(3, 3, asked));
+    renderPicker();
+    type("  lab  ");
+    expect(await screen.findByRole("button", { name: "lab-node-2" })).toBeInTheDocument();
+    expect(asked.map((p) => p.get("search"))).toEqual(["lab"]);
   });
 
   it("a one-character search sends no request and shows nothing", async () => {
