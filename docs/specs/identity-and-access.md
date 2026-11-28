@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `IAM` (used in rule identifiers, for example `IAM-ROLE-2`) |
-| Verified at | commit `61bebe96` (`v0.6.0-76-g61bebe96`), 2026-10-05 |
+| Last full review | 2026-10-05 |
 | Owning services | auth (`services/auth/`), acl (`services/acl/`), the shared `herd_common` auth, internal-token, and ACL helpers (`services/common/herd_common/`) |
 | Other services involved | every service that verifies a JWT (all but config), notifications (admin and contact lookups), inventory (group lookups, ACL and reservation-owner checks), secrets (ACL checks), reservations (batch group lookup, the reservation-owner answer), an LDAP or Active Directory server |
 | Design records | [ADR 0011](../design/0011-ldap-group-sync.md), [ADR 0016](../design/0016-oidc-single-sign-on.md) |
