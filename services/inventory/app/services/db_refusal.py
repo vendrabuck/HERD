@@ -4,14 +4,18 @@ A refusal is named by its SQLSTATE: the one Postgres gives through asyncpg, or, 
 the SQLite the unit suites run on, the SQLSTATE its extended error code stands for.
 Never from the exception's text, its arguments, or the statement: those carry the
 row's values, and a name read from text would follow whatever a value spells. The
-bulk importer's row reasons (INV-BULK-28) and the device create and update answers
-(INV-DEV-11) both classify through ``sqlstate_of``.
+bulk importer's row reasons (INV-BULK-28), the device create and update answers
+(INV-DEV-11), the dynamic-instance create (INV-DYN-4, INV-DYN-10), and the template
+and device config writes (``template_service._integrity_kind``) all classify through
+``sqlstate_of``.
 """
 
 from sqlalchemy.exc import DBAPIError
 
 # A unique constraint refused the row.
 UNIQUE_VIOLATION = "23505"
+# A foreign key refused the row.
+FOREIGN_KEY_VIOLATION = "23503"
 
 # SQLite's extended error codes (`sqlite3.Error.sqlite_errorname`) for the SQLSTATE
 # classes the callers distinguish.

@@ -947,3 +947,93 @@ async def test_a_template_deleted_before_a_device_insert_is_not_a_name_clash(
     assert raced
     assert "sqlstate=23503" in caplog.text
     assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+# A dynamic-instance create's integrity refusals -----------------------------------
+
+
+async def _dynamic_template(session_factory, tag: str) -> uuid.UUID:
+    async with session_factory() as s:
+        recipe = DriverPackage(
+            name=f"pg-live-recipe-{tag}",
+            connection_type="Hypervisor",
+            filename="r.zip",
+            storage_key=f"r-{tag}",
+            size_bytes=1,
+            sha256="0" * 64,
+            uploaded_by="pg",
+        )
+        hypervisor = Hypervisor(
+            name=f"pg-live-hv-{tag}",
+            endpoint="https://hv.example:8006",
+            hypervisor_type="proxmox",
+            secret_id=uuid.uuid4(),
+        )
+        s.add_all([recipe, hypervisor])
+        await s.flush()
+        template = DeviceTemplate(
+            name=f"pg-live-dyn-{tag}",
+            template_type="dynamic",
+            vendor="V",
+            model="M",
+            driver_id=recipe.id,
+            hypervisor_id=hypervisor.id,
+            sections=_SECTIONS,
+        )
+        s.add(template)
+        await s.commit()
+        return template.id
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["generated-name", "explicit-name"])
+@pytest.mark.parametrize("code", ["23514", "23503"])
+async def test_a_dynamic_instance_refused_for_anything_but_a_unique_violation_answers_at_once(
+    client, session_factory, lab, tag, sentinel, refusing_trigger, caplog, code, named
+):
+    """The internal create tries the next generated name only after a unique
+    violation (INV-DYN-10). A trigger refusing every insert of this test's rows with
+    another class 23 SQLSTATE answers the generic detail after one insert, where
+    the name loop used to run to its 10000-try cap."""
+    caplog.set_level(logging.INFO)
+    template_id = await _dynamic_template(session_factory, tag)
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "field_data": {"pw": sentinel, "code": code},
+    }
+    if named:
+        body["name"] = f"dyn-{code}-{tag}"
+    resp = await client.post(
+        "/devices/internal", headers={"X-Internal-Token": "test-token"}, json=body
+    )
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": _CONSTRAINT}
+    _assert_clean(resp.text, sentinel)
+    _assert_clean(caplog.text, sentinel)
+    assert caplog.text.count(f"sqlstate={code}") == 1
+    assert await _names(session_factory, Device, tag) == {lab["device"]}
+
+
+async def test_a_dynamic_instance_whose_generated_name_is_taken_tries_the_next(
+    client, session_factory, lab, tag
+):
+    """A real unique violation on the generated name, with a request_id no device
+    holds, moves on to the next n."""
+    template_id = await _dynamic_template(session_factory, tag)
+    reservation_id = uuid.uuid4()
+    body = {
+        "template_id": str(template_id),
+        "reservation_id": str(reservation_id),
+        "field_data": {"pw": "x"},
+    }
+    headers = {"X-Internal-Token": "test-token"}
+    first = await client.post(
+        "/devices/internal", headers=headers, json={**body, "request_id": str(uuid.uuid4())}
+    )
+    second = await client.post(
+        "/devices/internal", headers=headers, json={**body, "request_id": str(uuid.uuid4())}
+    )
+    assert (first.status_code, second.status_code) == (201, 201)
+    prefix = f"pg-live-dyn-{tag}-{str(reservation_id)[:8]}"
+    assert (first.json()["name"], second.json()["name"]) == (f"{prefix}-1", f"{prefix}-2")

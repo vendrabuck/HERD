@@ -5,8 +5,8 @@ the historical 409 wording; a foreign-key failure (a referenced hypervisor or
 driver absent at insert time, now that device_templates.hypervisor_id carries a
 real FK) must not be mislabeled as a name conflict. These tests pin both
 wordings and exercise the classifier on both database engines the project runs:
-asyncpg (Postgres, via a SQLSTATE) in production and aiosqlite (SQLite, via
-message text) in unit tests.
+asyncpg (Postgres, via a SQLSTATE) in production and aiosqlite (SQLite, via its
+extended error code) in unit tests, never via the error's text.
 
 The endpoint tests here use a dedicated engine with PRAGMA foreign_keys=ON so
 SQLite actually enforces the hypervisor_id FK; the default test engines leave
@@ -184,10 +184,42 @@ def test_integrity_kind_postgres_sqlstates():
     assert _integrity_kind(_make_integrity_error(_PgOrig("23514"))) == "unknown"
 
 
-def test_integrity_kind_sqlite_message_text():
-    unique = sqlite3.IntegrityError("UNIQUE constraint failed: device_templates.name")
-    fk = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
-    other = sqlite3.IntegrityError("NOT NULL constraint failed: device_templates.sections")
+def _real_sqlite_refusal(statement: str) -> sqlite3.IntegrityError:
+    """The IntegrityError sqlite3 itself raises for ``statement`` against a table
+    with a unique name, a foreign key, and a NOT NULL column."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE TABLE t (name TEXT UNIQUE, parent_id INTEGER REFERENCES parent(id),"
+            " sections TEXT NOT NULL)"
+        )
+        conn.execute("INSERT INTO t VALUES ('a', NULL, 's')")
+        with pytest.raises(sqlite3.IntegrityError) as caught:
+            conn.execute(statement)
+    finally:
+        conn.close()
+    return caught.value
+
+
+def test_integrity_kind_sqlite_error_codes():
+    unique = _real_sqlite_refusal("INSERT INTO t VALUES ('a', NULL, 's')")
+    fk = _real_sqlite_refusal("INSERT INTO t VALUES ('b', 7, 's')")
+    other = _real_sqlite_refusal("INSERT INTO t VALUES ('c', NULL, NULL)")
     assert _integrity_kind(_make_integrity_error(unique)) == "unique"
     assert _integrity_kind(_make_integrity_error(fk)) == "foreign_key"
     assert _integrity_kind(_make_integrity_error(other)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "UNIQUE constraint failed: device_templates.name",
+        "FOREIGN KEY constraint failed",
+        'duplicate key value violates unique constraint "device_templates_name_key"',
+    ],
+)
+def test_integrity_kind_never_reads_a_class_from_the_text(text):
+    """Text alone, with no SQLSTATE and no SQLite error code, names no class."""
+    assert _integrity_kind(_make_integrity_error(Exception(text))) == "unknown"

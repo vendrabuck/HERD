@@ -10,28 +10,20 @@ from app.models.driver_package import ConnectionType, DriverPackage
 from app.models.port import Port
 from app.models.template import DeviceTemplate
 from app.schemas.template import TemplateCreate, TemplateUpdate
+from app.services.db_refusal import FOREIGN_KEY_VIOLATION, UNIQUE_VIOLATION, sqlstate_of
 
 
 def _integrity_kind(exc: IntegrityError) -> str:
-    """Classify an IntegrityError, portably across asyncpg and aiosqlite.
-
-    Production runs asyncpg (Postgres), which exposes a SQLSTATE on
-    ``exc.orig`` (23505 unique_violation, 23503 foreign_key_violation). Unit
-    tests run aiosqlite (SQLite), which carries no SQLSTATE, only message text
-    ("UNIQUE constraint failed: ..." or "FOREIGN KEY constraint failed").
-    Returns "unique", "foreign_key", or "unknown"; the caller maps each to a
-    distinct HTTP response so a foreign-key failure is never reported as a
-    name conflict.
+    """Classify an IntegrityError by its SQLSTATE alone (``db_refusal.sqlstate_of``:
+    asyncpg's, or SQLite's extended error code mapped to the same classes), never
+    its text. Returns "unique", "foreign_key", or "unknown"; the caller maps each to
+    a distinct HTTP response so a foreign-key failure is never reported as a name
+    conflict.
     """
-    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
-    if sqlstate == "23505":
+    sqlstate = sqlstate_of(exc)
+    if sqlstate == UNIQUE_VIOLATION:
         return "unique"
-    if sqlstate == "23503":
-        return "foreign_key"
-    text = str(getattr(exc, "orig", exc)).lower()
-    if "unique constraint failed" in text:
-        return "unique"
-    if "foreign key constraint failed" in text:
+    if sqlstate == FOREIGN_KEY_VIOLATION:
         return "foreign_key"
     return "unknown"
 

@@ -419,6 +419,116 @@ async def test_internal_create_explicit_name_collision_new_request_id_409(client
     assert second.json()["detail"] == "Device with name 'dup-name' already exists"
 
 
+class _CodedRefusal(Exception):
+    """A driver error carrying only what db_refusal reads: a SQLSTATE, or SQLite's
+    extended error name; or, with neither, text alone."""
+
+    def __init__(self, text: str, sqlstate: str | None = None, errorname: str | None = None):
+        super().__init__(text)
+        if sqlstate is not None:
+            self.sqlstate = sqlstate
+        if errorname is not None:
+            self.sqlite_errorname = errorname
+
+
+_NOT_UNIQUE = [
+    pytest.param(_CodedRefusal("fk", sqlstate="23503"), id="23503"),
+    pytest.param(_CodedRefusal("check", sqlstate="23514"), id="23514"),
+    pytest.param(
+        _CodedRefusal("FOREIGN KEY constraint failed", errorname="SQLITE_CONSTRAINT_FOREIGNKEY"),
+        id="sqlite-foreign-key",
+    ),
+    # Text that names a unique column but carries no code: never read as one.
+    pytest.param(_CodedRefusal("UNIQUE constraint failed: devices.request_id"), id="text-only"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [False, True], ids=["generated-name", "explicit-name"])
+@pytest.mark.parametrize("orig", _NOT_UNIQUE)
+async def test_internal_create_a_refusal_that_is_not_a_unique_violation_answers_at_once(
+    client, orig, named
+):
+    """Only a unique violation moves the generated name on to the next n (INV-DYN-10):
+    any other refusal answers the generic detail after one insert, where every
+    IntegrityError used to read as a taken name and the loop ran 10000 inserts."""
+    from app.models.device import Device
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    tid = await _create_dynamic_template(client, "Refused VM")
+    real_commit = AsyncSession.commit
+    inserts = 0
+
+    async def refuse_device_inserts(self):
+        nonlocal inserts
+        if any(isinstance(obj, Device) for obj in self.new):
+            inserts += 1
+            raise IntegrityError("INSERT INTO devices ...", {}, orig)
+        return await real_commit(self)
+
+    body = {
+        "template_id": tid,
+        "reservation_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "field_data": {"image": "ubuntu"},
+    }
+    if named:
+        body["name"] = "refused-vm"
+    with patch.object(AsyncSession, "commit", refuse_device_inserts):
+        resp = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "Device violates a database constraint"}
+    assert inserts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [False, True], ids=["generated-name", "explicit-name"])
+async def test_internal_create_that_loses_a_request_id_race_returns_the_winner(client, named):
+    """A concurrent create with the same request_id commits between this create's
+    fast-path lookup and its insert: the real unique violation is followed by a
+    lookup of the request_id, and the winner's device answers (INV-DYN-4)."""
+    from app.models.device import Device, DeviceStatus, TopologyType
+    from app.services import inventory_service
+
+    tid = await _create_dynamic_template(client, "Raced VM")
+    req = uuid.uuid4()
+    async with TestSessionLocal() as session:
+        winner = Device(
+            name="the-winner",
+            template_id=uuid.UUID(tid),
+            topology_type=TopologyType.CLOUD,
+            status=DeviceStatus.RESERVED,
+            field_data={"image": "ubuntu"},
+            request_id=req,
+        )
+        session.add(winner)
+        await session.commit()
+        winner_id = str(winner.id)
+
+    real_lookup = inventory_service._get_device_by_request_id
+    lookups = 0
+
+    async def first_lookup_misses(db, request_id):
+        nonlocal lookups
+        lookups += 1
+        return None if lookups == 1 else await real_lookup(db, request_id)
+
+    body = {
+        "template_id": tid,
+        "reservation_id": str(uuid.uuid4()),
+        "request_id": str(req),
+        "field_data": {"image": "ubuntu"},
+    }
+    if named:
+        body["name"] = "the-loser"
+    with patch.object(inventory_service, "_get_device_by_request_id", first_lookup_misses):
+        resp = await client.post("/devices/internal", headers=_TOKEN, json=body)
+    assert resp.status_code == 201
+    assert resp.json()["id"] == winner_id
+    assert lookups == 2
+
+
 # --- Internal delete ---
 
 

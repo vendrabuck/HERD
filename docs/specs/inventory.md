@@ -312,9 +312,11 @@ Copy, delete) and `frontend/src/pages/TemplateEditorPage.tsx` (view and edit); r
   Enforced in: `services/inventory/app/services/template_service.py` (`_validate_driver_connection_type`, `create_template`) \
   Pinned by: `services/inventory/tests/test_dynamic_templates.py` (`test_dynamic_template_non_hypervisor_driver_422`, `test_device_template_hypervisor_driver_422`)
 - **INV-TPL-14.** A driver or hypervisor id that does not exist answers 422
-  `Referenced hypervisor or driver does not exist`, never a name conflict. \
+  `Referenced hypervisor or driver does not exist`, never a name conflict. The
+  refusal is classified by its SQLSTATE, or SQLite's extended error code, never by
+  its text. \
   Enforced in: `services/inventory/app/services/template_service.py` (`_integrity_kind`, `_integrity_http_error`) \
-  Pinned by: `services/inventory/tests/test_template_integrity_errors.py` (`test_create_fk_violation_is_422_not_name_conflict`, `test_integrity_kind_postgres_sqlstates`)
+  Pinned by: `services/inventory/tests/test_template_integrity_errors.py` (`test_create_fk_violation_is_422_not_name_conflict`, `test_integrity_kind_postgres_sqlstates`, `test_integrity_kind_sqlite_error_codes`, `test_integrity_kind_never_reads_a_class_from_the_text`)
 - **INV-TPL-15.** `PUT /templates/{id}` changes only the fields the body names. An
   unknown id answers 404. \
   Enforced in: `services/inventory/app/schemas/template.py` (`TemplateUpdate`); `services/inventory/app/services/template_service.py` (`update_template`) \
@@ -1566,9 +1568,11 @@ instance lifecycle is `dynamic-resources.md`'s.
   Enforced in: `services/inventory/app/services/inventory_service.py` (`validate_field_data`, `create_dynamic_instance_device`) \
   Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_allows_unknown_field_data`)
 - **INV-DYN-4.** A create carrying a `request_id` that already has a device answers 201
-  with that same device and creates nothing. \
-  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_unique_conflict_target`) \
-  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_same_request_id_returns_same_device`, `test_internal_create_explicit_name_same_request_id_returns_existing`)
+  with that same device and creates nothing, also when a concurrent create with that
+  `request_id` commits first: after a unique violation the create looks the
+  `request_id` up and answers its device. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_insert_dynamic_device`, `_holder_of_request_id`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_same_request_id_returns_same_device`, `test_internal_create_explicit_name_same_request_id_returns_existing`, `test_internal_create_that_loses_a_request_id_race_returns_the_winner`)
 - **INV-DYN-5.** Without a `request_id` every create makes a new device; an explicit
   name that is taken answers 409 `Device with name '<name>' already exists`. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`) \
@@ -1588,6 +1592,15 @@ instance lifecycle is `dynamic-resources.md`'s.
   `Could not generate a unique device name for prefix '<prefix>'`. \
   Enforced in: `services/inventory/app/services/inventory_service.py` (`create_dynamic_instance_device`, `_MAX_NAME_ATTEMPTS`) \
   Pinned by: none
+- **INV-DYN-10.** A refused insert moves the generated name on to the next `n` only
+  for a unique violation that no device holding the `request_id` explains, and an
+  explicit name answers 409 `Device with name '<name>' already exists` only then. Any
+  other integrity error (a foreign key, a CHECK, or one a trigger raises) answers 409
+  `Device violates a database constraint` after that one insert, with a log line
+  naming the SQLSTATE only (INV-DEV-11). The refusal is classified by its SQLSTATE,
+  or SQLite's extended error code, never by its text. \
+  Enforced in: `services/inventory/app/services/inventory_service.py` (`_insert_dynamic_device`, `_holder_of_request_id`, `_device_write_refused`); `services/inventory/app/services/db_refusal.py` (`sqlstate_of`) \
+  Pinned by: `services/inventory/tests/test_devices_internal.py` (`test_internal_create_a_refusal_that_is_not_a_unique_violation_answers_at_once`, `test_internal_create_name_collision_retry_with_request_id_set`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_a_dynamic_instance_refused_for_anything_but_a_unique_violation_answers_at_once`, `test_a_dynamic_instance_whose_generated_name_is_taken_tries_the_next`)
 
 **Out of scope.** The execution ledger, retries, and teardown order
 (`dynamic-resources.md`).
@@ -1737,7 +1750,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `{"error": "device_cabled", "connection_count", "connection_ids"}` | delete of a device a connection names | INV-DEL-4 |
 | 409 | `{"error": "port_cabled", "connection_count", "connection_ids"}` | delete or rename of a port a connection names | INV-PORT-8, INV-PORT-10 |
 | 409 | `Device with name '<name>' already exists` | duplicate device name | INV-DEV-1, INV-DEV-11, INV-DYN-5 |
-| 409 | `Device violates a database constraint` | a non-unique integrity error on device create or update | INV-DEV-11 |
+| 409 | `Device violates a database constraint` | a non-unique integrity error on device create or update, or on a dynamic-instance create | INV-DEV-11, INV-DYN-10 |
 | 409 | `Could not generate a unique device name for prefix '<prefix>'` | the dynamic-instance name search ran out | INV-DYN-9 |
 | 409 | `Device is not a dynamic instance` | internal delete of a non-dynamic device | INV-DYN-7 |
 | 409 | `Template with name '<name>' already exists` or `Template violates a database constraint` | duplicate template name; another integrity error | INV-TPL-3 |

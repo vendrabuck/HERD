@@ -272,26 +272,6 @@ def generated_device_name(template_name: str, reservation_id: uuid.UUID, n: int)
     return template_name[: DEVICE_NAME_MAX_LENGTH - len(suffix)] + suffix
 
 
-def _unique_conflict_target(exc: IntegrityError) -> str:
-    """Which column a unique-violation IntegrityError hit: "request_id" or "name".
-
-    Portable across asyncpg (Postgres) and aiosqlite (SQLite), the same idiom as
-    template_service._integrity_kind. Postgres surfaces a "Key (request_id)=..."
-    detail (and a "request_id"-named constraint); SQLite surfaces
-    "UNIQUE constraint failed: devices.request_id". Both carry the substring
-    "request_id" for a request_id collision, so it is checked first; anything
-    else (including the devices.name unique constraint) is treated as a name
-    collision, preserving the prior behavior where every IntegrityError on this
-    insert meant a name clash. Distinguishing the two matters because a name
-    collision must retry with the next generated name while a request_id
-    collision must return the existing row (issue #275).
-    """
-    text = str(getattr(exc, "orig", exc)).lower()
-    if "request_id" in text:
-        return "request_id"
-    return "name"
-
-
 async def _get_device_by_request_id(db: AsyncSession, request_id: uuid.UUID) -> Device | None:
     result = await db.execute(select(Device).where(Device.request_id == request_id))
     return result.unique().scalar_one_or_none()
@@ -303,13 +283,15 @@ async def _insert_dynamic_device(
     template_id: uuid.UUID,
     field_data: dict[str, Any],
     request_id: uuid.UUID | None = None,
-) -> Device | str:
+) -> Device | None:
     """Insert one RESERVED dynamic-instance device.
 
-    Returns the Device on success, or the conflict target ("name" or
-    "request_id") when the commit hits a unique constraint, so the caller can
-    retry a name collision but return the existing row on a request_id collision
-    (issue #275).
+    Returns the Device, or None when the commit hit a unique violation (the name,
+    or the request_id, is taken), so the caller can look for a device holding the
+    request_id and otherwise treat the name as taken (issue #275). The violation is
+    classified by its SQLSTATE alone (``db_refusal.sqlstate_of``), never its text;
+    any other integrity error raises the generic refusal (``_device_write_refused``,
+    INV-DEV-11) at once, never a retry under the next name.
     """
     device = Device(
         name=name,
@@ -324,15 +306,20 @@ async def _insert_dynamic_device(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        # With no request_id, NULLs never collide on the unique constraint, so
-        # the violation can only be the name. Skipping the classifier here also
-        # keeps a device NAME containing the substring "request_id" (which
-        # asyncpg echoes in its Key (name)=(...) detail) from misclassifying.
-        if request_id is None:
-            return "name"
-        return _unique_conflict_target(exc)
+        if sqlstate_of(exc) != UNIQUE_VIOLATION:
+            raise _device_write_refused(exc, name) from exc
+        return None
     await db.refresh(device)
     return device
+
+
+async def _holder_of_request_id(db: AsyncSession, request_id: uuid.UUID | None) -> Device | None:
+    """After a unique violation: the device that already holds this request_id, if
+    the violation was a concurrent create with it; None when there is no request_id
+    or no such device, so the violation was the name."""
+    if request_id is None:
+        return None
+    return await _get_device_by_request_id(db, request_id)
 
 
 async def create_dynamic_instance_device(
@@ -370,8 +357,8 @@ async def create_dynamic_instance_device(
     validate_field_data(template, field_data, allow_unknown=True)
 
     # Fast path: a redelivery whose request_id already has a device converges on
-    # it without re-inserting. The insert paths below still re-check on a
-    # request_id IntegrityError to cover a concurrent create that raced this one.
+    # it without re-inserting. The insert paths below look again after a unique
+    # violation, to cover a concurrent create that raced this one.
     if request_id is not None:
         existing = await _get_device_by_request_id(db, request_id)
         if existing is not None:
@@ -383,15 +370,12 @@ async def create_dynamic_instance_device(
     # both paths add a bare device row.
 
     if name is not None:
-        outcome = await _insert_dynamic_device(db, name, template_id, field_data, request_id)
-        if outcome == "request_id":
-            existing = await _get_device_by_request_id(db, request_id)
+        device = await _insert_dynamic_device(db, name, template_id, field_data, request_id)
+        if device is None:
+            existing = await _holder_of_request_id(db, request_id)
             if existing is not None:
                 return existing
             raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
-        if outcome == "name":
-            raise HTTPException(status_code=409, detail=f"Device with name '{name}' already exists")
-        device = outcome
     else:
         # Read once, before the loop: a refused insert rolls back, which expires the
         # template row. The prefix is named in the exhaustion detail only; each tried
@@ -401,24 +385,21 @@ async def create_dynamic_instance_device(
         device: Device | None = None
         n = 1
         while device is None and n <= _MAX_NAME_ATTEMPTS:
-            outcome = await _insert_dynamic_device(
+            device = await _insert_dynamic_device(
                 db,
                 generated_device_name(template_name, reservation_id, n),
                 template_id,
                 field_data,
                 request_id,
             )
-            if outcome == "request_id":
-                # A concurrent create with this request_id won the race; converge
-                # on its row rather than burning name attempts that all collide.
-                existing = await _get_device_by_request_id(db, request_id)
+            if device is None:
+                # A concurrent create with this request_id won the race: converge on
+                # its row rather than burning name attempts that all collide.
+                # Otherwise the name is taken; try the next n.
+                existing = await _holder_of_request_id(db, request_id)
                 if existing is not None:
                     return existing
-                break
-            if outcome == "name":
                 n += 1
-                continue
-            device = outcome
         if device is None:
             raise HTTPException(
                 status_code=409,
