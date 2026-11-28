@@ -44,7 +44,8 @@ async def lifespan(app: FastAPI):
         # a broker restart.
         nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
-        logger.info("Connected to NATS at %s", settings.nats_url)
+        # The broker URL is not logged.
+        logger.info("Connected to NATS")
         js = nc.jetstream()
         await ensure_stream(
             js,
@@ -53,7 +54,7 @@ async def lifespan(app: FastAPI):
             max_age_seconds=settings.nats_stream_max_age_seconds,
         )
         logger.info("JetStream stream HERD_RESERVATIONS ready")
-    except Exception:
+    except Exception as exc:
         # Nothing assigns app.state.nats after this lifespan, so the two failures
         # differ (RES-EVENT-4, OPS-NATS-1). A failed connect leaves no connection
         # for the life of the process: the outbox relay publishes nothing and
@@ -63,20 +64,21 @@ async def lifespan(app: FastAPI):
         # missing stream or on an update of an existing one (execution may have
         # created it): with the stream there, publishes succeed at once; while it
         # is missing, each publish fails and its row stays in the outbox and is
-        # retried every tick.
+        # retried every tick. Each line names the exception's class only, never its
+        # text or the broker URL.
         if app.state.nats is None:
             logger.warning(
-                "NATS unavailable at %s; events wait in the outbox until the service "
+                "NATS unavailable (%s); events wait in the outbox until the service "
                 "is restarted with the broker reachable",
-                settings.nats_url,
+                type(exc).__name__,
             )
         else:
             logger.warning(
-                "JetStream stream HERD_RESERVATIONS could not be created or updated at "
-                "%s; the connection is kept, so events publish if the stream exists, "
+                "JetStream stream HERD_RESERVATIONS could not be created or updated "
+                "(%s); the connection is kept, so events publish if the stream exists, "
                 "and while it is missing they wait in the outbox and the relay retries "
                 "them every tick",
-                settings.nats_url,
+                type(exc).__name__,
             )
 
     # Start expiration background task

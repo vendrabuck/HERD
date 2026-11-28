@@ -69,6 +69,7 @@ from app.services.reservation_service import (
     stage_wiring_changed,
     update_reservation,
 )
+from app.services.upstream_failure import unavailable_detail
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ async def create_new_reservation(
     except LookupError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return reservation
 
 
@@ -770,7 +771,7 @@ async def update_reservation_by_id(
     except LookupError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
     return reservation
@@ -913,6 +914,9 @@ async def _load_owned_or_admin(
 
 CABLING_UNAVAILABLE = "Cabling service is unavailable"
 EXECUTION_UNAVAILABLE = "Execution service is unavailable"
+# The fixed detail of a relayed 4xx whose body is not JSON (RES-FORK-10, RES-FORK-18).
+CABLING_REQUEST_FAILED = "Cabling request failed"
+EXECUTION_REQUEST_FAILED = "Execution request failed"
 
 # Issue #1577: cabling answered a save with 2xx, so the save most likely committed,
 # but its answer could not be read. Not "the save failed": the sweep's wiring heal
@@ -946,9 +950,10 @@ def _relay_cabling_fork_response(
     """Return a cabling fork response's JSON, or raise the mapped user-facing error.
 
     5xx maps to 503 (the issue #131 upstream-error convention; a transport failure
-    is raised as RuntimeError upstream and mapped to 503 by the same rule). A 4xx is
-    relayed verbatim, so cabling's structured 409 detail (port conflicts, ARCHIVED
-    refusal) reaches the user unchanged.
+    is raised as RuntimeError upstream and mapped to 503 by the same rule). A 4xx
+    keeps its status and relays its JSON detail, so cabling's structured 409 detail
+    (port conflicts, ARCHIVED refusal) reaches the user unchanged; a 4xx body that is
+    not JSON answers the fixed `CABLING_REQUEST_FAILED`, never its text.
 
     R4 review fix on 2ade362c: a 5xx body that IS structured JSON (e.g. cabling's
     L3 gate 503 ``{"error": "l3_config_unavailable"}``) relays that structured
@@ -970,7 +975,7 @@ def _relay_cabling_fork_response(
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=resp.status_code,
-            detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
+            detail=_cabling_detail(resp, fallback=CABLING_REQUEST_FAILED),
         )
     return _relay_success_body(resp, unreadable_detail=unreadable_detail)
 
@@ -979,27 +984,30 @@ def _relay_execution_response(resp: httpx.Response) -> Any:
     """Return an execution wiring response's JSON, or raise the mapped user error.
 
     Same discipline as _relay_cabling_fork_response (ADR 0007 Decision 6): 5xx maps to
-    503; a 4xx (execution's 409 frozen refusal, its 503-mapped upstream) relays verbatim
-    so the structured detail reaches the user unchanged. A 2xx whose body does not
-    parse answers 503 `Execution service is unavailable` (issue #1577).
+    503; a 4xx (execution's 409 frozen refusal, its 503-mapped upstream) keeps its
+    status and relays its JSON detail, so the structured detail reaches the user
+    unchanged; a 4xx body that is not JSON answers the fixed `EXECUTION_REQUEST_FAILED`,
+    never its text. A 2xx whose body does not parse answers 503 `Execution service is
+    unavailable` (issue #1577).
     """
     if resp.status_code >= 500:
         raise HTTPException(status_code=503, detail=EXECUTION_UNAVAILABLE)
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=resp.status_code,
-            detail=_cabling_detail(resp, fallback=resp.text or "Cabling request failed"),
+            detail=_cabling_detail(resp, fallback=EXECUTION_REQUEST_FAILED),
         )
     return _relay_success_body(resp, unreadable_detail=EXECUTION_UNAVAILABLE)
 
 
-def _cabling_detail(resp: httpx.Response, *, fallback: Any = "Cabling request failed") -> Any:
+def _cabling_detail(resp: httpx.Response, *, fallback: Any = CABLING_REQUEST_FAILED) -> Any:
     """Extract cabling's error detail, unwrapping the FastAPI {"detail": ...}
     envelope. Returns ``fallback`` when the body is not valid JSON at all (S10
     review fix, round 2: folds the former ``_cabling_json_detail_or_none`` into
     this one function via the flag, one unwrapper instead of two nearly
-    -identical ones). The 4xx relay uses the default (or ``resp.text``) so a
-    non-JSON 4xx body still surfaces something; the 5xx relay passes
+    -identical ones). The 4xx relays pass their fixed wording
+    (``CABLING_REQUEST_FAILED``, ``EXECUTION_REQUEST_FAILED``) for a non-JSON 4xx
+    body; the 5xx relay passes
     ``fallback=None`` so it can keep its own generic "Cabling service is
     unavailable" message instead of surfacing a raw proxy error page as if it
     were a structured detail. A body nested deeper than the decoder's recursion
@@ -1069,7 +1077,7 @@ async def get_reservation_fork(
                 "GET", f"/internal/forks/{reservation_id}", on_behalf_of=on_behalf_of
             )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1103,7 +1111,7 @@ async def update_reservation_fork_canvas(
             json_body={"canvas_data": body.canvas_data},
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1167,7 +1175,7 @@ async def save_reservation_fork(
             timeout=_FORK_SAVE_TIMEOUT_SECONDS,
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
 
     # Relay first: this raises the mapped user-facing error on a cabling 4xx/5xx (the
     # ARCHIVED 409, a port-conflict 409, or a 503), so nothing is staged when the save
@@ -1241,7 +1249,7 @@ async def get_reservation_fork_version(
             "GET", f"/internal/forks/{reservation_id}/versions/{version_id}"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1280,7 +1288,7 @@ async def restore_reservation_fork_version(
             "POST", f"/internal/forks/{reservation_id}/versions/{version_id}/restore"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_cabling_fork_response(resp)
 
 
@@ -1311,7 +1319,7 @@ async def get_reservation_wiring_status(
             "GET", f"/internal/reservations/{reservation_id}/wiring-status"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_execution_response(resp)
 
 
@@ -1355,7 +1363,7 @@ async def retry_reservation_wiring(
             "POST", f"/internal/reservations/{reservation_id}/wiring/retry"
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=unavailable_detail(exc))
     return _relay_execution_response(resp)
 
 

@@ -252,9 +252,16 @@ async def test_reconcile_403_bad_token_is_not_feature_off(caplog):
     """
     rid_first = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=10))
     rid_second = await _insert(purpose_classify_requested_at=NOW - timedelta(minutes=5))
-    call = AsyncMock(return_value=httpx.Response(403, json={"detail": "Invalid internal token"}))
-    with patch("app.services.purpose_service.call_service", call), caplog.at_level(logging.WARNING):
+    sent = "Invalid internal token orchestrator-403-sentinel-5e1b"
+    call = AsyncMock(return_value=httpx.Response(403, json={"detail": sent}))
+    with patch("app.services.purpose_service.call_service", call), caplog.at_level(logging.DEBUG):
         await _run_purpose_classify_reconcile()
+    # The orchestrator's detail is logged by its JSON type only, never its text: not in
+    # any record's message or traceback, and not in any attribute (the JSON log
+    # formatter emits every `extra=` key).
+    for text in [caplog.text] + [str(vars(r)) for r in caplog.records]:
+        assert "orchestrator-403-sentinel-5e1b" not in text
+    assert "a detail of type str" in caplog.text
 
     call.assert_awaited_once()
     for rid in (rid_first, rid_second):

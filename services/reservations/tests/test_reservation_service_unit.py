@@ -2162,6 +2162,9 @@ async def test_create_reservation_fork_raises_membership_refused_on_any_409():
 
     assert excinfo.value.device_ids == []
     assert excinfo.value.detail == conflict_detail
+    assert excinfo.value.status_code == 409
+    # The message is fixed text and the status, never cabling's detail.
+    assert str(excinfo.value) == "Cabling refused the fork create with 409"
 
 
 @pytest.mark.asyncio
@@ -2278,7 +2281,7 @@ async def test_fork_best_effort_port_claim_409_is_not_retried(caplog):
             {"reservation_id": str(uuid.uuid4()), "device_id": str(uuid.uuid4()), "port": "eth5"}
         ],
     }
-    mock_create = AsyncMock(side_effect=ForkMembershipRefused([], conflict_detail))
+    mock_create = AsyncMock(side_effect=ForkMembershipRefused([], conflict_detail, status_code=409))
     reservation_id = uuid.uuid4()
     with (
         patch("app.services.reservation_service._create_reservation_fork", new=mock_create),
@@ -2295,7 +2298,11 @@ async def test_fork_best_effort_port_claim_409_is_not_retried(caplog):
     ]
     assert len(warning_records) == 1
     assert warning_records[0].device_ids == []
-    assert warning_records[0].detail == conflict_detail
+    assert warning_records[0].status_code == 409
+    # Cabling's detail is not logged, in the message or as an extra.
+    assert not hasattr(warning_records[0], "detail")
+    assert "already claimed" not in caplog.text
+    assert "eth5" not in caplog.text
     assert is_fork_membership_refused(reservation_id) is True
     _fork_membership_refused.discard(reservation_id)
 

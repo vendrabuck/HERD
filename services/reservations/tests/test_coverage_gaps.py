@@ -1494,8 +1494,10 @@ async def test_expiration_loop_runs_every_step_and_a_failing_step_skips_none(cas
         ),
         key=lambda error: error[0],
     )
+    # Each line names the step's failure by its class (RES-UPSTREAM-3's label).
     assert errors == sorted(
-        ((_LOOP_STEPS[name], raised[name]) for name in failing), key=lambda error: error[0]
+        ((f"{_LOOP_STEPS[name]} (_StepFailed)", raised[name]) for name in failing),
+        key=lambda error: error[0],
     )
 
 

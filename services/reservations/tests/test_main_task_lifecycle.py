@@ -13,11 +13,27 @@ every wait by event-loop iterations.
 """
 
 import asyncio
+import logging
 from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.config import settings
+
+# A broker URL with userinfo: no startup line holds either part of it, the URL, or the
+# text of the exception the connect or the stream ensure raised (RES-EVENT-5).
+BROKER_SENTINEL = "brokerpw-sentinel-0d1f"
+BROKER_USER = "brokeruser-sentinel-7a2c"
+BROKER_URL_WITH_USERINFO = f"nats://{BROKER_USER}:{BROKER_SENTINEL}@127.0.0.1:1"
+
+
+def _assert_no_broker_userinfo(caplog) -> None:
+    """Neither half of the userinfo, nor the URL, in any record at any level, in its
+    message or in any attribute (the JSON formatter emits every `extra=` key)."""
+    for text in [caplog.text] + [str(vars(r)) for r in caplog.records]:
+        assert BROKER_SENTINEL not in text
+        assert BROKER_USER not in text
+        assert BROKER_URL_WITH_USERINFO not in text
 
 
 @pytest.mark.asyncio
@@ -110,7 +126,7 @@ async def test_lifespan_starts_without_nats_using_the_real_client(monkeypatch, c
 
     monkeypatch.setattr(jetstream, "NATS_INITIAL_CONNECT_ATTEMPTS", 2)
     monkeypatch.setattr(jetstream, "NATS_RECONNECT_TIME_WAIT_SECONDS", 0.01)
-    monkeypatch.setattr(settings, "nats_url", "nats://127.0.0.1:1")
+    monkeypatch.setattr(settings, "nats_url", BROKER_URL_WITH_USERINFO)
 
     async def fake_loop(interval_seconds=60):
         return None
@@ -129,18 +145,20 @@ async def test_lifespan_starts_without_nats_using_the_real_client(monkeypatch, c
                 entered.set()
                 assert mock_app.state.nats is None
 
-    with caplog.at_level("WARNING", logger="app.main"):
-        await asyncio.wait_for(_run(), timeout=10)
+    caplog.set_level(logging.DEBUG)
+    await asyncio.wait_for(_run(), timeout=10)
 
     assert entered.is_set()
     # RES-EVENT-4 (issue #1337): events are not skipped, they wait in the outbox,
-    # and a connection that failed at boot is not picked up later.
+    # and a connection that failed at boot is not picked up later. RES-EVENT-5: the
+    # line names the client's error class, never the broker URL or its userinfo.
     assert (
-        "NATS unavailable at nats://127.0.0.1:1; events wait in the outbox until the "
+        "NATS unavailable (NoServersError); events wait in the outbox until the "
         "service is restarted with the broker reachable"
     ) in caplog.text
     assert "skipped" not in caplog.text
     assert "could not be created or updated" not in caplog.text
+    _assert_no_broker_userinfo(caplog)
 
 
 @pytest.mark.asyncio
@@ -153,7 +171,7 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
     warning must not say the broker is unavailable or that a restart is needed."""
     from app.main import lifespan
 
-    monkeypatch.setattr(settings, "nats_url", "nats://broker:4222")
+    monkeypatch.setattr(settings, "nats_url", BROKER_URL_WITH_USERINFO)
     nc = MagicMock()
     nc.close = AsyncMock()
 
@@ -164,7 +182,10 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
         with (
             patch("app.main.create_all_and_stamp", new=AsyncMock()),
             patch("app.main.connect_nats", new=AsyncMock(return_value=nc)),
-            patch("app.main.ensure_stream", new=AsyncMock(side_effect=RuntimeError("boom"))),
+            patch(
+                "app.main.ensure_stream",
+                new=AsyncMock(side_effect=RuntimeError(f"{BROKER_SENTINEL} stream refused")),
+            ),
             patch("app.main.run_outbox_relay", new=AsyncMock()),
             patch("app.tasks.expiration.expiration_loop", new=fake_loop),
             patch("app.tasks.expiration.purpose_classify_loop", new=fake_loop),
@@ -173,17 +194,20 @@ async def test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect
             async with lifespan(mock_app):
                 assert mock_app.state.nats is nc
 
-    with caplog.at_level("WARNING", logger="app.main"):
-        await asyncio.wait_for(_run(), timeout=10)
+    caplog.set_level(logging.DEBUG)
+    await asyncio.wait_for(_run(), timeout=10)
 
     assert (
-        "JetStream stream HERD_RESERVATIONS could not be created or updated at "
-        "nats://broker:4222; the connection is kept, so events publish if the stream "
+        "JetStream stream HERD_RESERVATIONS could not be created or updated "
+        "(RuntimeError); the connection is kept, so events publish if the stream "
         "exists, and while it is missing they wait in the outbox and the relay retries "
         "them every tick"
     ) in caplog.text
     assert "NATS unavailable" not in caplog.text
     assert "restarted" not in caplog.text
+    # Connected, so the connect line is written too, without the URL.
+    assert "Connected to NATS" in caplog.text
+    _assert_no_broker_userinfo(caplog)
     nc.close.assert_awaited_once()
 
 
