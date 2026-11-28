@@ -133,21 +133,21 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | Method | Path | Who may call | Success | Rules |
 |---|---|---|---|---|
 | GET | `/devices` | any signed-in user (non-admins: visible DUTs only) | 200 | INV-AUTH-1, INV-LIST-1 to INV-LIST-4, INV-VIS-1 to INV-VIS-5, INV-RED-1 to INV-RED-4 |
-| POST | `/devices` | admin | 201 | INV-AUTH-2, INV-DEV-1 to INV-DEV-7, INV-FIELD-1 to INV-FIELD-7, INV-STATUS-1, INV-STATUS-8, INV-POLL-1 |
+| POST | `/devices` | admin | 201 | INV-AUTH-2, INV-DEV-1 to INV-DEV-7, INV-FIELD-1 to INV-FIELD-7, INV-STATUS-1, INV-STATUS-8, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
 | POST | `/devices/batch` | any signed-in user (non-admins: visible devices only) | 200 | INV-AUTH-1, INV-BATCH-1 to INV-BATCH-5, INV-RED-1 |
 | GET | `/devices/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-AUTH-1, INV-VIS-6, INV-VIS-7, INV-RED-1 |
-| PUT | `/devices/{id}` | admin | 200 | INV-AUTH-2, INV-DEV-8 to INV-DEV-11, INV-STATUS-4, INV-STATUS-9, INV-POLL-1 |
+| PUT | `/devices/{id}` | admin | 200 | INV-AUTH-2, INV-DEV-8 to INV-DEV-11, INV-STATUS-4, INV-STATUS-9, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
 | DELETE | `/devices/{id}` | admin | 204 | INV-AUTH-2, INV-DEL-1 to INV-DEL-9 |
 | GET | `/devices/{id}/ports` | any signed-in user (non-admins: visible devices only) | 200 | INV-AUTH-1, INV-PORT-1, INV-PORT-2, INV-RED-1 |
-| POST | `/devices/{id}/ports` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-4 |
-| POST | `/devices/{id}/ports/bulk` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-5, INV-PORT-6, INV-PORT-9 |
+| POST | `/devices/{id}/ports` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-4, INV-COL-1 to INV-COL-3 |
+| POST | `/devices/{id}/ports/bulk` | admin | 201 | INV-AUTH-2, INV-PORT-3, INV-PORT-5, INV-PORT-6, INV-PORT-9, INV-COL-1 to INV-COL-3 |
 | GET | `/ports/{id}` | any signed-in user (non-admins: ports of visible devices only) | 200 | INV-AUTH-1, INV-PORT-2, INV-RED-1 |
-| PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10 |
+| PUT | `/ports/{id}` | admin | 200 | INV-AUTH-2, INV-PORT-7, INV-PORT-10, INV-COL-1 to INV-COL-3 |
 | DELETE | `/ports/{id}` | admin | 204 | INV-AUTH-2, INV-PORT-8 |
 | GET | `/templates` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
 | GET | `/templates/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-TPL-1, INV-TPL-20, INV-TPL-25, INV-RED-5 |
-| POST | `/templates` | admin | 201 | INV-AUTH-2, INV-TPL-2 to INV-TPL-14, INV-POLL-1 |
-| PUT | `/templates/{id}` | admin | 200 | INV-AUTH-2, INV-TPL-15 to INV-TPL-18, INV-TPL-24, INV-POLL-1 |
+| POST | `/templates` | admin | 201 | INV-AUTH-2, INV-TPL-2 to INV-TPL-14, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
+| PUT | `/templates/{id}` | admin | 200 | INV-AUTH-2, INV-TPL-15 to INV-TPL-18, INV-TPL-24, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3 |
 | DELETE | `/templates/{id}` | admin | 204 | INV-AUTH-2, INV-TPL-19 |
 | GET | `/drivers` | any signed-in user | 200 | INV-AUTH-1, INV-DRV-1 |
 | GET | `/drivers/{id}` | any signed-in user | 200 | INV-AUTH-1, INV-DRV-1 |
@@ -159,13 +159,13 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/drivers/{id}/config-schema` | any signed-in user | 200 | none here; belongs to `device-configuration.md` |
 | GET | `/hypervisors` | admin | 200 | INV-HYP-1 |
 | GET | `/hypervisors/{id}` | admin | 200 | INV-HYP-1 |
-| POST | `/hypervisors` | admin | 201 | INV-HYP-1 to INV-HYP-4, INV-HYP-11, INV-HYP-12 |
-| PUT | `/hypervisors/{id}` | admin | 200 | INV-HYP-1, INV-HYP-2, INV-HYP-5, INV-HYP-6, INV-HYP-11, INV-HYP-12 |
+| POST | `/hypervisors` | admin | 201 | INV-HYP-1 to INV-HYP-4, INV-HYP-11, INV-HYP-12, INV-COL-1, INV-COL-2 |
+| PUT | `/hypervisors/{id}` | admin | 200 | INV-HYP-1, INV-HYP-2, INV-HYP-5, INV-HYP-6, INV-HYP-11, INV-HYP-12, INV-COL-1, INV-COL-2 |
 | DELETE | `/hypervisors/{id}` | admin | 204 | INV-HYP-1, INV-HYP-7 |
 | GET | `/device-groups` | admin | 200 | INV-AUTH-2, INV-GRP-1 |
-| POST | `/device-groups` | admin | 201 | INV-AUTH-2, INV-GRP-2, INV-GRP-17 |
+| POST | `/device-groups` | admin | 201 | INV-AUTH-2, INV-GRP-2, INV-GRP-17, INV-COL-1, INV-COL-2 |
 | GET | `/device-groups/{id}` | admin | 200 | INV-AUTH-2, INV-GRP-1 |
-| PUT | `/device-groups/{id}` | admin | 200 | INV-AUTH-2, INV-GRP-2, INV-GRP-17 |
+| PUT | `/device-groups/{id}` | admin | 200 | INV-AUTH-2, INV-GRP-2, INV-GRP-17, INV-COL-1, INV-COL-2 |
 | DELETE | `/device-groups/{id}` | admin | 204 | INV-AUTH-2, INV-GRP-3, INV-GRP-15, INV-GRP-16 |
 | POST | `/device-groups/{id}/devices/bulk` | admin | 200 | INV-AUTH-2, INV-GRP-4 to INV-GRP-7 |
 | POST | `/device-groups/{id}/devices/bulk-remove` | admin | 200 | INV-AUTH-2, INV-GRP-8, INV-GRP-15 |
@@ -174,7 +174,7 @@ is no compare-and-swap and no lock, so the last writer wins (INV-STATUS-7).
 | GET | `/device-groups/visible-devices?user_id` | the user themself, or any admin | 200 | INV-VIS-8, INV-VIS-9 |
 | GET | `/device-groups/device/{id}` | any signed-in user (non-admins: visible devices only) | 200 | INV-GRP-10 to INV-GRP-13, INV-VIS-6 |
 | GET | `/devices/export`, `/templates/export` | admin | 200 | INV-BULK-1 to INV-BULK-3, INV-BULK-19, INV-BULK-21, INV-CSV-1, INV-CSV-2 |
-| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-BULK-25, INV-BULK-26, INV-BULK-28, INV-CSV-3 |
+| POST | `/devices/import`, `/templates/import` (multipart) | admin | 200 | INV-BULK-4 to INV-BULK-16, INV-BULK-18 to INV-BULK-20, INV-BULK-25, INV-BULK-26, INV-BULK-28, INV-CSV-3, INV-COL-1 to INV-COL-3 |
 | `/devices/{id}/config-versions...`, `/devices/{id}/apply-jobs`, `/apply-jobs/...` | | see `device-configuration.md` | | none here |
 
 `GET /devices` takes `template_id`, `topology_type`, `status`, `dut_only`, `search`,
@@ -203,7 +203,7 @@ Every route here requires `X-Internal-Token` (INV-INT-1).
 | POST | `/internal/devices/batch` | `X-Internal-Token` | cabling (L3 intent validation) | list of `{id, name, connection_type, status}` | INV-INT-1, INV-INT-3, INV-INT-4 |
 | POST | `/devices/resolve-by-name` | `X-Internal-Token` | cabling (topology import) | `{resolved: {name: id}}` | INV-INT-1, INV-INT-5 |
 | GET | `/devices/health-config` | `X-Internal-Token` | execution (health scheduler) | list of `{device_id, resolved_interval_seconds}` | INV-INT-1, INV-POLL-3 |
-| POST | `/devices/internal` | `X-Internal-Token` | execution (dynamic provisioning) | the created or existing device | INV-INT-1, INV-DYN-1 to INV-DYN-6, INV-DYN-9, INV-STATUS-3 |
+| POST | `/devices/internal` | `X-Internal-Token` | execution (dynamic provisioning) | the created or existing device | INV-INT-1, INV-DYN-1 to INV-DYN-6, INV-DYN-9, INV-STATUS-3, INV-COL-1 to INV-COL-3 |
 | DELETE | `/devices/{id}/internal` | `X-Internal-Token` | execution (dynamic teardown) | 204 | INV-INT-1, INV-DYN-7, INV-DYN-8 |
 | GET | `/templates/{id}/internal` | `X-Internal-Token` | execution, ai-orchestrator | the template, password-field defaults in clear | INV-INT-1, INV-TPL-20, INV-RED-5 |
 | GET | `/drivers/{id}/internal-download` | `X-Internal-Token` | execution (driver loader) | the archive bytes | INV-INT-1, INV-DRV-2 |
@@ -892,8 +892,8 @@ to one or more user groups; that grant is what lets a non-admin see a device.
   Enforced in: `services/inventory/app/services/device_group_service.py` (`get_no_pool_group`, `add_device_to_no_pool`) \
   Pinned by: none
 - **INV-GRP-17.** A group name is 1 to 100 characters. \
-  Enforced in: `services/inventory/app/schemas/device_group.py` (`DeviceGroupCreate`, `DeviceGroupUpdate`) \
-  Pinned by: none
+  Enforced in: `services/inventory/app/schemas/device_group.py` (`DeviceGroupCreate`, `DeviceGroupUpdate`, `DEVICE_GROUP_NAME_MAX_LENGTH`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_a_string_at_its_bound_passes_and_one_past_is_refused`)
 
 **Out of scope.** User groups and their membership are the auth service's
 (`identity-and-access.md`). Cabling's device-group boundary check on connections calls
@@ -1343,11 +1343,12 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   on the wait. A request cancelled while its work runs gives its slot back only when
   the thread ends; one cancelled while it waits takes none and runs nothing. The row
   loop, each row's schema checks and create or update, and every database call stay on
-  the event loop in the request's session. A cell's decode, its value or the text of
-  the decoder's error (the text alone, never the exception, which would keep the
-  whole upload alive in a reference cycle), is applied where the row loop reads the
-  cell, so every row's outcome and reason are the ones an on-loop decode gave
-  (INV-BULK-9, INV-BULK-24).
+  the event loop in the request's session. A cell's decode, its value or the reason
+  chosen for its error (INV-BULK-28; for a syntax error, the decoder's message), is
+  applied where the row loop reads the cell; only the reason is kept, never the
+  exception, which would keep the whole upload alive in a reference cycle. So every
+  row's outcome and reason are the ones an on-loop decode gave (INV-BULK-9,
+  INV-BULK-24).
   Before issue #1417 all of this ran on the event loop: measured on one core, a 10 MiB
   JSON file held it about 120 ms, and a 10 MiB CSV file from about 0.3 s to about 1.4 s,
   more the shorter and more numerous its rows. An export closes its database session
@@ -1359,33 +1360,42 @@ inventory and templates pages; routes `GET /devices/export`, `POST /devices/impo
   or dry run, is wording the importer chooses by the failure's class, never the text
   of an exception, and so are its log lines. A refusal raised by the create or update
   functions keeps its detail (section 9; one whose detail is not a string is `the row
-  could not be imported`), a schema error keeps INV-BULK-9's `<field>: <message>`, and
-  the JSON cell reasons of INV-BULK-22 and INV-BULK-24 are unchanged. A row the
-  database refuses is rejected `the database refused the row: ` followed by the
-  refusal's class, read from the SQLSTATE asyncpg gives or the extended error code
-  SQLite gives, never from the message: `a value that must be unique is already in
-  use` (23505), `a record the row refers to does not exist` (23503), `a required value
-  is missing` (23502), `a value is outside what the database allows` (23514), `a value
-  breaks a database constraint` (any other code of class 23), `a value is longer than
-  its column allows` (22001), `a number is out of range for its column` (22003), `a
-  value holds a character the database cannot store, such as a NUL` (22021, 22P05),
-  and `a value does not fit the type of its column` (any other code of class 22,
-  among them the 22000 asyncpg raises, before it sends, for an integer past a
-  column's range). A class 23 reason ends with ` (constraint <name>)` when Postgres
-  names the constraint and the name is 1 to 63 letters, digits, or underscores. Any
-  other code, or none, is `the database refused the row`; any other failure is `the
-  row could not be imported`. The service logs a warning naming the SQLSTATE for a
-  database refusal, and only the exception's class name for any other failure. In a
-  JSON import, a `template_name`, `driver_name`, or `hypervisor_name` that is present,
-  not null, and not a string (0 and false included, which were read as absent) is
-  rejected `<column>: must be a string`; a `field_data` or `sections` value that is a
-  number or a boolean, `a JSON cell must be an object, a list, or JSON text`; and in
-  either format a poll interval that `int` cannot read (text that is not an integer, a
-  list, an object, infinity, or NaN; a JSON number with a fraction is truncated),
-  `poll_interval_seconds: must be a whole number`. A refused row is rolled back and
-  the rows after it are judged on their own (INV-BULK-7). \
-  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_sqlstate_of`, `_constraint_name_of`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `DATABASE_REFUSED_REASON`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
-  Pinned by: `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_device_rows_postgres_refuses_get_fixed_reasons`, `test_template_rows_postgres_refuses_get_fixed_reasons`, `test_a_template_whose_driver_goes_before_its_insert_gets_the_fixed_reason`, `test_a_device_name_taken_before_its_insert_gets_the_fixed_reason`); `services/inventory/tests/test_bulk_service_unit.py` (`test_a_refused_row_is_named_by_its_sqlstate`, `test_a_row_sqlite_refuses_is_named_by_its_error_code`, `test_a_row_that_fails_otherwise_keeps_no_text`, `test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason`, `test_a_json_cell_that_is_not_json_raises_the_fixed_reason`, `test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason`); `services/inventory/tests/test_bulk.py` (`test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route`, `test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason`, `test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason`, `test_an_unexpected_row_failure_is_reported_without_its_text`); `tests/integration/test_bulk_import_export.py` (`test_template_import_rows_the_database_refuses_get_fixed_reasons`)
+  could not be imported`): a duplicate name or a missing reference the database finds
+  at commit is answered by those functions' own details (INV-DEV-1, INV-DEV-11,
+  INV-TPL-3, INV-TPL-14). A schema error keeps INV-BULK-9's `<field>: <message>`, a
+  value past its column's bound among them (INV-COL-1 to INV-COL-3, INV-POLL-5), and a
+  row name holding a NUL character is that schema error, `name: Value error, must not
+  contain a NUL character`, before the importer looks the name up. The JSON cell
+  reasons of INV-BULK-22 and INV-BULK-24 are unchanged. A refusal the database raises
+  outside those functions is named by its SQLSTATE, read from the error asyncpg gives
+  or mapped from SQLite's extended error code, never from the message. A connection
+  the driver reports lost, or an SQLSTATE of class 08 (connection), 40 (transaction
+  rollback: a serialization failure or a deadlock), 53 (insufficient resources), or
+  57 (operator intervention: a cancelled statement or a statement timeout), is
+  rejected `the database was unavailable or busy; run the import again`. Otherwise
+  the reason is `the database refused the row: ` followed by the refusal's class: `a
+  value that must be unique is already in use` (23505), `a record the row refers to
+  does not exist` (23503), `a required value is missing` (23502), `a value is outside
+  what the database allows` (23514), `a value breaks a database constraint` (any other
+  code of class 23), `a value is longer than its column allows` (22001), `a number is
+  out of range for its column` (22003), `a value holds a character the database
+  cannot store, such as a NUL` (22021, 22P05), and `a value does not fit the type of
+  its column` (any other code of class 22). No reason names a constraint. Any other
+  SQLSTATE, or none, is `the database refused the row`, and so is a SQLAlchemy error
+  that is not a driver error (`PendingRollbackError` or `InvalidRequestError`, for
+  example); any other failure is `the row could not be imported`. The service logs a
+  warning naming the SQLSTATE for a driver error, and only the exception's class name
+  for any other failure. In a JSON import, a `template_name`, `driver_name`, or
+  `hypervisor_name` that is present, not null, and not a string (0 and false
+  included, which were read as absent) is rejected `<column>: must be a string`; a
+  `field_data` or `sections` value that is a number or a boolean, `a JSON cell must
+  be an object, a list, or JSON text`; and in either format a poll interval that
+  `int` cannot read (text that is not an integer, a list, an object, infinity, or
+  NaN; a JSON number with a fraction is truncated), `poll_interval_seconds: must be a
+  whole number`. A refused row is rolled back and the rows after it are judged on
+  their own (INV-BULK-7). \
+  Enforced in: `services/inventory/app/services/bulk_service.py` (`_row_failure_reason`, `_database_reason`, `_sqlstate_of`, `_http_reason`, `_text_cell`, `_coerce_int`, `_coerce_json_cell`, `_decode_json_cells`, `_RowReasonError`, `_RowName`, `DATABASE_REFUSED_REASON`, `DATABASE_UNAVAILABLE_REASON`, `_TRANSIENT_SQLSTATE_CLASSES`, `ROW_UNEXPECTED_REASON`, `CELL_NOT_A_STRING_REASON`, `POLL_NOT_A_WHOLE_NUMBER_REASON`, `JSON_CELL_NOT_JSON_REASON`) \
+  Pinned by: `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_device_rows_past_a_column_bound_name_the_field`, `test_template_rows_past_a_column_bound_name_the_field`, `test_a_refusal_raised_outside_the_service_functions_gets_its_fixed_reason`, `test_a_template_whose_driver_goes_before_its_insert_gets_the_fixed_reason`, `test_a_device_name_taken_before_its_insert_gets_the_fixed_reason`); `services/inventory/tests/test_bulk_service_unit.py` (`test_a_refused_row_is_named_by_its_sqlstate`, `test_a_row_whose_connection_was_lost_is_named_unavailable`, `test_a_row_sqlite_refuses_is_named_by_its_error_code`, `test_a_row_that_fails_otherwise_keeps_no_text`, `test_a_poll_cell_that_is_not_a_whole_number_raises_the_fixed_reason`, `test_a_json_cell_that_is_not_json_raises_the_fixed_reason`, `test_a_cell_decode_that_fails_otherwise_keeps_the_chosen_reason`); `services/inventory/tests/test_bulk.py` (`test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route`, `test_a_cell_of_the_wrong_kind_is_rejected_with_a_fixed_reason`, `test_a_csv_poll_cell_that_is_not_a_number_is_rejected_with_a_fixed_reason`, `test_an_unexpected_row_failure_is_reported_without_its_text`); `services/inventory/tests/test_column_bounds.py` (`test_the_device_importers_name_the_field_a_row_breaks`, `test_the_template_importers_name_the_field_a_row_breaks`); `tests/integration/test_bulk_import_export.py` (`test_template_import_rows_past_a_column_bound_name_the_field`)
 - **INV-BULK-21.** A device export, CSV or JSON, leaves out every dynamic-instance device
   (a device carrying a `request_id`); every other device is exported. An instance device
   lives only as long as its reservation, and its dynamic template cannot hold a device,
@@ -1576,7 +1586,67 @@ the poller cannot honor.
   Enforced in: `frontend/src/pages/TemplateEditorPage.tsx` (`handleSave`) \
   Pinned by: `frontend/src/test/pages/TemplateEditorPage.editflow.test.tsx` (`rejects a poll interval below the 30-second floor`, `rejects a non-integer poll interval`, `accepts a blank poll interval as null (no polling)`)
 
+- **INV-POLL-5.** `poll_interval_seconds` on a device or a template is at most
+  2147483647, the largest value of its `integer` column; a larger value answers 422
+  `Input should be less than or equal to 2147483647` naming the field, on create and
+  update, and an import row carrying one is rejected with that item as its reason
+  (INV-BULK-28). There is no product bound below it. \
+  Enforced in: `services/inventory/app/schemas/device.py` (`PollInterval`, `DeviceCreate`, `DeviceUpdate`); `services/inventory/app/schemas/template.py` (`TemplateCreate`, `TemplateUpdate`); `services/inventory/app/schemas/column_bounds.py` (`INT32_MAX`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_an_integer_at_the_column_maximum_passes_and_one_more_is_refused`, `test_the_route_answers_the_one_422_item_naming_the_field`, `test_values_at_each_bound_are_accepted_through_the_routes`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_values_at_each_bound_are_stored_by_the_real_columns`, `test_values_past_a_bound_answer_422_on_the_interactive_routes`)
+
 **Out of scope.** Poll tiers and the scheduler (`operations-and-observability.md`).
+
+### 8.17 Request field bounds
+
+**What it does.** Every value an inventory request schema accepts for a device,
+template, port, device group, or hypervisor is one its column stores: a string field
+is bounded to its column's length, a text field refuses a NUL character, and a value
+written to a `json` column refuses a number that is not finite. Each refusal is the
+ordinary 422 item naming the field, with fixed wording and no input value, and an
+import row carrying one is rejected with that item as its reason (INV-BULK-28).
+
+**Surfaces.** `DeviceCreate`, `DeviceUpdate`, `InternalDeviceCreate`,
+`TemplateCreate`, `TemplateUpdate` (with `FieldDefinition` in its sections),
+`PortCreate`, `BulkPortCreate`, `PortUpdate`, `DeviceGroupCreate`,
+`DeviceGroupUpdate`, `HypervisorCreate`, and `HypervisorUpdate`, on the create and
+update routes of section 5, `POST /devices/internal`, and both importers.
+
+**Rules.**
+
+- **INV-COL-1.** A string field is bounded to its column's length, counted in
+  characters: a device, port, template, or hypervisor name at most 255; a template's
+  vendor, model, and part number at most 255; a hypervisor's endpoint at most 512 and
+  its type at most 50; a device group name at most 100. A bulk port prefix keeps its
+  own bound of 200 (INV-PORT-5) and a device group description its 2000 (INV-GRP-2).
+  A longer value answers 422 `String should have at most <n> characters` naming the
+  field. \
+  Enforced in: `services/inventory/app/schemas/column_bounds.py` (`column_string`); `services/inventory/app/schemas/device.py` (`DeviceName`); `services/inventory/app/schemas/template.py` (`TemplateString`); `services/inventory/app/schemas/port.py` (`PortName`, `BulkPortCreate`); `services/inventory/app/schemas/device_group.py` (`DeviceGroupName`, `DeviceGroupDescription`); `services/inventory/app/schemas/hypervisor.py` (`HypervisorName`, `HypervisorEndpoint`, `HypervisorType`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_a_string_at_its_bound_passes_and_one_past_is_refused`, `test_a_string_bound_is_its_column_length_or_shorter`, `test_the_route_answers_the_one_422_item_naming_the_field`, `test_values_at_each_bound_are_accepted_through_the_routes`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_values_at_each_bound_are_stored_by_the_real_columns`, `test_values_past_a_bound_answer_422_on_the_interactive_routes`)
+- **INV-COL-2.** A string field written to a text or varchar column refuses a NUL
+  character with 422 `Value error, must not contain a NUL character` naming the
+  field: every field of INV-COL-1, a template's icon and description, a device
+  group's description, and a hypervisor's description. A string inside `field_data`
+  or `sections` is stored in a `json` column, which holds a NUL, and is not refused. \
+  Enforced in: `services/inventory/app/schemas/column_bounds.py` (`ColumnText`, `column_string`, `NUL_CHARACTER_MESSAGE`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_a_nul_character_in_a_text_field_is_refused`, `test_the_route_answers_the_one_422_item_naming_the_field`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_values_past_a_bound_answer_422_on_the_interactive_routes`, `test_values_at_each_bound_are_stored_by_the_real_columns`)
+- **INV-COL-3.** A device's or port's `field_data`, on every create and update, and a
+  template section field's `default` refuse a number that is not finite (NaN,
+  Infinity, or -Infinity, nested at any depth) with 422 `Value error, must not hold a
+  number that is not finite (NaN or Infinity)` naming the field; a `json` column
+  refuses such a number. A finite number of any size is accepted. \
+  Enforced in: `services/inventory/app/schemas/column_bounds.py` (`JsonObject`, `refuse_non_finite`, `NON_FINITE_NUMBER_MESSAGE`); `services/inventory/app/schemas/template.py` (`FieldDefinition`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_a_number_that_is_not_finite_in_a_json_field_is_refused`, `test_a_finite_number_in_a_json_field_passes`, `test_the_non_finite_scan_needs_no_recursion`, `test_a_section_field_default_that_is_not_finite_is_refused_on_its_own`, `test_the_route_answers_the_one_422_item_naming_the_field`); `services/inventory/tests/test_bulk_import_reasons_live_pg.py` (`test_values_past_a_bound_answer_422_on_the_interactive_routes`)
+- **INV-COL-4.** A unit check fails when a string, integer, or JSON field of the
+  schemas above, or a `String(n)` column of their tables, is neither bounded by these
+  rules nor named exempt with its reason: the bulk port index and count, the
+  template type (a three-value literal), and the device audit names, which come from
+  the caller's token. \
+  Enforced in: `services/inventory/tests/test_column_bounds.py` (`_EXEMPT_FIELDS`, `_EXEMPT_COLUMNS`) \
+  Pinned by: `services/inventory/tests/test_column_bounds.py` (`test_every_field_of_the_covered_schemas_is_in_the_table_or_exempt`, `test_every_string_column_of_the_covered_tables_is_bounded_or_exempt`)
+
+**Out of scope.** Driver packages (section 8.10) and device configurations
+(`device-configuration.md`) keep their own bounds. Query parameters of the read
+routes are not request bodies and are not covered here.
 
 ## 9. Errors
 
@@ -1612,7 +1682,7 @@ other error carries `detail` as a string or as the object shown.
 | 409 | `Hypervisor with name '<name>' already exists` | duplicate hypervisor name | INV-HYP-2 |
 | 409 | `Cannot delete hypervisor: templates still reference it` | hypervisor delete while referenced | INV-HYP-7 |
 | 409 | `Device group '<name>' already exists` | duplicate group name | INV-GRP-2 |
-| 422 | validation list | schema violations: name lengths, unknown enum values, an explicit null on a NOT NULL device field (INV-DEV-11), poll interval below the floor, template field and section rules, batch over 500 ids, group bulk over 500 ids, port bulk bounds, blank hypervisor fields, bad export or import `format`, missing internal token header | INV-DEV-1, INV-DEV-6, INV-POLL-1, INV-TPL-2, INV-TPL-4 to INV-TPL-12, INV-BATCH-1, INV-GRP-2, INV-GRP-4, INV-GRP-9, INV-GRP-17, INV-PORT-4, INV-PORT-5, INV-HYP-11, INV-BULK-19, INV-INT-1, INV-INT-3 |
+| 422 | validation list | schema violations: name lengths, a string past its column's length, a NUL character in a text field, a number that is not finite in `field_data` or a section default, unknown enum values, an explicit null on a NOT NULL device field (INV-DEV-11), poll interval below the floor or above 2147483647, template field and section rules, batch over 500 ids, group bulk over 500 ids, port bulk bounds, blank hypervisor fields, bad export or import `format`, missing internal token header | INV-DEV-1, INV-DEV-6, INV-POLL-1, INV-POLL-5, INV-COL-1 to INV-COL-3, INV-TPL-2, INV-TPL-4 to INV-TPL-12, INV-BATCH-1, INV-GRP-2, INV-GRP-4, INV-GRP-9, INV-GRP-17, INV-PORT-4, INV-PORT-5, INV-HYP-11, INV-BULK-19, INV-INT-1, INV-INT-3 |
 | 422 | `Devices not found: <ids>` | group bulk add naming a device that does not exist | INV-GRP-7 |
 | 422 | `Template not found`, `Template is not a device template`, `Template is not a port template`, `Template is not a dynamic template` | device, port, or dynamic-instance create from the wrong template | INV-DEV-2, INV-PORT-3, INV-DYN-1 |
 | 422 | `Template '<name>' has unknown hardware identity. ...` | device create from a template whose vendor or model is `unknown` | INV-DEV-3 |
@@ -1742,7 +1812,6 @@ exist); #1025 tracks the corrections.
 - INV-PORT-9: repeated port names on one device.
 - INV-GRP-15: a device left in no group is not returned to `No Pool`.
 - INV-GRP-16: renaming or deleting `No Pool`.
-- INV-GRP-17: the group name length.
 - INV-DRV-9: the storage key, the store-before-commit order, and the cleanup on a
   duplicate name.
 - INV-DRV-17: a user-role download and the download content type.

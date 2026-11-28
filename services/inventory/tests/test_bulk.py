@@ -2503,8 +2503,10 @@ _ROW_SENTINEL = "sentinel-7c1f0e5a9b2d4e88"
 
 
 class _RefusingDriverError(Exception):
-    """Stands in for the driver error a refused statement wraps: its text and its
-    cause both carry the row's values, as asyncpg's do."""
+    """Stands in for the driver error a refused statement wraps: a SQLSTATE on it,
+    a constraint name on its cause, and the test's marker value in both texts. The
+    reason is exactly the fixed text and the report carries no text from the
+    error."""
 
     def __init__(self, sqlstate, constraint_name=None):
         super().__init__(f"refused: {_ROW_SENTINEL}")
@@ -2550,12 +2552,20 @@ async def _post_resource_rows(client, resource: str, items: list, dry_run: bool 
         ("templates", "update_template"),
     ],
 )
+@pytest.mark.parametrize(
+    "sqlstate, reason",
+    [
+        ("23505", "the database refused the row: a value that must be unique is already in use"),
+        ("40001", "the database was unavailable or busy; run the import again"),
+    ],
+    ids=["23505", "40001"],
+)
 async def test_a_row_the_database_refuses_is_reported_by_its_class_through_the_route(
-    client, monkeypatch, caplog, resource, service_function, dry_run
+    client, monkeypatch, caplog, resource, service_function, dry_run, sqlstate, reason
 ):
-    """The report names the refusal's class and constraint, and neither it nor the
-    log holds the statement, its parameters, or any value of the row; the next row
-    is judged on its own."""
+    """A refusal raised out of the create or update function: the reason is exactly
+    the fixed text for its SQLSTATE, the report and the log carry no text from the
+    error, and the next row is judged on its own."""
     from app.services import bulk_service
 
     template = await _create_template(client, name="Firewall")
@@ -2588,7 +2598,7 @@ async def test_a_row_the_database_refuses_is_reported_by_its_class_through_the_r
     async def refusing(db, *args, **kwargs):
         # The schema object is the last positional argument of all four.
         if args[-1].name == "bad":
-            raise _refused_statement("23505", "devices_name_key")
+            raise _refused_statement(sqlstate, "devices_name_key")
         return await real(db, *args, **kwargs)
 
     monkeypatch.setattr(bulk_service, service_function, refusing)
@@ -2599,12 +2609,10 @@ async def test_a_row_the_database_refuses_is_reported_by_its_class_through_the_r
     _assert_nothing_of_the_row_or_statement(caplog.text)
     rows = resp.json()["rows"]
     assert (rows[0]["action"], rows[0]["identity"]) == ("reject", "bad")
-    assert rows[0]["reason"] == (
-        "the database refused the row: a value that must be unique is already in use "
-        "(constraint devices_name_key)"
-    )
+    assert rows[0]["reason"] == reason
+    assert "devices_name_key" not in resp.text
     assert (rows[1]["action"], rows[1]["identity"], rows[1]["reason"]) == ("create", "good", None)
-    assert "sqlstate=23505" in caplog.text
+    assert f"sqlstate={sqlstate}" in caplog.text
 
 
 @pytest.mark.asyncio

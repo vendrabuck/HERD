@@ -22,7 +22,7 @@ A rejected row's reason is fixed wording chosen by this module, never the text o
 an exception (`_row_failure_reason`): a schema error names each field and its
 message (`_validation_reason`), a service's refusal keeps its own fixed detail,
 and a row the database refuses is named by the refusal's class (its SQLSTATE, or
-SQLite's error code), with the constraint's name when the database gives one.
+SQLite's error code) alone.
 
 There is no cross-schema bulk path: this lives in the inventory service and only
 touches the inventory schema, matching the service-boundary rule.
@@ -32,7 +32,6 @@ import csv
 import io
 import json
 import logging
-import re
 import uuid
 from typing import Any
 
@@ -42,7 +41,7 @@ from herd_common.csv_import import read_csv_rows
 from herd_common.csv_safety import csv_safe_cell, csv_unsafe_cell
 from herd_common.rehearsal import rehearsal_session
 from herd_common.validation_errors import holds_lone_surrogate
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,6 +51,7 @@ from app.models.driver_package import DriverPackage
 from app.models.hypervisor import Hypervisor
 from app.models.template import DeviceTemplate
 from app.schemas.bulk import BulkImportReport, RowResult
+from app.schemas.column_bounds import ColumnText
 from app.schemas.device import DeviceCreate, DeviceUpdate
 from app.schemas.template import TemplateCreate, TemplateUpdate
 from app.services.inventory_service import create_device, update_device
@@ -143,9 +143,15 @@ JSON_CELL_NOT_JSON_REASON = "a JSON cell must be an object, a list, or JSON text
 
 # A row the database refuses. The reason names the refusal's class, read from the
 # SQLSTATE Postgres (asyncpg) gives, or the error code SQLite gives, never from the
-# exception's text. When Postgres names the constraint, its name is added in
-# parentheses.
+# exception's text. The create and update functions answer a duplicate name or a
+# missing reference with their own fixed details; the class 23 entries name such a
+# refusal raised outside them.
 DATABASE_REFUSED_REASON = "the database refused the row"
+# A failure of the database rather than of the row (SQLSTATE classes 08, 40, 53,
+# and 57, or a connection the driver reports lost): the same row may import on a
+# second run.
+DATABASE_UNAVAILABLE_REASON = "the database was unavailable or busy; run the import again"
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57"})
 _SQLSTATE_REASONS = {
     "23505": "a value that must be unique is already in use",
     "23503": "a record the row refers to does not exist",
@@ -170,8 +176,6 @@ _SQLITE_SQLSTATES = {
     "SQLITE_CONSTRAINT_CHECK": "23514",
     "SQLITE_TOOBIG": "22001",
 }
-# A constraint name is added only when it is a plain identifier.
-_CONSTRAINT_NAME = re.compile(r"[A-Za-z0-9_]{1,63}")
 # Any other failure of a row: no exception text, only the fact.
 ROW_UNEXPECTED_REASON = "the row could not be imported"
 
@@ -200,27 +204,16 @@ def _sqlstate_of(exc: DBAPIError) -> str | None:
     return _SQLITE_SQLSTATES.get(getattr(orig, "sqlite_errorname", None) or "")
 
 
-def _constraint_name_of(exc: DBAPIError) -> str | None:
-    """The refused constraint's name when Postgres gives one (asyncpg keeps it on the
-    driver exception the adapter wraps), and only a plain identifier."""
-    for candidate in (exc.orig, getattr(exc.orig, "__cause__", None)):
-        name = getattr(candidate, "constraint_name", None)
-        if isinstance(name, str) and _CONSTRAINT_NAME.fullmatch(name):
-            return name
-    return None
-
-
 def _database_reason(exc: DBAPIError) -> str:
     sqlstate = _sqlstate_of(exc)
     logger.warning("bulk import row refused by the database: sqlstate=%s", sqlstate or "none")
+    if exc.connection_invalidated or (sqlstate or "")[:2] in _TRANSIENT_SQLSTATE_CLASSES:
+        return DATABASE_UNAVAILABLE_REASON
     if sqlstate is None:
         return DATABASE_REFUSED_REASON
     detail = _SQLSTATE_REASONS.get(sqlstate) or _SQLSTATE_CLASS_REASONS.get(sqlstate[:2])
     if detail is None:
         return DATABASE_REFUSED_REASON
-    constraint = _constraint_name_of(exc) if sqlstate.startswith("23") else None
-    if constraint is not None:
-        detail = f"{detail} (constraint {constraint})"
     return f"{DATABASE_REFUSED_REASON}: {detail}"
 
 
@@ -259,6 +252,14 @@ def _text_cell(raw_row: dict[str, Any], field: str) -> str:
     if not isinstance(value, str):
         raise _RowReasonError(CELL_NOT_A_STRING_REASON.format(field=field))
     return value.strip()
+
+
+class _RowName(BaseModel):
+    """A row's name, checked before the importer looks it up by name: a name holding
+    a NUL character is a schema error naming the field, the one the create and update
+    schemas give (INV-COL-2), rather than a lookup the database refuses."""
+
+    name: ColumnText
 
 
 def _row_shape_reason(raw_row: Any) -> str | None:
@@ -452,11 +453,10 @@ class _DecodedCell:
     chose for the exception it raised. `_coerce_json_cell` hands the value back, or
     raises `_CellDecodeError` with that reason, when the row loop reaches the cell,
     so the row's outcome and reason are the ones an on-loop decode gave. It keeps the
-    reason, never the
-    exception: an exception's traceback holds the decoding frame, which holds every
-    row, so each failed cell would keep the whole upload alive in a reference cycle
-    until the garbage collector found it. It equals neither None nor "", as the
-    non-empty text it stands for does not."""
+    reason, never the exception: an exception's traceback holds the decoding frame,
+    which holds every row, so each failed cell would keep the whole upload alive in
+    a reference cycle until the garbage collector found it. It equals neither None
+    nor "", as the non-empty text it stands for does not."""
 
     __slots__ = ("reason", "value")
 
@@ -622,6 +622,7 @@ async def _import_device_rows(
                     RowResult(row=index, action="reject", reason="missing required field: name")
                 )
                 continue
+            _RowName(name=name)
 
             template_name = _text_cell(raw_row, "template_name")
             if not template_name:
@@ -788,6 +789,7 @@ async def _import_template_rows(
                     RowResult(row=index, action="reject", reason="missing required field: name")
                 )
                 continue
+            _RowName(name=name)
 
             driver_id: uuid.UUID | None = None
             driver_name = _text_cell(raw_row, "driver_name")

@@ -807,8 +807,9 @@ _UNIQUE = f"{_REFUSED}: a value that must be unique is already in use"
 
 
 class _DriverError(Exception):
-    """A driver error shaped like asyncpg's adapter error: a SQLSTATE on it, the
-    constraint name on the asyncpg exception it wraps, and row values in both texts."""
+    """A driver error shaped like asyncpg's adapter error: a SQLSTATE on it, a
+    constraint name on the exception it wraps, and the test's marker value in both
+    texts, which no reason may carry."""
 
     def __init__(self, sqlstate, constraint_name=None):
         super().__init__(f"value {_SENTINEL} refused")
@@ -826,35 +827,35 @@ def _statement_error(orig, cls=None):
     )
 
 
+_TRANSIENT = "the database was unavailable or busy; run the import again"
+
+# The constraint name rides on the driver error (asyncpg keeps one there for a class
+# 23 refusal); no reason carries it.
 _SQLSTATE_CASES = [
-    ("23505", "devices_name_key", f"{_UNIQUE} (constraint devices_name_key)"),
-    (
-        "23503",
-        "devices_template_id_fkey",
-        f"{_REFUSED}: a record the row refers to does not exist"
-        " (constraint devices_template_id_fkey)",
-    ),
+    ("23505", "devices_name_key", _UNIQUE),
+    ("23503", "devices_template_id_fkey", f"{_REFUSED}: a record the row refers to does not exist"),
     ("23502", None, f"{_REFUSED}: a required value is missing"),
-    (
-        "23514",
-        "ck_poll",
-        f"{_REFUSED}: a value is outside what the database allows (constraint ck_poll)",
-    ),
-    ("23P01", None, f"{_REFUSED}: a value breaks a database constraint"),
+    ("23514", "ck_poll", f"{_REFUSED}: a value is outside what the database allows"),
+    ("23P01", "ex_overlap", f"{_REFUSED}: a value breaks a database constraint"),
     ("23505", _SENTINEL, _UNIQUE),
-    ("23505", "a name; with spaces", _UNIQUE),
-    ("23505", "x" * 64, _UNIQUE),
-    (
-        "22001",
-        "not_added_outside_class_23",
-        f"{_REFUSED}: a value is longer than its column allows",
-    ),
+    ("22001", "devices_name_key", f"{_REFUSED}: a value is longer than its column allows"),
     ("22003", None, f"{_REFUSED}: a number is out of range for its column"),
     ("22021", None, f"{_REFUSED}: {_NUL}"),
     ("22P05", None, f"{_REFUSED}: {_NUL}"),
     ("22000", None, f"{_REFUSED}: a value does not fit the type of its column"),
     ("22P02", None, f"{_REFUSED}: a value does not fit the type of its column"),
-    ("40001", None, _REFUSED),
+    ("08000", None, _TRANSIENT),
+    ("08003", None, _TRANSIENT),
+    ("08006", None, _TRANSIENT),
+    ("40001", None, _TRANSIENT),
+    ("40P01", None, _TRANSIENT),
+    ("40000", None, _TRANSIENT),
+    ("53100", None, _TRANSIENT),
+    ("53300", None, _TRANSIENT),
+    ("57014", None, _TRANSIENT),
+    ("57P01", None, _TRANSIENT),
+    ("42P01", None, _REFUSED),
+    ("XX000", None, _REFUSED),
     (None, None, _REFUSED),
 ]
 
@@ -897,6 +898,26 @@ async def test_a_refused_row_is_named_by_its_sqlstate(
     report = await _import_one_refused_row(importer, failure)
     assert [(r.identity, r.action, r.reason) for r in report.rows] == [
         ("bad", "reject", reason),
+        ("good", "create", None),
+    ]
+    assert _SENTINEL not in report.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["devices", "templates"])
+@pytest.mark.parametrize("sqlstate", [None, "23505", "22001"], ids=["none", "23505", "22001"])
+async def test_a_row_whose_connection_was_lost_is_named_unavailable(db_setup, importer, sqlstate):
+    """A connection the driver reports lost names the database, not the row, whatever
+    SQLSTATE rides on the error."""
+    failure = DBAPIError(
+        "INSERT INTO devices (name) VALUES ($1::VARCHAR)",
+        (_SENTINEL,),
+        _DriverError(sqlstate),
+        connection_invalidated=True,
+    )
+    report = await _import_one_refused_row(importer, failure)
+    assert [(r.identity, r.action, r.reason) for r in report.rows] == [
+        ("bad", "reject", _TRANSIENT),
         ("good", "create", None),
     ]
     assert _SENTINEL not in report.model_dump_json()
