@@ -80,6 +80,15 @@ MINIO_READ_TIMEOUT_SECONDS = 30
 MINIO_RETRIES = 2
 MINIO_RETRY_BACKOFF_FACTOR = 0.2
 MINIO_RETRY_STATUSES = (500, 502, 503, 504)
+# The threads the MinIO client sends one multipart upload's parts on (its own
+# ThreadPool, in addition to the storage threads); passed to put_object explicitly.
+MINIO_PART_THREADS = 3
+# Connections the urllib3 pool keeps: every storage thread's own request plus its
+# upload's part threads, so concurrent multipart uploads never open more connections
+# at once than the pool takes back (urllib3 discards a connection returned to a full
+# pool, with a "Connection pool is full" warning). It caps idle connections only;
+# urllib3 opens a connection when a request needs one.
+MINIO_POOL_CONNECTIONS = DRIVER_STORAGE_THREADS * (MINIO_PART_THREADS + 1)
 
 _T = TypeVar("_T")
 
@@ -121,7 +130,7 @@ def _minio_http_client():
         timeout=urllib3.Timeout(
             connect=MINIO_CONNECT_TIMEOUT_SECONDS, read=MINIO_READ_TIMEOUT_SECONDS
         ),
-        maxsize=DRIVER_STORAGE_THREADS,
+        maxsize=MINIO_POOL_CONNECTIONS,
         cert_reqs="CERT_REQUIRED",
         ca_certs=os.environ.get("SSL_CERT_FILE") or certifi.where(),
         retries=urllib3.Retry(
@@ -218,6 +227,7 @@ def upload_object(key: str, data: bytes, content_type: str = "application/octet-
             io.BytesIO(data),
             length=len(data),
             content_type=content_type,
+            num_parallel_uploads=MINIO_PART_THREADS,
         )
     elif _backend == "local":
         dest = _resolve_local(key)

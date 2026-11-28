@@ -1036,12 +1036,15 @@ download, delete); routes under `/drivers`. The package format is in
   where `loop.getaddrinfo` resolves the names of new database and NATS connections
   (issue #1416). At most four such calls run at once; another waits for a thread,
   with no bound on the wait, and one cancelled while it waits never runs. A stalled
-  object store can hold those four threads, and so delay other driver uploads,
-  replacements, downloads, and deletes, but not name resolution, the event loop, or
-  any other worker thread. A download gives its database connection back before it
-  waits for a storage thread, so downloads held by a stalled store hold none. \
-  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`); `services/inventory/app/services/driver_service.py` (`download_driver`) \
-  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`)
+  object store can hold those four threads, and the up to `MINIO_PART_THREADS` (3)
+  threads the MinIO client starts for each multipart upload in addition to them, and
+  so delay other driver uploads, replacements, downloads, and deletes, but not name
+  resolution, the event loop, or any other worker thread. Replacements and deletes
+  keep their pooled database connection while they wait on storage; create and
+  download hold none (a download gives its connection back before it waits for a
+  storage thread). \
+  Enforced in: `services/inventory/app/storage.py` (`DRIVER_STORAGE_THREADS`, `storage_executor`, `run_on_storage_thread`, `MINIO_PART_THREADS`); `services/inventory/app/services/driver_service.py` (`create_driver`, `replace_driver_file`, `download_driver`, `delete_driver`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_storage_pool_is_its_own_and_sized_by_the_named_constant`, `test_storage_calls_run_at_most_the_bound_at_once_and_leave_name_resolution_free`, `test_an_error_raised_on_a_storage_thread_reaches_the_caller_unchanged`, `test_downloads_waiting_on_storage_hold_no_database_connection_and_respect_the_bound`, `test_a_create_waiting_on_storage_holds_no_database_connection`)
 - **INV-DRV-23.** On MinIO, a connect gives up after `MINIO_CONNECT_TIMEOUT_SECONDS`
   (15), and a request is sent under the same timeout: over plain HTTP
   (`MINIO_USE_SSL=false`, the default) a whole request body (one part, at most 5 MiB)
@@ -1063,11 +1066,16 @@ download, delete); routes under `/drivers`. The package format is in
   start is answered and its parts are not (the parts' 90.4 s, then the abort's
   90.4 s), and about 120 s after its parts are stored when its completion goes
   unanswered (30 s, then the abort's 90.4 s). Apart from a body send over plain HTTP,
-  the bounds are on each wait for progress, not on a whole transfer. These are
+  the bounds are on each wait for progress, not on a whole transfer. Execution's
+  internal download client (`download_driver_package`) gives up after 30 s without
+  an answer, before inventory's retries end; inventory's call still runs to its own
+  bound on its storage thread. The pool keeps up to `MINIO_POOL_CONNECTIONS` (16)
+  connections, every storage thread's own request plus its upload's three part
+  threads, so concurrent multipart uploads never discard a connection. These are
   named constants, not settings. The failure answers as
   INV-DRV-20 and section 10 say. \
-  Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`) \
-  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`, `test_each_request_of_a_storage_call_is_tried_as_its_method_allows`)
+  Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `upload_object`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`, `MINIO_PART_THREADS`, `MINIO_POOL_CONNECTIONS`); `services/execution/app/services/driver_loader.py` (`download_driver_package`) \
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`, `test_each_request_of_a_storage_call_is_tried_as_its_method_allows`, `test_concurrent_multipart_uploads_never_overflow_the_connection_pool`)
 - **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
   create answers 500 and commits no row, and a storage failure on file replace answers
   500 and leaves the row naming the old archive, which is still stored and still

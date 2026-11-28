@@ -18,7 +18,8 @@ every new database and NATS connection. These tests pin INV-DRV-22 and INV-DRV-2
   however steadily a scripted store (``_FakeStore``) reads it;
 - against that store, each request of a download, delete, single-part upload, or
   multipart upload is tried as its method allows, in the sequence INV-DRV-23's
-  figures count.
+  figures count, and four multipart uploads at once never overflow the pool;
+- a create, like a download, holds no database connection while it waits on storage.
 
 The only wall-clock bounds are escapes for the failure path (a deadlock or an
 honoured Retry-After), each far above what a passing run takes.
@@ -27,6 +28,7 @@ honoured Retry-After), each far above what a passing run takes.
 import asyncio
 import contextlib
 import io
+import logging
 import socket
 import threading
 import time
@@ -246,7 +248,8 @@ def test_the_minio_client_sends_through_a_pool_with_the_named_bounds(reset_stora
     assert retries.backoff_factor == 0.2
     assert sorted(retries.status_forcelist) == [500, 502, 503, 504]
     assert retries.respect_retry_after_header is False
-    assert kw["maxsize"] == storage.DRIVER_STORAGE_THREADS
+    assert storage.MINIO_PART_THREADS == 3
+    assert kw["maxsize"] == storage.MINIO_POOL_CONNECTIONS == 16
     assert kw["cert_reqs"] == "CERT_REQUIRED"
 
 
@@ -389,9 +392,11 @@ class _Request:
 class _FakeStore:
     """A minimal S3 endpoint on 127.0.0.1 for the real MinIO client. The bucket's
     location lookup and HEAD are answered; every other request is recorded as a
-    _Request and answered as ``policy(kind)`` says: "ok", "never" (read the body,
-    then hold the request unanswered), or "stall-body" (a GET's headers and one byte
-    of a longer body, then nothing). The kinds are get, put, put-part, create,
+    _Request and answered as ``policy(kind)`` says: "ok", "hold-for-peers" (answered
+    once ``release_at`` requests have been in flight at once, or at the escape),
+    "never" (read the body, then hold the request unanswered), or "stall-body" (a
+    GET's headers and one byte of a longer body, then nothing). ``peak_in_flight``
+    counts the most requests it held at once. The kinds are get, put, put-part, create,
     complete, abort, and delete. ``read_rate`` (bytes per second) slows every body
     read, and ``rcvbuf`` sets the store's socket receive buffer."""
 
@@ -399,6 +404,9 @@ class _FakeStore:
         self.requests: list[_Request] = []
         self.stop = threading.Event()
         self._lock = threading.Lock()
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self.release_at = float("inf")
         store = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -457,8 +465,21 @@ class _FakeStore:
                 request = _Request(kind)
                 with store._lock:
                     store.requests.append(request)
+                    store.in_flight += 1
+                    store.peak_in_flight = max(store.peak_in_flight, store.in_flight)
+                try:
+                    self._script(kind, request)
+                finally:
+                    with store._lock:
+                        store.in_flight -= 1
+
+            def _script(self, kind: str, request: _Request) -> None:
                 action = policy(kind)
                 self._read_body(request)
+                if action == "hold-for-peers":
+                    deadline = time.monotonic() + _ESCAPE_SECONDS
+                    while store.peak_in_flight < store.release_at and time.monotonic() < deadline:
+                        time.sleep(0.01)
                 if action == "never":
                     return self._hold()
                 if kind == "get" and action == "stall-body":
@@ -482,6 +503,7 @@ class _FakeStore:
 
         class Server(ThreadingHTTPServer):
             daemon_threads = True
+            request_queue_size = 64
 
             def handle_error(self, request, client_address):
                 pass  # a client that gave up resets its connection; expected here
@@ -644,3 +666,57 @@ def test_each_request_of_a_storage_call_is_tried_as_its_method_allows(
         assert error is not None
         assert store.kinds() == expected
     assert elapsed >= serial_reads * storage.MINIO_READ_TIMEOUT_SECONDS
+
+
+async def test_concurrent_multipart_uploads_never_overflow_the_connection_pool(
+    reset_storage, caplog
+):
+    """Four multipart uploads at once, one per storage thread, each sending its two
+    parts in parallel: eight part requests in flight, past the four connections the
+    pool used to keep. The pool keeps MINIO_POOL_CONNECTIONS, so urllib3 never
+    discards a returned connection with a "Connection pool is full" warning."""
+    caplog.set_level(logging.WARNING, logger="urllib3")
+    parts = 2 * storage.DRIVER_STORAGE_THREADS
+    with _FakeStore(lambda kind: "hold-for-peers" if kind == "put-part" else "ok") as store:
+        store.release_at = parts
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    storage.run_on_storage_thread(
+                        storage.upload_object, f"pkg{n}.zip", b"x" * _TEN_MIB
+                    )
+                    for n in range(storage.DRIVER_STORAGE_THREADS)
+                )
+            ),
+            _ESCAPE_SECONDS,
+        )
+        kinds = store.kinds()
+        peak = store.peak_in_flight
+    assert kinds.count("put-part") == parts
+    assert kinds.count("complete") == storage.DRIVER_STORAGE_THREADS
+    assert peak == parts
+    assert "Connection pool is full" not in caplog.text
+
+
+async def test_a_create_waiting_on_storage_holds_no_database_connection(client, file_db):
+    """A driver create runs no query before its upload, so while the upload waits on
+    storage its session holds no pooled connection (INV-DRV-22)."""
+    engine, _ = file_db
+    gate = _Gate()
+    with patch.object(
+        driver_service, "upload_object", lambda key, data, content_type="": gate(None)
+    ):
+        create = asyncio.ensure_future(
+            client.post(
+                "/drivers",
+                data={"name": "Waiting", "connection_type": "Management"},
+                files={"file": ("d.zip", io.BytesIO(_driver_zip(1)), "application/zip")},
+            )
+        )
+        try:
+            await _until(lambda: gate.entered == 1)
+            assert engine.pool.checkedout() == 0
+        finally:
+            gate.release.set()
+        resp = await create
+    assert resp.status_code == 201, resp.text
