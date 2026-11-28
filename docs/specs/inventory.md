@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `INV` (used in rule identifiers, for example `INV-DEV-1`) |
-| Verified at | commit `4f352698` (`v0.6.0-89-g4f352698`), 2026-10-06; the inventory code is unchanged since `fd589e50` |
+| Last full review | 2026-10-06 |
 | Owning services | inventory (`services/inventory/`) |
 | Other services involved | auth (user group membership and names), reservations (device delete guard, device holds), cabling (device delete guard, device-group boundary and visibility lookups), secrets (hypervisor secret reference), execution (reads devices, templates, drivers, and hypervisors; creates and deletes dynamic-instance devices; health polling) |
 | Design records | [ADR 0002](../design/0002-driver-published-config-schemas.md), [ADR 0004](../design/0004-dynamic-resources.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md) |

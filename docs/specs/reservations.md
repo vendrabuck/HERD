@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `RES` (used in rule identifiers, for example `RES-CREATE-1`) |
-| Verified at | commit `fd589e50` (`v0.6.0-68-gfd589e50`), 2026-10-05 |
+| Last full review | 2026-10-05 |
 | Owning services | reservations (`services/reservations/`) |
 | Other services involved | inventory (device and template data, device status), cabling (topology validation, the per-reservation fork), execution (consumes events, posts the provision result, owns wiring status), ai-orchestrator (purpose classification), auth (JWT only), notifications and integration (consume events) |
 | Design records | [ADR 0001](../design/0001-editable-reservation-topologies.md), [ADR 0004](../design/0004-dynamic-resources.md), [ADR 0006](../design/0006-fork-reconcile-and-as-built.md), [ADR 0007](../design/0007-connection-driven-reconcile.md), [ADR 0009](../design/0009-l2-l3-connection-driven-reconcile.md), [ADR 0013](../design/0013-lab-purpose-classification.md) |

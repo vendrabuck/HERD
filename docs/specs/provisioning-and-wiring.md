@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Area prefix | `WIRE` (used in rule identifiers, for example `WIRE-ORDER-1`) |
-| Verified at | commit `61bebe96` (`v0.6.0-76-g61bebe96`), 2026-10-05 |
+| Last full review | 2026-10-05 |
 | Owning services | execution (`services/execution/`) |
 | Other services involved | reservations (stages the events, answers the corroboration check, proxies the user routes), cabling (the fork's intended wiring and routing intent, fabric lookup), inventory (switch devices, templates, config versions, driver packages), the driver packages run in execution's sandbox |
 | Design records | [ADR 0006](../design/0006-fork-reconcile-and-as-built.md), [ADR 0007](../design/0007-connection-driven-reconcile.md), [ADR 0009](../design/0009-l2-l3-connection-driven-reconcile.md), [ADR 0014](../design/0014-first-class-layer-3-routing.md), [ADR 0018](../design/0018-reconcile-respects-the-drive-claim.md) (Proposed) |
@@ -2326,6 +2326,14 @@ The in-line retry loop count (WIRE-DRIVER-2) is not asserted by any test.
   first logs in to the switch.
   Recorded in issue #1209, [DRIVERS.md](../DRIVERS.md), and the docstring of
   `_release_orphaned_allocations`.
+- The database sessions of the wiring paths set no `lock_timeout` (and no
+  `statement_timeout`): execution's engine, built by `herd_common.database.make_database`,
+  sets neither, so a wiring write that meets a row lock, or the VLAN allocation advisory
+  lock, held by a stuck transaction waits without a bound. A bound would raise
+  `LockNotAvailable`, which each caller would have to map (a NAK on the consumer, a
+  per-reservation skip in the retry tick, a 503 on the manual retry route); that mapping
+  belongs to ADR 0018 phase 3, which the 2026-11-25 decision on issue #1481 stopped.
+  Recorded in issue #1498 (item 5).
 
 ### Rules with no test
 
