@@ -13,7 +13,8 @@ Both live in the same document so they cannot drift apart.
 ## What a specification is, and is not
 
 A specification states what HERD does **today**, verified against the code and the
-tests at the commit named in its header. It is descriptive, not aspirational.
+tests when it was last fully reviewed (the date in its header). It is descriptive, not
+aspirational.
 
 | Question | Read |
 |---|---|
@@ -73,8 +74,8 @@ repository paths and relative links only.
 These rules are what make a specification trustworthy. A document that breaks them is
 not finished.
 
-1. **As-built.** Every statement describes behavior that exists at the commit in the
-   header. Read the code and the tests; do not write from memory, from an ADR, or
+1. **As-built.** Every statement describes behavior that exists in the code the
+   document describes. Read the code and the tests; do not write from memory, from an ADR, or
    from another document. An ADR records a decision at a point in time and the code
    may have moved since.
 2. **Every rule is numbered and has a stable identifier.** The form is
@@ -168,8 +169,10 @@ not finished.
   every repository path they name must exist in a fresh clone (a generated or ignored
   file does not count, and the host's build output can hide that) and every relative
   link must resolve.
-- The header's "Verified at" line names the commit the document was last checked
-  against in full. A partial update leaves that line alone.
+- The header's "Last full review" line gives the date the document was last checked
+  against the code in full (#1312; it replaced a "Verified at" line that named a
+  commit, which a reader took to mean more than a partial update delivered). A partial
+  update leaves that line alone.
 
 ## Writing a new specification
 
