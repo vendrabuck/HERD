@@ -163,6 +163,28 @@ WIRING_STALE_BUILD_REASON = "build intent gone; pending release"
 # selects with no second list to edit.
 NON_RETRYABLE_REASON_PREFIXES = (WIRING_UNRESOLVABLE_REASON, WIRING_NOT_SIMPLE_CHAIN_REASON)
 
+# The two pinned reasons a switch-level failure records on a row while the switch itself
+# was read (issue #1199): its driver package is broken (`_wiring_load_failure`, issue
+# #1002), or its template is missing (`wiring_template_missing_reason`). Neither says the
+# switch or the hop is gone, so a release row pinned by one of them may still describe a
+# connection on the device; the admin re-drive
+# (`wiring_retry_service.redrive_pinned_releases`) drives exactly those rows.
+WIRING_PACKAGE_UNLOADABLE_PREFIX = f"{WIRING_UNRESOLVABLE_REASON}: driver load failed: "
+
+# The switch label each layer's reasons use: "switch" (L1), "L2 switch", "L3 switch".
+WIRING_SWITCH_LABELS = {"l1": "switch", "l2": "L2 switch", "l3": "L3 switch"}
+
+
+def wiring_template_missing_reason(layer: str, switch_id) -> str:
+    """The pinned reason a row records when its switch was read but the switch's
+    template was not found (inventory answered 404), for `layer` "l1", "l2", or "l3".
+    The one builder of that text, so the re-drive's match (issue #1199) cannot drift
+    from what the applies write."""
+    return (
+        f"{WIRING_UNRESOLVABLE_REASON}: template for {WIRING_SWITCH_LABELS[layer]} "
+        f"{switch_id} not found"
+    )
+
 
 def _wiring_load_failure(exc: BaseException, switch_id: str) -> tuple[str, int]:
     """The (last_error, attempts) a wiring row records when ``load_driver`` raised.
@@ -208,6 +230,19 @@ async def _run_sandbox(*args, **kwargs):
     from app.services.driver_sandbox import execute_driver_method
 
     return await asyncio.to_thread(execute_driver_method, *args, **kwargs)
+
+
+async def _prepare_driver_dependencies(driver_path: str) -> str:
+    """Run `driver_sandbox.prepare_driver_dependencies` off the event loop, once per
+    wiring driver action (issue #1495, `_run_driver_with_retry`).
+
+    It may wait on a `pip install` child for up to DRIVER_PIP_INSTALL_TIMEOUT_SECONDS,
+    so it runs on a worker thread like `_run_sandbox`. It never raises; its answer
+    (installed, failed, not needed, disabled) is returned for the caller and the tests.
+    """
+    from app.services.driver_sandbox import prepare_driver_dependencies
+
+    return await asyncio.to_thread(prepare_driver_dependencies, driver_path)
 
 
 class TransientUpstreamError(RuntimeError):
@@ -2232,7 +2267,18 @@ async def _run_driver_with_retry(
     retried up to WIRING_DRIVER_ATTEMPTS with exponential backoff. Returns
     (success, attempts, last_error, last_result). A driver failure is compensated
     per connection and never NAKs the message (Decision 7).
+
+    The package's dependency install (`driver_sandbox.prepare_driver_dependencies`,
+    a `pip install` only with ALLOW_DRIVER_PIP_INSTALL on, a package that has a
+    `requirements.txt`, and no `_deps` yet) runs ONCE per call, before the first
+    attempt, and every attempt runs with `install_dependencies=False` (issue #1495).
+    So one action spends at most one install, bounded by
+    DRIVER_PIP_INSTALL_TIMEOUT_SECONDS, plus its attempts, each bounded by the sandbox
+    timeout; a failed or timed-out install is logged and is not repeated by the
+    remaining attempts, which run the driver child without the missing dependencies.
+    The next action (or the next pass) tries the install again, once.
     """
+    await _prepare_driver_dependencies(driver_path)
     delay = WIRING_DRIVER_INITIAL_DELAY
     last_error: str | None = None
     last_result: dict | None = None
@@ -2245,6 +2291,7 @@ async def _run_driver_with_retry(
                 context,
                 method_kwargs=method_kwargs,
                 password_keys=password_keys,
+                install_dependencies=False,
             )
         except Exception as exc:  # noqa: BLE001 - sandbox failures are per-connection
             last_error = f"driver raised: {exc}"
@@ -2364,7 +2411,7 @@ async def _apply_wiring_pairs(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: switch {switch_id} not found"
         elif template_data is None:
-            load_error = f"{WIRING_UNRESOLVABLE_REASON}: template for switch {switch_id} not found"
+            load_error = wiring_template_missing_reason("l1", switch_id)
 
         context: dict = {}
         password_keys: set = set()
@@ -2809,11 +2856,7 @@ async def _run_vlan_definition_op(
     if switch_data is None:
         return False, 0, f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
     if template_data is None:
-        return (
-            False,
-            0,
-            f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found",
-        )
+        return False, 0, wiring_template_missing_reason("l2", switch_id)
 
     driver_id = uuid.UUID(switch_data["driver_id"])
     driver_sha256 = switch_data.get("driver_sha256", "unknown")
@@ -3591,9 +3634,7 @@ async def _apply_l2_memberships(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: L2 switch {switch_id} not found"
         elif template_data is None:
-            load_error = (
-                f"{WIRING_UNRESOLVABLE_REASON}: template for L2 switch {switch_id} not found"
-            )
+            load_error = wiring_template_missing_reason("l2", switch_id)
 
         context: dict = {}
         password_keys: set = set()
@@ -4869,9 +4910,7 @@ async def _apply_l3_adjacency(
         if switch_data is None:
             load_error = f"{WIRING_UNRESOLVABLE_REASON}: L3 switch {switch_id} not found"
         elif template_data is None:
-            load_error = (
-                f"{WIRING_UNRESOLVABLE_REASON}: template for L3 switch {switch_id} not found"
-            )
+            load_error = wiring_template_missing_reason("l3", switch_id)
 
         context: dict = {}
         password_keys: set = set()

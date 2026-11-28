@@ -310,6 +310,60 @@ def test_the_one_row_budget_is_unchanged_for_l1_and_l2():
 ALLOWANCE_MS = 1000
 
 
+# The dependency install's own timeout (issue #1495); a literal here, so a change to
+# the constant is seen.
+INSTALL_MS = 60_000
+
+
+def test_with_pip_install_on_the_budget_counts_one_install_per_action():
+    """Issue #1495: with ALLOW_DRIVER_PIP_INSTALL on, each action's worst case is one
+    60s install (once per action, never per attempt) plus its three attempts and its
+    backoff. One row: 3 x 150.6s = 451.8s, 8 minutes; an L2 add (four actions):
+    602.4s, 11 minutes; with the flag off, unchanged. For every whole-second timeout
+    up to an hour the budget is the plain round-up of that sum, with the same 1.2s
+    of least slack as without the install (60s per action is a whole minute per row
+    of three)."""
+    from app.services.wiring_claim import install_ms_per_action
+
+    assert install_ms_per_action() == 0
+    assert claim_budget() == timedelta(minutes=5)
+    with patch.object(settings, "allow_driver_pip_install", True):
+        assert install_ms_per_action() == INSTALL_MS
+        assert claim_budget() == timedelta(minutes=8)
+        assert claim_budget(4) == timedelta(minutes=11)
+        assert WiringRowClaims().budget == timedelta(minutes=8)
+        slacks = []
+        for timeout in range(1, 3601):
+            with patch.object(settings, "execution_timeout_seconds", timeout):
+                drive = 3 * (INSTALL_MS + _worst_case_action_ms(timeout))
+                minutes = -(-drive // 60_000)  # ceil
+                assert claim_budget() == timedelta(minutes=minutes), timeout
+                slacks.append(minutes * 60_000 - drive)
+        assert min(slacks) == 1200
+
+
+@pytest.mark.parametrize(
+    ("route_operations", "minutes"),
+    [
+        # (R + 2) x (60s + 90.6s + the 1s allowance), never under the one-row 8 minutes.
+        (0, 8),  # 303.2s, held at the one-row 8 minutes (451.8s with the install)
+        (1, 8),  # 454.8s
+        (2, 11),  # 606.4s
+        (10, 31),  # 1819.2s
+        (1_000, 2_532),  # 151,903.2s
+    ],
+)
+def test_with_pip_install_on_an_l3_pins_budget_counts_one_install_per_action(
+    route_operations, minutes
+):
+    """The L3 pin's budget takes the install into every one of its R + 2 actions."""
+    with patch.object(settings, "allow_driver_pip_install", True):
+        assert l3_pin_claim_budget(route_operations) == timedelta(minutes=minutes)
+        budget = l3_pin_claim_budget(route_operations) // timedelta(milliseconds=1)
+        drive = (route_operations + 2) * (INSTALL_MS + _worst_case_action_ms(30) + ALLOWANCE_MS)
+        assert budget > drive
+
+
 @pytest.mark.parametrize(
     ("route_operations", "timeout", "minutes"),
     [
@@ -1552,7 +1606,15 @@ DRIVER_LOAD_S = 30
 
 
 async def _drive_l3_worst_case(
-    row_id, holder, *, provision, routes, through_retry=False, overhead_ms=0, record_runs=True
+    row_id,
+    holder,
+    *,
+    provision,
+    routes,
+    through_retry=False,
+    overhead_ms=0,
+    record_runs=True,
+    install_s=0,
 ):
     """Drive one L3 pin with `holder`'s claim, every driver action taking its worst
     case: three attempts, each running to the driver timeout, with both backoff
@@ -1567,7 +1629,9 @@ async def _drive_l3_worst_case(
     `routes`); otherwise `_apply_l3_adjacency` is called directly with `routes`.
     `record_runs` False stands in a bare object for each execution run instead of
     writing it, so the sweep over every route count stays fast; the claim and ledger
-    writes are real either way.
+    writes are real either way. `install_s` is the virtual time each dependency
+    install takes (`driver_sandbox.prepare_driver_dependencies`, issue #1495); every
+    install is counted in `observed["installs"]`.
 
     Returns what was observed: the virtual time the driver load finished, the first
     driver call, the logout finished, whether the rival's claim succeeded, and the
@@ -1581,8 +1645,13 @@ async def _drive_l3_worst_case(
     )
 
     clock = _VirtualClock()
-    observed: dict = {"calls": [], "first_call_at": None}
+    observed: dict = {"calls": [], "first_call_at": None, "installs": 0}
     attempts: dict = {}
+
+    def _install(driver_path):
+        observed["installs"] += 1
+        clock.advance(install_s)
+        return "failed"
 
     def _driver(driver_path, action, context, **kwargs):
         key = (action, (kwargs.get("method_kwargs") or {}).get("destination"))
@@ -1656,6 +1725,9 @@ async def _drive_l3_worst_case(
         # timers, which `overhead_ms` stands for on the virtual clock.
         stack.enter_context(
             patch("app.services.nats_consumer._run_sandbox", AsyncMock(side_effect=_driver))
+        )
+        stack.enter_context(
+            patch("app.services.driver_sandbox.prepare_driver_dependencies", side_effect=_install)
         )
         stack.enter_context(
             patch("app.services.execution_service.create_execution_run", side_effect=_create)
@@ -1747,6 +1819,37 @@ async def test_an_l3_pins_claim_is_still_held_when_its_last_driver_action_finish
         # stays FAILED. Never in_progress: the holder kept its claim to the end.
         expected = "released" if route_operations == 0 else "still_failed"
         assert [o["outcome"] for o in observed["outcomes"]] == [expected]
+
+
+@pytest.mark.parametrize("route_count", [0, 1, 2, 10])
+async def test_with_pip_install_on_an_l3_pins_claim_outlives_one_install_per_action(route_count):
+    """Issue #1495, driven: with ALLOW_DRIVER_PIP_INSTALL on and every install running
+    to its 60s timeout and failing (so it would be due again), each action installs
+    once, not once per attempt, and the pin is still held when its logout finishes;
+    a second pass that tries to claim it then loses. Before the fix each attempt
+    installed again, 270.6s per action, and the 5-minute claim of a pin with no
+    routes ran out after its first action."""
+    row_id = await _seed_l3_failed(intended="RELEASED", routes=_routes(route_count))
+    holder = WiringRowClaims()
+    with patch.object(settings, "allow_driver_pip_install", True):
+        observed = await _drive_l3_worst_case(
+            row_id,
+            holder,
+            provision=False,
+            routes=_routes(route_count),
+            through_retry=True,
+            install_s=INSTALL_MS / 1000,
+        )
+        budget = l3_pin_claim_budget(route_count)
+
+    actions = route_count + 2
+    assert observed["installs"] == actions, "one install per action, not per attempt"
+    assert len(observed["calls"]) == 3 * actions
+    drive = observed["logout_finished_at"] - observed["loaded_at"]
+    assert drive == timedelta(milliseconds=actions * (INSTALL_MS + _worst_case_action_ms(30)))
+    assert observed["rival_claimed"] is False, "a second pass claimed the pin mid-drive"
+    assert holder.held[row_id] == observed["loaded_at"] + budget
+    assert holder.held[row_id] > observed["logout_finished_at"]
 
 
 async def test_a_raised_driver_timeout_still_keeps_an_l3_pins_claim_through_its_drive():
