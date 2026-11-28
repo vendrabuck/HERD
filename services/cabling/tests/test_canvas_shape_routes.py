@@ -578,15 +578,17 @@ async def test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_side", ["a", "b"])
 @pytest.mark.parametrize("kind", ["node_not_an_object", "deep", "lone_surrogate"])
-async def test_a_diff_or_restore_of_a_bad_version_answers_409(client, kind):
+async def test_a_diff_or_restore_of_a_bad_version_answers_409(client, kind, bad_side):
     topology_id = await _seed_topology("lab", USER_A, BAD_STORED[kind])
     resp = await client.put(f"/topologies/{topology_id}", json={"canvas_data": _good_canvas()})
     assert resp.status_code == 200, resp.text
     bad_version, good_version = await _version_ids(topology_id)
-    resp = await client.get(
-        f"/topologies/{topology_id}/versions/diff", params={"a": bad_version, "b": good_version}
-    )
+    sides = {"a": bad_version, "b": good_version}
+    if bad_side == "b":
+        sides = {"a": good_version, "b": bad_version}
+    resp = await client.get(f"/topologies/{topology_id}/versions/diff", params=sides)
     assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
     resp = await client.post(f"/topologies/{topology_id}/versions/{bad_version}/restore", json={})
     assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
