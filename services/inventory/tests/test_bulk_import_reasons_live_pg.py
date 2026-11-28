@@ -779,8 +779,8 @@ async def test_generated_device_names_are_stored_by_the_real_column(
 ):
     """The internal create names a dynamic instance after its template (INV-DYN-2).
     With a template name of 245 to 255 characters (four-byte characters here) every
-    generated name is stored whole by the real devices.name column, two creates get
-    distinct names, and no log record carries the request's field data."""
+    generated name is stored whole by the real devices.name column, and two creates
+    get distinct names."""
     caplog.set_level(logging.INFO)
     async with session_factory() as s:
         recipe = DriverPackage(
@@ -861,7 +861,8 @@ async def test_a_device_create_refused_for_anything_but_its_name_is_not_a_name_c
     """Every integrity error on create used to answer `Device with name ... already
     exists`. A class 23 refusal that is not a unique violation, raised here by the
     trigger with the row's field data in its message, detail, and hint, answers the
-    generic detail on the route and in an import row; nothing it carries leaks."""
+    generic detail on the route and in an import row, and its log line names the
+    SQLSTATE only."""
     caplog.set_level(logging.INFO)
     name = f"create-{code}-{tag}"
     payload = {
