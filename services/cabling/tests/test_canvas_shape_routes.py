@@ -11,6 +11,7 @@ The ASGI transport is built with `raise_app_exceptions=False`, so a status the a
 answers is what these tests see.
 """
 
+import asyncio
 import copy
 import csv
 import io
@@ -37,6 +38,7 @@ from app.models.template import TopologyTemplate
 from app.models.topology import Topology, TopologyVersion
 from app.services import canvas_shape
 from app.services.canvas_shape import INLINE_CHECK_VALUES, STORED_CANVAS_UNREADABLE_DETAIL
+from herd_common import bulk_work
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -557,12 +559,27 @@ async def test_every_reader_of_a_bad_topology_answers_409(client, kind):
     assert templates == []
 
 
+_WAIT = 10.0
+
+
+@pytest.fixture
+def fresh_limiters(monkeypatch):
+    """Limiters of this test's own, so a slot one test holds never reaches another."""
+    monkeypatch.setattr(canvas_shape, "_check_slots", None)
+    monkeypatch.setattr(canvas_shape, "_check_workers", None)
+    monkeypatch.setattr(bulk_work, "_limiter", None)
+    monkeypatch.setattr(bulk_work, "_workers", None)
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("fresh_limiters")
 async def test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thread(
     client, monkeypatch
 ):
     """A topology read whose canvas holds more than `INLINE_CHECK_VALUES` values is
-    judged on a bulk worker thread, good or bad, with the answer a small one gets."""
+    judged on a worker thread of the check's own, good or bad, with the answer a
+    small one gets. Every await is bounded and the test ends on its slots all given
+    back, so a slot that is never released fails it."""
     seen: list[int] = []
     real = canvas_shape.stored_shape_problem
 
@@ -576,12 +593,16 @@ async def test_a_stored_canvas_past_the_inline_budget_is_judged_on_a_worker_thre
     bad_id = await _seed_topology("wide-bad", USER_A, {"nodes": [], "edges": [*wide, 1]})
     small_id = await _seed_topology("small", USER_A, _good_canvas())
     loop_thread = threading.get_ident()
-    assert (await client.get(f"/topologies/{good_id}")).status_code == 200
-    resp = await client.get(f"/topologies/{bad_id}")
-    assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
-    assert len(seen) == 2 and loop_thread not in seen
-    assert (await client.get(f"/topologies/{small_id}")).status_code == 200
-    assert len(seen) == 2
+    async with asyncio.timeout(_WAIT):
+        assert (await client.get(f"/topologies/{good_id}")).status_code == 200
+        resp = await client.get(f"/topologies/{bad_id}")
+        assert (resp.status_code, resp.json()) == (409, UNREADABLE_409)
+        assert len(seen) == 2 and loop_thread not in seen
+        assert (await client.get(f"/topologies/{small_id}")).status_code == 200
+        assert len(seen) == 2
+        limiter = canvas_shape.stored_check_limiter()
+        while limiter.borrowed_tokens:
+            await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -1027,6 +1048,36 @@ async def test_a_stored_long_edge_id_is_read_and_refused_only_where_it_is_writte
     # The owner repairs it with a canvas whose edge id fits.
     resp = await client.put(f"/topologies/{topology_id}", json={"canvas_data": _good_canvas()})
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_an_empty_canvas_saves_over_a_readable_draft_with_a_long_edge_id(client):
+    """The empty-canvas guard judges the draft as stored, not as written: a draft
+    whose edge id is past the wiring column's width is still readable, the read
+    answers it, and an empty save over it, with no saved canvas to fall back on and
+    the fork holding wiring, is a deliberate clear (TOPO-SHAPE-8)."""
+    reservation_id, fork_id, _ = await _seed_fork(_long_edge_id_canvas(), None)
+    assert len(await _connection_rows(fork_id)) == 1
+    read = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
+    assert read.json()["canvas_data"]["edges"][0]["id"] == "e" * 300
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": {"nodes": [], "edges": []}, "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _connection_rows(fork_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_fork_with_no_draft_answers_a_null_canvas_not_a_saved_one(client):
+    """A draft that was never stored is not a draft without the shape: the read
+    answers null, never the canvas of a saved version (TOPO-SHAPE-8)."""
+    reservation_id, fork_id, _ = await _seed_fork(None, _good_canvas())
+    resp = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["canvas_data"] is None
+    assert len(resp.json()["versions"]) == 1
 
 
 @pytest.mark.asyncio

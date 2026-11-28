@@ -631,25 +631,29 @@ async def test_a_stored_canvas_within_the_budget_is_judged_on_the_loop(monkeypat
     assert seen == []
 
 
+@pytest.mark.usefixtures("fresh_limiters")
 async def test_a_stored_canvas_past_the_budget_is_judged_on_a_worker_thread(monkeypatch):
     """One value more and the whole check runs on a worker thread, with the same
-    answer the check gives anywhere."""
+    answer the check gives anywhere. Every await is bounded and the test ends on
+    its own slots all given back, so a slot that is never released fails it."""
     seen = _threads_of_the_check(monkeypatch)
     loop_thread = threading.get_ident()
-    canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
-    assert await stored_canvas_problem(canvas) is None
-    assert len(seen) == 1 and seen[0] != loop_thread
-    bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)] + [{"id": 1}]}
-    assert await stored_canvas_problem(bad) == CanvasProblem(
-        ("edges", INLINE_CHECK_VALUES - 1, "id"), STRING
-    )
-    assert len(seen) == 2 and seen[1] != loop_thread
-    # Each of the exact-budget canvases of the test above, one value larger.
-    one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 1)}]}
-    assert await stored_canvas_problem(one_wide_item) is None
-    nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 3)}}]}
-    assert await stored_canvas_problem(nested) is None
-    assert len(seen) == 4 and loop_thread not in seen
+    async with asyncio.timeout(_WAIT):
+        canvas = {"edges": [{} for _ in range(INLINE_CHECK_VALUES)]}
+        assert await stored_canvas_problem(canvas) is None
+        assert len(seen) == 1 and seen[0] != loop_thread
+        bad = {"edges": [{} for _ in range(INLINE_CHECK_VALUES - 1)] + [{"id": 1}]}
+        assert await stored_canvas_problem(bad) == CanvasProblem(
+            ("edges", INLINE_CHECK_VALUES - 1, "id"), STRING
+        )
+        assert len(seen) == 2 and seen[1] != loop_thread
+        # Each of the exact-budget canvases of the test above, one value larger.
+        one_wide_item = {"edges": [{f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 1)}]}
+        assert await stored_canvas_problem(one_wide_item) is None
+        nested = {"nodes": [{"data": {f"k{i}": 0 for i in range(INLINE_CHECK_VALUES - 3)}}]}
+        assert await stored_canvas_problem(nested) is None
+        assert len(seen) == 4 and loop_thread not in seen
+    await _until(lambda: stored_check_limiter().borrowed_tokens == 0)
 
 
 async def test_a_wide_top_level_is_judged_on_a_worker_thread(monkeypatch):
