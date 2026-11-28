@@ -15,7 +15,10 @@ every new database and NATS connection. These tests pin INV-DRV-22 and INV-DRV-2
   count, and against a real socket that never answers, or that answers 503 with a
   long Retry-After, a request gives up after exactly 1 + ``MINIO_RETRIES`` attempts;
 - over plain HTTP a whole request body must be sent within the connect timeout,
-  however steadily a scripted store (``_FakeStore``) reads it.
+  however steadily a scripted store (``_FakeStore``) reads it;
+- against that store, each request of a download, delete, single-part upload, or
+  multipart upload is tried as its method allows, in the sequence INV-DRV-23's
+  figures count.
 
 The only wall-clock bounds are escapes for the failure path (a deadlock or an
 honoured Retry-After), each far above what a passing run takes.
@@ -557,3 +560,87 @@ def test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout(
             first_window = [t for t in request.read_times if t - request.read_times[0] <= 0.5]
             gaps = [b - a for a, b in zip(first_window, first_window[1:], strict=False)]
             assert max(gaps) < storage.MINIO_CONNECT_TIMEOUT_SECONDS
+
+
+_TEN_MIB = 10 * 1024 * 1024  # DRIVER_MAX_SIZE_BYTES: two 5 MiB parts
+_TRIES = 1 + storage.MINIO_RETRIES
+
+
+@pytest.mark.parametrize(
+    ("answered", "call", "expected", "serial_reads"),
+    [
+        pytest.param(
+            (),
+            lambda: storage.download_object("pkg.zip"),
+            ["get"] * _TRIES,
+            _TRIES,
+            id="a download the store never answers",
+        ),
+        pytest.param(
+            (),
+            lambda: storage.delete_object("pkg.zip"),
+            ["delete"] * _TRIES,
+            _TRIES,
+            id="a delete the store never answers",
+        ),
+        pytest.param(
+            (),
+            lambda: storage.upload_object("pkg.zip", b"x" * 1024),
+            ["put"] * _TRIES,
+            _TRIES,
+            id="a single-part upload the store never answers",
+        ),
+        pytest.param(
+            ("stall-body",),
+            lambda: storage.download_object("pkg.zip"),
+            ["get"],
+            1,
+            id="a download whose answer stops after its headers",
+        ),
+        pytest.param(
+            (),
+            lambda: storage.upload_object("pkg.zip", b"x" * _TEN_MIB),
+            ["create"],
+            1,
+            id="a multipart upload whose start goes unanswered",
+        ),
+        pytest.param(
+            ("create",),
+            lambda: storage.upload_object("pkg.zip", b"x" * _TEN_MIB),
+            ["create"] + ["put-part"] * (2 * _TRIES) + ["abort"] * _TRIES,
+            2 * _TRIES,
+            id="a multipart upload whose parts go unanswered",
+        ),
+        pytest.param(
+            ("create", "put-part"),
+            lambda: storage.upload_object("pkg.zip", b"x" * _TEN_MIB),
+            ["create", "put-part", "put-part", "complete"] + ["abort"] * _TRIES,
+            1 + _TRIES,
+            id="a multipart upload whose completion goes unanswered",
+        ),
+    ],
+)
+def test_each_request_of_a_storage_call_is_tried_as_its_method_allows(
+    reset_storage, monkeypatch, answered, call, expected, serial_reads
+):
+    """The request sequences behind INV-DRV-23's figures, against a store that accepts
+    connections and answers only the kinds listed. A GET, PUT, or DELETE is tried
+    three times; a body read after the headers and a POST (a multipart upload's start
+    or completion) are tried once; a multipart upload sends its two parts in parallel
+    and, after a failure once started, its abort, tried three times. Scaled: a 0.2 s
+    read timeout; the call takes at least one read timeout per request attempt waited
+    in series (``serial_reads``), the figures' arithmetic."""
+    monkeypatch.setattr(storage, "MINIO_CONNECT_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(storage, "MINIO_READ_TIMEOUT_SECONDS", 0.2)
+
+    def policy(kind):
+        if "stall-body" in answered:
+            return "stall-body"
+        return "ok" if kind in answered else "never"
+
+    with _FakeStore(policy) as store:
+        error, elapsed = _timed(call)
+        assert elapsed < _ESCAPE_SECONDS, "a storage call outlived its bounds"
+        assert error is not None
+        assert store.kinds() == expected
+    assert elapsed >= serial_reads * storage.MINIO_READ_TIMEOUT_SECONDS

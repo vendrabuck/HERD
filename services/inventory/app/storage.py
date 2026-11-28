@@ -26,17 +26,31 @@ timeout: urllib3 hands a request body (one part, at most 5 MiB) to one ``sendall
 so over plain HTTP (``MINIO_USE_SSL=false``, the compose default) the whole body must
 be sent within 15 s, about 341 KiB/s for a 5 MiB part, however steadily the store
 takes it; over TLS the timeout applies to each send. A wait for the next bytes of an
-answer gives up after ``MINIO_READ_TIMEOUT_SECONDS`` (30). A request that fails that
-way, or is answered 500, 502, 503, or 504, is tried again at most ``MINIO_RETRIES``
-(2) times, with backoffs of 0 s and then 0.4 s between the attempts and never a wait
-the store names in a Retry-After header. Against a store that accepts connections and
-never answers, one call therefore ends within three attempts of at most 35 s each,
-plus the 0.4 s backoff, plus, for a download whose body stops after its headers (a
-body read is not retried), one more 30 s read: about 136 s. Apart from a body send
-over plain HTTP, these are bounds on each wait for progress, not on a whole transfer:
-a store that keeps sending a few bytes at a time is not cut off by them, and the
-lookup of the store's host name (on the storage thread) is not bounded by the connect
-timeout.
+answer gives up after ``MINIO_READ_TIMEOUT_SECONDS`` (30). A GET, HEAD, PUT, or
+DELETE that fails that way, or is answered 500, 502, 503, or 504, is tried again at
+most ``MINIO_RETRIES`` (2) times, with backoffs of 0 s and then 0.4 s between the
+attempts and never a wait the store names in a Retry-After header; urllib3 tries a
+POST again only when its connection fails.
+
+Those bound one request. A storage call is one request, except an upload over 5 MiB
+(minio's MIN_PART_SIZE), which minio sends as a multipart upload: a POST to start it,
+its 5 MiB parts as PUTs in parallel on minio's own threads, a POST to complete it,
+and, after any failure once it has started, a DELETE to abort it. Against a store
+that accepts connections and never answers:
+
+- a download, a delete, or an upload of at most 5 MiB ends within three 30 s attempts
+  and the 0.4 s backoff, 90.4 s;
+- a download whose answer stops after its headers ends 30 s after its last bytes (a
+  body read is not tried again);
+- a multipart upload ends within 30 s when its start goes unanswered; within about
+  181 s when the start is answered and the parts are not (the parts' 90.4 s, then the
+  abort's 90.4 s); and about 120 s after its parts are stored when the completion goes
+  unanswered (30 s, then the abort's 90.4 s).
+
+Apart from a body send over plain HTTP, these are bounds on each wait for progress,
+not on a whole transfer: a store that keeps sending a few bytes at a time is not cut
+off by them, and the lookup of the store's host name (on the storage thread) is not
+bounded by the connect timeout.
 """
 
 import asyncio

@@ -1045,16 +1045,27 @@ download, delete); routes under `/drivers`. The package format is in
   (`MINIO_USE_SSL=false`, the default) a whole request body (one part, at most 5 MiB)
   must be sent within it, about 341 KiB/s for a 5 MiB part however steadily the store
   takes it, and over TLS it applies to each send. A wait for the next bytes of an
-  answer gives up after `MINIO_READ_TIMEOUT_SECONDS` (30), and a request that fails that way or is
-  answered 500, 502, 503, or 504 is tried again at most `MINIO_RETRIES` (2) times,
-  with no wait a Retry-After header names (issue #1416). Against a store that accepts
-  connections and never answers, one storage call ends within about 136 s (three
-  attempts of at most 35 s, a 0.4 s backoff, and one 30 s read of a download body that
-  stops); the bounds are on each wait for progress, not on a whole transfer. These are
+  answer gives up after `MINIO_READ_TIMEOUT_SECONDS` (30). A GET, HEAD, PUT, or
+  DELETE that fails that way or is answered 500, 502, 503, or 504 is tried again at
+  most `MINIO_RETRIES` (2) times, 0 s and then 0.4 s apart, with no wait a Retry-After
+  header names; a POST (the start or the completion of a multipart upload) is tried
+  again only when its connection fails (issue #1416). Those are the bounds of one
+  request. A storage call is one request, except an upload over 5 MiB, which the
+  MinIO client sends as a multipart upload: a POST to start it, its parts of 5 MiB as
+  parallel PUTs, a POST to complete it, and, after a failure once it has started, a
+  DELETE to abort it. Against a store that accepts connections and never answers, a
+  download, a delete, or an upload of at most 5 MiB ends within 90.4 s (three 30 s
+  attempts and the 0.4 s backoff); a download whose answer stops after its headers
+  ends 30 s after its last bytes (a body read is not tried again); and a multipart
+  upload ends within 30 s when its start goes unanswered, within about 181 s when the
+  start is answered and its parts are not (the parts' 90.4 s, then the abort's
+  90.4 s), and about 120 s after its parts are stored when its completion goes
+  unanswered (30 s, then the abort's 90.4 s). Apart from a body send over plain HTTP,
+  the bounds are on each wait for progress, not on a whole transfer. These are
   named constants, not settings (the issue's triage). The failure answers as
   INV-DRV-20 and section 10 say. \
   Enforced in: `services/inventory/app/storage.py` (`_minio_http_client`, `init_storage`, `MINIO_CONNECT_TIMEOUT_SECONDS`, `MINIO_READ_TIMEOUT_SECONDS`, `MINIO_RETRIES`, `MINIO_RETRY_STATUSES`) \
-  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`)
+  Pinned by: `services/inventory/tests/test_driver_storage_threads.py` (`test_the_minio_client_sends_through_a_pool_with_the_named_bounds`, `test_a_store_that_never_answers_is_given_up_after_the_retries`, `test_a_long_retry_after_is_not_waited_out`, `test_over_plain_http_a_whole_body_send_must_end_within_the_connect_timeout`, `test_each_request_of_a_storage_call_is_tried_as_its_method_allows`)
 - **INV-DRV-20.** The archive is stored before the row changes: a storage failure on
   create answers 500 and commits no row, and a storage failure on file replace answers
   500 and leaves the row naming the old archive, which is still stored and still
