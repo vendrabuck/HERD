@@ -20,8 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from app.config import settings
 
-# A broker URL can carry `user:password@`; no startup line may hold either part, or
-# the text of the exception the connect or the stream ensure raised (RES-EVENT-5).
+# A broker URL with userinfo: no startup line holds either part of it, the URL, or the
+# text of the exception the connect or the stream ensure raised (RES-EVENT-5).
 BROKER_SENTINEL = "brokerpw-sentinel-0d1f"
 BROKER_USER = "brokeruser-sentinel-7a2c"
 BROKER_URL_WITH_USERINFO = f"nats://{BROKER_USER}:{BROKER_SENTINEL}@127.0.0.1:1"

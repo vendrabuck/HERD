@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
         # a broker restart.
         nc = await connect_nats(settings.nats_url)
         app.state.nats = nc
-        # The broker URL is not logged: it can carry `user:password@`.
+        # The broker URL is not logged.
         logger.info("Connected to NATS")
         js = nc.jetstream()
         await ensure_stream(
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
         # created it): with the stream there, publishes succeed at once; while it
         # is missing, each publish fails and its row stays in the outbox and is
         # retried every tick. Each line names the exception's class only, never its
-        # text or the broker URL (which can carry `user:password@`).
+        # text or the broker URL.
         if app.state.nats is None:
             logger.warning(
                 "NATS unavailable (%s); events wait in the outbox until the service "

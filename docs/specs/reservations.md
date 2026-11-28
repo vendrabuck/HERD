@@ -1311,10 +1311,9 @@ caller.
   (`operations-and-observability.md`, OPS-OUTBOX-6). That case logs `JetStream stream
   HERD_RESERVATIONS could not be created or updated (<class>); the connection is kept,
   so events publish if the stream exists, and while it is missing they wait in the
-  outbox and the relay retries them every tick`. Neither says events are skipped. Each
-  names the exception's class only; no startup line holds the broker URL
-  (`NATS_URL`, which can carry `user:password@`), and a successful connect logs
-  `Connected to NATS`. \
+  outbox and the relay retries them every tick`. Neither says events are skipped. Startup
+  lines name the outcome and the exception class; the broker URL is not logged,
+  and a successful connect logs `Connected to NATS`. \
   Enforced in: `services/reservations/app/main.py` (`lifespan`) \
   Pinned by: `services/reservations/tests/test_main_task_lifecycle.py` (`test_lifespan_starts_without_nats_using_the_real_client`, `test_lifespan_names_a_failed_stream_ensure_apart_from_a_failed_connect`)
 

@@ -5,13 +5,13 @@ inventory, cabling, execution, or auth fails, what reservations writes about it 
 503 detail, an exception message, a log line, a row, an outbox payload) holds fixed
 text, the service's name, the HTTP status code, the exception's class name, and ids.
 Never the body the other service answered, and never an exception's own text, which
-can quote that body or the address the service was reached at (`user:password@`
-included).
+can quote that body or the address the service was reached at, its userinfo
+included.
 
 Each test makes the upstream answer or raise with `SENTINEL` (in the body, in the
 exception's text, and in an address with userinfo), answers an error status with
 `REASON` as the status line's reason phrase, and reaches every service at a
-configured URL with `user:<USERINFO_SECRET>@` userinfo. It asserts that none of them
+configured URL with `user:<USERINFO_MARKER>@` userinfo. It asserts that none of them
 reaches the answer, the rows, the outbox payloads, or any log record at any level
 (its message, its traceback, and every attribute), while the fixed wording, the class
 name, and the status do. The one record left out is httpx's own INFO request line
@@ -92,10 +92,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
 SENTINEL = "upstream-text-sentinel-9c4e"
-USERINFO_SECRET = "upstream-userinfo-pw-3f7a"
+USERINFO_MARKER = "upstream-userinfo-pw-3f7a"
 # What an exception raised on the way to another service can quote: the body, and
 # the address with userinfo.
-EXC_TEXT = f"{SENTINEL} at http://svc-user:{USERINFO_SECRET}@upstream:8000/x"
+EXC_TEXT = f"{SENTINEL} at http://svc-user:{USERINFO_MARKER}@upstream:8000/x"
 BODY = {"detail": f"{SENTINEL} refused", "trace": EXC_TEXT}
 # The reason phrase of every error status the tests answer: an httpx.HTTPStatusError's
 # text quotes it, with the request URL.
@@ -104,10 +104,10 @@ REASON = "upstream-reason-phrase-5d21"
 TOKEN = "internal-token-wording"
 # Every service is configured at a URL with userinfo, which the request URL (and so an
 # httpx.HTTPStatusError's text) keeps.
-INV = f"http://svc-user:{USERINFO_SECRET}@inventory:8000"
-CAB = f"http://svc-user:{USERINFO_SECRET}@cabling:8000"
-EXE = f"http://svc-user:{USERINFO_SECRET}@execution:8000"
-AUTH = f"http://svc-user:{USERINFO_SECRET}@auth:8000"
+INV = f"http://svc-user:{USERINFO_MARKER}@inventory:8000"
+CAB = f"http://svc-user:{USERINFO_MARKER}@cabling:8000"
+EXE = f"http://svc-user:{USERINFO_MARKER}@execution:8000"
+AUTH = f"http://svc-user:{USERINFO_MARKER}@auth:8000"
 OWNER = uuid.uuid4()
 DEVICE = uuid.uuid4()
 TEMPLATE = uuid.uuid4()
@@ -246,7 +246,7 @@ def _assert_absent(caplog, *texts: str) -> None:
     for text in [*texts, *record_texts]:
         assert SENTINEL not in text
         assert REASON not in text
-        assert USERINFO_SECRET not in text
+        assert USERINFO_MARKER not in text
 
 
 # --- the helpers ------------------------------------------------------------------------
@@ -264,7 +264,7 @@ def test_unreachable_names_the_class_and_never_the_text(error):
 
 
 def test_an_http_status_error_is_labelled_by_its_status():
-    request = httpx.Request("GET", f"http://svc-user:{USERINFO_SECRET}@inventory/x")
+    request = httpx.Request("GET", f"http://svc-user:{USERINFO_MARKER}@inventory/x")
     response = httpx.Response(502, json=BODY, request=request)
     exc = httpx.HTTPStatusError(EXC_TEXT, request=request, response=response)
     assert failure_label(exc) == "HTTP 502"
@@ -295,7 +295,7 @@ def _status_error(status: int = 500) -> httpx.HTTPStatusError:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        assert REASON in str(exc) and USERINFO_SECRET in str(exc)
+        assert REASON in str(exc) and USERINFO_MARKER in str(exc)
         return exc
     raise AssertionError("raise_for_status did not raise")
 
