@@ -14,9 +14,9 @@ exception's text, and in an address with userinfo), answers an error status with
 configured URL with `user:<USERINFO_MARKER>@` userinfo. It asserts that none of them
 reaches the answer, the rows, the outbox payloads, or any log record at any level
 (its message, its traceback, and every attribute), while the fixed wording, the class
-name, and the status do. The one record left out is httpx's own INFO request line
-(logger `httpx`), which `herd_common.logging.setup_logging` keeps by decision and
-which names the method, the URL, and the status line. One test is narrower, and says
+name, and the status do. The one record left out is the request line httpx logs
+itself (logger `httpx`), which `herd_common.logging.setup_logging` configures and
+this service does not word. One test is narrower, and says
 why: a background fork call that raised logs a traceback that chains the httpx
 exception itself, so only the line's message and the exception it logs are checked
 there. Nothing between the route (or the background function) and the network is
@@ -678,6 +678,25 @@ async def test_a_fork_call_that_cannot_reach_cabling_logs_only_the_class(network
     ]
     assert SENTINEL not in record.getMessage()
     assert SENTINEL not in str(record.exc_info[1])
+
+
+@pytest.mark.asyncio
+async def test_a_fork_create_that_cannot_reach_cabling_logs_the_httpx_exception_itself(
+    network, caplog
+):
+    """The fork create calls httpx directly: the failure line's traceback is the
+    transport error itself, kept by decision (RES-UPSTREAM-1 and RES-UPSTREAM-3)."""
+    rid = uuid.uuid4()
+    network.post(f"{CAB}/internal/forks").mock(side_effect=httpx.ConnectError("refused"))
+    caplog.set_level(logging.DEBUG)
+    assert await _create_reservation_fork_best_effort(rid, TOPOLOGY, "u", [DEVICE]) is False
+    (record,) = [
+        r for r in _records(caplog) if r.__dict__.get("action") == "reservation_fork_create_failed"
+    ]
+    assert isinstance(record.exc_info[1], httpx.ConnectError)
+    assert (
+        record.getMessage() == f"Fork creation failed for reservation {rid}; leaving fork_id null"
+    )
 
 
 # --- tracebacks of an error status -------------------------------------------------------

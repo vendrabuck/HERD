@@ -1378,7 +1378,10 @@ user in the flow. The routes, callers, and answers are in section 7.
 **What it does.** When reservations cannot get an answer it can use from inventory,
 cabling, execution, auth, or the AI orchestrator, the error a user sees and the log
 line an operator reads say which service and what kind of failure, in fixed words.
-Neither repeats what the other service answered or the text of the error raised.
+The 503 answers of RES-UPSTREAM-1 and RES-UPSTREAM-2, and the messages and `extra`
+fields of the log lines of RES-UPSTREAM-2 to RES-UPSTREAM-4, hold none of what the
+other service answered and none of the text of the error raised; what a traceback a
+log line attaches can hold is RES-UPSTREAM-3.
 
 **Surfaces.** The 503 answers of create, PATCH, and the fork and wiring routes
 (section 9); the log lines of the background fork calls, the inventory status
@@ -1397,13 +1400,16 @@ provision-result callback.
   #1577, a missing internal token). The detail never holds the body the service
   answered or the exception's own text. The background fork create, archive, and
   prune raise the same messages (`Cabling fork-create returned <status>`, `Cabling
-  fork-archive returned <status>`, `Cabling fork prune returned <status>`), so the
-  traceback their failure lines attach starts with that message; for a call that
-  raised it also holds the httpx exception the message chains, whose text is the
+  fork-archive returned <status>`, `Cabling fork prune returned <status>`) for an
+  error status, so the traceback their failure lines attach starts with that
+  message. For a call that raised, the archive and the prune raise `Failed to
+  contact cabling service: <label>`, whose traceback also holds the httpx exception
+  it chains; the fork create calls httpx directly, so the traceback of its failure
+  line is that httpx exception itself. Either way the httpx exception's text is the
   httpx or OS error text and, for a protocol error, includes one line of what the
   other side sent (RES-UPSTREAM-3). \
   Enforced in: `services/reservations/app/services/upstream_failure.py` (`UpstreamUnavailable`, `unreachable`, `answered`, `failure_label`); `services/reservations/app/services/reservation_service.py` (`_validate_dynamic_requests`, `_validate_topology_connectivity`, `_create_reservation_fork`, `_prune_removed_devices_from_fork`, `_cabling_fork_call`, `_execution_wiring_call`, `_lazy_create_reservation_fork`, `_archive_reservation_fork`, `create_reservation`, `update_reservation`, `INVENTORY_RESERVE_FAILED`, `HYPERVISOR_CHECK_UNAVAILABLE`) \
-  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unreachable_names_the_class_and_never_the_text`, `test_an_http_status_error_is_labelled_by_its_status`, `test_answered_names_the_call_and_the_status`, `test_create_names_the_class_when_inventory_cannot_be_reached`, `test_create_names_the_status_when_inventory_answers_an_error`, `test_create_names_only_the_status_of_a_failed_topology_validation`, `test_create_names_the_class_when_cabling_validation_cannot_be_reached`, `test_create_names_the_class_when_a_dynamic_template_cannot_be_read`, `test_a_create_whose_inventory_flip_fails_answers_fixed_wording`, `test_patch_names_the_class_when_inventory_cannot_be_reached`, `test_a_failed_lazy_fork_create_names_only_the_status`, `test_a_fork_route_without_an_internal_token_answers_fixed_wording`, `test_a_wiring_route_without_an_internal_token_answers_fixed_wording`, `test_a_failed_fork_create_logs_only_the_status`, `test_a_failed_fork_archive_logs_only_the_status`, `test_a_failed_fork_prune_logs_only_the_status`, `test_a_fork_call_that_cannot_reach_cabling_logs_only_the_class`); `services/reservations/tests/test_fork_endpoints.py` (`test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_transport_error_is_503_failed_to_contact`)
+  Pinned by: `services/reservations/tests/test_upstream_failure_wording.py` (`test_unreachable_names_the_class_and_never_the_text`, `test_an_http_status_error_is_labelled_by_its_status`, `test_answered_names_the_call_and_the_status`, `test_create_names_the_class_when_inventory_cannot_be_reached`, `test_create_names_the_status_when_inventory_answers_an_error`, `test_create_names_only_the_status_of_a_failed_topology_validation`, `test_create_names_the_class_when_cabling_validation_cannot_be_reached`, `test_create_names_the_class_when_a_dynamic_template_cannot_be_read`, `test_a_create_whose_inventory_flip_fails_answers_fixed_wording`, `test_patch_names_the_class_when_inventory_cannot_be_reached`, `test_a_failed_lazy_fork_create_names_only_the_status`, `test_a_fork_route_without_an_internal_token_answers_fixed_wording`, `test_a_wiring_route_without_an_internal_token_answers_fixed_wording`, `test_a_failed_fork_create_logs_only_the_status`, `test_a_failed_fork_archive_logs_only_the_status`, `test_a_failed_fork_prune_logs_only_the_status`, `test_a_fork_call_that_cannot_reach_cabling_logs_only_the_class`, `test_a_fork_create_that_cannot_reach_cabling_logs_the_httpx_exception_itself`); `services/reservations/tests/test_fork_endpoints.py` (`test_a_refused_or_failed_lazy_create_answers_503_with_cablings_status`, `test_a_lazy_create_that_cannot_reach_cabling_answers_503`); `services/reservations/tests/test_fork_and_wiring_routes.py` (`test_an_upstream_transport_error_is_503_failed_to_contact`)
 - **RES-UPSTREAM-2.** A route that catches a `RuntimeError` (create, PATCH, and the
   fork and wiring routes) answers 503 with its message only when it is an
   `UpstreamUnavailable`, the type every message of RES-UPSTREAM-1 has
@@ -1447,7 +1453,10 @@ provision-result callback.
 **Out of scope.** What a relayed 4xx or 5xx detail of a fork or wiring route holds is
 RES-FORK-10 and RES-FORK-18; validation messages built from inventory or cabling data
 (device and template names, topology edge and route reasons) are the create rules of
-sections 8.1, 8.3, and 8.4.
+sections 8.1, 8.3, and 8.4. The traceback a log line keeps for a transport or
+protocol error holds that error's text, by decision (RES-UPSTREAM-3); the request
+line httpx logs itself is configured by `herd_common.logging.setup_logging`, not
+worded here.
 
 ## 9. Errors
 
