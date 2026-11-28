@@ -58,7 +58,11 @@ from app.schemas.fork import (
     SkippedConstrainedEdgeResponse,
 )
 from app.services.canvas_nodes import strip_device_nodes
-from app.services.canvas_shape import readable_canvas_or_none, require_readable_canvas
+from app.services.canvas_shape import (
+    readable_canvas_or_none,
+    require_readable_canvas,
+    stored_canvas_problem,
+)
 from app.services.fork_save_service import (
     WireSpec,
     assert_endpoints_are_members,
@@ -80,6 +84,40 @@ router = APIRouter(prefix="/internal/forks", tags=["forks"])
 # Cap on the connection id sample the by-device lookup returns (issue #940); the
 # count beside it is always the true total.
 CONNECTION_ID_SAMPLE_LIMIT = 10
+
+# The answer to a fork save or canvas PUT of a canvas with no nodes while the stored
+# draft does not have the shape and the fork holds wiring (TOPO-SHAPE-8).
+EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL = (
+    "The stored draft cannot be read and this fork holds wiring; restore a saved "
+    "version, or rebuild the canvas, before saving a canvas with no nodes"
+)
+
+
+async def _answered_draft(fork: ReservationFork, latest: ForkVersion | None) -> dict | None:
+    """The canvas the fork read answers: the draft when it has the shape; when it
+    does not, the canvas of the latest saved version, which the fork's wiring rows
+    were reconciled to, when that one has it; otherwise None (TOPO-SHAPE-8)."""
+    draft = await readable_canvas_or_none(fork.canvas_data, kind="fork", row_id=fork.id)
+    if draft is not None or fork.canvas_data is None or latest is None:
+        return draft
+    return await readable_canvas_or_none(latest.canvas_data, kind="fork_version", row_id=latest.id)
+
+
+async def _refuse_empty_canvas_over_unreadable_draft(
+    db: AsyncSession, fork: ReservationFork, canvas: dict
+) -> None:
+    """409 ``EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL`` for a canvas with no nodes
+    when the stored draft does not have the shape and the fork holds a connection
+    or an L3 route row: the fork read answered no canvas for that draft, so such a
+    canvas is what an editor opened on it would send (TOPO-SHAPE-8)."""
+    if canvas.get("nodes"):
+        return
+    if await stored_canvas_problem(fork.canvas_data) is None:
+        return
+    for model in (ForkConnection, ForkL3Route):
+        held = await db.execute(select(model.id).where(model.fork_id == fork.id).limit(1))
+        if held.first() is not None:
+            raise HTTPException(status_code=409, detail=EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL)
 
 
 def _check_internal_token(token: str) -> None:
@@ -492,10 +530,11 @@ async def get_fork_internal(
         parent_topology_id=fork.parent_topology_id,
         parent_version_id=fork.parent_version_id,
         status=fork.status,
-        # A draft that fails the shape check is answered as null, not refused: the
-        # wiring, versions, and routes beside it are what execution reads.
+        # A draft that fails the shape check is answered by the latest saved
+        # version's canvas, or as null, never refused: the wiring, versions, and
+        # routes beside it are what execution reads (TOPO-SHAPE-8).
         canvas_data=strip_device_nodes(
-            await readable_canvas_or_none(fork.canvas_data, kind="fork", row_id=fork.id)
+            await _answered_draft(fork, versions[0] if versions else None)
         ),
         draft_restored_from_id=fork.draft_restored_from_id,
         created_at=fork.created_at,
@@ -651,6 +690,7 @@ async def update_fork_canvas_internal(
     fork = await _load_fork(db, reservation_id, for_update=True)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+    await _refuse_empty_canvas_over_unreadable_draft(db, fork, body.canvas_data)
 
     stripped_canvas = strip_device_nodes(body.canvas_data)
     fork.canvas_data = stripped_canvas
@@ -740,6 +780,9 @@ async def save_fork_internal(
     fork = await _load_fork(db, reservation_id)
     if fork.status == ForkStatus_ARCHIVED:
         raise HTTPException(status_code=409, detail="Fork is archived and cannot be edited")
+    # Every canvas write is held to the shape check, so a draft that has the shape
+    # keeps it: one judged here before the lock is still judged right under it.
+    await _refuse_empty_canvas_over_unreadable_draft(db, fork, body.canvas_data)
 
     # Reduce every device node's `data.device` to the allowlist before anything
     # downstream (membership check, L3 parse, wiring resolve, the eventual

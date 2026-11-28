@@ -25,8 +25,10 @@ from app.config import settings
 from app.database import Base, get_db
 from app.dependencies import get_current_user_payload
 from app.main import app
+from app.models.connection import Connection
 from app.models.fork import (
     ForkConnection,
+    ForkL3Route,
     ForkStatus_ACTIVE,
     ForkVersion,
     ReservationFork,
@@ -676,19 +678,223 @@ async def test_a_bad_template_answers_409_and_its_owner_can_replace_it(client, k
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("saved", ["good", "bad"])
 @pytest.mark.parametrize("kind", list(BAD_STORED))
-async def test_the_fork_read_answers_its_wiring_with_a_null_draft(client, kind):
-    """Execution reads the wiring from this route: a bad draft is answered as null
-    and every other part as stored."""
-    reservation_id, _, version_id = await _seed_fork(BAD_STORED[kind], _good_canvas())
+async def test_the_fork_read_answers_its_wiring_over_a_bad_draft(client, kind, saved):
+    """Execution reads the wiring from this route: a bad draft is answered by the
+    latest saved canvas, or as null when that one is bad too, and every other part
+    as stored."""
+    saved_canvas = _good_canvas() if saved == "good" else copy.deepcopy(BAD_STORED[kind])
+    reservation_id, _, version_id = await _seed_fork(BAD_STORED[kind], saved_canvas)
     resp = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["canvas_data"] is None
+    assert body["canvas_data"] == (_good_canvas() if saved == "good" else None)
     assert [(c["device_a_id"], c["device_b_id"], c["edge_key"]) for c in body["connections"]] == [
         (DEV_A, DEV_B, "e1")
     ]
     assert [v["id"] for v in body["versions"]] == [str(version_id)]
+
+
+async def _wired_fork() -> tuple[uuid.UUID, uuid.UUID, dict]:
+    """A fork built through the real routes: created empty, then saved with one
+    cable between DEV_A and DEV_B over a physical connection, so it holds one
+    connection row and version 2. Returns (reservation_id, fork_id, saved canvas)."""
+    async with TestSessionLocal() as db:
+        db.add(
+            Connection(
+                device_a_id=uuid.UUID(DEV_A),
+                port_a="eth0",
+                device_b_id=uuid.UUID(DEV_B),
+                port_b="eth0",
+                created_by="seed",
+            )
+        )
+        await db.commit()
+    reservation_id = uuid.uuid4()
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as raw:
+        created = await raw.post(
+            "/internal/forks",
+            json={"reservation_id": str(reservation_id), "member_device_ids": [DEV_A, DEV_B]},
+            headers=_internal(),
+        )
+        assert created.status_code == 201, created.text
+        saved = await raw.post(
+            f"/internal/forks/{reservation_id}/save",
+            json={"canvas_data": _good_canvas(), "member_device_ids": [DEV_A, DEV_B]},
+            headers=_internal(),
+        )
+        assert saved.status_code == 200, saved.text
+        assert len(saved.json()["built"]) == 1
+    return reservation_id, uuid.UUID(created.json()["fork_id"]), _good_canvas()
+
+
+async def _connection_rows(fork_id: uuid.UUID) -> list[tuple]:
+    async with TestSessionLocal() as db:
+        rows = (
+            (await db.execute(select(ForkConnection).where(ForkConnection.fork_id == fork_id)))
+            .scalars()
+            .all()
+        )
+    return sorted((str(r.id), r.port_a, r.port_b, r.edge_key) for r in rows)
+
+
+async def _store(model, row_id: uuid.UUID, canvas) -> None:
+    async with TestSessionLocal() as db:
+        (await db.get(model, row_id)).canvas_data = canvas
+        await db.commit()
+
+
+async def _latest_fork_version(fork_id: uuid.UUID) -> ForkVersion:
+    async with TestSessionLocal() as db:
+        return (
+            (
+                await db.execute(
+                    select(ForkVersion)
+                    .where(ForkVersion.fork_id == fork_id)
+                    .order_by(ForkVersion.version_number.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+
+EMPTY_OVER_UNREADABLE_409 = {
+    "detail": "The stored draft cannot be read and this fork holds wiring; restore a saved "
+    "version, or rebuild the canvas, before saving a canvas with no nodes"
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", list(BAD_STORED))
+async def test_a_fork_read_over_a_bad_draft_answers_the_latest_saved_canvas(client, kind):
+    """Open, then Save: the read answers the canvas the wiring was saved from, and
+    saving exactly what was read leaves every connection row as it was."""
+    reservation_id, fork_id, saved_canvas = await _wired_fork()
+    before = await _connection_rows(fork_id)
+    assert len(before) == 1
+    await _store(ReservationFork, fork_id, copy.deepcopy(BAD_STORED[kind]))
+    read = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
+    assert read.status_code == 200, read.text
+    assert read.json()["canvas_data"] == saved_canvas
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": read.json()["canvas_data"], "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert (resp.json()["released"], resp.json()["built"]) == ([], [])
+    assert resp.json()["unchanged_count"] == 1
+    assert await _connection_rows(fork_id) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["node_not_an_object", "deep", "lone_surrogate"])
+@pytest.mark.parametrize("saved", ["bad", "null"])
+async def test_an_empty_canvas_over_a_bad_draft_is_refused_while_the_fork_holds_wiring(
+    client, kind, saved
+):
+    """With neither the draft nor the latest saved canvas readable, the read
+    answers no canvas, and saving or putting the empty canvas an editor opened on
+    it would send is refused: no connection row is released."""
+    reservation_id, fork_id, saved_canvas = await _wired_fork()
+    before = await _connection_rows(fork_id)
+    await _store(ReservationFork, fork_id, copy.deepcopy(BAD_STORED[kind]))
+    latest = await _latest_fork_version(fork_id)
+    await _store(
+        ForkVersion, latest.id, copy.deepcopy(BAD_STORED[kind]) if saved == "bad" else None
+    )
+    # An older version that is readable is not the state the wiring was saved
+    # from, so it is never answered in the draft's place.
+    async with TestSessionLocal() as db:
+        first = (
+            await db.execute(
+                select(ForkVersion).where(
+                    ForkVersion.fork_id == fork_id, ForkVersion.version_number == 1
+                )
+            )
+        ).scalar_one()
+        first.canvas_data = {"nodes": [{"id": "older"}], "edges": []}
+        await db.commit()
+    read = await client.get(f"/internal/forks/{reservation_id}", headers=_internal())
+    assert read.status_code == 200, read.text
+    assert read.json()["canvas_data"] is None
+    for empty in ({"nodes": [], "edges": []}, {}, {"nodes": None, "edges": []}):
+        resp = await client.post(
+            f"/internal/forks/{reservation_id}/save",
+            json={"canvas_data": empty, "member_device_ids": [DEV_A, DEV_B]},
+            headers=_internal(),
+        )
+        assert (resp.status_code, resp.json()) == (409, EMPTY_OVER_UNREADABLE_409)
+        resp = await client.put(
+            f"/internal/forks/{reservation_id}/canvas",
+            json={"canvas_data": empty},
+            headers=_internal(),
+        )
+        assert (resp.status_code, resp.json()) == (409, EMPTY_OVER_UNREADABLE_409)
+    assert await _connection_rows(fork_id) == before
+    assert await _stored_canvas(ReservationFork, fork_id) == BAD_STORED[kind]
+    assert (await _latest_fork_version(fork_id)).version_number == 2
+    # A canvas with nodes is a deliberate rebuild, and saves as any other.
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": saved_canvas, "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _connection_rows(fork_id) == before
+
+
+@pytest.mark.asyncio
+async def test_an_empty_canvas_saves_when_the_draft_is_readable_or_nothing_is_wired(client):
+    """The refusal needs all three: no nodes, a draft without the shape, and wiring."""
+    reservation_id, fork_id, _ = await _wired_fork()
+    empty = {"nodes": [], "edges": []}
+    resp = await client.put(
+        f"/internal/forks/{reservation_id}/canvas", json={"canvas_data": empty}, headers=_internal()
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": empty, "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["released"]) == 1
+    assert await _connection_rows(fork_id) == []
+    await _store(ReservationFork, fork_id, copy.deepcopy(BAD_STORED["node_not_an_object"]))
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": empty, "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert resp.status_code == 200, resp.text
+    # An L3 route row is wiring too.
+    async with TestSessionLocal() as db:
+        db.add(
+            ForkL3Route(
+                fork_id=fork_id,
+                device_id=uuid.UUID(DEV_A),
+                destination="10.0.0.0/24",
+                interface="eth0",
+                route_key="seed-route",
+                created_by="seed",
+            )
+        )
+        await db.commit()
+    await _store(ReservationFork, fork_id, copy.deepcopy(BAD_STORED["node_not_an_object"]))
+    resp = await client.post(
+        f"/internal/forks/{reservation_id}/save",
+        json={"canvas_data": empty, "member_device_ids": [DEV_A, DEV_B]},
+        headers=_internal(),
+    )
+    assert (resp.status_code, resp.json()) == (409, EMPTY_OVER_UNREADABLE_409)
+    resp = await client.put(
+        f"/internal/forks/{reservation_id}/canvas", json={"canvas_data": empty}, headers=_internal()
+    )
+    assert (resp.status_code, resp.json()) == (409, EMPTY_OVER_UNREADABLE_409)
 
 
 @pytest.mark.asyncio

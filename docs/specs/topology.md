@@ -228,8 +228,8 @@ Every row is guarded by `X-Internal-Token` (TOPO-FORK-1).
 | GET | `/internal/forks/{reservation_id}` | `X-Internal-Token` | reservations (fork read), execution (intended wiring), ai-orchestrator (purpose signals) | fork detail | TOPO-FORK-9, TOPO-FORK-25, TOPO-SHAPE-8 |
 | GET | `/internal/forks/{reservation_id}/versions/{version_id}` | `X-Internal-Token` | reservations | one fork version with its canvas | TOPO-FORK-10, TOPO-SHAPE-8 |
 | POST | `/internal/forks/{reservation_id}/versions/{version_id}/restore` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges, draft_restored_from_id}` | TOPO-FORK-12, TOPO-MARKER-1, TOPO-FVER-3, TOPO-FSTATE-3, TOPO-SHAPE-8 |
-| PUT | `/internal/forks/{reservation_id}/canvas` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges}` | TOPO-FORK-11, TOPO-FVER-3, TOPO-FSTATE-3, TOPO-SHAPE-5 |
-| POST | `/internal/forks/{reservation_id}/save` | `X-Internal-Token` | reservations | `ForkSaveResponse` | TOPO-FORK-13 to TOPO-FORK-24, TOPO-CLAIM-1 to TOPO-CLAIM-4, TOPO-FVER-2, TOPO-MARKER-2, TOPO-FSTATE-4, TOPO-SHAPE-5 |
+| PUT | `/internal/forks/{reservation_id}/canvas` | `X-Internal-Token` | reservations | `{id, valid, invalid_edges}` | TOPO-FORK-11, TOPO-FVER-3, TOPO-FSTATE-3, TOPO-SHAPE-5, TOPO-SHAPE-8 |
+| POST | `/internal/forks/{reservation_id}/save` | `X-Internal-Token` | reservations | `ForkSaveResponse` | TOPO-FORK-13 to TOPO-FORK-24, TOPO-CLAIM-1 to TOPO-CLAIM-4, TOPO-FVER-2, TOPO-MARKER-2, TOPO-FSTATE-4, TOPO-SHAPE-5, TOPO-SHAPE-8 |
 | POST | `/internal/forks/{reservation_id}/prune-devices` | `X-Internal-Token` | reservations (device removal) | `{fork_id, version_number, changed, released}` | TOPO-PRUNE-1 to TOPO-PRUNE-4, TOPO-FVER-4, TOPO-SHAPE-8 |
 | POST | `/internal/forks/{reservation_id}/archive` | `X-Internal-Token` | reservations (terminal transitions, sweep) | `{fork_id, reservation_id, status}` or 204 | TOPO-FSTATE-2 |
 
@@ -1888,15 +1888,26 @@ sections 8.4 to 8.14.
   problem=canvas_data.<path>: <message>`, and nothing of the canvas. \
   Enforced in: `services/cabling/app/services/canvas_shape.py` (`stored_canvas_readable`) \
   Pinned by: `services/cabling/tests/test_canvas_shape.py` (`test_require_readable_canvas_returns_a_good_canvas_and_refuses_a_bad_one`, `test_readable_canvas_or_none_gives_none_for_a_bad_canvas`); `services/cabling/tests/test_canvas_shape_routes.py` (`test_a_skipped_topology_is_logged_by_id_and_problem_only`)
-- **TOPO-SHAPE-8.** On a fork: the fork read answers a draft without the shape as
-  `canvas_data` null, with its wiring, versions, and routes as stored, since execution
-  reads the wiring there; the fork version read and the version restore answer the 409
+- **TOPO-SHAPE-8.** On a fork: the fork read answers a draft without the shape with
+  the canvas of the fork's latest saved version in its place, when that one has the
+  shape, and otherwise as `canvas_data` null, never with a 409, and with its wiring,
+  versions, and routes as stored, since execution reads the wiring there. The latest
+  version is the one the fork's connection and L3 route rows were reconciled to, so an
+  editor that opens the fork and saves what it read changes no row; an older version
+  is never answered, since saving it would. When the read answered null, a fork save
+  or canvas PUT whose canvas has no nodes (none, null, or an empty list), while the
+  stored draft is still without the shape and the fork holds at least one connection
+  or L3 route row, answers 409 `The stored draft cannot be read and this fork holds
+  wiring; restore a saved version, or rebuild the canvas, before saving a canvas with
+  no nodes` and writes nothing; a canvas with nodes saves as any other. By decision,
+  as TOPO-SHAPE-6: an editor never opens a drawing it could not load as an empty one
+  whose save would release the reservation's cables. The fork version read and the version restore answer the 409
   of TOPO-SHAPE-6 for a version without the shape; fork create answers it for a parent
   canvas without the shape and writes nothing; and a prune reads a saved canvas without
   the shape as none (every row touching a removed device releases, and the appended
   version's canvas is null) and leaves a draft without the shape as it is. \
-  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `get_fork_version_internal`, `restore_fork_version_internal`); `services/cabling/app/services/fork_service.py` (`create_fork`); `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`); `services/cabling/app/services/canvas_shape.py` (`readable_canvas_or_none`) \
-  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_with_a_null_draft`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
+  Enforced in: `services/cabling/app/routes/forks.py` (`get_fork_internal`, `_answered_draft`, `_refuse_empty_canvas_over_unreadable_draft`, `EMPTY_CANVAS_OVER_UNREADABLE_DRAFT_DETAIL`, `update_fork_canvas_internal`, `save_fork_internal`, `get_fork_version_internal`, `restore_fork_version_internal`); `services/cabling/app/services/fork_service.py` (`create_fork`); `services/cabling/app/services/fork_save_service.py` (`prune_fork_devices`); `services/cabling/app/services/canvas_shape.py` (`readable_canvas_or_none`) \
+  Pinned by: `services/cabling/tests/test_canvas_shape_routes.py` (`test_the_fork_read_answers_its_wiring_over_a_bad_draft`, `test_a_fork_read_over_a_bad_draft_answers_the_latest_saved_canvas`, `test_an_empty_canvas_over_a_bad_draft_is_refused_while_the_fork_holds_wiring`, `test_an_empty_canvas_saves_when_the_draft_is_readable_or_nothing_is_wired`, `test_a_bad_fork_version_answers_409_on_read_and_restore`, `test_a_fork_is_not_created_from_a_bad_parent`, `test_a_prune_over_a_bad_draft_and_saved_canvas_still_releases`)
 
 **Out of scope.** The editor's own handling of a canvas it loads is sections 8.17 and
 8.20.
@@ -1931,6 +1942,7 @@ other error carries `detail` as a string or the object shown.
 | 409 | `{message, conflicts: [{reservation_id, device_id, port}]}` | fork create or save claiming a port another active fork holds | TOPO-CLAIM-1 |
 | 409 | `{"error": "l3_intent_invalid", "invalid_routes": [...]}` | fork save whose changed routing intent fails validation | TOPO-FORK-21 |
 | 409 | `Stored canvas cannot be read; save a new canvas to replace it, or delete it` | a route that reads a stored canvas without the shape | TOPO-SHAPE-6, TOPO-SHAPE-8 |
+| 409 | `The stored draft cannot be read and this fork holds wiring; restore a saved version, or rebuild the canvas, before saving a canvas with no nodes` | a fork save or canvas PUT of a canvas with no nodes over such a draft | TOPO-SHAPE-8 |
 | 422 | `Cannot connect a port to itself` | a connection from a port to itself; per row in bulk | TOPO-CONN-3 |
 | 422 | `Device <id> does not exist` | inventory answers 404 for a device being cabled; per row in bulk | TOPO-BOUND-2 |
 | 422 | `Devices belong to different device groups and share none; cross-group cabling is disabled.` | cabling across disjoint device groups; per row in bulk | TOPO-BOUND-1 |
