@@ -837,12 +837,34 @@ async def test_a_loop_cycle_that_raises_an_error_status_logs_only_its_label(
     ("error", "logged"),
     [
         ("provisioning failed: KeyError", "KeyError"),
+        (f"provisioning failed: {'A' * 100}", "A" * 100),
         (f"provisioning failed: {SENTINEL}", None),
+        (f"provisioning failed: {'A' * 101}", None),
+        ("provisioning failed: app.Error", None),
+        ("provisioning failed: Key:Error", None),
+        ("provisioning failed: svc/Error", None),
+        ("provisioning failed: svc@Error", None),
+        ("provisioning failed: Key Error", None),
+        ("provisioning failed: 9Error", None),
         (EXC_TEXT, None),
         (f"provisioning failed: KeyError\n{SENTINEL}", None),
         (None, None),
     ],
-    ids=["documented_form", "form_with_text", "free_text", "form_then_text", "none"],
+    ids=[
+        "documented_form",
+        "longest_name",
+        "form_with_text",
+        "name_too_long",
+        "dot",
+        "colon",
+        "slash",
+        "at_sign",
+        "space",
+        "leading_digit",
+        "free_text",
+        "form_then_text",
+        "none",
+    ],
 )
 async def test_a_failed_provision_result_logs_only_a_class_name(network, caplog, error, logged):
     """Execution's documented `error` is `provisioning failed: <ClassName>`; only that
@@ -895,10 +917,13 @@ async def test_the_group_read_logs_only_the_class(network, caplog):
     caplog.set_level(logging.DEBUG)
     assert await fetch_user_groups_map(users, "Bearer t") == {users[0]: []}
     assert "fetching user groups (ReadTimeout)" in caplog.text
-    # A body whose entries cannot be converted is logged by the error's class too.
-    route.mock(return_value=httpx.Response(200, json={str(users[0]): [{"name": SENTINEL}]}))
+    # A body whose entries cannot be converted is logged by the error's class only. No
+    # conversion here quotes the value it was given (the KeyError's text is `'id'`), so
+    # the exact message is what pins that nothing of the error is appended.
+    route.mock(return_value=httpx.Response(200, json={str(users[0]): [{"name": "g"}]}))
     assert await fetch_user_groups_map(users, "Bearer t") == {users[0]: []}
-    assert "unexpected error in fetch_user_groups_map (KeyError)" in caplog.text
+    (record,) = [r for r in _records(caplog) if "fetch_user_groups_map" in r.getMessage()]
+    assert record.getMessage() == "unexpected error in fetch_user_groups_map (KeyError)"
     _assert_absent(caplog)
 
 
