@@ -229,6 +229,30 @@ describe("EditDevicesModal", () => {
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
 
+    it("while a new search is on its way, the previous rows stay and the notice is hidden", async () => {
+      server.use(
+        http.get("/api/inventory/devices", ({ request }) => {
+          const params = new URL(request.url).searchParams;
+          if (params.get("limit") === "500") {
+            return HttpResponse.json({ items: NAME_MAP, total: NAME_MAP.length, skip: 0, limit: 500 });
+          }
+          // The unfiltered list answers 50 of 120; a search never answers.
+          if (params.get("search")) return new Promise<never>(() => {});
+          return HttpResponse.json({ items: MANY, total: 120, skip: 0, limit: 50 });
+        }),
+      );
+      renderModal();
+      expect(await screen.findByText(/^70 more matching devices are not listed\./)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByRole("textbox", { name: "Search available devices" }), {
+        target: { value: "lab-node-4" },
+      });
+      await waitFor(() =>
+        expect(screen.queryByText(/more matching devices are not listed\./)).not.toBeInTheDocument(),
+      );
+      expect(screen.getAllByRole("button", { name: /^Add lab-node-/ })).toHaveLength(50);
+    });
+
     it("says nothing more when the page holds every match", async () => {
       server.use(cappedHandler(50, []));
       renderModal();

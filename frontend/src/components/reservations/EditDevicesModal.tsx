@@ -35,7 +35,9 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
   // filtered by current status (issue #999).
   // One page of candidates: past it, MoreMatchesNotice says how many match and
   // the search narrows the list (issue #1590). A failed read shows LoadError,
-  // never "No available devices found".
+  // never "No available devices found". While a new search is on its way the
+  // previous rows stay (keepPreviousData) and the notice is hidden, since its
+  // count belongs to the previous search.
   const availableQuery = usePaginatedDevices(
     {
       topology_type: reservation.topology_type,
@@ -231,7 +233,7 @@ export function EditDevicesModal({ reservation, open, onClose, onUpdated }: Prop
                 </button>
               ))}
           </div>
-          {availableData && (
+          {availableData && !availableQuery.isPlaceholderData && (
             <MoreMatchesNotice
               shown={availableData.items.length}
               total={availableData.total}

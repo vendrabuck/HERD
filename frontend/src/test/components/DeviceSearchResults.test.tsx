@@ -107,6 +107,28 @@ describe("DeviceSearchPicker, more matches than one page (issue #1590)", () => {
     ]);
   });
 
+  it("while a new term is on its way, the previous rows stay and the notice is hidden", async () => {
+    server.use(
+      http.get("/api/inventory/devices", ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        if (params.get("limit") === "500") return HttpResponse.json({ items: [], total: 0, skip: 0, limit: 500 });
+        // "lab" answers 20 of 35; "labx" never answers.
+        if (params.get("search") !== "lab") return new Promise<never>(() => {});
+        const items = Array.from({ length: DEVICE_SEARCH_LIMIT }, (_, i) => device(i));
+        return HttpResponse.json({ items, total: 35, skip: 0, limit: DEVICE_SEARCH_LIMIT });
+      }),
+    );
+    renderPicker();
+    type("lab");
+    expect(await screen.findByText(NOTICE)).toBeInTheDocument();
+
+    type("labx");
+    await flushPending();
+    // The rows are the previous term's placeholder; the count would be "lab"'s.
+    expect(screen.getAllByRole("button", { name: /^lab-node-/ })).toHaveLength(20);
+    expect(screen.queryByText(NOTICE)).not.toBeInTheDocument();
+  });
+
   it("says nothing more when the page holds every match", async () => {
     server.use(searchHandler(3, 3, []));
     renderPicker();

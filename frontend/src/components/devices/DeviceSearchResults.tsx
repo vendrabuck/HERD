@@ -14,7 +14,9 @@ import type { Device } from "@/types/device.types";
  * rows; else one button per device, named by the device, and under them
  * `MoreMatchesNotice` when the server holds more matches than the page. So a
  * failed search never reads as a search with no match, and a match past the
- * page is never silently missing.
+ * page is never silently missing. While a new term is on its way the previous
+ * term's rows stay (`keepPreviousData`), but the notice is hidden: its count
+ * belongs to the previous term, not the text now in the box.
  */
 export function DeviceSearchResults({
   query,
@@ -68,12 +70,14 @@ export function DeviceSearchResults({
           {d.name}
         </button>
       ))}
-      <MoreMatchesNotice
-        shown={page.items.length}
-        total={page.total}
-        noun="devices"
-        className="px-3 py-2 border-t border-gray-100"
-      />
+      {!query.isPlaceholderData && (
+        <MoreMatchesNotice
+          shown={page.items.length}
+          total={page.total}
+          noun="devices"
+          className="px-3 py-2 border-t border-gray-100"
+        />
+      )}
     </div>
   );
 }
